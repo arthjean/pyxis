@@ -1,0 +1,58 @@
+# Workspace MVP (Phase 1). Les spikes Phase 0 vivent dans `spikes/` (workspace
+# séparé, jetable) et sont exclus ici. Crates internes nommées `agent-*` (ADR-8).
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["spikes"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+# Lints clippy obligatoires (mandat global). panic/unimplemented/dbg = deny ;
+# unwrap/expect = warn (jamais deny, cf. CLAUDE.md / tokio #3887).
+[workspace.lints.clippy]
+panic = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+unwrap_in_result = "warn"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+rand = "0.9"
+base64 = "0.22"
+hex = "0.4"
+url = "2"
+thiserror = "2"
+keyring = { version = "3", features = ["sync-secret-service"] }
+open = "5"
+async-trait = "0.1"
+async-stream = "0.3"
+futures-util = "0.3"
+eventsource-stream = "0.2"
+# outils FS (Glob/Grep) — standards, légers, déjà en cache registry.
+regex = "1"
+globset = "0.4"
+walkdir = "2"
+# frontend terminal (US-019) + sandbox (US-020).
+ratatui = "0.29"
+crossterm = "0.28"
+landlock = "0.4"
+anyhow = "1"
+# crates internes
+agent-tokenizer = { path = "crates/agent-tokenizer" }
+agent-core = { path = "crates/agent-core" }
+agent-session = { path = "crates/agent-session" }
+agent-tools = { path = "crates/agent-tools" }
+agent-auth = { path = "crates/agent-auth" }
+agent-provider = { path = "crates/agent-provider" }
+agent-sandbox = { path = "crates/agent-sandbox" }
+agent-tui = { path = "crates/agent-tui" }

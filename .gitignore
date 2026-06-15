@@ -1,0 +1,15 @@
+# Rust build artifacts (workspace + spikes sub-workspace)
+/target
+/spikes/target
+
+# Local agent runtime state (sessions, scratch) — never shared
+/.numen
+
+# Claude Code local tooling (machine-specific, paneflow-managed)
+/.claude/settings.local.json
+/.claude/agent-memory
+
+# Editor / OS cruft
+*.swp
+*.swo
+.DS_Store
