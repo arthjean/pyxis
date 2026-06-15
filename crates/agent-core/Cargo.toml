@@ -1,0 +1,22 @@
+[package]
+name = "agent-core"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Invariant 1 (ARCHITECTURE §2) : agent-core ne dépend NI d'agent-tui NI
+# d'agent-provider. Seule dépendance hors-core autorisée : agent-tokenizer
+# (headless). Les I/O (Provider, Session, Clock, Tools) sont injectées via traits.
+[dependencies]
+agent-tokenizer.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+async-stream.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
