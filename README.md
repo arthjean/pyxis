@@ -24,6 +24,13 @@ Numen is built around a **headless core** (`agent-core`) that emits only structu
   <a href="#faq">FAQ</a>
 </p>
 
+<p align="center">
+  <img src="assets/images/welcome.png" alt="Numen's welcome screen: a monochrome terminal card with a braille Dyson-sphere logo, running on a ChatGPT subscription (codex, gpt-5.5)" width="720" />
+</p>
+<p align="center">
+  <sub>The welcome screen: a native terminal agent on your ChatGPT subscription (gpt-5.5 via codex), monochrome, no window.</sub>
+</p>
+
 ```console
 $ numen
   numen · gpt-5.5 · ~/dev/myproject
