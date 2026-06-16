@@ -3,27 +3,30 @@
 
 use std::io::{self, Stdout};
 
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
-/// Entre en mode plein écran (raw + alt screen).
+/// Entre en mode plein écran (raw + alt screen + capture souris). La capture
+/// souris route la molette vers l'app (scroll du transcript) ; contrepartie : la
+/// sélection au clic-glissé passe par Shift (la copie native n'est plus directe).
 pub fn enter() -> io::Result<Tui> {
     enable_raw_mode()?;
     let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen)?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     Terminal::new(CrosstermBackend::new(out))
 }
 
 /// Restaure le terminal (à appeler en sortie, y compris sur erreur).
 pub fn leave(tui: &mut Tui) -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(tui.backend_mut(), LeaveAlternateScreen)?;
+    execute!(tui.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     tui.show_cursor()?;
     Ok(())
 }

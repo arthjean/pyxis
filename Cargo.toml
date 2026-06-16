@@ -42,9 +42,13 @@ eventsource-stream = "0.2"
 regex = "1"
 globset = "0.4"
 walkdir = "2"
-# frontend terminal (US-019) + sandbox (US-020).
-ratatui = "0.29"
+# frontend terminal (US-019) + sandbox (US-020). `unstable-rendered-line-info` :
+# expose `Paragraph::line_count` pour borner le scroll au nombre de lignes APRÈS
+# wrap (sinon impossible de remonter tout en haut quand des lignes wrappent).
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
+# rendu markdown des réponses (CommonMark + GFM) → spans ratatui.
+pulldown-cmark = { version = "0.12", default-features = false }
 landlock = "0.4"
 anyhow = "1"
 # MCP (ARCHITECTURE §6) : SDK Rust officiel. Client stdio uniquement au départ
