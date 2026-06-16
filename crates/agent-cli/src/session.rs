@@ -5,6 +5,7 @@
 //! interactive le relit pour enchaîner les tours sans réimplémenter la
 //! construction de messages du cœur.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agent_core::compaction::CompactKind;
@@ -36,6 +37,14 @@ impl SharedSession {
         if let Ok(mut s) = self.snapshot.lock() {
             *s = messages.to_vec();
         }
+    }
+
+    /// Bascule le fichier de persistance vers une session reprise (`/resume`).
+    /// `cursor` = nombre de messages déjà présents dans la session (les prochains
+    /// `sync` n'écriront que la suite). Le snapshot mémoire est mis à jour à part
+    /// par la boucle interactive (poignée `conversation`).
+    pub fn switch_file(&self, path: &Path, cursor: usize) -> Result<(), SessionError> {
+        self.inner.switch_to(path, cursor)
     }
 }
 

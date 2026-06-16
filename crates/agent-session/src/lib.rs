@@ -19,11 +19,12 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 use agent_core::CompactKind;
-use agent_core::message::Message;
+use agent_core::message::{Message, Role};
 use agent_core::session::{FileSnapshot, Session, SessionEntry, SessionError};
 
 /// Nom du fichier de session dans un dossier de travail.
@@ -56,6 +57,46 @@ impl JsonlSession {
             file: Mutex::new(file),
             cursor: Mutex::new(0),
         })
+    }
+
+    /// Crée (ou rouvre en append) une session sur un fichier nommé (un fichier
+    /// par conversation : `<dir>/<id>.jsonl`). Crée le dossier parent au besoin.
+    pub fn create_at(path: &Path) -> Result<Self, SessionError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(io_err)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(io_err)?;
+        Ok(Self {
+            file: Mutex::new(file),
+            cursor: Mutex::new(0),
+        })
+    }
+
+    /// Bascule le fichier de persistance vers `path` (resume d'une session
+    /// passée) en repositionnant le curseur à `cursor` messages déjà écrits : les
+    /// prochains `sync` n'appendront que le delta dans la session reprise.
+    pub fn switch_to(&self, path: &Path, cursor: usize) -> Result<(), SessionError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(io_err)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(io_err)?;
+        *self
+            .file
+            .lock()
+            .map_err(|_| SessionError::Io("verrou fichier empoisonné".into()))? = file;
+        *self
+            .cursor
+            .lock()
+            .map_err(|_| SessionError::Io("verrou curseur empoisonné".into()))? = cursor;
+        Ok(())
     }
 
     fn append(&self, entry: &SessionEntry) -> Result<(), SessionError> {
@@ -184,6 +225,115 @@ pub fn resume_file(path: &Path) -> Result<ResumedSession, SessionError> {
     Ok(out)
 }
 
+/// Métadonnée d'une session listée pour le menu `/resume`.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    /// Nom de fichier (`<id>.jsonl`) — identifiant résolu côté CLI.
+    pub id: String,
+    /// Résumé : premier message utilisateur (vide si aucun).
+    pub summary: String,
+    pub message_count: usize,
+    pub modified: SystemTime,
+}
+
+/// Liste les sessions reprenables d'un dossier (`*.jsonl`), triées du plus
+/// récent au plus ancien. Ignore les sessions vides et celle de `exclude` (la
+/// session courante). Tolérante : un fichier illisible est simplement sauté.
+pub fn list_sessions(dir: &Path, exclude: Option<&Path>) -> Vec<SessionInfo> {
+    let exclude = exclude.and_then(|p| p.canonicalize().ok());
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if let Some(ex) = &exclude
+            && path.canonicalize().ok().as_ref() == Some(ex)
+        {
+            continue;
+        }
+        let Ok(resumed) = resume_file(&path) else {
+            continue;
+        };
+        if resumed.messages.is_empty() {
+            continue;
+        }
+        let summary = resumed
+            .messages
+            .iter()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.text())
+            .unwrap_or_default();
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        out.push(SessionInfo {
+            id: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            summary,
+            message_count: resumed.messages.len(),
+            modified,
+        });
+    }
+    out.sort_by_key(|s| std::cmp::Reverse(s.modified));
+    out
+}
+
+/// Agrège les prompts utilisateur de TOUTES les sessions d'un dossier (ancien →
+/// récent), pour l'historique navigable **par dossier** (façon Claude Code).
+/// Exclut `exclude` (la session courante, encore vide), dédupe les doublons
+/// consécutifs et garde au plus `cap` entrées (les plus récentes). Les sessions
+/// sont ordonnées par date de modification (approx. chronologique).
+pub fn workspace_prompts(dir: &Path, exclude: Option<&Path>, cap: usize) -> Vec<String> {
+    let exclude = exclude.and_then(|p| p.canonicalize().ok());
+    let mut files: Vec<(SystemTime, PathBuf)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if let Some(ex) = &exclude
+            && path.canonicalize().ok().as_ref() == Some(ex)
+        {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        files.push((mtime, path));
+    }
+    files.sort_by_key(|(t, _)| *t); // ancien → récent
+
+    let mut out: Vec<String> = Vec::new();
+    for (_, path) in files {
+        let Ok(resumed) = resume_file(&path) else {
+            continue;
+        };
+        for m in &resumed.messages {
+            if m.role == Role::User {
+                let text = m.text();
+                if !text.trim().is_empty() && out.last().map(String::as_str) != Some(text.as_str()) {
+                    out.push(text);
+                }
+            }
+        }
+    }
+    if out.len() > cap {
+        out.drain(0..out.len() - cap);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +449,71 @@ mod tests {
         );
         assert_eq!(resumed.messages.len(), 1);
         assert_eq!(resumed.messages[0].text(), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_excludes_current_and_empties() {
+        let dir = tmp("list");
+        let a = JsonlSession::create_at(&dir.join("a.jsonl")).unwrap();
+        a.sync(&[Message::user("session A")]).await.unwrap();
+        let b = JsonlSession::create_at(&dir.join("b.jsonl")).unwrap();
+        b.sync(&[Message::user("session B"), Message::assistant_text("ok")])
+            .await
+            .unwrap();
+        JsonlSession::create_at(&dir.join("empty.jsonl")).unwrap(); // vide → ignorée
+
+        let list = list_sessions(&dir, Some(&dir.join("a.jsonl")));
+        assert_eq!(list.len(), 1, "a exclue, empty ignorée → reste b");
+        assert_eq!(list[0].id, "b.jsonl");
+        assert_eq!(list[0].summary, "session B");
+        assert_eq!(list[0].message_count, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn workspace_prompts_aggregates_across_sessions() {
+        let dir = tmp("wprompts");
+        let a = JsonlSession::create_at(&dir.join("a.jsonl")).unwrap();
+        a.sync(&[
+            Message::user("a1"),
+            Message::assistant_text("r"),
+            Message::user("a2"),
+            Message::user("a2"), // doublon consécutif → dédupliqué
+        ])
+        .await
+        .unwrap();
+        let b = JsonlSession::create_at(&dir.join("b.jsonl")).unwrap();
+        b.sync(&[Message::user("b1")]).await.unwrap();
+        let cur = JsonlSession::create_at(&dir.join("cur.jsonl")).unwrap();
+        cur.sync(&[Message::user("courant")]).await.unwrap();
+
+        let prompts = workspace_prompts(&dir, Some(&dir.join("cur.jsonl")), 100);
+        let pos = |x: &str| prompts.iter().position(|p| p == x);
+        assert!(pos("a1").unwrap() < pos("a2").unwrap(), "ordre intra-session");
+        assert_eq!(prompts.iter().filter(|p| *p == "a2").count(), 1, "dédup");
+        assert!(pos("b1").is_some(), "agrégé depuis une autre session");
+        assert!(pos("courant").is_none(), "session courante exclue");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn switch_to_appends_to_resumed_file() {
+        let dir = tmp("switch");
+        let old = JsonlSession::create_at(&dir.join("old.jsonl")).unwrap();
+        old.sync(&[Message::user("ancien")]).await.unwrap();
+        drop(old);
+
+        // session courante, puis bascule vers `old` au curseur 1 (1 msg présent).
+        let s = JsonlSession::create_at(&dir.join("cur.jsonl")).unwrap();
+        s.switch_to(&dir.join("old.jsonl"), 1).unwrap();
+        s.sync(&[Message::user("ancien"), Message::assistant_text("suite")])
+            .await
+            .unwrap();
+
+        let resumed = resume_file(&dir.join("old.jsonl")).unwrap();
+        assert_eq!(resumed.messages.len(), 2, "le delta s'est appendé à old");
+        assert_eq!(resumed.messages[1].text(), "suite");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
