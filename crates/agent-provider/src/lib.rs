@@ -17,7 +17,8 @@ pub mod chatgpt_request;
 pub mod credential;
 
 pub use chatgpt::{
-    DEFAULT_MAX_CONTEXT, DEFAULT_REASONING_EFFORT, KEYRING_ACCOUNT, OpenAiChatGptProvider,
+    DEFAULT_MAX_CONTEXT, DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, KEYRING_ACCOUNT,
+    OpenAiChatGptProvider,
 };
 pub use chatgpt_events::CodexEventMapper;
 pub use chatgpt_request::build_responses_body;

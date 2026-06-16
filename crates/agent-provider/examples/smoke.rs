@@ -8,12 +8,13 @@
 //! bout « ça marche avec mon abonnement » — il n'y a pas encore de CLI (EP-005).
 //!
 //! ⚠️ Le slug `model` dépend de ce que ton abonnement expose côté backend Codex
-//! (défaut `gpt-5`). En cas de `400 invalid model`, passe le bon id en 2e arg.
+//! (défaut `DEFAULT_MODEL`). En cas de `400 ... not supported`, passe le bon id
+//! en 2e arg (slugs versionnés : `gpt-5.4`, `gpt-5.5`…).
 
 use agent_auth::{Credential, store};
 use agent_core::message::Message;
 use agent_core::provider::{CanonicalRequest, Provider, StreamEvent};
-use agent_provider::{KEYRING_ACCOUNT, OpenAiChatGptProvider};
+use agent_provider::{DEFAULT_MODEL, KEYRING_ACCOUNT, OpenAiChatGptProvider};
 use futures_util::StreamExt;
 
 #[tokio::main]
@@ -22,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prompt = args
         .next()
         .unwrap_or_else(|| "Dis bonjour en une phrase.".to_string());
-    let model = args.next().unwrap_or_else(|| "gpt-5".to_string());
+    let model = args.next().unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
     let cred = match store::load(KEYRING_ACCOUNT)? {
         Some(Credential::Oauth(o)) => o,

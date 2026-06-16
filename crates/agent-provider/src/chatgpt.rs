@@ -40,6 +40,13 @@ pub const DEFAULT_MAX_CONTEXT: u32 = 256_000;
 /// Effort de raisonnement par défaut (Codex CLI ≈ "medium").
 pub const DEFAULT_REASONING_EFFORT: &str = "medium";
 
+/// Slug de modèle par défaut. Le backend Codex (abonnement ChatGPT) impose une
+/// liste blanche de slugs VERSIONNÉS qu'il fait évoluer (retraits fréquents) : le
+/// slug générique `gpt-5` est rejeté en 400 ("not supported when using Codex with
+/// a ChatGPT account"). **Valeur volatile** — surchargeable via `--model` ou la
+/// commande `/models` en session (voir `agent_tui::MODELS`).
+pub const DEFAULT_MODEL: &str = "gpt-5.5";
+
 /// Borne du corps d'erreur HTTP capturé (évite un message géant en log).
 const MAX_ERR_BODY: usize = 2000;
 
