@@ -76,6 +76,7 @@ dependencies = [
  "async-trait",
  "eventsource-stream",
  "futures-util",
+ "rand",
  "reqwest",
  "serde",
  "serde_json",

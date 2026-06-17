@@ -25,6 +25,9 @@ tokio.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
 eventsource-stream.workspace = true
 thiserror.workspace = true
+# US-029 : génération du session_id (UUID v4) pour prompt_cache_key. `rand` est
+# déjà épinglé au workspace (agent-auth) → aucune nouvelle crate téléchargée.
+rand.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

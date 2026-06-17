@@ -122,6 +122,9 @@ pub struct Accumulator {
     pub stop: Option<StopReason>,
     open: HashMap<ToolCallId, PartialCall>,
     order: Vec<ToolCallId>,
+    /// Reasoning items chiffrés capturés (US-031, replay isolé) : `(id, contenu)`,
+    /// dans l'ordre d'arrivée (avant leurs function_calls). Vides si replay OFF.
+    reasonings: Vec<(String, String)>,
 }
 
 impl Accumulator {
@@ -158,6 +161,10 @@ impl Accumulator {
                     self.order.push(id);
                 }
             }
+            StreamEvent::EncryptedReasoning {
+                id,
+                encrypted_content,
+            } => self.reasonings.push((id, encrypted_content)),
             StreamEvent::ToolCallEnd { .. } | StreamEvent::Usage { .. } => {}
             StreamEvent::Done { stop } => self.stop = Some(stop),
         }
@@ -192,6 +199,14 @@ impl Accumulator {
         if !self.text.is_empty() {
             content.push(ContentBlock::Text {
                 text: self.text.clone(),
+            });
+        }
+        // US-031 : reasoning items chiffrés AVANT les function_calls (paire rs/fc).
+        // Vide si replay OFF → message identique au chemin plat.
+        for (id, encrypted_content) in &self.reasonings {
+            content.push(ContentBlock::EncryptedReasoning {
+                id: id.clone(),
+                encrypted_content: encrypted_content.clone(),
             });
         }
         for id in &self.order {
@@ -329,6 +344,41 @@ mod tests {
             },
         ]);
         assert!(matches!(post_stream_transition(&a), Transition::EndTurn));
+    }
+
+    // US-031 : l'Accumulator capture les reasoning items et les place AVANT les
+    // tool_use dans le message assistant.
+    #[test]
+    fn accumulator_orders_reasoning_before_tooluse() {
+        let a = acc_with(vec![
+            StreamEvent::EncryptedReasoning {
+                id: "rs_1".into(),
+                encrypted_content: "ENC".into(),
+            },
+            StreamEvent::ToolCallStart {
+                id: "c1".into(),
+                name: "bash".into(),
+            },
+            StreamEvent::ToolCallDelta {
+                id: "c1".into(),
+                args_json: "{}".into(),
+            },
+            StreamEvent::Done {
+                stop: StopReason::ToolUse,
+            },
+        ]);
+        let m = a.to_assistant_message();
+        let rs = m
+            .content
+            .iter()
+            .position(|b| matches!(b, ContentBlock::EncryptedReasoning { .. }))
+            .unwrap();
+        let tu = m
+            .content
+            .iter()
+            .position(|b| matches!(b, ContentBlock::ToolUse { .. }))
+            .unwrap();
+        assert!(rs < tu, "reasoning avant tool_use");
     }
 
     #[test]

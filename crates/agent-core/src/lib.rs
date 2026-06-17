@@ -70,6 +70,9 @@ mod loop_tests {
         summary: String,
         summary_fails: bool,
         log: Arc<Mutex<Vec<&'static str>>>,
+        /// Capture les `messages` de chaque requête (US-028 : vérifier l'injection
+        /// éphémère sans toucher au transcript persistant).
+        requests: Arc<Mutex<Vec<Vec<Message>>>>,
     }
 
     #[async_trait::async_trait]
@@ -82,9 +85,10 @@ mod loop_tests {
         }
         async fn stream(
             &self,
-            _req: CanonicalRequest,
+            req: CanonicalRequest,
         ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
             self.log.lock().unwrap().push("stream");
+            self.requests.lock().unwrap().push(req.messages.clone());
             match self.turns.lock().unwrap().pop_front() {
                 Some(MockTurn::Stream(evs)) => Ok(Box::pin(futures_util::stream::iter(
                     evs.into_iter().map(Ok),
@@ -201,11 +205,13 @@ mod loop_tests {
     struct Harness {
         log: Arc<Mutex<Vec<&'static str>>>,
         boundaries: Arc<InMemorySession>,
+        requests: Arc<Mutex<Vec<Vec<Message>>>>,
         deps: Deps,
     }
 
     fn harness(turns: Vec<MockTurn>, summary_fails: bool, max_context: u32) -> Harness {
         let log = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let session = Arc::new(InMemorySession {
             synced: Mutex::new(Vec::new()),
             cursor: Mutex::new(0),
@@ -225,6 +231,7 @@ mod loop_tests {
             summary: "RÉSUMÉ".to_string(),
             summary_fails,
             log: Arc::clone(&log),
+            requests: Arc::clone(&requests),
         });
         let deps = Deps {
             provider,
@@ -236,6 +243,7 @@ mod loop_tests {
         Harness {
             log,
             boundaries: session,
+            requests,
             deps,
         }
     }
@@ -305,6 +313,67 @@ mod loop_tests {
         let stream_at = log.iter().position(|e| *e == "stream");
         assert!(sync_at.is_some() && stream_at.is_some());
         assert!(sync_at < stream_at, "sync doit précéder stream: {log:?}");
+    }
+
+    // US-024 : le DERNIER message assistant est syncé AVANT EndTurn — sinon
+    // `/resume` perd la dernière réponse. Le sync final est delta-only (idempotent) :
+    // `synced.len() == 2` prouve l'absence de doublon du message user déjà syncé.
+    #[tokio::test]
+    async fn final_assistant_turn_synced_before_endturn() {
+        let h = harness(vec![text_turn("réponse finale")], false, 100_000);
+        let ctx = AgentContext::new("mock").push(Message::user("question"));
+        let events = drive(ctx, h.deps).await;
+        assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
+
+        let synced = h.boundaries.synced.lock().unwrap();
+        assert_eq!(
+            synced.len(),
+            2,
+            "user + assistant final, sans doublon: {synced:?}"
+        );
+        let last = synced.last().unwrap();
+        assert_eq!(last.role, crate::message::Role::Assistant);
+        assert!(
+            last.text().contains("réponse finale"),
+            "le dernier message persisté doit être la réponse finale: {synced:?}"
+        );
+    }
+
+    // US-028 : les messages de contexte (AGENTS.md + env) sont préfixés à CHAQUE
+    // requête mais JAMAIS persistés ni accumulés dans le transcript (rechargés).
+    #[tokio::test]
+    async fn context_messages_injected_per_request_never_persisted() {
+        let h = harness(vec![tool_turn("c1"), text_turn("fini")], false, 100_000);
+        let ctx = AgentContext::new("mock")
+            .with_context_messages(vec![
+                Message::user("# AGENTS.md instructions\nCTX_AGENTS"),
+                Message::user("<environment>CTX_ENV</environment>"),
+            ])
+            .push(Message::user("fais X"));
+        let events = drive(ctx, h.deps).await;
+        assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
+
+        // 1. Chaque requête envoyée au provider commence par les 2 messages de contexte.
+        let reqs = h.requests.lock().unwrap();
+        assert!(reqs.len() >= 2, "au moins 2 tours");
+        for (i, msgs) in reqs.iter().enumerate() {
+            assert!(
+                msgs[0].text().contains("CTX_AGENTS") && msgs[1].text().contains("CTX_ENV"),
+                "tour {i} : le contexte doit préfixer la requête"
+            );
+            assert!(
+                msgs.iter().filter(|m| m.text().contains("CTX_AGENTS")).count() == 1,
+                "tour {i} : pas d'accumulation du contexte (une seule occurrence)"
+            );
+        }
+
+        // 2. Le transcript persistant NE contient PAS les messages de contexte.
+        let synced = h.boundaries.synced.lock().unwrap();
+        assert!(
+            !synced.iter().any(|m| m.text().contains("CTX_AGENTS")
+                || m.text().contains("CTX_ENV")),
+            "le contexte éphémère ne doit jamais être persisté: {synced:?}"
+        );
     }
 
     // US-006 AC4 + US-008 AC4 : erreur de contexte → withholding → compaction
@@ -453,6 +522,7 @@ mod loop_tests {
                     ProviderError::Http {
                         status: 413,
                         message: "too long".into(),
+                        retry_after_ms: None,
                     },
                 ),
                 text_turn("repris après 413"),

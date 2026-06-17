@@ -41,6 +41,14 @@ pub enum ContentBlock {
         media_type: String,
         data: String,
     },
+    /// Reasoning item CHIFFRÉ du backend Codex (US-031, replay isolé). Capturé
+    /// uniquement derrière le flag `reasoning_replay` (défaut OFF) pour réémission
+    /// de la paire `rs`/`fc` ; DROPPÉ à la compaction (contrainte protocole). Le
+    /// `encrypted_content` est opaque (jamais loggé/affiché).
+    EncryptedReasoning {
+        id: String,
+        encrypted_content: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -139,6 +147,20 @@ mod tests {
             ],
         };
         assert_eq!(m.text(), "ab");
+    }
+
+    // US-031 : la variante EncryptedReasoning sérialise en tag snake_case et
+    // round-trip (rétro-compat JSONL : variante additive, sessions existantes intactes).
+    #[test]
+    fn encrypted_reasoning_serde_roundtrip() {
+        let b = ContentBlock::EncryptedReasoning {
+            id: "rs_1".into(),
+            encrypted_content: "OPAQUE".into(),
+        };
+        let json = serde_json::to_string(&b).unwrap();
+        assert!(json.contains("\"type\":\"encrypted_reasoning\""));
+        let back: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert_eq!(b, back);
     }
 
     #[test]

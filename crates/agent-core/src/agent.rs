@@ -67,6 +67,11 @@ pub struct AgentContext {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub config: RunConfig,
+    /// Messages de contexte ÉPHÉMÈRES (US-028) : AGENTS.md + bloc environnement,
+    /// préfixés à CHAQUE requête mais JAMAIS poussés dans `messages` ni persistés
+    /// (rechargés par tour, pas accumulés). Stateless-safe : le contexte projet est
+    /// re-fourni à chaque tour sans polluer le transcript ni `instructions`.
+    pub context_messages: Vec<Message>,
 }
 
 impl AgentContext {
@@ -77,6 +82,7 @@ impl AgentContext {
             messages: Vec::new(),
             tools: Vec::new(),
             config: RunConfig::default(),
+            context_messages: Vec::new(),
         }
     }
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
@@ -91,19 +97,30 @@ impl AgentContext {
         self.config = config;
         self
     }
+    pub fn with_context_messages(mut self, messages: Vec<Message>) -> Self {
+        self.context_messages = messages;
+        self
+    }
 }
 
 fn make_request(
     model: &str,
     system: &Option<String>,
+    context_messages: &[Message],
     messages: &[Message],
     tools: &[ToolSpec],
     max_output: u32,
 ) -> CanonicalRequest {
+    // US-028 : préfixe ÉPHÉMÈRE (AGENTS.md + env). Stable avant volatil pour
+    // préserver le préfixe cacheable ; jamais persisté (le transcript reste
+    // `messages` seul).
+    let mut all = Vec::with_capacity(context_messages.len() + messages.len());
+    all.extend_from_slice(context_messages);
+    all.extend_from_slice(messages);
     CanonicalRequest {
         model: model.to_string(),
         system: system.clone(),
-        messages: messages.to_vec(),
+        messages: all,
         tools: tools.to_vec(),
         max_output_tokens: max_output,
     }
@@ -114,14 +131,37 @@ fn backoff(config: &RunConfig, attempt: u32) -> Duration {
     Duration::from_millis(config.backoff_base_ms.saturating_mul(factor))
 }
 
+/// Plafond du délai `Retry-After` honoré (US-023). Un serveur ne peut pas geler la
+/// boucle indéfiniment : un délai aberrant est borné, on retente puis on abandonne
+/// selon `max_retries`. Identique au cap de Pi (60 s).
+const MAX_RETRY_AFTER_MS: u64 = 60_000;
+
+/// Délai de retry effectif (US-023) : `max(backoff exponentiel, Retry-After)`, le
+/// délai serveur (ms exact) primant quand il est plus long, borné à
+/// `MAX_RETRY_AFTER_MS`. Les erreurs sans en-tête serveur retombent sur le backoff.
+fn retry_delay(base: Duration, err: &ProviderError) -> Duration {
+    match err {
+        ProviderError::Http {
+            retry_after_ms: Some(ms),
+            ..
+        } => base.max(Duration::from_millis((*ms).min(MAX_RETRY_AFTER_MS))),
+        _ => base,
+    }
+}
+
 /// Lance l'agent. Renvoie un `Stream<AgentEvent>` à consommer (TUI, `-p`, Paneflow).
 pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent> + Send {
     async_stream::stream! {
-        let AgentContext { model, system, mut messages, tools, config } = ctx;
+        let AgentContext { model, system, mut messages, tools, config, context_messages } = ctx;
 
         // ContextBudget calculé UNE FOIS pour ce modèle (invariant 5).
         let max_context = deps.provider.capabilities().max_context;
         let mut budget = ContextBudget::for_model(max_context, config.max_output_tokens);
+        // US-028 : le préfixe éphémère (AGENTS.md + env) est envoyé à CHAQUE requête
+        // mais absent de `messages`. On l'ajoute aux ESTIMATIONS locales (sens
+        // conservateur : compaction au plus tôt, jamais trop tard) ; l'`usage` réel
+        // du backend l'inclut déjà. Stable sur le run → calculé une fois.
+        let context_tokens = estimate_input(&context_messages, deps.tokenizer.as_ref());
         let mut compaction = CompactionState::default();
         let mut pending: Option<PendingError> = None;
         let mut model_turns: u32 = 0;
@@ -131,6 +171,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
         // US-014 — garde-fous déterministes (override de la logique du modèle).
         let mut loop_guard = LoopGuard::new(config.loop_guard_threshold);
         let mut usage_budget = UsageBudget::new(config.token_budget, config.cost_budget);
+        // US-030 (MidTurn) : armé quand un long tool_result franchit le seuil →
+        // force la compaction au prochain tour, AVANT de relancer le modèle.
+        let mut force_compact = false;
 
         loop {
             iterations += 1;
@@ -154,7 +197,15 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                 return;
             }
 
-            let transition: Transition = match pre_stream_transition(
+            let transition: Transition = if force_compact && pending.is_none() {
+                // US-030 MidTurn : compaction forcée par un long tool_result au tour
+                // précédent. Le withholding (`pending`) reste PRIORITAIRE : si une
+                // erreur de contexte est en attente, on laisse `pre_stream_transition`
+                // la traiter (Recover) et le force reste armé pour le tour d'après.
+                force_compact = false;
+                Transition::Compact(CompactKind::Auto)
+            } else {
+                match pre_stream_transition(
                 pending,
                 model_turns,
                 config.max_turns,
@@ -174,7 +225,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     if budget.should_microcompact() {
                         let pruned = microcompact(&mut messages, config.micro_keep_recent);
                         if pruned > 0 {
-                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()));
+                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(context_tokens));
                             yield AgentEvent::Compacted(CompactKind::Micro);
                         }
                     }
@@ -183,7 +234,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     // projection (contexte estimé + sortie max) franchirait le
                     // budget (edge case #3, « avant un gros tour »).
                     if usage_budget.is_active() {
-                        let est_in = estimate_input(&messages, deps.tokenizer.as_ref()) as u64;
+                        let est_in = estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(context_tokens) as u64;
                         if let Some(reason) =
                             usage_budget.would_exceed(est_in, config.max_output_tokens as u64)
                         {
@@ -196,6 +247,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     let req = make_request(
                         &model,
                         &system,
+                        &context_messages,
                         &messages,
                         &tools,
                         config.max_output_tokens,
@@ -217,7 +269,13 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 }
                                 transient_retries += 1;
                                 // attempt indexé à partir de 0 → délais 1×,2×,4×.
-                                deps.clock.sleep(backoff(&config, transient_retries - 1)).await;
+                                // US-023 : honore Retry-After (max(backoff, retry_after), borné).
+                                deps.clock
+                                    .sleep(retry_delay(
+                                        backoff(&config, transient_retries - 1),
+                                        &e,
+                                    ))
+                                    .await;
                                 continue;
                             }
                             ErrorClass::Auth(a) => {
@@ -246,6 +304,20 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 acc.push(StreamEvent::ReasoningDelta { text });
                             }
                             Ok(StreamEvent::Usage { usage }) => {
+                                // Sonde d'observabilité (US-021 AC3 / US-029) : compare
+                                // l'usage backend réel à l'estimation locale. Env-gated,
+                                // défaut OFF → chemin et sortie inchangés en prod.
+                                if std::env::var_os("NUMEN_DEBUG_USAGE").is_some() {
+                                    let est_in = estimate_input(&messages, deps.tokenizer.as_ref())
+                                        .saturating_add(context_tokens);
+                                    eprintln!(
+                                        "[usage] backend input={} output={} | estimé_local input≈{} (ratio réel/estimé={:.3})",
+                                        usage.input,
+                                        usage.output,
+                                        est_in,
+                                        usage.input as f64 / (est_in.max(1) as f64),
+                                    );
+                                }
                                 budget.observe_usage(usage);
                                 last_usage = Some(usage);
                             }
@@ -272,7 +344,13 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 }
                                 transient_retries += 1;
                                 // attempt indexé à partir de 0 → délais 1×,2×,4×.
-                                deps.clock.sleep(backoff(&config, transient_retries - 1)).await;
+                                // US-023 : honore Retry-After (max(backoff, retry_after), borné).
+                                deps.clock
+                                    .sleep(retry_delay(
+                                        backoff(&config, transient_retries - 1),
+                                        &e,
+                                    ))
+                                    .await;
                                 continue;
                             }
                             ErrorClass::Auth(a) => {
@@ -296,7 +374,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     if let Some(u) = last_usage {
                         usage_budget.record_usage(u);
                     } else {
-                        let est_in = estimate_input(&messages, deps.tokenizer.as_ref());
+                        let est_in = estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(context_tokens);
                         let est_out = deps.tokenizer.count_text(acc.text()) as u32;
                         budget.observe_estimated(est_in);
                         usage_budget.record(est_in as u64, est_out as u64);
@@ -308,11 +386,21 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
 
                     post_stream_transition(&acc)
                 }
+            }
             };
 
             // Match EXHAUSTIF sur les 6 variantes (AC1) — vérifié à la compilation.
             match transition {
                 Transition::EndTurn => {
+                    // US-024 — persistance du DERNIER tour assistant : le message
+                    // assistant final (acc.to_assistant_message) vient d'être poussé,
+                    // mais le sync d'en-tête de boucle ne s'exécuterait qu'au tour
+                    // SUIVANT, qui n'aura pas lieu. Sync final (delta-only, idempotent)
+                    // avant de rendre la main, sinon `/resume` perd la dernière réponse.
+                    if let Err(e) = deps.session.sync(&messages).await {
+                        yield AgentEvent::Error(AgentError::Session(e.to_string()));
+                        return;
+                    }
                     yield AgentEvent::EndTurn;
                     return;
                 }
@@ -380,6 +468,16 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     o.is_error,
                                 ));
                             }
+                            // US-030 MidTurn : les tool_results qu'on vient d'ajouter
+                            // ne sont PAS encore dans le budget (basé sur l'usage du
+                            // tour précédent). On PROJETTE leur poids (sans écraser le
+                            // budget réel) ; si un long résultat franchit le seuil, on
+                            // force la compaction au prochain tour, avant le modèle.
+                            let projected = estimate_input(&messages, deps.tokenizer.as_ref())
+                                .saturating_add(context_tokens);
+                            if budget.would_autocompact(projected) {
+                                force_compact = true;
+                            }
                             // reboucle : le modèle voit les résultats.
                         }
                     }
@@ -395,7 +493,10 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 yield AgentEvent::Error(AgentError::Session(e.to_string()));
                                 return;
                             }
-                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()));
+                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(context_tokens));
+                            // US-030 : ancre le baseline sur le PROCHAIN usage réel
+                            // (anti double-compaction immédiate).
+                            budget.mark_compacted();
                             yield AgentEvent::Compacted(kind);
                         }
                         Err(_) => {
@@ -407,7 +508,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             // anti error-loop : microcompact structurel pour baisser
                             // la pression avant de reboucler.
                             let _ = microcompact(&mut messages, config.micro_keep_recent);
-                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()));
+                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(context_tokens));
                         }
                     }
                 }
@@ -424,7 +525,8 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 yield AgentEvent::Error(AgentError::Session(e.to_string()));
                                 return;
                             }
-                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()));
+                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(context_tokens));
+                            budget.mark_compacted();
                             yield AgentEvent::Compacted(CompactKind::Reactive);
                         }
                         Err(e) => {
@@ -486,5 +588,71 @@ pub async fn run_headless(ctx: AgentContext, deps: Deps) -> HeadlessResult {
         text,
         events,
         ended,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn http(retry_after_ms: Option<u64>) -> ProviderError {
+        ProviderError::Http {
+            status: 429,
+            message: String::new(),
+            retry_after_ms,
+        }
+    }
+
+    // US-023 : sans en-tête serveur → backoff seul.
+    #[test]
+    fn retry_delay_without_header_uses_backoff() {
+        let base = Duration::from_millis(50);
+        assert_eq!(retry_delay(base, &http(None)), base);
+        assert_eq!(
+            retry_delay(base, &ProviderError::Transport("x".into())),
+            base
+        );
+    }
+
+    // US-023 : Retry-After plus long que le backoff → c'est lui qui prime.
+    #[test]
+    fn retry_delay_honors_longer_retry_after() {
+        let base = Duration::from_millis(50);
+        assert_eq!(
+            retry_delay(base, &http(Some(2_000))),
+            Duration::from_millis(2_000)
+        );
+    }
+
+    // US-023 : backoff plus long que Retry-After → le backoff prime (max).
+    #[test]
+    fn retry_delay_keeps_longer_backoff() {
+        let base = Duration::from_millis(5_000);
+        assert_eq!(retry_delay(base, &http(Some(1_000))), base);
+    }
+
+    // US-023 : un Retry-After aberrant est borné (jamais de gel indéfini).
+    #[test]
+    fn retry_delay_caps_absurd_retry_after() {
+        let base = Duration::from_millis(50);
+        assert_eq!(
+            retry_delay(base, &http(Some(3_600_000))),
+            Duration::from_millis(MAX_RETRY_AFTER_MS)
+        );
+    }
+
+    // backoff : exponentiel plafonné à 32× (2^5), pas de débordement.
+    #[test]
+    fn backoff_is_exponential_capped() {
+        let cfg = RunConfig {
+            backoff_base_ms: 10,
+            ..RunConfig::default()
+        };
+        assert_eq!(backoff(&cfg, 0), Duration::from_millis(10));
+        assert_eq!(backoff(&cfg, 1), Duration::from_millis(20));
+        assert_eq!(backoff(&cfg, 2), Duration::from_millis(40));
+        // au-delà de 2^5 le facteur est figé à 32.
+        assert_eq!(backoff(&cfg, 5), Duration::from_millis(320));
+        assert_eq!(backoff(&cfg, 50), Duration::from_millis(320));
     }
 }

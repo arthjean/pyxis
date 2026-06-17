@@ -38,6 +38,9 @@ pub enum StreamEvent {
     ToolCallEnd { id: ToolCallId },
     Usage { usage: TokenUsage },
     Done { stop: StopReason },
+    /// Reasoning item chiffré (US-031, replay isolé) : émis par l'adapter UNIQUEMENT
+    /// si `reasoning_replay` est actif. Capturé par l'`Accumulator`.
+    EncryptedReasoning { id: String, encrypted_content: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -102,8 +105,15 @@ pub struct CanonicalResponse {
 pub enum ProviderError {
     #[error("transport: {0}")]
     Transport(String),
+    /// Erreur HTTP non-2xx. `retry_after_ms` (US-023) porte le délai serveur
+    /// parsé (`Retry-After` / `retry-after-ms`) quand présent : la boucle l'honore
+    /// via `max(backoff, retry_after)`. `None` = pas d'en-tête → backoff seul.
     #[error("http {status}: {message}")]
-    Http { status: u16, message: String },
+    Http {
+        status: u16,
+        message: String,
+        retry_after_ms: Option<u64>,
+    },
     #[error("décodage: {0}")]
     Decode(String),
     #[error("flux interrompu: {0}")]
@@ -173,14 +183,16 @@ mod tests {
         assert!(
             ProviderError::Http {
                 status: 413,
-                message: "too long".into()
+                message: "too long".into(),
+                retry_after_ms: None,
             }
             .is_context_error()
         );
         assert!(
             !ProviderError::Http {
                 status: 529,
-                message: "overloaded".into()
+                message: "overloaded".into(),
+                retry_after_ms: None,
             }
             .is_context_error()
         );

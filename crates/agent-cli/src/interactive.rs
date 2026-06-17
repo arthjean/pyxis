@@ -45,7 +45,13 @@ enum McpEvent {
 
 pub struct InteractiveConfig {
     pub model: String,
-    pub system: String,
+    /// Guidelines comportementales des outils (US-026), injectées dans le system
+    /// prompt. Stockées brutes (pas pré-composées) car le system de base dépend du
+    /// slug courant (US-027) et est recomposé par tour.
+    pub tool_guidelines: Vec<String>,
+    /// Contexte projet éphémère (AGENTS.md + env, US-028), ré-injecté à chaque tour
+    /// dans `AgentContext::context_messages` (jamais persisté).
+    pub context_messages: Vec<Message>,
     pub run_config: RunConfig,
     pub tool_specs: Vec<ToolSpec>,
     pub truecolor: bool,
@@ -90,6 +96,25 @@ pub fn compose_system(base: &str, goal: Option<&str>) -> String {
     }
 }
 
+/// Injecte les guidelines comportementales des outils (US-026) dans le system
+/// prompt sous une section dédiée. Appelé UNE fois au démarrage (les outils sont
+/// fixes) pour produire la base que `compose_system` enrichit ensuite par tour.
+/// Sans guideline, renvoie la base inchangée (pas de section vide).
+pub fn with_tool_guidelines(base: &str, guidelines: &[String]) -> String {
+    if guidelines.is_empty() {
+        return base.to_string();
+    }
+    let mut s = String::from(base);
+    s.push_str("\n\n## Règles d'utilisation des outils\n");
+    for g in guidelines {
+        s.push_str("- ");
+        s.push_str(g);
+        s.push('\n');
+    }
+    s.truncate(s.trim_end().len());
+    s
+}
+
 /// Construit le contexte du tour (conversation à jour + message) et lance
 /// `run_agent` dans une tâche dont les events reviennent par `tx`.
 fn launch_turn(
@@ -101,12 +126,20 @@ fn launch_turn(
 ) {
     let mut msgs = conversation.lock().map(|g| g.clone()).unwrap_or_default();
     msgs.push(Message::user(user_msg.to_string()));
+    // US-027 : system de base sélectionné par le slug COURANT (recalculé par tour →
+    // un `/models` change le template) + guidelines outils + directive d'objectif.
+    let base = with_tool_guidelines(
+        crate::prompt::select_system_prompt(&cfg.model),
+        &cfg.tool_guidelines,
+    );
     let ctx = AgentContext {
         model: cfg.model.clone(),
-        system: Some(compose_system(&cfg.system, cfg.goal.as_deref())),
+        system: Some(compose_system(&base, cfg.goal.as_deref())),
         messages: msgs,
         tools: cfg.tool_specs.clone(),
         config: cfg.run_config.clone(),
+        // US-028 : contexte projet ré-injecté chaque tour, jamais persisté.
+        context_messages: cfg.context_messages.clone(),
     };
     let deps = deps.clone();
     let tx = tx.clone();

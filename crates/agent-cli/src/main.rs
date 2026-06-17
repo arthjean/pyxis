@@ -7,7 +7,9 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod approver;
+mod context;
 mod interactive;
+mod prompt;
 mod session;
 
 use std::sync::Arc;
@@ -26,10 +28,6 @@ use agent_tools::{Bash, Edit, Glob, Grep, Read, Registry, Write};
 use crate::approver::TuiApprover;
 use crate::interactive::InteractiveConfig;
 use crate::session::SharedSession;
-
-const SYSTEM_PROMPT: &str = "Tu es Numen, un agent de codage en terminal. Tu travailles dans le \
-    workspace courant. Utilise les outils (read, glob, grep, write, edit, bash) pour explorer et \
-    modifier le code. Sois concis et direct ; confine tes actions au workspace.";
 
 struct Args {
     prompt: Option<String>,
@@ -91,6 +89,11 @@ fn main() -> anyhow::Result<()> {
         agent_mcp::McpConfigFile::default()
     };
 
+    // Contexte projet (AGENTS.md + env) lu AVANT le sandbox : la remontée
+    // d'ancêtres jusqu'au `.git` devient inaccessible une fois Landlock posé
+    // (US-028). Injecté ensuite comme messages éphémères par tour.
+    let context_msgs = context::messages(&workspace, &context::today_utc());
+
     // Sandbox FS AVANT le runtime (thread principal → hérité par les workers).
     if args.sandbox {
         match agent_sandbox::enforce_process(&workspace) {
@@ -106,7 +109,7 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run(args, workspace, skills, mcp_config))
+    rt.block_on(run(args, workspace, skills, mcp_config, context_msgs))
 }
 
 /// Découvre les serveurs MCP avant le sandbox : `<workspace>/.mcp.json` (priorité
@@ -155,6 +158,7 @@ async fn run(
     workspace: std::path::PathBuf,
     skills: Vec<String>,
     mcp_config: agent_mcp::McpConfigFile,
+    context_msgs: Vec<Message>,
 ) -> anyhow::Result<()> {
     // 1. Credential abonnement ChatGPT (keyring). Absente → on guide vers le login.
     let cred = match store::load(KEYRING_ACCOUNT)? {
@@ -166,11 +170,21 @@ async fn run(
             );
         }
     };
-    let provider: Arc<dyn Provider> = Arc::new(OpenAiChatGptProvider::new(
+    let mut chatgpt = OpenAiChatGptProvider::new(
         cred,
         agent_provider::DEFAULT_MAX_CONTEXT,
         Some(agent_provider::DEFAULT_REASONING_EFFORT.to_string()),
-    ));
+    );
+    // US-022 : idle timeout SSE configurable par session (défaut 60 s). Une valeur
+    // env invalide/0 est ignorée → garde le défaut (watchdog jamais désactivé).
+    if let Some(secs) = std::env::var("NUMEN_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+    {
+        chatgpt = chatgpt.with_idle_timeout(std::time::Duration::from_secs(secs));
+    }
+    let provider: Arc<dyn Provider> = Arc::new(chatgpt);
 
     // 2. Proxy réseau allow-list (fail-closed). Durcit les commandes Bash.
     let proxy = agent_sandbox::spawn_proxy(ProxyPolicy::new(args.allow_hosts.clone())).await?;
@@ -226,6 +240,11 @@ async fn run(
         .register(Bash)
         .build();
     let tool_specs = registry.tool_specs();
+    // US-026/US-027 : guidelines comportementales des outils, collectées AVANT que
+    // `registry` ne soit déplacé dans `Deps`. Le system prompt de base est désormais
+    // sélectionné PAR SLUG (US-027) au moment de composer (headless ici, par tour en
+    // interactif), pas figé : un `/models` doit pouvoir changer le template.
+    let tool_guidelines = registry.behavioral_guidelines();
 
     // 5. Deps injectées dans la boucle.
     let deps = Deps {
@@ -238,12 +257,16 @@ async fn run(
 
     // 6. Dispatch headless (-p) vs interactif.
     if let Some(prompt) = args.prompt {
+        // Headless one-shot : slug fixe (`args.model`) → template sélectionné une fois.
+        let base =
+            interactive::with_tool_guidelines(prompt::select_system_prompt(&args.model), &tool_guidelines);
         let ctx = AgentContext {
             model: args.model,
-            system: Some(interactive::compose_system(SYSTEM_PROMPT, goal.as_deref())),
+            system: Some(interactive::compose_system(&base, goal.as_deref())),
             messages: vec![Message::user(prompt)],
             tools: tool_specs,
             config: RunConfig::default(),
+            context_messages: context_msgs,
         };
         let result = agent_core::run_headless(ctx, deps).await;
         // En one-shot, pas de boucle d'objectif : on retire juste le marqueur.
@@ -269,7 +292,8 @@ async fn run(
 
         let cfg = InteractiveConfig {
             model: args.model,
-            system: SYSTEM_PROMPT.to_string(),
+            tool_guidelines,
+            context_messages: context_msgs,
             run_config: RunConfig::default(),
             tool_specs,
             truecolor: agent_tui::supports_truecolor(),

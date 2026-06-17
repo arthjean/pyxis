@@ -23,6 +23,27 @@ pub enum CompactKind {
 
 const PRUNED_PLACEHOLDER: &str = "[résultat d'outil élagué pour économiser le contexte]";
 
+/// Préfixe marquant un message-résumé (US-030). Sert de garde anti-« résumé de
+/// résumé » : un message portant ce préfixe est EXCLU du prompt de re-résumé puis
+/// gardé verbatim, pour ne pas dégrader le résumé en le re-résumant.
+pub const SUMMARY_PREFIX: &str = "[Résumé de la conversation précédente]\n";
+
+/// Budget de sortie du summarizer (US-030 : porté de 1024 à 4096 — un résumé
+/// dense d'une longue session ne tient pas en 1024 tokens).
+const SUMMARY_MAX_OUTPUT: u32 = 4096;
+
+/// Borne d'octets du résumé combiné (US-030) : empêche la croissance illimitée du
+/// résumé sur de nombreux cycles (~8K tokens, large pour plusieurs résumés denses).
+const SUMMARY_COMBINED_MAX: usize = 32_000;
+
+/// Vrai si `msg` est un message-résumé (produit par une compaction précédente).
+pub fn is_summary_message(msg: &Message) -> bool {
+    msg.role == Role::User
+        && msg.content.iter().any(
+            |b| matches!(b, ContentBlock::Text { text } if text.starts_with(SUMMARY_PREFIX)),
+        )
+}
+
 const SUMMARY_SYSTEM: &str = "Tu résumes une conversation entre un utilisateur et un agent de codage. \
 Produis un résumé dense et fidèle : objectifs, décisions, fichiers/commandes clés, état courant et \
 prochaine étape. Garde tout ce qui est nécessaire pour CONTINUER la tâche sans le contexte original.";
@@ -85,12 +106,6 @@ pub async fn full_compact(
     model: &str,
     provider: &dyn Provider,
 ) -> Result<(), AgentError> {
-    // images strippées AVANT le résumé (on ne re-paye pas les tokens vision).
-    // Idempotent : sans danger même si la compaction échoue ensuite.
-    for m in messages.iter_mut() {
-        m.strip_images();
-    }
-
     // On conserve le dernier message utilisateur (l'ask courant) hors résumé.
     // IMPORTANT : on ne mute PAS `messages` de façon destructive avant que le
     // résumé ait réussi — un échec provider doit préserver le transcript
@@ -112,16 +127,41 @@ pub async fn full_compact(
         ));
     }
 
+    // US-030 — garde anti « résumé de résumé » : un résumé antérieur est gardé
+    // VERBATIM (jamais re-résumé, ce qui le dégraderait) ; seul le matériel NOUVEAU
+    // (non-résumé) part au summarizer. Les blocs `Thinking` sont strippés (raisonnement
+    // verbeux et non porteur d'état pour la continuation).
+    // Tous les résumés antérieurs (≥ 0) sont gardés verbatim ; un transcript
+    // corrompu/repris pouvant en porter plusieurs, on ne perd aucun.
+    let prior_summaries: Vec<String> = messages[..upto]
+        .iter()
+        .filter(|m| is_summary_message(m))
+        .map(Message::text)
+        .collect();
+    let to_summarize: Vec<Message> = messages[..upto]
+        .iter()
+        .filter(|m| !is_summary_message(m))
+        .map(strip_for_summary)
+        .collect();
+
+    // Que des résumés et rien de neuf → recompaction inutile (ne pas appeler le
+    // provider avec un historique vide ; le circuit breaker gérera la pression).
+    if to_summarize.iter().all(|m| m.content.is_empty()) {
+        return Err(AgentError::Compaction(
+            "rien de nouveau à résumer (déjà compacté)".to_string(),
+        ));
+    }
+
     let req = CanonicalRequest {
         model: model.to_string(),
         system: Some(SUMMARY_SYSTEM.to_string()),
-        messages: messages[..upto].to_vec(),
+        messages: to_summarize,
         tools: Vec::new(),
-        max_output_tokens: 1024,
+        max_output_tokens: SUMMARY_MAX_OUTPUT,
     };
     // `?` ici laisse `messages` intact en cas d'échec (From<ProviderError>).
     let resp = provider.complete(req).await?;
-    let summary: String = resp
+    let new_summary: String = resp
         .content
         .iter()
         .filter_map(|b| match b {
@@ -132,11 +172,24 @@ pub async fn full_compact(
 
     // Résumé vide (refus silencieux, réponse sans bloc Text) : NE PAS écraser le
     // transcript par un contexte vide. `messages` est encore intact ici.
-    if summary.trim().is_empty() {
+    if new_summary.trim().is_empty() {
         return Err(AgentError::Compaction(
             "résumé vide reçu du provider".to_string(),
         ));
     }
+
+    // Combine les résumés antérieurs (verbatim, préfixe retiré) + le nouveau, puis
+    // BORNE l'ensemble (la compaction doit RÉDUIRE : sur N cycles, sans borne le
+    // résumé croîtrait de ~N×SUMMARY_MAX_OUTPUT). On garde la QUEUE la plus récente
+    // (le nouveau résumé, char-safe) — l'historique le plus ancien se tasse.
+    let mut combined = String::new();
+    for old in &prior_summaries {
+        let body = old.strip_prefix(SUMMARY_PREFIX).unwrap_or(old);
+        combined.push_str(body);
+        combined.push_str("\n\n");
+    }
+    combined.push_str(&new_summary);
+    let combined = cap_tail(&combined, SUMMARY_COMBINED_MAX);
 
     let trailing_user = if trailing_is_user {
         messages.last().cloned()
@@ -147,13 +200,53 @@ pub async fn full_compact(
     messages.push(Message {
         role: Role::User,
         content: vec![ContentBlock::Text {
-            text: format!("[Résumé de la conversation précédente]\n{summary}"),
+            text: format!("{SUMMARY_PREFIX}{combined}"),
         }],
     });
     if let Some(u) = trailing_user {
         messages.push(u);
     }
     Ok(())
+}
+
+/// Garde la QUEUE de `s` sur `max` octets (frontière de caractère), préfixée d'un
+/// marqueur d'élision si tronqué (US-030). Préserve le contenu le plus RÉCENT.
+fn cap_tail(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut cut = s.len() - max;
+    while cut < s.len() && !s.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!(
+        "[…début du résumé élidé pour borner le contexte…]\n{}",
+        &s[cut..]
+    )
+}
+
+/// Copie un message pour le summarizer en retirant : les `Image` (on ne re-paye pas
+/// les tokens vision), les blocs `Thinking` (US-030) et `EncryptedReasoning` (US-031,
+/// reasoning droppé à la compaction, contrainte protocole) — non porteurs d'état de
+/// continuation. Opère sur une COPIE : `messages` (et ses images) reste INTACT tant
+/// que le résumé n'a pas réussi — un échec provider ne doit pas détruire le transcript.
+fn strip_for_summary(msg: &Message) -> Message {
+    Message {
+        role: msg.role,
+        content: msg
+            .content
+            .iter()
+            .filter(|b| {
+                !matches!(
+                    b,
+                    ContentBlock::Image { .. }
+                        | ContentBlock::Thinking { .. }
+                        | ContentBlock::EncryptedReasoning { .. }
+                )
+            })
+            .cloned()
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -170,6 +263,8 @@ mod tests {
     struct StubProvider {
         caps: Capabilities,
         response: CanonicalResponse,
+        /// Capture la dernière requête `complete` (vérifie l'input du summarizer).
+        last_req: std::sync::Mutex<Option<CanonicalRequest>>,
     }
 
     impl StubProvider {
@@ -187,6 +282,7 @@ mod tests {
                     usage: TokenUsage::default(),
                     stop: StopReason::EndTurn,
                 },
+                last_req: std::sync::Mutex::new(None),
             }
         }
     }
@@ -218,8 +314,9 @@ mod tests {
         }
         async fn complete(
             &self,
-            _req: CanonicalRequest,
+            req: CanonicalRequest,
         ) -> Result<CanonicalResponse, ProviderError> {
+            *self.last_req.lock().unwrap() = Some(req);
             Ok(self.response.clone())
         }
         fn classify_error(&self, _err: &ProviderError) -> ErrorClass {
@@ -231,11 +328,24 @@ mod tests {
     #[tokio::test]
     async fn full_compact_rejects_empty_summary_and_preserves_transcript() {
         let provider = StubProvider::with_summary("");
-        let mut messages = vec![Message::user("vieux"), Message::assistant_text("réponse")];
+        // Une IMAGE dans le transcript : elle doit survivre à un échec de compaction
+        // (l'élision des images opère sur la COPIE summarizer, pas sur `messages`).
+        let mut messages = vec![
+            Message::user("vieux"),
+            Message::assistant(vec![
+                ContentBlock::Text {
+                    text: "réponse".into(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                },
+            ]),
+        ];
         let before = messages.clone();
         let res = full_compact(&mut messages, "m", &provider).await;
         assert!(res.is_err(), "résumé vide doit échouer");
-        assert_eq!(messages, before, "transcript préservé en cas d'échec");
+        assert_eq!(messages, before, "transcript ET images préservés en cas d'échec");
     }
 
     // #5 : rien à résumer (1 seul message user) → Err, pas d'appel destructeur.
@@ -262,6 +372,131 @@ mod tests {
         assert_eq!(messages.len(), 2, "[résumé] + dernier message user");
         assert!(messages[0].text().contains("RÉSUMÉ"));
         assert_eq!(messages[1].text(), "q2 courant");
+    }
+
+    // US-030 AC1 : recompaction → l'ancien résumé est EXCLU du prompt de re-résumé
+    // mais préservé verbatim dans le nouveau résumé (pas de résumé de résumé).
+    #[tokio::test]
+    async fn full_compact_excludes_prior_summary_keeps_it_verbatim() {
+        let provider = StubProvider::with_summary("NOUVEAU");
+        let mut messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: format!("{SUMMARY_PREFIX}ANCIEN"),
+                }],
+            },
+            Message::assistant_text("travail récent"),
+            Message::user("question courante"),
+        ];
+        full_compact(&mut messages, "m", &provider).await.unwrap();
+
+        // le summarizer n'a PAS reçu l'ancien résumé.
+        let seen = provider.last_req.lock().unwrap().clone().unwrap();
+        assert!(
+            seen.messages.iter().all(|m| !is_summary_message(m)),
+            "ancien résumé exclu du prompt: {:?}",
+            seen.messages
+        );
+        // l'ancien résumé survit verbatim, combiné au nouveau.
+        assert!(messages[0].text().contains("ANCIEN"));
+        assert!(messages[0].text().contains("NOUVEAU"));
+        assert!(is_summary_message(&messages[0]));
+        assert_eq!(messages[1].text(), "question courante");
+    }
+
+    // US-030 : plusieurs résumés antérieurs (transcript corrompu/repris) sont TOUS
+    // conservés verbatim, aucun perdu.
+    #[tokio::test]
+    async fn full_compact_preserves_all_prior_summaries() {
+        let provider = StubProvider::with_summary("TROIS");
+        let mut messages = vec![
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: format!("{SUMMARY_PREFIX}UN"),
+                }],
+            },
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: format!("{SUMMARY_PREFIX}DEUX"),
+                }],
+            },
+            Message::assistant_text("travail"),
+            Message::user("courant"),
+        ];
+        full_compact(&mut messages, "m", &provider).await.unwrap();
+        let txt = messages[0].text();
+        assert!(txt.contains("UN") && txt.contains("DEUX") && txt.contains("TROIS"));
+    }
+
+    // US-030 : Thinking strippé avant le summarizer ; max_output porté à 4096.
+    #[tokio::test]
+    async fn full_compact_strips_thinking_and_uses_4096() {
+        let provider = StubProvider::with_summary("RÉSUMÉ");
+        let mut messages = vec![
+            Message::user("q"),
+            Message::assistant(vec![
+                ContentBlock::Thinking {
+                    text: "raisonnement verbeux".into(),
+                },
+                ContentBlock::EncryptedReasoning {
+                    id: "rs_1".into(),
+                    encrypted_content: "ENC".into(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                },
+                ContentBlock::Text { text: "réponse".into() },
+            ]),
+            Message::user("courant"),
+        ];
+        full_compact(&mut messages, "m", &provider).await.unwrap();
+        let seen = provider.last_req.lock().unwrap().clone().unwrap();
+        assert_eq!(seen.max_output_tokens, 4096, "summarizer max porté à 4096");
+        // US-030/US-031 : Image, Thinking ET reasoning chiffré strippés avant le summarizer
+        // (vision non re-payée, raisonnement non porteur d'état de continuation).
+        let has_stripped = seen.messages.iter().flat_map(|m| &m.content).any(|b| {
+            matches!(
+                b,
+                ContentBlock::Image { .. }
+                    | ContentBlock::Thinking { .. }
+                    | ContentBlock::EncryptedReasoning { .. }
+            )
+        });
+        assert!(
+            !has_stripped,
+            "Image + Thinking + reasoning strippés du summarizer"
+        );
+    }
+
+    // US-030 : le résumé combiné est BORNÉ (garde la queue récente) → pas de
+    // croissance illimitée sur N cycles.
+    #[test]
+    fn cap_tail_bounds_and_keeps_recent() {
+        // sous la borne → inchangé.
+        assert_eq!(cap_tail("court", 1000), "court");
+        // au-dessus → tronqué par la tête, queue récente conservée + marqueur.
+        let long = format!("{}FIN_RÉCENTE", "x".repeat(50_000));
+        let out = cap_tail(&long, 32_000);
+        assert!(out.len() < long.len());
+        assert!(out.contains("élidé"));
+        assert!(out.ends_with("FIN_RÉCENTE"), "la queue récente est gardée");
+    }
+
+    #[test]
+    fn is_summary_message_detects_prefix() {
+        let s = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: format!("{SUMMARY_PREFIX}corps"),
+            }],
+        };
+        assert!(is_summary_message(&s));
+        assert!(!is_summary_message(&Message::user("question normale")));
+        assert!(!is_summary_message(&Message::assistant_text("réponse")));
     }
 
     #[test]

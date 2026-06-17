@@ -16,6 +16,15 @@ pub struct ContextBudget {
     auto_threshold: u32,
     current_input: u32,
     usage_seen: bool,
+    /// Baseline post-compaction (US-030) : input incompressible juste APRÈS une
+    /// compaction (résumé + system + outils + contexte). Les seuils mesurent
+    /// `current - prefill` (la CROISSANCE depuis la dernière compaction), jamais
+    /// l'absolu — sinon l'overhead fixe re-déclenche une compaction immédiate
+    /// (double-compaction, risk #6). Défaut 0 → comportement absolu d'origine.
+    prefill_input: u32,
+    /// Vrai entre une compaction réussie et le PREMIER `usage` réel suivant : ce
+    /// premier usage devient le `prefill` (ancré sur l'usage backend, pas l'estimé).
+    awaiting_baseline: bool,
 }
 
 impl ContextBudget {
@@ -30,6 +39,8 @@ impl ContextBudget {
             auto_threshold: pct(usable, 80),
             current_input: 0,
             usage_seen: false,
+            prefill_input: 0,
+            awaiting_baseline: false,
         }
     }
 
@@ -58,23 +69,48 @@ impl ContextBudget {
         self.usage_seen = false;
     }
 
-    /// Chemin nominal : consomme l'`usage` émis par le stream.
+    /// Chemin nominal : consomme l'`usage` émis par le stream. US-030 : le PREMIER
+    /// usage réel après une compaction devient le baseline `prefill` (overhead
+    /// incompressible), pour mesurer ensuite la croissance et non l'absolu.
     pub fn observe_usage(&mut self, usage: TokenUsage) {
         self.current_input = usage.input;
         self.usage_seen = true;
+        if self.awaiting_baseline {
+            self.prefill_input = usage.input;
+            self.awaiting_baseline = false;
+        }
     }
 
     /// Fallback (provider sans usage) : alimente le seuil avec une estimation
-    /// locale. NE met PAS `usage_seen` (c'est une estimation, pas un signal réel).
+    /// locale. NE met PAS `usage_seen` (c'est une estimation, pas un signal réel),
+    /// NI le baseline (ancré uniquement sur l'usage RÉEL, US-030).
     pub fn observe_estimated(&mut self, estimated_input: u32) {
         self.current_input = estimated_input;
     }
 
+    /// US-030 : signale qu'une compaction vient de réussir → le prochain `usage`
+    /// réel ancrera le baseline `prefill` (anti double-compaction immédiate).
+    pub fn mark_compacted(&mut self) {
+        self.awaiting_baseline = true;
+    }
+
+    pub fn prefill_input(&self) -> u32 {
+        self.prefill_input
+    }
+
     pub fn should_microcompact(&self) -> bool {
-        self.current_input >= self.micro_threshold
+        self.current_input.saturating_sub(self.prefill_input) >= self.micro_threshold
     }
     pub fn should_autocompact(&self) -> bool {
-        self.current_input >= self.auto_threshold
+        self.current_input.saturating_sub(self.prefill_input) >= self.auto_threshold
+    }
+
+    /// US-030 (MidTurn) : projette si un input DONNÉ déclencherait l'auto-compaction,
+    /// SANS muter le budget basé sur l'usage réel. Sert à détecter un long
+    /// `tool_result` qui vient de franchir le seuil, pour compacter avant le tour
+    /// modèle suivant.
+    pub fn would_autocompact(&self, projected_input: u32) -> bool {
+        projected_input.saturating_sub(self.prefill_input) >= self.auto_threshold
     }
 }
 
@@ -97,6 +133,11 @@ pub fn estimate_input(messages: &[Message], counter: &dyn TokenCounter) -> u32 {
                 }
                 ContentBlock::ToolResult { content, .. } => counter.count_text(content),
                 ContentBlock::Image { .. } => 0,
+                // US-031 : le reasoning chiffré est envoyé au backend quand le replay
+                // est actif → compte dans le budget (sinon absent des messages).
+                ContentBlock::EncryptedReasoning {
+                    encrypted_content, ..
+                } => counter.count_text(encrypted_content),
             };
         }
     }
@@ -137,6 +178,47 @@ mod tests {
         assert!(!b2.usage_seen(), "estimation ≠ signal réel");
         assert!(b2.should_microcompact());
         assert!(!b2.should_autocompact());
+    }
+
+    // US-030 : après compaction, le 1er usage réel devient baseline → pas de
+    // double-compaction immédiate ; le seuil mesure ensuite la croissance.
+    #[test]
+    fn post_compaction_baseline_prevents_immediate_recompaction() {
+        // fenêtre 1000, réserve 200 → auto 640.
+        let mut b = ContextBudget::for_model(1000, 200);
+        b.mark_compacted();
+        // 1er usage réel post-compaction : 650 (overhead incompressible). Sans
+        // baseline, 650 >= 640 → recompaction immédiate. Avec baseline : 650 devient
+        // prefill, donc current - prefill = 0 → pas de compaction.
+        b.observe_usage(TokenUsage {
+            input: 650,
+            output: 5,
+        });
+        assert_eq!(b.prefill_input(), 650);
+        assert!(
+            !b.should_autocompact(),
+            "le baseline neutralise l'overhead post-compaction"
+        );
+        // la conversation croît de 640 au-dessus du baseline → re-déclenche.
+        b.observe_usage(TokenUsage {
+            input: 650 + 640,
+            output: 5,
+        });
+        assert!(b.should_autocompact(), "croissance réelle re-déclenche");
+    }
+
+    #[test]
+    fn would_autocompact_projects_without_mutation() {
+        let mut b = ContextBudget::for_model(1000, 200); // auto 640
+        b.observe_usage(TokenUsage {
+            input: 100,
+            output: 5,
+        });
+        assert!(b.would_autocompact(640), "projection franchit le seuil");
+        assert!(!b.would_autocompact(639));
+        // la projection ne mute pas le budget réel.
+        assert_eq!(b.current_input(), 100);
+        assert!(!b.should_autocompact());
     }
 
     #[test]

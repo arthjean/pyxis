@@ -16,7 +16,7 @@
 
 use agent_core::message::{ContentBlock, Message, Role};
 use agent_core::provider::{CanonicalRequest, ToolSpec};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 const DEFAULT_INSTRUCTIONS: &str = "You are a helpful assistant.";
 
@@ -44,6 +44,24 @@ pub fn build_responses_body(req: &CanonicalRequest, reasoning_effort: Option<&st
         body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
     }
     body
+}
+
+/// Borne d'une clé de cache : 64 CODE-POINTS Unicode (US-029). Clamp Unicode-safe
+/// (jamais une coupe mid-codepoint), pas une borne d'octets.
+const CACHE_KEY_MAX_CODEPOINTS: usize = 64;
+
+/// Clampe une clé de cache à 64 code-points (US-029). Une clé déjà ≤ 64 est
+/// inchangée (boundary). `chars().take()` garantit l'absence de coupe au milieu
+/// d'un code-point.
+pub fn clamp_cache_key(key: &str) -> String {
+    key.chars().take(CACHE_KEY_MAX_CODEPOINTS).collect()
+}
+
+/// Injecte `prompt_cache_key` (clampé) dans un body déjà construit (US-029). Le
+/// backend ChatGPT réutilise son cache de préfixe quand la clé est STABLE par
+/// session → latence et tokens d'entrée réduits sur les tours répétés.
+pub fn inject_cache_key(body: &mut Value, session_id: &str) {
+    body["prompt_cache_key"] = json!(clamp_cache_key(session_id));
 }
 
 /// Convertit le transcript canonique en `input[]` de la Responses API.
@@ -108,6 +126,28 @@ fn assistant_items(blocks: &[ContentBlock], input: &mut Vec<Value>) {
             "role": "assistant",
             "content": [ { "type": "output_text", "text": text, "annotations": [] } ],
         }));
+    }
+    // US-031 (replay isolé) : reasoning items chiffrés réémis AVANT les function_calls
+    // (paire `rs`/`fc` cohérente, sinon 400). Un reasoning ORPHELIN (message sans
+    // function_call) est SAUTÉ. Présent uniquement si `reasoning_replay` est actif
+    // (sinon les blocs n'existent pas → chemin plat inchangé).
+    let has_tool_use = blocks
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+    if has_tool_use {
+        for b in blocks {
+            if let ContentBlock::EncryptedReasoning {
+                id,
+                encrypted_content,
+            } = b
+            {
+                input.push(json!({
+                    "type": "reasoning",
+                    "id": id,
+                    "encrypted_content": encrypted_content,
+                }));
+            }
+        }
     }
     for b in blocks {
         if let ContentBlock::ToolUse {
@@ -268,6 +308,41 @@ mod tests {
         assert!(tool["strict"].is_null());
     }
 
+    // US-029 : clamp à 64 code-points (Unicode-safe), boundary inchangée.
+    #[test]
+    fn cache_key_clamps_to_64_codepoints() {
+        // ASCII court → inchangé.
+        assert_eq!(clamp_cache_key("abc"), "abc");
+        // UUID v4 (36 chars) → inchangé (≤ 64, boundary).
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(clamp_cache_key(uuid), uuid);
+        // 64 chars exactement → inchangé.
+        let exactly64: String = "x".repeat(64);
+        assert_eq!(clamp_cache_key(&exactly64).chars().count(), 64);
+        // > 64 ASCII → 64.
+        let long: String = "y".repeat(100);
+        assert_eq!(clamp_cache_key(&long).chars().count(), 64);
+        // > 64 multi-octets (emoji) → 64 CODE-POINTS (pas octets), UTF-8 valide.
+        let emojis: String = "🦀".repeat(70);
+        let clamped = clamp_cache_key(&emojis);
+        assert_eq!(clamped.chars().count(), 64);
+        assert!(clamped.ends_with('🦀'), "pas de coupe mid-codepoint");
+    }
+
+    #[test]
+    fn inject_cache_key_sets_clamped_field() {
+        let mut body = build_responses_body(&req(vec![Message::user("x")], vec![], None), None);
+        assert!(body.get("prompt_cache_key").is_none());
+        inject_cache_key(&mut body, "session-abc");
+        assert_eq!(body["prompt_cache_key"], "session-abc");
+        // clé > 64 → clampée dans le body.
+        inject_cache_key(&mut body, &"z".repeat(80));
+        assert_eq!(
+            body["prompt_cache_key"].as_str().unwrap().chars().count(),
+            64
+        );
+    }
+
     #[test]
     fn no_tools_omits_tools_field() {
         let body = build_responses_body(&req(vec![Message::user("x")], vec![], None), None);
@@ -281,6 +356,52 @@ mod tests {
         assert_eq!(with["reasoning"]["summary"], "auto");
         let without = build_responses_body(&req(vec![Message::user("x")], vec![], None), None);
         assert!(without.get("reasoning").is_none());
+    }
+
+    // US-031 : reasoning réémis AVANT son function_call ; orphelin (sans tool_use) sauté.
+    #[test]
+    fn reasoning_replayed_before_function_call_orphan_skipped() {
+        let assistant = Message::assistant(vec![
+            ContentBlock::EncryptedReasoning {
+                id: "rs_1".into(),
+                encrypted_content: "ENC".into(),
+            },
+            ContentBlock::ToolUse {
+                id: "c1".into(),
+                name: "bash".into(),
+                input: json!({}),
+            },
+        ]);
+        let body = build_responses_body(&req(vec![assistant], vec![], None), None);
+        let input = body["input"].as_array().unwrap();
+        let rs = input.iter().position(|i| i["type"] == "reasoning").unwrap();
+        let fc = input
+            .iter()
+            .position(|i| i["type"] == "function_call")
+            .unwrap();
+        assert!(rs < fc, "reasoning avant function_call (paire rs/fc)");
+        assert_eq!(input[rs]["id"], "rs_1");
+        assert_eq!(input[rs]["encrypted_content"], "ENC");
+
+        // reasoning ORPHELIN (message sans tool_use) → sauté (pas de 400).
+        let orphan = Message::assistant(vec![
+            ContentBlock::Text {
+                text: "juste du texte".into(),
+            },
+            ContentBlock::EncryptedReasoning {
+                id: "rs_x".into(),
+                encrypted_content: "ENC".into(),
+            },
+        ]);
+        let body2 = build_responses_body(&req(vec![orphan], vec![], None), None);
+        assert!(
+            body2["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|i| i["type"] != "reasoning"),
+            "reasoning orphelin sauté"
+        );
     }
 
     #[test]

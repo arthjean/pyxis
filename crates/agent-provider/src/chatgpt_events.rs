@@ -23,11 +23,22 @@ pub struct CodexEventMapper {
     active: Option<ActiveCall>,
     /// Au moins un tool call a-t-il été émis ? (override stop `completed`→`ToolUse`).
     saw_tool_call: bool,
+    /// US-031 : capturer les reasoning items chiffrés pour replay ? Défaut OFF
+    /// (chemin plat : les reasoning items sont ignorés comme en MVP).
+    replay: bool,
 }
 
 impl CodexEventMapper {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construit un mapper avec le replay reasoning (US-031) activé ou non.
+    pub fn with_replay(replay: bool) -> Self {
+        Self {
+            replay,
+            ..Self::default()
+        }
     }
 
     /// Traduit un payload `data:` SSE (un event Responses JSON) en 0..n
@@ -116,12 +127,35 @@ impl CodexEventMapper {
     }
 
     fn on_item_done(&mut self, v: &Value) -> Vec<StreamEvent> {
-        let is_function = v
+        let item_type = v
             .get("item")
             .and_then(|i| i.get("type"))
-            .and_then(Value::as_str)
-            == Some("function_call");
-        if !is_function {
+            .and_then(Value::as_str);
+        // US-031 : reasoning item chiffré → capturé UNIQUEMENT si replay actif
+        // (sinon ignoré comme en MVP). `encrypted_content`/`id` opaques.
+        if item_type == Some("reasoning") {
+            if !self.replay {
+                return Vec::new();
+            }
+            let item = match v.get("item") {
+                Some(i) => i,
+                None => return Vec::new(),
+            };
+            let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+            let enc = item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            // un reasoning sans contenu chiffré n'est pas réinjectable → ignoré.
+            if id.is_empty() || enc.is_empty() {
+                return Vec::new();
+            }
+            return vec![StreamEvent::EncryptedReasoning {
+                id: id.to_string(),
+                encrypted_content: enc.to_string(),
+            }];
+        }
+        if item_type != Some("function_call") {
             return Vec::new();
         }
         // arguments finaux : priorité à l'item.done, sinon l'accumulé.
@@ -373,6 +407,30 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ProviderError::ContextLengthExceeded));
         assert!(err.is_context_error());
+    }
+
+    // US-031 : reasoning item chiffré capturé UNIQUEMENT si replay actif (défaut OFF).
+    #[test]
+    fn reasoning_item_captured_only_when_replay_on() {
+        let done = r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"ENC"}}"#;
+        // OFF (défaut) → ignoré (chemin plat).
+        assert!(CodexEventMapper::new().ingest(done).unwrap().is_empty());
+        // ON → EncryptedReasoning émis.
+        let ev = CodexEventMapper::with_replay(true).ingest(done).unwrap();
+        assert_eq!(
+            ev,
+            vec![StreamEvent::EncryptedReasoning {
+                id: "rs_1".into(),
+                encrypted_content: "ENC".into()
+            }]
+        );
+        // reasoning sans contenu chiffré → ignoré même en ON (non réinjectable).
+        let empty =
+            r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_2"}}"#;
+        assert!(CodexEventMapper::with_replay(true)
+            .ingest(empty)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
