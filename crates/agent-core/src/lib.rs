@@ -205,6 +205,18 @@ mod loop_tests {
         }
     }
 
+    struct MissingTools;
+    #[async_trait::async_trait]
+    impl ToolDispatch for MissingTools {
+        async fn dispatch(
+            &self,
+            _calls: Vec<ToolInvocation>,
+            _events: ToolEventSink,
+        ) -> Vec<ToolOutcome> {
+            Vec::new()
+        }
+    }
+
     // ───────── harnais ─────────
 
     struct Harness {
@@ -559,6 +571,91 @@ mod loop_tests {
                 .any(|e| matches!(e, AgentEvent::Text(t) if t.contains("repris")))
         );
         assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
+    }
+
+    #[tokio::test]
+    async fn stream_without_terminal_fails_closed() {
+        let h = harness(
+            vec![MockTurn::Stream(vec![StreamEvent::TextDelta {
+                text: "partiel".into(),
+            }])],
+            false,
+            100_000,
+        );
+        let ctx = AgentContext::new("mock").push(Message::user("go"));
+        let events = drive(ctx, h.deps).await;
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::StreamReset)),
+            "les deltas visibles doivent être retirés: {events:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(AgentEvent::Error(crate::AgentError::Provider(_)))
+            ),
+            "fin sans terminal doit fail-closed: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_after_visible_delta_resets_headless_output() {
+        let h = harness(
+            vec![
+                MockTurn::StreamThenErr(
+                    vec![StreamEvent::TextDelta {
+                        text: "fantôme ".into(),
+                    }],
+                    ProviderError::Stream("reset".into()),
+                ),
+                text_turn("final"),
+            ],
+            false,
+            100_000,
+        );
+        let ctx = AgentContext::new("mock").push(Message::user("go"));
+        let res = run_headless(ctx, h.deps).await;
+        assert_eq!(res.text, "final");
+        assert!(matches!(res.ended, crate::HeadlessEnd::EndTurn));
+    }
+
+    #[tokio::test]
+    async fn maxtokens_plain_text_is_exhausted_not_success() {
+        let h = harness(
+            vec![MockTurn::Stream(vec![
+                StreamEvent::TextDelta {
+                    text: "tronqué".into(),
+                },
+                StreamEvent::Done {
+                    stop: StopReason::MaxTokens,
+                },
+            ])],
+            false,
+            100_000,
+        );
+        let ctx = AgentContext::new("mock").push(Message::user("go"));
+        let res = run_headless(ctx, h.deps).await;
+        assert_eq!(res.text, "");
+        assert!(matches!(
+            res.ended,
+            crate::HeadlessEnd::Exhausted(ExhaustReason::MaxOutputTokens {
+                visible_output: true
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn dispatcher_missing_outcome_is_contract_error() {
+        let mut h = harness(vec![tool_turn("c1")], false, 100_000);
+        h.deps.tools = Arc::new(MissingTools);
+        let ctx = AgentContext::new("mock").push(Message::user("go"));
+        let events = drive(ctx, h.deps).await;
+        assert!(
+            matches!(
+                events.last(),
+                Some(AgentEvent::Error(crate::AgentError::Provider(_)))
+            ),
+            "outcome manquant doit casser le contrat: {events:?}"
+        );
     }
 
     // US-006/008 : MaxTokens en plein tool_call → withholding (Recover) → réactive,

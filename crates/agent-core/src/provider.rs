@@ -85,7 +85,7 @@ pub enum StopReason {
     Refusal,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Capabilities {
     pub vision: bool,
     pub tools: bool,
@@ -101,23 +101,6 @@ pub struct Capabilities {
     pub reasoning_options: ReasoningCapabilities,
     #[serde(default)]
     pub cache: CacheCapabilities,
-}
-
-impl Default for Capabilities {
-    fn default() -> Self {
-        Self {
-            vision: false,
-            tools: false,
-            prompt_caching: false,
-            reasoning: false,
-            server_side_state: false,
-            max_context: 0,
-            limits: CapabilityLimits::default(),
-            tool_calling: ToolCallingCapabilities::default(),
-            reasoning_options: ReasoningCapabilities::default(),
-            cache: CacheCapabilities::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -155,12 +138,12 @@ impl ToolSpec {
         if self.name.trim().is_empty() {
             return Err(ToolSpecValidationError::EmptyName);
         }
-        if !self
+        if self
             .input_schema
             .as_object()
             .and_then(|schema| schema.get("type"))
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|kind| kind == "object")
+            .is_none_or(|kind| kind != "object")
         {
             return Err(ToolSpecValidationError::SchemaMustBeObject {
                 tool: self.name.clone(),

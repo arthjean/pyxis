@@ -11,17 +11,17 @@ use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
 
-use crate::budget::{ContextBudget, estimate_input};
+use crate::budget::{ContextBudget, estimate_input, estimate_static_input};
 use crate::compaction::{CompactKind, CompactionState, full_compact, microcompact};
 use crate::deps::Deps;
 use crate::error::{AgentError, ProviderFailure};
 use crate::event::{AgentEvent, ToolCallView, ToolResultView};
 use crate::guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget, batch_signature};
-use crate::message::Message;
+use crate::message::{Message, ToolCallId};
 use crate::provider::{
     CanonicalRequest, ErrorClass, ProviderError, StreamEvent, TokenUsage, ToolSpec,
 };
-use crate::tools::{ToolDispatchEvent, ToolEventSink};
+use crate::tools::{ToolDispatchEvent, ToolEventSink, ToolOutcome};
 use crate::transition::{
     Accumulator, ContextErrorKind, ExhaustReason, PendingError, Transition, post_stream_transition,
     pre_stream_transition,
@@ -150,6 +150,43 @@ fn retry_delay(base: Duration, err: &ProviderError) -> Duration {
     }
 }
 
+fn validate_tool_outcomes(
+    expected_ids: &[ToolCallId],
+    outcomes: &[ToolOutcome],
+) -> Result<(), AgentError> {
+    use std::collections::HashSet;
+
+    if outcomes.len() != expected_ids.len() {
+        return Err(AgentError::Provider(ProviderFailure::contract(format!(
+            "tool dispatcher returned {} outcomes for {} calls",
+            outcomes.len(),
+            expected_ids.len()
+        ))));
+    }
+    let expected: HashSet<&str> = expected_ids.iter().map(String::as_str).collect();
+    let mut seen = HashSet::new();
+    for outcome in outcomes {
+        if !expected.contains(outcome.id.as_str()) {
+            return Err(AgentError::Provider(ProviderFailure::contract(format!(
+                "tool dispatcher returned unknown call id: {}",
+                outcome.id
+            ))));
+        }
+        if !seen.insert(outcome.id.as_str()) {
+            return Err(AgentError::Provider(ProviderFailure::contract(format!(
+                "tool dispatcher returned duplicate call id: {}",
+                outcome.id
+            ))));
+        }
+    }
+    if let Some(missing) = expected_ids.iter().find(|id| !seen.contains(id.as_str())) {
+        return Err(AgentError::Provider(ProviderFailure::contract(format!(
+            "tool dispatcher omitted call id: {missing}"
+        ))));
+    }
+    Ok(())
+}
+
 /// Lance l'agent. Renvoie un `Stream<AgentEvent>` à consommer (TUI, `-p`, Paneflow).
 pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent> + Send {
     async_stream::stream! {
@@ -158,11 +195,15 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
         // ContextBudget calculé UNE FOIS pour ce modèle (invariant 5).
         let max_context = deps.provider.capabilities().max_context;
         let mut budget = ContextBudget::for_model(max_context, config.max_output_tokens);
-        // US-028 : le préfixe éphémère (AGENTS.md + env) est envoyé à CHAQUE requête
-        // mais absent de `messages`. On l'ajoute aux ESTIMATIONS locales (sens
-        // conservateur : compaction au plus tôt, jamais trop tard) ; l'`usage` réel
-        // du backend l'inclut déjà. Stable sur le run → calculé une fois.
-        let context_tokens = estimate_input(&context_messages, deps.tokenizer.as_ref());
+        // L'usage backend compte tout ce qui est envoyé : system, contexte
+        // éphémère, schémas d'outils et transcript. Les projections locales doivent
+        // porter le même overhead statique, sinon la compaction arrive trop tard.
+        let static_input_tokens = estimate_static_input(
+            &system,
+            &context_messages,
+            &tools,
+            deps.tokenizer.as_ref(),
+        );
         let mut compaction = CompactionState::default();
         let mut pending: Option<PendingError> = None;
         let mut model_turns: u32 = 0;
@@ -226,7 +267,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     if budget.should_microcompact() {
                         let pruned = microcompact(&mut messages, config.micro_keep_recent);
                         if pruned > 0 {
-                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(context_tokens));
+                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(static_input_tokens));
                             yield AgentEvent::Compacted(CompactKind::Micro);
                         }
                     }
@@ -235,7 +276,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     // projection (contexte estimé + sortie max) franchirait le
                     // budget (edge case #3, « avant un gros tour »).
                     if usage_budget.is_active() {
-                        let est_in = estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(context_tokens) as u64;
+                        let est_in = estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(static_input_tokens) as u64;
                         if let Some(reason) =
                             usage_budget.would_exceed(est_in, config.max_output_tokens as u64)
                         {
@@ -320,7 +361,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 // défaut OFF → chemin et sortie inchangés en prod.
                                 if std::env::var_os("PYXIS_DEBUG_USAGE").is_some() {
                                     let est_in = estimate_input(&messages, deps.tokenizer.as_ref())
-                                        .saturating_add(context_tokens);
+                                        .saturating_add(static_input_tokens);
                                     eprintln!(
                                         "[usage] backend input={} output={} | estimé_local input≈{} (ratio réel/estimé={:.3})",
                                         usage.input,
@@ -347,6 +388,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
 
                     if let Some(e) = stream_err {
                         if e.is_context_error() {
+                            if acc.has_visible_output() {
+                                yield AgentEvent::StreamReset;
+                            }
                             pending = Some(PendingError { kind: ContextErrorKind::PromptTooLong });
                             continue;
                         }
@@ -355,8 +399,14 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             | ErrorClass::RateLimited
                             | ErrorClass::Overloaded(_) => {
                                 if transient_retries >= config.max_retries {
+                                    if acc.has_visible_output() {
+                                        yield AgentEvent::StreamReset;
+                                    }
                                     yield AgentEvent::Error((&e).into());
                                     return;
+                                }
+                                if acc.has_visible_output() {
+                                    yield AgentEvent::StreamReset;
                                 }
                                 transient_retries += 1;
                                 // attempt indexé à partir de 0 → délais 1×,2×,4×.
@@ -370,10 +420,16 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 continue;
                             }
                             ErrorClass::Auth(a) => {
+                                if acc.has_visible_output() {
+                                    yield AgentEvent::StreamReset;
+                                }
                                 yield AgentEvent::Error(AgentError::Auth(a));
                                 return;
                             }
                             ErrorClass::InvalidRequest => {
+                                if acc.has_visible_output() {
+                                    yield AgentEvent::StreamReset;
+                                }
                                 yield AgentEvent::Error((&e).into());
                                 return;
                             }
@@ -390,17 +446,22 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     if let Some(u) = last_usage {
                         usage_budget.record_usage(u);
                     } else {
-                        let est_in = estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(context_tokens);
+                        let est_in = estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(static_input_tokens);
                         let est_out = deps.tokenizer.count_text(acc.text()) as u32;
                         budget.observe_estimated(est_in);
                         usage_budget.record(est_in as u64, est_out as u64);
                     }
 
-                    if !acc.is_empty() {
+                    let transition = post_stream_transition(&acc);
+                    let commits_assistant =
+                        matches!(transition, Transition::EndTurn | Transition::RunTools(_));
+                    if commits_assistant && !acc.is_empty() {
                         messages.push(acc.to_assistant_message());
+                    } else if acc.has_visible_output() {
+                        yield AgentEvent::StreamReset;
                     }
 
-                    post_stream_transition(&acc)
+                    transition
                 }
             }
             };
@@ -477,6 +538,8 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             }
                             let (tool_event_tx, mut tool_event_rx) =
                                 tokio::sync::mpsc::unbounded_channel();
+                            let expected_ids: Vec<ToolCallId> =
+                                calls.iter().map(|c| c.id.clone()).collect();
                             let dispatch =
                                 deps.tools.dispatch(calls, ToolEventSink::new(tool_event_tx));
                             tokio::pin!(dispatch);
@@ -501,6 +564,10 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     }
                                 }
                             }
+                            if let Err(e) = validate_tool_outcomes(&expected_ids, &outcomes) {
+                                yield AgentEvent::Error(e);
+                                return;
+                            }
                             for o in &outcomes {
                                 yield AgentEvent::ToolResult(ToolResultView {
                                     id: o.id.clone(),
@@ -521,7 +588,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             // budget réel) ; si un long résultat franchit le seuil, on
                             // force la compaction au prochain tour, avant le modèle.
                             let projected = estimate_input(&messages, deps.tokenizer.as_ref())
-                                .saturating_add(context_tokens);
+                                .saturating_add(static_input_tokens);
                             if budget.would_autocompact(projected) {
                                 force_compact = true;
                             }
@@ -540,7 +607,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 yield AgentEvent::Error(AgentError::Session(e.to_string()));
                                 return;
                             }
-                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(context_tokens));
+                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(static_input_tokens));
                             // US-030 : ancre le baseline sur le PROCHAIN usage réel
                             // (anti double-compaction immédiate).
                             budget.mark_compacted();
@@ -555,7 +622,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             // anti error-loop : microcompact structurel pour baisser
                             // la pression avant de reboucler.
                             let _ = microcompact(&mut messages, config.micro_keep_recent);
-                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(context_tokens));
+                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(static_input_tokens));
                         }
                     }
                 }
@@ -572,7 +639,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 yield AgentEvent::Error(AgentError::Session(e.to_string()));
                                 return;
                             }
-                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(context_tokens));
+                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(static_input_tokens));
                             budget.mark_compacted();
                             yield AgentEvent::Compacted(CompactKind::Reactive);
                         }
@@ -618,16 +685,26 @@ pub async fn run_headless(ctx: AgentContext, deps: Deps) -> HeadlessResult {
     futures_util::pin_mut!(stream);
 
     let mut text = String::new();
+    let mut pending_text = String::new();
     let mut events = 0usize;
     let mut ended = HeadlessEnd::EndTurn;
 
     while let Some(ev) = stream.next().await {
         events += 1;
         match ev {
-            AgentEvent::Text(t) => text.push_str(&t),
+            AgentEvent::StreamReset => pending_text.clear(),
+            AgentEvent::Text(t) => pending_text.push_str(&t),
+            AgentEvent::ToolCall(_) => {
+                text.push_str(&pending_text);
+                pending_text.clear();
+            }
             AgentEvent::Exhausted(r) => ended = HeadlessEnd::Exhausted(r),
             AgentEvent::Error(e) => ended = HeadlessEnd::Error(e),
-            AgentEvent::EndTurn => ended = HeadlessEnd::EndTurn,
+            AgentEvent::EndTurn => {
+                text.push_str(&pending_text);
+                pending_text.clear();
+                ended = HeadlessEnd::EndTurn;
+            }
             _ => {}
         }
     }

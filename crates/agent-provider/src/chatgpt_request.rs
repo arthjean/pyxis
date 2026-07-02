@@ -10,9 +10,9 @@
 //!   `input[]` à chaque tour (mappe le canonique, ARCHITECTURE/PROVIDERS §4.1).
 //! - `call_id` corrèle `function_call` ↔ `function_call_output`.
 //!
-//! ⚠️ Reasoning items NON réinjectés en MVP (voir `chatgpt.rs` — risque #1 à
-//! valider en live ; le modèle raisonne et on affiche le résumé, mais on ne
-//! renvoie pas les items chiffrés au tour suivant).
+//! Les reasoning items chiffrés sont réinjectés avant leurs `function_call` quand
+//! le transcript en contient. Les blocs orphelins restent sautés pour éviter une
+//! paire reasoning/call invalide.
 
 use agent_core::message::{ContentBlock, Message, Role};
 use agent_core::provider::{CanonicalRequest, ToolSpec};
@@ -112,8 +112,8 @@ fn user_content(blocks: &[ContentBlock]) -> Vec<Value> {
 }
 
 /// Un message assistant produit : un item `message` (texte concaténé) puis un
-/// item `function_call` par `tool_use`. Les blocs `thinking` ne sont PAS
-/// réinjectés (MVP, cf. en-tête de module).
+/// item `function_call` par `tool_use`. Les blocs `thinking` affichables ne sont
+/// pas réinjectés ; seuls les blocs chiffrés opaques le sont.
 fn assistant_items(blocks: &[ContentBlock], input: &mut Vec<Value>) {
     let mut text = String::new();
     for b in blocks {

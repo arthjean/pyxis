@@ -24,8 +24,8 @@ pub struct CodexEventMapper {
     last_active_item: Option<String>,
     /// Au moins un tool call a-t-il été émis ? (override stop `completed`→`ToolUse`).
     saw_tool_call: bool,
-    /// US-031 : capturer les reasoning items chiffrés pour replay ? Défaut OFF
-    /// (chemin plat : les reasoning items sont ignorés comme en MVP).
+    /// US-031 : capturer les reasoning items chiffrés pour replay ? Le mapper brut
+    /// garde un défaut OFF ; le provider ChatGPT l'active explicitement.
     replay: bool,
 }
 
@@ -68,28 +68,26 @@ impl CodexEventMapper {
             "response.output_item.added" => Ok(self.on_item_added(&v)),
             "response.function_call_arguments.delta" => {
                 if let (Some(key), Some(delta)) = (
-                    self.event_item_key(&v),
+                    self.event_item_key(&v, "function_call_arguments.delta")?,
                     v.get("delta").and_then(Value::as_str),
-                ) {
-                    if let Some(active) = self.active.get_mut(&key) {
-                        active.args.push_str(delta);
-                    }
+                ) && let Some(active) = self.active.get_mut(&key)
+                {
+                    active.args.push_str(delta);
                 }
                 Ok(Vec::new())
             }
             "response.function_call_arguments.done" => {
                 // Source d'autorité des arguments complets (remplace l'accumulé).
                 if let (Some(key), Some(args)) = (
-                    self.event_item_key(&v),
+                    self.event_item_key(&v, "function_call_arguments.done")?,
                     v.get("arguments").and_then(Value::as_str),
-                ) {
-                    if let Some(active) = self.active.get_mut(&key) {
-                        active.args = args.to_string();
-                    }
+                ) && let Some(active) = self.active.get_mut(&key)
+                {
+                    active.args = args.to_string();
                 }
                 Ok(Vec::new())
             }
-            "response.output_item.done" => Ok(self.on_item_done(&v)),
+            "response.output_item.done" => self.on_item_done(&v),
             "response.completed" | "response.done" | "response.incomplete" => {
                 Ok(self.on_terminal(&v))
             }
@@ -124,9 +122,7 @@ impl CodexEventMapper {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let item_id = item_id(item)
-            .unwrap_or_else(|| call_id.as_str())
-            .to_string();
+        let item_id = item_id(item).unwrap_or(call_id.as_str()).to_string();
         if let Some(index) = v.get("output_index").and_then(Value::as_u64) {
             self.output_index_to_item.insert(index, item_id.clone());
         }
@@ -142,20 +138,20 @@ impl CodexEventMapper {
         vec![StreamEvent::ToolCallStart { id: call_id, name }]
     }
 
-    fn on_item_done(&mut self, v: &Value) -> Vec<StreamEvent> {
+    fn on_item_done(&mut self, v: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
         let item_type = v
             .get("item")
             .and_then(|i| i.get("type"))
             .and_then(Value::as_str);
-        // US-031 : reasoning item chiffré → capturé UNIQUEMENT si replay actif
-        // (sinon ignoré comme en MVP). `encrypted_content`/`id` opaques.
+        // US-031 : reasoning item chiffré, capturé uniquement si replay actif.
+        // `encrypted_content`/`id` opaques.
         if item_type == Some("reasoning") {
             if !self.replay {
-                return Vec::new();
+                return Ok(Vec::new());
             }
             let item = match v.get("item") {
                 Some(i) => i,
-                None => return Vec::new(),
+                None => return Ok(Vec::new()),
             };
             let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
             let enc = item
@@ -164,26 +160,26 @@ impl CodexEventMapper {
                 .unwrap_or_default();
             // un reasoning sans contenu chiffré n'est pas réinjectable → ignoré.
             if id.is_empty() || enc.is_empty() {
-                return Vec::new();
+                return Ok(Vec::new());
             }
-            return vec![StreamEvent::EncryptedReasoning {
+            return Ok(vec![StreamEvent::EncryptedReasoning {
                 id: id.to_string(),
                 encrypted_content: enc.to_string(),
-            }];
+            }]);
         }
         if item_type != Some("function_call") {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         // arguments finaux : priorité à l'item.done, sinon l'accumulé.
         let item_args = v
             .get("item")
             .and_then(|i| i.get("arguments"))
             .and_then(Value::as_str);
-        let Some(key) = self.event_item_key(v) else {
-            return Vec::new();
+        let Some(key) = self.event_item_key(v, "output_item.done")? else {
+            return Ok(Vec::new());
         };
         let Some(active) = self.active.remove(&key) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         if self.last_active_item.as_deref() == Some(key.as_str()) {
             self.last_active_item = None;
@@ -201,32 +197,49 @@ impl CodexEventMapper {
             });
         }
         out.push(StreamEvent::ToolCallEnd { id: active.call_id });
-        out
+        Ok(out)
     }
 
-    fn event_item_key(&self, v: &Value) -> Option<String> {
+    fn event_item_key(&self, v: &Value, event_name: &str) -> Result<Option<String>, ProviderError> {
         if let Some(id) = v.get("item_id").and_then(Value::as_str)
             && self.active.contains_key(id)
         {
-            return Some(id.to_string());
+            return Ok(Some(id.to_string()));
         }
         if let Some(id) = v.get("item").and_then(item_id)
             && self.active.contains_key(id)
         {
-            return Some(id.to_string());
+            return Ok(Some(id.to_string()));
         }
         if let Some(index) = v.get("output_index").and_then(Value::as_u64)
             && let Some(id) = self.output_index_to_item.get(&index)
         {
-            return Some(id.clone());
+            return Ok(Some(id.clone()));
+        }
+        let call_id = v
+            .get("call_id")
+            .or_else(|| v.get("item").and_then(|i| i.get("call_id")))
+            .and_then(Value::as_str);
+        if let Some(call_id) = call_id {
+            let mut matches = self
+                .active
+                .iter()
+                .filter(|(_, active)| active.call_id == call_id);
+            if let Some((key, _)) = matches.next()
+                && matches.next().is_none()
+            {
+                return Ok(Some(key.clone()));
+            }
         }
         if self.active.len() == 1 {
-            return self.active.keys().next().cloned();
+            return Ok(self.active.keys().next().cloned());
         }
-        self.last_active_item
-            .as_ref()
-            .filter(|id| self.active.contains_key(*id))
-            .cloned()
+        if self.active.is_empty() {
+            return Ok(None);
+        }
+        Err(ProviderError::Decode(format!(
+            "ambiguous {event_name} without item id"
+        )))
     }
 
     fn on_terminal(&mut self, v: &Value) -> Vec<StreamEvent> {
@@ -445,6 +458,63 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_parallel_tool_delta_fails_closed() {
+        let mut m = CodexEventMapper::new();
+        assert!(
+            m.ingest(
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_a","id":"fc_a","name":"read","arguments":""}}"#
+            )
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolCallStart { id, .. } if id == "call_a"))
+        );
+        assert!(
+            m.ingest(
+                r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_b","id":"fc_b","name":"write","arguments":""}}"#
+            )
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolCallStart { id, .. } if id == "call_b"))
+        );
+        let err = m
+            .ingest(r#"{"type":"response.function_call_arguments.delta","delta":"{}"}"#)
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Decode(_)));
+    }
+
+    #[test]
+    fn parallel_tool_delta_can_fallback_to_unique_call_id() {
+        let mut m = CodexEventMapper::new();
+        m.ingest(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_a","id":"fc_a","name":"read","arguments":""}}"#,
+        )
+        .unwrap();
+        m.ingest(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_b","id":"fc_b","name":"write","arguments":""}}"#,
+        )
+        .unwrap();
+        assert!(
+            m.ingest(
+                r#"{"type":"response.function_call_arguments.done","call_id":"call_b","arguments":"{\"path\":\"b.txt\"}"}"#
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let ev = m
+            .ingest(
+                r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_b","name":"write"}}"#,
+            )
+            .unwrap();
+        assert!(ev.iter().any(|e| {
+            matches!(
+                e,
+                StreamEvent::ToolCallDelta { id, args_json }
+                if id == "call_b" && args_json == "{\"path\":\"b.txt\"}"
+            )
+        }));
+    }
+
+    #[test]
     fn args_only_in_item_done_still_emitted() {
         // backend qui n'envoie pas de deltas : args uniquement dans output_item.done.
         let ev = ingest_all(&[
@@ -494,7 +564,7 @@ mod tests {
         assert!(err.is_context_error());
     }
 
-    // US-031 : reasoning item chiffré capturé UNIQUEMENT si replay actif (défaut OFF).
+    // US-031 : reasoning item chiffré capturé uniquement si replay actif.
     #[test]
     fn reasoning_item_captured_only_when_replay_on() {
         let done = r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"ENC"}}"#;

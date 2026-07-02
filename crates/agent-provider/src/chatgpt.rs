@@ -5,14 +5,9 @@
 //! contexte complet reconstruit côté client à chaque tour → mappe proprement le
 //! canonique (PROVIDERS §4.1, le piège WebSocket+state est explicitement évité).
 //!
-//! ⚠️ Risque #1 à valider au premier run live (non testable ici, pas de token) :
-//! le backend est un modèle à raisonnement et reçoit `include:
-//! ["reasoning.encrypted_content"]`. Le MVP **n'réinjecte pas** les reasoning
-//! items aux tours suivants. Si le backend rejette (`400` « reasoning item
-//! required ») un `function_call` non précédé de son reasoning item, le fix est
-//! borné : porter le `thinkingSignature` de Pi (capturer l'item reasoning à
-//! `output_item.done`, le stocker dans le transcript, le réémettre dans
-//! `input[]`). Voir `docs/openai-subscription-auth.md` §1.b.
+//! Le backend est un modèle à raisonnement et reçoit `include:
+//! ["reasoning.encrypted_content"]`. Les reasoning items chiffrés sont capturés
+//! puis réémis avant leurs `function_call` pour préserver la continuité stateless.
 
 use std::time::Duration;
 
@@ -75,8 +70,7 @@ pub struct OpenAiChatGptProvider {
     /// Identifiant de session STABLE (UUID v4), envoyé en `prompt_cache_key` à
     /// chaque requête (US-029) → le backend réutilise son cache de préfixe.
     session_id: String,
-    /// US-031 (P2, replay isolé) : réinjecter les reasoning items chiffrés ?
-    /// **Défaut OFF** — jamais le chemin par défaut (risque 400, à valider en live).
+    /// US-031 : réinjecter les reasoning items chiffrés en mode stateless.
     reasoning_replay: bool,
 }
 
@@ -143,7 +137,7 @@ impl OpenAiChatGptProvider {
                     strict_json_schema: false,
                 },
                 reasoning_options: ReasoningCapabilities {
-                    encrypted_replay: false,
+                    encrypted_replay: true,
                 },
                 cache: CacheCapabilities {
                     prompt_cache_key: true,
@@ -152,7 +146,7 @@ impl OpenAiChatGptProvider {
             reasoning_effort,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             session_id: new_session_id(),
-            reasoning_replay: false,
+            reasoning_replay: true,
         }
     }
 
@@ -174,10 +168,10 @@ impl OpenAiChatGptProvider {
         self
     }
 
-    /// Active/désactive le replay des reasoning items chiffrés (US-031, P2). OFF par
-    /// défaut : activer expose au risque 400 (paire `rs`/`fc`), à valider en live.
+    /// Active/désactive le replay des reasoning items chiffrés (US-031).
     pub fn with_reasoning_replay(mut self, on: bool) -> Self {
         self.reasoning_replay = on;
+        self.capabilities.reasoning_options.encrypted_replay = on;
         self
     }
 }
@@ -407,11 +401,15 @@ impl Provider for OpenAiChatGptProvider {
         let replay = self.reasoning_replay; // Copy → capturé dans le stream 'static.
         let mapped = async_stream::stream! {
             let mut mapper = CodexEventMapper::with_replay(replay);
+            let mut saw_terminal = false;
             while let Some(ev) = es.next().await {
                 match ev {
                     Ok(event) => match mapper.ingest(&event.data) {
                         Ok(events) => {
                             for e in events {
+                                if matches!(e, StreamEvent::Done { .. }) {
+                                    saw_terminal = true;
+                                }
                                 yield Ok(e);
                             }
                         }
@@ -425,6 +423,9 @@ impl Provider for OpenAiChatGptProvider {
                         return;
                     }
                 }
+            }
+            if !saw_terminal {
+                yield Err(ProviderError::Stream("missing terminal event".to_string()));
             }
         };
         Ok(idle_guarded(mapped.boxed(), self.idle_timeout).boxed())
@@ -500,7 +501,16 @@ mod tests {
         let c = p.capabilities();
         assert!(!c.server_side_state, "SSE stateless → mappe le canonique");
         assert!(c.tools && c.reasoning);
+        assert!(c.reasoning_options.encrypted_replay);
         assert_eq!(p.kind(), ProviderKind::OpenAiChatGpt);
+    }
+
+    #[test]
+    fn reasoning_replay_flag_updates_capabilities() {
+        let p = provider().with_reasoning_replay(false);
+        assert!(!p.capabilities().reasoning_options.encrypted_replay);
+        let p = p.with_reasoning_replay(true);
+        assert!(p.capabilities().reasoning_options.encrypted_replay);
     }
 
     // US-029 : session_id = UUID v4 bien formé, stable par instance, unique.

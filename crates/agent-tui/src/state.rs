@@ -327,6 +327,9 @@ pub struct AppState {
     /// Nouveaux blocs arrivés pendant que l'utilisateur a remonté le transcript
     /// (pill « revenir en bas », US-046). Remis à 0 dès le retour au bas.
     pub unseen: usize,
+    /// Début du stream live courant : index de bloc et compteur de caractères.
+    /// Utilisé pour retirer les deltas abandonnés quand le core retry/recover.
+    stream_start: Option<(usize, usize)>,
 }
 
 /// Action déduite d'une touche, interprétée par la boucle agent-cli.
@@ -371,6 +374,7 @@ impl AppState {
             turn_chars: 0,
             reduced_motion: false,
             unseen: 0,
+            stream_start: None,
         }
     }
 
@@ -452,7 +456,9 @@ impl AppState {
     pub fn apply(&mut self, ev: &AgentEvent) {
         let before = self.blocks.len();
         match ev {
+            AgentEvent::StreamReset => self.reset_streaming(),
             AgentEvent::Text(t) => {
+                self.begin_streaming();
                 self.status = Status::Thinking;
                 self.turn_chars += t.chars().count();
                 match self.blocks.last_mut() {
@@ -467,6 +473,7 @@ impl AppState {
                 }
             }
             AgentEvent::Reasoning(t) => {
+                self.begin_streaming();
                 self.status = Status::Thinking;
                 self.turn_chars += t.chars().count();
                 match self.blocks.last_mut() {
@@ -594,6 +601,21 @@ impl AppState {
         if let Some(Block::Assistant { streaming, .. }) = self.blocks.last_mut() {
             *streaming = false;
         }
+        self.stream_start = None;
+    }
+
+    fn begin_streaming(&mut self) {
+        if self.stream_start.is_none() {
+            self.stream_start = Some((self.blocks.len(), self.turn_chars));
+        }
+    }
+
+    fn reset_streaming(&mut self) {
+        if let Some((block_start, chars_start)) = self.stream_start.take() {
+            self.blocks.truncate(block_start);
+            self.turn_chars = chars_start;
+        }
+        self.status = Status::Thinking;
     }
 
     /// Remonte dans le transcript de `n` lignes, clampé à la borne calculée au
@@ -1111,6 +1133,25 @@ mod tests {
             }
         ));
         assert_eq!(s.status, Status::Idle);
+    }
+
+    #[test]
+    fn stream_reset_removes_uncommitted_blocks() {
+        let mut s = AppState::new("gpt-5", false);
+        s.apply(&AgentEvent::Text("préfixe".into()));
+        s.apply(&AgentEvent::Reasoning("raison".into()));
+        s.apply(&AgentEvent::StreamReset);
+        assert!(s.blocks.is_empty());
+        assert_eq!(s.turn_chars, 0);
+        s.apply(&AgentEvent::Text("final".into()));
+        s.apply(&AgentEvent::EndTurn);
+        assert_eq!(
+            s.blocks,
+            vec![Block::Assistant {
+                text: "final".into(),
+                streaming: false
+            }]
+        );
     }
 
     #[test]

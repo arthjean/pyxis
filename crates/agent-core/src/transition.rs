@@ -48,6 +48,12 @@ pub enum ExhaustReason {
     ToolLoop {
         count: u32,
     },
+    /// Le modèle a atteint son budget de sortie. Ce n'est pas une fin propre :
+    /// la réponse peut être tronquée, voire vide si le reasoning a consommé le
+    /// budget.
+    MaxOutputTokens {
+        visible_output: bool,
+    },
 }
 
 /// Transition exhaustive. Chaque variante est un événement décisionnel.
@@ -91,6 +97,9 @@ pub fn pre_stream_transition(
 pub fn post_stream_transition(acc: &Accumulator) -> Transition {
     let calls = acc.tool_calls();
     match acc.stop {
+        None => Transition::Fail(AgentError::Provider(ProviderFailure::contract(
+            "provider stream ended without terminal event",
+        ))),
         Some(StopReason::ToolUse) if !calls.is_empty() && !acc.has_open_tool_calls() => {
             Transition::RunTools(calls)
         }
@@ -111,12 +120,13 @@ pub fn post_stream_transition(acc: &Accumulator) -> Transition {
                 kind: ContextErrorKind::MaxTokensInput,
             })
         }
+        Some(StopReason::MaxTokens) => Transition::Exhausted(ExhaustReason::MaxOutputTokens {
+            visible_output: acc.has_visible_output(),
+        }),
         Some(StopReason::Refusal) => Transition::Fail(AgentError::Provider(
             ProviderFailure::contract("refus du modèle"),
         )),
-        // EndTurn / StopSequence / MaxTokens-sans-calls (texte tronqué mais
-        // exploitable) / ToolUse-sans-calls (fail-closed) / None → fin propre.
-        _ => Transition::EndTurn,
+        Some(StopReason::EndTurn | StopReason::StopSequence) => Transition::EndTurn,
     }
 }
 
@@ -214,6 +224,10 @@ impl Accumulator {
 
     pub fn has_open_tool_calls(&self) -> bool {
         !self.open.is_empty()
+    }
+
+    pub fn has_visible_output(&self) -> bool {
+        !self.text.is_empty() || !self.reasoning.is_empty()
     }
 
     /// Appels d'outils complets, validés à `ToolCallEnd`.
@@ -390,8 +404,9 @@ mod tests {
     }
 
     #[test]
-    fn maxtokens_plain_text_ends_turn() {
-        // texte tronqué sans tool_call en cours → fin de tour (output exploitable)
+    fn maxtokens_plain_text_exhausts() {
+        // texte tronqué sans tool_call en cours : non-success, car le reasoning
+        // peut avoir consommé le budget avant une réponse complète.
         let a = acc_with(vec![
             StreamEvent::TextDelta {
                 text: "réponse coupée".into(),
@@ -400,7 +415,20 @@ mod tests {
                 stop: StopReason::MaxTokens,
             },
         ]);
-        assert!(matches!(post_stream_transition(&a), Transition::EndTurn));
+        assert!(matches!(
+            post_stream_transition(&a),
+            Transition::Exhausted(ExhaustReason::MaxOutputTokens {
+                visible_output: true
+            })
+        ));
+    }
+
+    #[test]
+    fn missing_terminal_event_fails_closed() {
+        let a = acc_with(vec![StreamEvent::TextDelta {
+            text: "partiel".into(),
+        }]);
+        assert!(matches!(post_stream_transition(&a), Transition::Fail(_)));
     }
 
     // US-031 : l'Accumulator capture les reasoning items et les place AVANT les

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use agent_core::message::Message;
+use agent_core::message::{ContentBlock, Message};
 use agent_core::provider::ToolSpec;
 use agent_core::{AgentContext, AgentEvent, Deps, RunConfig, run_agent};
 use agent_provider::KEYRING_ACCOUNT;
@@ -172,6 +172,17 @@ fn take_goal_done(state: &mut AppState) -> bool {
     false
 }
 
+fn scrub_encrypted_reasoning(messages: &mut [Message]) -> usize {
+    let mut removed = 0usize;
+    for msg in messages {
+        let before = msg.content.len();
+        msg.content
+            .retain(|b| !matches!(b, ContentBlock::EncryptedReasoning { .. }));
+        removed += before.saturating_sub(msg.content.len());
+    }
+    removed
+}
+
 /// Lance la session interactive. Restaure le terminal en sortie quoi qu'il arrive.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -324,7 +335,18 @@ async fn event_loop(
                                 } else {
                                     cfg.model = arg.to_string();
                                     state.model = arg.to_string();
-                                    state.blocks.push(Block::Notice(format!("Modèle : {arg}")));
+                                    let removed = conversation
+                                        .lock()
+                                        .map(|mut msgs| scrub_encrypted_reasoning(&mut msgs[..]))
+                                        .unwrap_or_default();
+                                    let suffix = if removed > 0 {
+                                        format!(" ({removed} reasoning items retirés)")
+                                    } else {
+                                        String::new()
+                                    };
+                                    state
+                                        .blocks
+                                        .push(Block::Notice(format!("Modèle : {arg}{suffix}")));
                                 }
                             }
                             "/goal" if running => state.blocks.push(Block::Notice(
@@ -771,7 +793,8 @@ fn new_session_path(dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{GOAL_DONE_MARKER, compose_system, take_goal_done};
+    use super::{GOAL_DONE_MARKER, compose_system, scrub_encrypted_reasoning, take_goal_done};
+    use agent_core::message::{ContentBlock, Message};
     use agent_tui::{AppState, Block};
 
     #[test]
@@ -810,5 +833,29 @@ mod tests {
                 if text == "c'est terminé" && !text.contains(GOAL_DONE_MARKER)),
             "marqueur strippé du dernier bloc",
         );
+    }
+
+    #[test]
+    fn scrub_encrypted_reasoning_removes_only_replay_blocks() {
+        let mut messages = vec![Message::assistant(vec![
+            ContentBlock::Text { text: "ok".into() },
+            ContentBlock::EncryptedReasoning {
+                id: "rs_1".into(),
+                encrypted_content: "ENC".into(),
+            },
+            ContentBlock::ToolUse {
+                id: "c1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            },
+        ])];
+        assert_eq!(scrub_encrypted_reasoning(&mut messages), 1);
+        assert!(
+            messages[0]
+                .content
+                .iter()
+                .all(|b| !matches!(b, ContentBlock::EncryptedReasoning { .. }))
+        );
+        assert_eq!(messages[0].content.len(), 2);
     }
 }

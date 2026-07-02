@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentEvent {
+    /// Le stream courant a été abandonné avant commit (retry/recover).
+    /// Les clients doivent retirer les deltas live non finalisés.
+    StreamReset,
     /// Delta de texte assistant.
     Text(String),
     /// Delta de raisonnement (si le provider en émet).

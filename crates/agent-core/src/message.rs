@@ -50,9 +50,9 @@ pub enum ContentBlock {
         data: String,
     },
     /// Reasoning item CHIFFRÉ du backend Codex (US-031, replay isolé). Capturé
-    /// uniquement derrière le flag `reasoning_replay` (défaut OFF) pour réémission
-    /// de la paire `rs`/`fc` ; DROPPÉ à la compaction (contrainte protocole). Le
-    /// `encrypted_content` est opaque (jamais loggé/affiché).
+    /// quand `reasoning_replay` est actif pour réémission de la paire `rs`/`fc` ;
+    /// DROPPÉ à la compaction (contrainte protocole). Le `encrypted_content` est
+    /// opaque (jamais loggé/affiché).
     EncryptedReasoning {
         id: String,
         encrypted_content: String,

@@ -271,6 +271,11 @@ async fn run(
             context_messages: context_msgs,
         };
         let result = agent_core::run_headless(ctx, deps).await;
+        match result.ended {
+            agent_core::HeadlessEnd::Error(e) => anyhow::bail!("{e}"),
+            agent_core::HeadlessEnd::Exhausted(reason) => anyhow::bail!("arrêt: {reason:?}"),
+            agent_core::HeadlessEnd::EndTurn => {}
+        }
         // En one-shot, pas de boucle d'objectif : on retire juste le marqueur.
         let text = result
             .text
@@ -280,9 +285,6 @@ async fn run(
         print!("{text}");
         if !text.ends_with('\n') {
             println!();
-        }
-        if let agent_core::HeadlessEnd::Error(e) = result.ended {
-            anyhow::bail!("{e}");
         }
     } else {
         // Registre MCP construit depuis la config découverte avant le sandbox

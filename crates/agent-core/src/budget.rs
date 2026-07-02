@@ -6,7 +6,7 @@
 use agent_tokenizer::TokenCounter;
 
 use crate::message::{ContentBlock, Message};
-use crate::provider::TokenUsage;
+use crate::provider::{TokenUsage, ToolSpec};
 
 #[derive(Debug, Clone)]
 pub struct ContextBudget {
@@ -144,6 +144,29 @@ pub fn estimate_input(messages: &[Message], counter: &dyn TokenCounter) -> u32 {
     u32::try_from(total).unwrap_or(u32::MAX)
 }
 
+/// Estime l'overhead statique envoyé avec chaque requête : system prompt,
+/// contexte éphémère et schémas d'outils. Le backend compte ces tokens dans
+/// `usage.input`; les projections locales doivent donc les inclure aussi.
+pub fn estimate_static_input(
+    system: &Option<String>,
+    context_messages: &[Message],
+    tools: &[ToolSpec],
+    counter: &dyn TokenCounter,
+) -> u32 {
+    let mut total = system
+        .as_deref()
+        .map(|s| counter.count_text(s))
+        .unwrap_or_default();
+    total = total.saturating_add(estimate_input(context_messages, counter) as usize);
+    for tool in tools {
+        total = total
+            .saturating_add(counter.count_text(&tool.name))
+            .saturating_add(counter.count_text(&tool.description))
+            .saturating_add(counter.count_text(&tool.input_schema.to_string()));
+    }
+    u32::try_from(total).unwrap_or(u32::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +250,27 @@ mod tests {
         let est = estimate_input(&msgs, &HeuristicCounter);
         // 8 octets → 2 tokens ; 4 octets → 1 token
         assert_eq!(est, 3);
+    }
+
+    #[test]
+    fn estimate_static_input_counts_system_context_and_tools() {
+        let tools = vec![ToolSpec {
+            name: "read".into(),
+            description: "lit".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } }
+            }),
+        }];
+        let est = estimate_static_input(
+            &Some("system prompt".into()),
+            &[Message::user("ctxctxctxctx")],
+            &tools,
+            &HeuristicCounter,
+        );
+        assert!(
+            est > estimate_input(&[Message::user("ctxctxctxctx")], &HeuristicCounter),
+            "system et tools doivent compter dans l'estimation"
+        );
     }
 }
