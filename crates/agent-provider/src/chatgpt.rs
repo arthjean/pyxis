@@ -9,6 +9,7 @@
 //! replay reasoning est activé explicitement. Par défaut, ce chemin reste OFF
 //! jusqu'à validation live du wire post-rename.
 
+use std::sync::RwLock;
 use std::time::Duration;
 
 use agent_auth::OAuthCredential;
@@ -98,7 +99,7 @@ pub struct OpenAiChatGptProvider {
     idle_timeout: Duration,
     /// Identifiant de session STABLE (UUID v4), envoyé en `prompt_cache_key` à
     /// chaque requête (US-029) → le backend réutilise son cache de préfixe.
-    session_id: String,
+    session_id: RwLock<String>,
     /// US-031 : réinjecter les reasoning items chiffrés en mode stateless.
     reasoning_replay: bool,
 }
@@ -174,7 +175,7 @@ impl OpenAiChatGptProvider {
             },
             reasoning_effort,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
-            session_id: new_session_id(),
+            session_id: RwLock::new(new_session_id()),
             reasoning_replay: false,
         }
     }
@@ -202,6 +203,20 @@ impl OpenAiChatGptProvider {
         self.reasoning_replay = on;
         self.capabilities.reasoning_options.encrypted_replay = on;
         self
+    }
+
+    pub fn with_prompt_cache_key(self, key: impl Into<String>) -> Self {
+        if let Ok(mut session_id) = self.session_id.write() {
+            *session_id = key.into();
+        }
+        self
+    }
+
+    fn prompt_cache_key(&self) -> String {
+        self.session_id
+            .read()
+            .map(|key| key.clone())
+            .unwrap_or_else(|_| new_session_id())
     }
 }
 
@@ -532,7 +547,8 @@ impl Provider for OpenAiChatGptProvider {
             },
         );
         // US-029 : clé de cache stable par session → réutilisation du cache backend.
-        inject_cache_key(&mut body, &self.session_id);
+        let prompt_cache_key = self.prompt_cache_key();
+        inject_cache_key(&mut body, &prompt_cache_key);
 
         // 3. POST. `.json()` pose content-type ; on ajoute les en-têtes propriétaires
         //    (Authorization, chatgpt-account-id, originator, OpenAI-Beta, accept).
@@ -651,6 +667,12 @@ impl Provider for OpenAiChatGptProvider {
     async fn disconnect_auth(&self) -> Result<(), ProviderError> {
         self.creds.disconnect().await;
         Ok(())
+    }
+
+    fn set_prompt_cache_key(&self, key: &str) {
+        if let Ok(mut session_id) = self.session_id.write() {
+            *session_id = key.to_string();
+        }
     }
 
     fn classify_error(&self, err: &ProviderError) -> ErrorClass {
@@ -780,7 +802,15 @@ mod tests {
         );
         assert_ne!(new_session_id(), new_session_id(), "deux UUID diffèrent");
         // un provider porte un session_id UUID stocké à la construction.
-        assert_eq!(provider().session_id.len(), 36);
+        assert_eq!(provider().prompt_cache_key().len(), 36);
+    }
+
+    #[test]
+    fn prompt_cache_key_can_be_rebound_per_session() {
+        let p = provider().with_prompt_cache_key("pyxis-session-a");
+        assert_eq!(p.prompt_cache_key(), "pyxis-session-a");
+        p.set_prompt_cache_key("pyxis-session-b");
+        assert_eq!(p.prompt_cache_key(), "pyxis-session-b");
     }
 
     #[test]

@@ -116,9 +116,9 @@ fn read_capped(path: &Path, cap: usize) -> Option<String> {
 }
 
 /// Bloc environnement (US-028) : cwd, shell, date, fuseau. Message `user` injecté
-/// chaque tour. Shell/fuseau best-effort depuis l'env (défauts `sh`/`UTC`).
+/// chaque tour. Shell aligné sur l'outil `bash`; fuseau best-effort depuis l'env.
 fn environment_block(workspace: &Path, date: &str) -> String {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
+    let shell = default_shell();
     let timezone = std::env::var("TZ").unwrap_or_else(|_| "UTC".to_string());
     format!(
         "<environment>\n<cwd>{}</cwd>\n<shell>{}</shell>\n<current_date>{}</current_date>\n<timezone>{}</timezone>\n</environment>",
@@ -127,6 +127,17 @@ fn environment_block(workspace: &Path, date: &str) -> String {
         date,
         timezone
     )
+}
+
+fn default_shell() -> String {
+    #[cfg(windows)]
+    {
+        "powershell.exe".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string())
+    }
 }
 
 /// Date UTC `YYYY-MM-DD` (fournie au bloc environnement). Calculée sans dépendance

@@ -23,7 +23,7 @@ use agent_core::{AgentContext, Deps, RunConfig};
 use agent_provider::{KEYRING_ACCOUNT, OpenAiChatGptProvider};
 use agent_sandbox::{ProxyPolicy, set_proxy_env};
 use agent_tokenizer::HeuristicCounter;
-use agent_tools::permission::{AutoApprove, AutoDeny, PermissionMode};
+use agent_tools::permission::{AutoDeny, PermissionMode};
 use agent_tools::{Bash, Edit, Glob, Grep, Read, Registry, Write};
 
 use crate::approver::TuiApprover;
@@ -32,6 +32,7 @@ use crate::session::SharedSession;
 
 const RESUME_TAINT_SCAN_MESSAGES: usize = 8;
 
+#[derive(Debug)]
 struct Args {
     prompt: Option<String>,
     resume: Option<String>,
@@ -44,19 +45,37 @@ struct Args {
     input_cost_micro_per_ktok: Option<String>,
     output_cost_micro_per_ktok: Option<String>,
     overload_fallback_model: Option<String>,
+    help: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CliPermissionPolicy {
     mode: PermissionMode,
-    auto_approve_routine: bool,
 }
 
-fn parse_args() -> Args {
+const HELP: &str = "\
+Usage: pyxis [options] [prompt]
+
+Options:
+  -p, --print <prompt>                 Mode headless one-shot
+      --resume [latest|<file.jsonl>]    Reprendre une session
+      --model <slug>                    Modèle à utiliser
+      --allow <host>                    Autoriser un host réseau
+  -y, --yes                             Accepter les edits en headless
+      --no-sandbox                      Désactiver le sandbox FS
+      --token-budget <n>                Budget total de tokens
+      --cost-budget-micro-usd <n>       Budget coût total
+      --input-cost-micro-per-ktok <n>   Prix input
+      --output-cost-micro-per-ktok <n>  Prix output
+      --overload-fallback-model <slug>  Modèle de repli sur surcharge
+  -h, --help                            Afficher cette aide
+";
+
+fn parse_args() -> anyhow::Result<Args> {
     parse_args_from(std::env::args().skip(1))
 }
 
-fn parse_args_from<I>(raw: I) -> Args
+fn parse_args_from<I>(raw: I) -> anyhow::Result<Args>
 where
     I: IntoIterator<Item = String>,
 {
@@ -72,46 +91,69 @@ where
         input_cost_micro_per_ktok: None,
         output_cost_micro_per_ktok: None,
         overload_fallback_model: None,
+        help: false,
     };
     let mut it = raw.into_iter().peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "-p" | "--print" => args.prompt = it.next(),
+            "-h" | "--help" => args.help = true,
+            "-p" | "--print" => args.prompt = Some(next_value(&mut it, a.as_str())?),
             "--resume" => {
                 args.resume = match it.peek() {
                     Some(next) if !next.starts_with('-') => it.next(),
                     _ => Some(String::new()),
                 };
             }
-            "--model" => {
-                if let Some(m) = it.next() {
-                    args.model = m;
-                }
-            }
-            "--allow" => {
-                if let Some(h) = it.next() {
-                    args.allow_hosts.push(h);
-                }
-            }
+            "--model" => args.model = next_value(&mut it, "--model")?,
+            "--allow" => args.allow_hosts.push(next_value(&mut it, "--allow")?),
             "--yes" | "-y" => args.yes = true,
             "--no-sandbox" => args.sandbox = false,
-            "--token-budget" => args.token_budget = it.next(),
-            "--cost-budget-micro-usd" => args.cost_budget_micro_usd = it.next(),
-            "--input-cost-micro-per-ktok" => args.input_cost_micro_per_ktok = it.next(),
-            "--output-cost-micro-per-ktok" => args.output_cost_micro_per_ktok = it.next(),
-            "--overload-fallback-model" => args.overload_fallback_model = it.next(),
+            "--token-budget" => args.token_budget = Some(next_value(&mut it, "--token-budget")?),
+            "--cost-budget-micro-usd" => {
+                args.cost_budget_micro_usd = Some(next_value(&mut it, "--cost-budget-micro-usd")?)
+            }
+            "--input-cost-micro-per-ktok" => {
+                args.input_cost_micro_per_ktok =
+                    Some(next_value(&mut it, "--input-cost-micro-per-ktok")?)
+            }
+            "--output-cost-micro-per-ktok" => {
+                args.output_cost_micro_per_ktok =
+                    Some(next_value(&mut it, "--output-cost-micro-per-ktok")?)
+            }
+            "--overload-fallback-model" => {
+                args.overload_fallback_model =
+                    Some(next_value(&mut it, "--overload-fallback-model")?)
+            }
             other => {
                 // un argument nu sans -p est traité comme le prompt (mode -p implicite).
-                if args.prompt.is_none() && !other.starts_with('-') {
+                if other.starts_with('-') {
+                    anyhow::bail!("argument inconnu: {other}");
+                }
+                if args.prompt.is_none() {
                     args.prompt = Some(other.to_string());
+                } else {
+                    anyhow::bail!("argument positionnel inattendu: {other}");
                 }
             }
         }
     }
-    args
+    Ok(args)
 }
 
-fn resolve_resume_path(
+fn next_value<I>(it: &mut std::iter::Peekable<I>, flag: &str) -> anyhow::Result<String>
+where
+    I: Iterator<Item = String>,
+{
+    let Some(value) = it.next() else {
+        anyhow::bail!("{flag}: valeur manquante");
+    };
+    if value.starts_with('-') {
+        anyhow::bail!("{flag}: valeur manquante");
+    }
+    Ok(value)
+}
+
+pub(crate) fn resolve_resume_path(
     sessions_dir: &std::path::Path,
     arg: &str,
 ) -> anyhow::Result<std::path::PathBuf> {
@@ -123,8 +165,12 @@ fn resolve_resume_path(
             .ok_or_else(|| anyhow::anyhow!("resume : aucune session disponible"))?;
         return Ok(sessions_dir.join(latest.id));
     }
-    crate::interactive::session_path_from_arg(sessions_dir, arg)
-        .ok_or_else(|| anyhow::anyhow!("resume : identifiant de session invalide"))
+    let path = crate::interactive::session_path_from_arg(sessions_dir, arg)
+        .ok_or_else(|| anyhow::anyhow!("resume : identifiant de session invalide"))?;
+    if !path.is_file() {
+        anyhow::bail!("resume : session introuvable: {}", path.display());
+    }
+    Ok(path)
 }
 
 fn parse_positive_u64(raw: &str, name: &str) -> anyhow::Result<u64> {
@@ -191,6 +237,16 @@ fn run_config_from_args(args: &Args) -> anyhow::Result<RunConfig> {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
         });
+    if let Some(fallback) = &overload_fallback_model
+        && prompt::uses_codex_finetuned_prompt(&args.model)
+            != prompt::uses_codex_finetuned_prompt(fallback)
+    {
+        anyhow::bail!(
+            "modèle de repli incompatible avec le prompt système: primary={} fallback={}",
+            args.model,
+            fallback
+        );
+    }
 
     Ok(RunConfig {
         token_budget,
@@ -200,35 +256,31 @@ fn run_config_from_args(args: &Args) -> anyhow::Result<RunConfig> {
     })
 }
 
-fn permission_policy(headless: bool, yes: bool, sandbox_enforced: bool) -> CliPermissionPolicy {
+fn permission_policy(headless: bool, yes: bool, _sandbox_enforced: bool) -> CliPermissionPolicy {
     if !headless {
         return CliPermissionPolicy {
             mode: PermissionMode::Default,
-            auto_approve_routine: false,
         };
     }
     if !yes {
         return CliPermissionPolicy {
             mode: PermissionMode::Default,
-            auto_approve_routine: false,
         };
     }
-    if sandbox_enforced {
-        CliPermissionPolicy {
-            mode: PermissionMode::AcceptEdits,
-            auto_approve_routine: false,
-        }
-    } else {
-        CliPermissionPolicy {
-            mode: PermissionMode::Default,
-            auto_approve_routine: false,
-        }
+    CliPermissionPolicy {
+        mode: PermissionMode::AcceptEdits,
     }
 }
 
 fn sandbox_enforced_from_args(args: &Args, workspace: &std::path::Path) -> bool {
     if !args.sandbox {
-        eprintln!("[sandbox] désactivé par --no-sandbox : outils sensibles non auto-approuvés");
+        if args.yes {
+            eprintln!(
+                "[sandbox] désactivé par --no-sandbox : --yes peut accepter les edits sans confinement FS"
+            );
+        } else {
+            eprintln!("[sandbox] désactivé par --no-sandbox");
+        }
         return false;
     }
     match agent_sandbox::enforce_process(workspace) {
@@ -239,14 +291,24 @@ fn sandbox_enforced_from_args(args: &Args, workspace: &std::path::Path) -> bool 
             status == agent_sandbox::fs::SandboxStatus::Enforced
         }
         Err(e) => {
-            eprintln!("[sandbox] échec d'application : {e} ; outils sensibles non auto-approuvés");
+            if args.yes {
+                eprintln!(
+                    "[sandbox] échec d'application : {e} ; --yes peut accepter les edits sans confinement FS"
+                );
+            } else {
+                eprintln!("[sandbox] échec d'application : {e}");
+            }
             false
         }
     }
 }
 
 fn main() -> anyhow::Result<()> {
-    let args = parse_args();
+    let args = parse_args()?;
+    if args.help {
+        print!("{HELP}");
+        return Ok(());
+    }
     let workspace = std::env::current_dir()?;
 
     // Skills lus AVANT le sandbox : `~/.agents/skills` est hors workspace, donc
@@ -320,10 +382,10 @@ fn home_dir() -> Option<std::path::PathBuf> {
 /// Liste les skills disponibles dans `~/.agents/skills` (un dossier = un skill,
 /// nom = nom du dossier), triés. Symlink partagé entre CLIs ; lecture best-effort.
 fn read_skills() -> Vec<String> {
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = home_dir() else {
         return Vec::new();
     };
-    let dir = std::path::Path::new(&home).join(".agents").join("skills");
+    let dir = home.join(".agents").join("skills");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
@@ -346,6 +408,7 @@ async fn run(
     sandbox_enforced: bool,
 ) -> anyhow::Result<()> {
     let run_config = run_config_from_args(&args)?;
+    let headless = args.prompt.is_some();
     // 1. Credential abonnement ChatGPT (keyring). Absente → on guide vers le login.
     let cred = match store::load(KEYRING_ACCOUNT)? {
         Some(agent_auth::Credential::Oauth(o)) if o.provider == ProviderId::OpenAiChatGpt => o,
@@ -398,6 +461,7 @@ async fn run(
     } else {
         (interactive::new_session_path(&sessions_dir), Vec::new())
     };
+    provider.set_prompt_cache_key(&interactive::prompt_cache_key_for_session(&current_session));
     let jsonl = agent_session::JsonlSession::create_at(&current_session)
         .map_err(|e| anyhow::anyhow!("session : {e}"))?;
     let (shared_session, conversation) = SharedSession::new(jsonl);
@@ -411,23 +475,18 @@ async fn run(
         RESUME_TAINT_SCAN_MESSAGES,
     );
 
-    // Objectif de session persistant (`/goal`) : chargé du sidecar `.pyxis/goal`
-    // (survit au redémarrage), composé dans le system prompt à chaque tour.
-    let goal = std::fs::read_to_string(workspace.join(".pyxis").join("goal"))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    // Objectif persistant par session (`/goal`) : uniquement en interactif.
+    let goal = if headless {
+        None
+    } else {
+        interactive::read_goal(&interactive::goal_path_for_session(&current_session))
+    };
 
     // 4. Registry d'outils + approbateur (TUI en interactif, auto en headless).
-    let headless = args.prompt.is_some();
     let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
     let policy = permission_policy(headless, args.yes, sandbox_enforced);
     let approver: Arc<dyn agent_tools::permission::Approver> = if headless {
-        if policy.auto_approve_routine {
-            Arc::new(AutoApprove::new())
-        } else {
-            Arc::new(AutoDeny)
-        }
+        Arc::new(AutoDeny)
     } else {
         Arc::new(TuiApprover::new(perm_tx))
     };
@@ -476,6 +535,7 @@ async fn run(
             tools: tool_specs,
             config: run_config,
             context_messages: context_msgs,
+            ephemeral_messages: Vec::new(),
         };
         let result = agent_core::run_headless(ctx, deps).await;
         match result.ended {
@@ -534,7 +594,9 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, parse_args_from, permission_policy, run_config_from_args};
+    use super::{
+        Args, parse_args_from, permission_policy, resolve_resume_path, run_config_from_args,
+    };
 
     fn args() -> Args {
         Args {
@@ -549,6 +611,7 @@ mod tests {
             input_cost_micro_per_ktok: None,
             output_cost_micro_per_ktok: None,
             overload_fallback_model: None,
+            help: false,
         }
     }
 
@@ -598,8 +661,17 @@ mod tests {
     }
 
     #[test]
+    fn run_config_rejects_cross_prompt_family_fallback() {
+        let mut args = args();
+        args.model = "gpt-5-codex".into();
+        args.overload_fallback_model = Some("gpt-5.5".into());
+        let err = run_config_from_args(&args).unwrap_err().to_string();
+        assert!(err.contains("modèle de repli incompatible"));
+    }
+
+    #[test]
     fn parse_args_reads_resume_latest() {
-        let args = parse_args_from(vec!["--resume".to_string()]);
+        let args = parse_args_from(vec!["--resume".to_string()]).unwrap();
         assert_eq!(args.resume.as_deref(), Some(""));
         assert!(args.prompt.is_none());
     }
@@ -611,7 +683,8 @@ mod tests {
             "123.jsonl".to_string(),
             "-p".to_string(),
             "continue".to_string(),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(args.resume.as_deref(), Some("123.jsonl"));
         assert_eq!(args.prompt.as_deref(), Some("continue"));
     }
@@ -622,29 +695,77 @@ mod tests {
             "--resume".to_string(),
             "-p".to_string(),
             "continue".to_string(),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(args.resume.as_deref(), Some(""));
         assert_eq!(args.prompt.as_deref(), Some("continue"));
+    }
+
+    #[test]
+    fn parse_args_rejects_missing_print_value() {
+        let err = parse_args_from(vec!["-p".to_string(), "--resume".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("-p: valeur manquante"));
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_flag() {
+        let err = parse_args_from(vec!["--wat".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("argument inconnu"));
+    }
+
+    #[test]
+    fn parse_args_rejects_model_flag_without_value() {
+        let err = parse_args_from(vec!["--model".to_string(), "--resume".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--model: valeur manquante"));
+    }
+
+    #[test]
+    fn parse_args_rejects_extra_positional() {
+        let err = parse_args_from(vec!["one".to_string(), "two".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("argument positionnel inattendu"));
+    }
+
+    #[test]
+    fn parse_args_reads_help() {
+        let args = parse_args_from(vec!["--help".to_string()]).unwrap();
+        assert!(args.help);
+    }
+
+    #[test]
+    fn resolve_resume_path_rejects_missing_explicit_session() {
+        let dir = std::env::temp_dir().join(format!("pyxis-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = resolve_resume_path(&dir, "missing.jsonl")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("session introuvable"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn headless_without_yes_is_fail_closed_default() {
         let p = permission_policy(true, false, true);
         assert_eq!(p.mode, agent_tools::permission::PermissionMode::Default);
-        assert!(!p.auto_approve_routine);
     }
 
     #[test]
     fn headless_yes_accepts_edits_but_not_sensitive_actions() {
         let p = permission_policy(true, true, true);
         assert_eq!(p.mode, agent_tools::permission::PermissionMode::AcceptEdits);
-        assert!(!p.auto_approve_routine);
     }
 
     #[test]
-    fn headless_yes_does_not_auto_approve_without_sandbox() {
+    fn headless_yes_accepts_edits_even_without_sandbox() {
         let p = permission_policy(true, true, false);
-        assert_eq!(p.mode, agent_tools::permission::PermissionMode::Default);
-        assert!(!p.auto_approve_routine);
+        assert_eq!(p.mode, agent_tools::permission::PermissionMode::AcceptEdits);
     }
 }

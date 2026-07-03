@@ -63,7 +63,7 @@ pub struct InteractiveConfig {
     /// Skills disponibles (lus avant le sandbox), sous-menu `/skills`.
     pub skills: Vec<String>,
     /// Objectif de session persistant (`/goal`), composé dans le system à chaque
-    /// tour. Chargé du sidecar `.pyxis/goal` au démarrage (survit au redémarrage).
+    /// tour. Chargé du sidecar de session au démarrage.
     pub goal: Option<String>,
     /// Durcissement appliqué aux sous-process MCP (env scrub + proxy).
     pub command_hardener: agent_tools::CommandHardener,
@@ -81,7 +81,8 @@ const GOAL_CONTINUE_PROMPT: &str = "Poursuis l'objectif de session. S'il reste \
     du travail, continue. S'il est pleinement atteint et vérifié, termine ta \
     réponse par <<GOAL_DONE>> seul sur la dernière ligne.";
 
-const GOAL_ITERS_FILE: &str = "goal.iters";
+const MCP_DISABLED_NOTICE: &str =
+    "MCP : diagnostic config uniquement. L'exécution d'outils MCP n'est pas exposée dans ce build.";
 
 /// Compose le system prompt effectif : base + DIRECTIVE de complétion. L'objectif
 /// vit dans `instructions` (re-envoyé chaque tour) donc survit à la compaction —
@@ -122,6 +123,30 @@ pub fn with_tool_guidelines(base: &str, guidelines: &[String]) -> String {
     s
 }
 
+pub(crate) fn prompt_cache_key_for_session(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("session");
+    format!("pyxis-{stem}")
+}
+
+pub(crate) fn goal_path_for_session(path: &Path) -> PathBuf {
+    path.with_extension("goal")
+}
+
+pub(crate) fn goal_iters_path_for_session(path: &Path) -> PathBuf {
+    path.with_extension("goal.iters")
+}
+
+pub(crate) fn read_goal(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Construit le contexte du tour (conversation à jour + message) et lance
 /// `run_agent` dans une tâche dont les events reviennent par `tx`.
 fn launch_turn(
@@ -130,9 +155,15 @@ fn launch_turn(
     deps: &Deps,
     tx: &mpsc::Sender<AgentEvent>,
     user_msg: &str,
+    persist_user_message: bool,
 ) {
     let mut msgs = conversation.lock().map(|g| g.clone()).unwrap_or_default();
-    msgs.push(Message::user(user_msg.to_string()));
+    let ephemeral_messages = if persist_user_message {
+        msgs.push(Message::user(user_msg.to_string()));
+        Vec::new()
+    } else {
+        vec![Message::user(user_msg.to_string())]
+    };
     // US-027 : system de base sélectionné par le slug COURANT (recalculé par tour →
     // un `/models` change le template) + guidelines outils + directive d'objectif.
     let base = with_tool_guidelines(
@@ -147,6 +178,7 @@ fn launch_turn(
         config: cfg.run_config.clone(),
         // US-028 : contexte projet ré-injecté chaque tour, jamais persisté.
         context_messages: cfg.context_messages.clone(),
+        ephemeral_messages,
     };
     let deps = deps.clone();
     let tx = tx.clone();
@@ -199,26 +231,22 @@ pub(crate) fn session_path_from_arg(sessions_dir: &Path, arg: &str) -> Option<Pa
     Some(sessions_dir.join(candidate))
 }
 
-fn read_goal_iters(path: Option<&Path>) -> u32 {
-    path.and_then(|p| std::fs::read_to_string(p).ok())
+fn read_goal_iters(path: &Path) -> u32 {
+    std::fs::read_to_string(path)
+        .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(0)
 }
 
-fn write_goal_iters(path: Option<&Path>, value: u32) -> std::io::Result<()> {
-    if let Some(path) = path {
-        std::fs::write(path, value.to_string())?;
-    }
-    Ok(())
+fn write_goal_iters(path: &Path, value: u32) -> std::io::Result<()> {
+    std::fs::write(path, value.to_string())
 }
 
-fn remove_if_exists(path: Option<&Path>) -> std::io::Result<()> {
-    if let Some(path) = path {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
+fn remove_if_exists(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
     Ok(())
 }
@@ -297,9 +325,8 @@ async fn event_loop(
     state.skills = std::mem::take(&mut cfg.skills);
     state.sessions = load_sessions(&sessions_dir, &current_session);
     state.mcp_servers = mcp_metas(&mcp);
-    // Sidecar de l'objectif persistant (`<workspace>/.pyxis/goal`).
-    let goal_path = sessions_dir.parent().map(|p| p.join("goal"));
-    let goal_iters_path = sessions_dir.parent().map(|p| p.join(GOAL_ITERS_FILE));
+    let mut goal_path = goal_path_for_session(&current_session);
+    let mut goal_iters_path = goal_iters_path_for_session(&current_session);
     // Historique des prompts de TOUT le dossier (toutes les conversations).
     state.load_history(agent_session::workspace_prompts(
         &sessions_dir,
@@ -333,7 +360,7 @@ async fn event_loop(
     // Compteur de relances automatiques de la boucle d'objectif (reset à chaque
     // saisie utilisateur / nouvel objectif).
     let mut goal_iters: u32 = if cfg.goal.is_some() {
-        read_goal_iters(goal_iters_path.as_deref())
+        read_goal_iters(&goal_iters_path)
     } else {
         0
     };
@@ -387,7 +414,7 @@ async fn event_loop(
                     InputAction::Submit(prompt) if !running => {
                         state.push_user(prompt.clone());
                         goal_iters = 0;
-                        launch_turn(&conversation, &cfg, &deps, &agent_tx, &prompt);
+                        launch_turn(&conversation, &cfg, &deps, &agent_tx, &prompt, true);
                         running = true;
                     }
                     InputAction::Command(line) => {
@@ -448,29 +475,26 @@ async fn event_loop(
                                 })),
                                 "clear" => {
                                     cfg.goal = None;
-                                    if let Err(e) = remove_if_exists(goal_path.as_deref()) {
+                                    if let Err(e) = remove_if_exists(&goal_path) {
                                         state.blocks.push(Block::Error(format!("goal: {e}")));
                                     }
-                                    if let Err(e) = remove_if_exists(goal_iters_path.as_deref()) {
+                                    if let Err(e) = remove_if_exists(&goal_iters_path) {
                                         state.blocks.push(Block::Error(format!("goal: {e}")));
                                     }
                                     state.blocks.push(Block::Notice("Objectif effacé.".into()));
                                 }
                                 g => {
-                                    // Fixe l'objectif (sidecar : survit redémarrage + /resume)
-                                    // ET lance immédiatement le travail vers lui.
+                                    // Fixe l'objectif de cette session et lance le travail.
                                     cfg.goal = Some(g.to_string());
-                                    if let Some(p) = &goal_path
-                                        && let Err(e) = std::fs::write(p, g)
-                                    {
+                                    if let Err(e) = std::fs::write(&goal_path, g) {
                                         state.blocks.push(Block::Error(format!("goal: {e}")));
                                     }
-                                    if let Err(e) = write_goal_iters(goal_iters_path.as_deref(), 0) {
+                                    if let Err(e) = write_goal_iters(&goal_iters_path, 0) {
                                         state.blocks.push(Block::Error(format!("goal: {e}")));
                                     }
                                     goal_iters = 0;
                                     state.push_user(g);
-                                    launch_turn(&conversation, &cfg, &deps, &agent_tx, g);
+                                    launch_turn(&conversation, &cfg, &deps, &agent_tx, g, true);
                                     running = true;
                                 }
                             },
@@ -482,11 +506,12 @@ async fn event_loop(
                                 ));
                             }
                             "/resume" => {
-                                let Some(path) = session_path_from_arg(&sessions_dir, arg) else {
-                                    state.blocks.push(Block::Error(
-                                        "resume: identifiant de session invalide".into(),
-                                    ));
-                                    continue;
+                                let path = match crate::resolve_resume_path(&sessions_dir, arg) {
+                                    Ok(path) => path,
+                                    Err(e) => {
+                                        state.blocks.push(Block::Error(format!("{e}")));
+                                        continue;
+                                    }
                                 };
                                 match agent_session::resume_file(&path) {
                                     Ok(r) if !r.messages.is_empty() => {
@@ -495,6 +520,18 @@ async fn event_loop(
                                             state.blocks.push(Block::Error(format!("resume: {e}")));
                                         } else {
                                             current_session = path;
+                                            goal_path = goal_path_for_session(&current_session);
+                                            goal_iters_path =
+                                                goal_iters_path_for_session(&current_session);
+                                            cfg.goal = read_goal(&goal_path);
+                                            goal_iters = if cfg.goal.is_some() {
+                                                read_goal_iters(&goal_iters_path)
+                                            } else {
+                                                0
+                                            };
+                                            deps.provider.set_prompt_cache_key(
+                                                &prompt_cache_key_for_session(&current_session),
+                                            );
                                             if let Ok(mut g) = conversation.lock() {
                                                 *g = msgs.clone();
                                             }
@@ -512,9 +549,34 @@ async fn event_loop(
                                                 load_sessions(&sessions_dir, &current_session);
                                         }
                                     }
-                                    Ok(_) => state
-                                        .blocks
-                                        .push(Block::Notice("Session vide.".into())),
+                                    Ok(_) => {
+                                        if let Err(e) = session.switch_file(&path, 0) {
+                                            state.blocks.push(Block::Error(format!("resume: {e}")));
+                                            continue;
+                                        }
+                                        current_session = path;
+                                        goal_path = goal_path_for_session(&current_session);
+                                        goal_iters_path =
+                                            goal_iters_path_for_session(&current_session);
+                                        cfg.goal = read_goal(&goal_path);
+                                        goal_iters = if cfg.goal.is_some() {
+                                            read_goal_iters(&goal_iters_path)
+                                        } else {
+                                            0
+                                        };
+                                        deps.provider.set_prompt_cache_key(
+                                            &prompt_cache_key_for_session(&current_session),
+                                        );
+                                        if let Ok(mut g) = conversation.lock() {
+                                            g.clear();
+                                        }
+                                        state.blocks.clear();
+                                        state
+                                            .blocks
+                                            .push(Block::Notice("Session vide.".into()));
+                                        state.sessions =
+                                            load_sessions(&sessions_dir, &current_session);
+                                    }
                                     Err(e) => {
                                         state.blocks.push(Block::Error(format!("resume: {e}")))
                                     }
@@ -522,13 +584,25 @@ async fn event_loop(
                             }
                             // /clear est un alias de /new : même mécanique (nouveau
                             // fichier de session + contexte vidé), seul le libellé change.
-                            // L'objectif (`cfg.goal`) survit, comme le system prompt.
                             "/new" | "/clear" => {
                                 let path = new_session_path(&sessions_dir);
                                 if let Err(e) = session.switch_file(&path, 0) {
                                     state.blocks.push(Block::Error(format!("{cmd}: {e}")));
                                 } else {
                                     current_session = path;
+                                    goal_path = goal_path_for_session(&current_session);
+                                    goal_iters_path = goal_iters_path_for_session(&current_session);
+                                    cfg.goal = None;
+                                    goal_iters = 0;
+                                    if let Err(e) = remove_if_exists(&goal_path) {
+                                        state.blocks.push(Block::Error(format!("goal: {e}")));
+                                    }
+                                    if let Err(e) = remove_if_exists(&goal_iters_path) {
+                                        state.blocks.push(Block::Error(format!("goal: {e}")));
+                                    }
+                                    deps.provider.set_prompt_cache_key(
+                                        &prompt_cache_key_for_session(&current_session),
+                                    );
                                     if let Ok(mut g) = conversation.lock() {
                                         g.clear();
                                     }
@@ -630,10 +704,10 @@ async fn event_loop(
                         if endturn && cfg.goal.is_some() {
                             if take_goal_done(&mut state) {
                                 cfg.goal = None;
-                                if let Err(e) = remove_if_exists(goal_path.as_deref()) {
+                                if let Err(e) = remove_if_exists(&goal_path) {
                                     state.blocks.push(Block::Error(format!("goal: {e}")));
                                 }
-                                if let Err(e) = remove_if_exists(goal_iters_path.as_deref()) {
+                                if let Err(e) = remove_if_exists(&goal_iters_path) {
                                     state.blocks.push(Block::Error(format!("goal: {e}")));
                                 }
                                 state
@@ -642,9 +716,7 @@ async fn event_loop(
                                 running = false;
                             } else if goal_iters < MAX_GOAL_ITERS {
                                 goal_iters += 1;
-                                if let Err(e) =
-                                    write_goal_iters(goal_iters_path.as_deref(), goal_iters)
-                                {
+                                if let Err(e) = write_goal_iters(&goal_iters_path, goal_iters) {
                                     state.blocks.push(Block::Error(format!("goal: {e}")));
                                     running = false;
                                     continue;
@@ -658,6 +730,7 @@ async fn event_loop(
                                     &deps,
                                     &agent_tx,
                                     GOAL_CONTINUE_PROMPT,
+                                    false,
                                 );
                                 // running reste true : un nouveau tour est lancé.
                             } else {
@@ -763,6 +836,10 @@ fn handle_mcp(
     }
     match action {
         "connect" | "reconnect" => {
+            if !mcp_connect_enabled() {
+                state.blocks.push(Block::Notice(MCP_DISABLED_NOTICE.into()));
+                return;
+            }
             if let Some(cfg) = mcp_config_for(mcp, server)
                 && mcp_requires_trust(&cfg)
             {
@@ -776,6 +853,10 @@ fn handle_mcp(
             start_mcp_connect(server, mcp, mcp_tx, command_hardener, state, None);
         }
         "trust" => {
+            if !mcp_connect_enabled() {
+                state.blocks.push(Block::Notice(MCP_DISABLED_NOTICE.into()));
+                return;
+            }
             let cfg = match mcp_config_for(mcp, server) {
                 Some(cfg) => cfg,
                 None => {
@@ -835,6 +916,10 @@ fn handle_mcp(
             .blocks
             .push(Block::Notice(format!("Action MCP inconnue : {other}"))),
     }
+}
+
+fn mcp_connect_enabled() -> bool {
+    std::env::var_os("PYXIS_EXPERIMENTAL_MCP_CONNECT").is_some()
 }
 
 fn start_mcp_connect(

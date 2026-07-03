@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AgentError;
 use crate::message::{ContentBlock, Message, Role};
-use crate::provider::{CanonicalRequest, Provider, TokenUsage};
+use crate::provider::{CanonicalRequest, Provider, StopReason, TokenUsage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -171,6 +171,20 @@ pub async fn full_compact(
     // `?` ici laisse `messages` intact en cas d'échec (From<ProviderError>).
     let resp = provider.complete(req).await?;
     let usage = resp.usage;
+    match resp.stop {
+        StopReason::EndTurn | StopReason::StopSequence => {}
+        StopReason::MaxTokens => {
+            return Err(AgentError::Compaction(
+                "résumé tronqué par max_tokens".to_string(),
+            ));
+        }
+        StopReason::ToolUse | StopReason::Refusal => {
+            return Err(AgentError::Compaction(format!(
+                "résumé incomplet reçu du provider: {:?}",
+                resp.stop
+            )));
+        }
+    }
     let new_summary: String = resp
         .content
         .iter()
@@ -288,6 +302,10 @@ mod tests {
 
     impl StubProvider {
         fn with_summary(text: &str) -> Self {
+            Self::with_summary_stop(text, StopReason::EndTurn)
+        }
+
+        fn with_summary_stop(text: &str, stop: StopReason) -> Self {
             Self {
                 caps: caps(),
                 response: CanonicalResponse {
@@ -299,7 +317,7 @@ mod tests {
                         }]
                     },
                     usage: TokenUsage::default(),
-                    stop: StopReason::EndTurn,
+                    stop,
                 },
                 last_req: std::sync::Mutex::new(None),
             }
@@ -369,6 +387,16 @@ mod tests {
             messages, before,
             "transcript ET images préservés en cas d'échec"
         );
+    }
+
+    #[tokio::test]
+    async fn full_compact_rejects_truncated_summary_and_preserves_transcript() {
+        let provider = StubProvider::with_summary_stop("résumé partiel", StopReason::MaxTokens);
+        let mut messages = vec![Message::user("vieux"), Message::assistant_text("réponse")];
+        let before = messages.clone();
+        let res = full_compact(&mut messages, "m", &provider, 4096).await;
+        assert!(res.is_err(), "résumé tronqué doit échouer");
+        assert_eq!(messages, before, "transcript préservé");
     }
 
     // #5 : rien à résumer (1 seul message user) → Err, pas d'appel destructeur.

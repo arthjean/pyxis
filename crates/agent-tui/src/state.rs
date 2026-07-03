@@ -66,7 +66,7 @@ pub const COMMANDS: &[(&str, &str, bool)] = &[
         "Configure le fournisseur d'authentification",
         true,
     ),
-    ("/mcp", "Gère les serveurs MCP (connexion)", true),
+    ("/mcp", "Diagnostics des serveurs MCP", true),
     ("/resume", "Reprend une conversation passée", true),
     (
         "/new",
@@ -842,14 +842,8 @@ impl AppState {
                 let status = status.map(|(status, _)| status);
                 let connecting = status == Some(McpStatus::Connecting);
                 if status == Some(McpStatus::Connected) {
-                    let reconnect = if needs_trust {
-                        MenuItem::new("trust", "Trust reconnect", "affiche commande et env", true)
-                    } else {
-                        MenuItem::new("reconnect", "Reconnect", "", true)
-                    };
                     vec![
                         MenuItem::new("disconnect", "Disconnect", "", true),
-                        reconnect,
                         MenuItem::new("tools", "View tools", "", true),
                     ]
                 } else if needs_trust {
@@ -859,9 +853,9 @@ impl AppState {
                         if connecting {
                             "connexion en cours…"
                         } else {
-                            "affiche commande et env"
+                            "outils MCP non exposés"
                         },
-                        !connecting,
+                        false,
                     )]
                 } else {
                     vec![MenuItem::new(
@@ -870,9 +864,9 @@ impl AppState {
                         if connecting {
                             "connexion en cours…"
                         } else {
-                            ""
+                            "outils MCP non exposés"
                         },
-                        !connecting,
+                        false,
                     )]
                 }
             }
@@ -931,6 +925,7 @@ impl AppState {
             Menu::ProviderList => format!("/providers subscription {}", item.id),
             Menu::ProviderActions => format!("/providers subscription {provider} {}", item.id),
             Menu::McpList if item.enabled => format!("/mcp {} ", item.id),
+            Menu::McpActions if !item.enabled => return,
             Menu::McpActions => format!("/mcp {} {}", self.active_mcp_server(), item.id),
             Menu::McpList | Menu::Resume | Menu::None => return,
         };
@@ -993,6 +988,7 @@ impl AppState {
                 InputAction::None
             }
             Menu::McpList => InputAction::None,
+            Menu::McpActions if !item.enabled => InputAction::None,
             Menu::McpActions => {
                 let server = self.active_mcp_server();
                 self.clear_input();
@@ -1302,7 +1298,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_server_selection_descends_then_dispatches_connect() {
+    fn mcp_server_selection_descends_to_disabled_connect() {
         let mut s = AppState::new("gpt-5", false);
         s.mcp_servers = vec![McpServerMeta {
             name: "fetch".into(),
@@ -1318,13 +1314,14 @@ mod tests {
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(action, InputAction::None);
         assert_eq!(s.input, "/mcp fetch ");
-        // Déconnecté → seule action « connect ».
+        // Déconnecté: connect visible mais inactif, car les outils MCP ne sont
+        // pas exposés au modèle dans ce build.
         let items = s.menu_items();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "connect");
-        // Entrée sur « connect » → commande dispatché.
+        assert!(!items[0].enabled);
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(action, InputAction::Command("/mcp fetch connect".into()));
+        assert_eq!(action, InputAction::None);
     }
 
     #[test]
@@ -1341,12 +1338,13 @@ mod tests {
         let items = s.menu_items();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "trust");
+        assert!(!items[0].enabled);
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(action, InputAction::Command("/mcp local trust".into()));
+        assert_eq!(action, InputAction::None);
     }
 
     #[test]
-    fn mcp_connected_server_offers_disconnect_reconnect_tools() {
+    fn mcp_connected_server_offers_disconnect_and_tools() {
         let mut s = AppState::new("gpt-5", false);
         s.mcp_servers = vec![McpServerMeta {
             name: "fs".into(),
@@ -1357,7 +1355,7 @@ mod tests {
         }];
         s.set_input("/mcp fs ".into());
         let ids: Vec<_> = s.menu_items().into_iter().map(|i| i.id).collect();
-        assert_eq!(ids, vec!["disconnect", "reconnect", "tools"]);
+        assert_eq!(ids, vec!["disconnect", "tools"]);
     }
 
     #[test]
@@ -1374,7 +1372,7 @@ mod tests {
         // actions, pas rester bloqué sur la liste (régression review #7).
         s.set_input("/mcp my server ".into());
         let ids: Vec<_> = s.menu_items().into_iter().map(|i| i.id).collect();
-        assert_eq!(ids, vec!["disconnect", "reconnect", "tools"]);
+        assert_eq!(ids, vec!["disconnect", "tools"]);
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
             action,

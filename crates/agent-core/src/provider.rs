@@ -435,6 +435,7 @@ pub trait Provider: Send + Sync {
     async fn disconnect_auth(&self) -> Result<(), ProviderError> {
         Ok(())
     }
+    fn set_prompt_cache_key(&self, _key: &str) {}
 }
 
 #[cfg(test)]

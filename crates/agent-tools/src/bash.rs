@@ -31,10 +31,15 @@ impl Tool for Bash {
         "bash"
     }
     fn description(&self) -> String {
-        "Exécute une commande shell (sh -c) dans le workspace et retourne \
+        #[cfg(windows)]
+        let description = "Exécute une commande PowerShell (powershell.exe -NoProfile -NonInteractive -Command) dans le workspace et retourne \
          stdout/stderr et le code de sortie. La commande tourne sous timeout. \
-         Paramètre : command."
-            .to_string()
+         Paramètre : command.";
+        #[cfg(not(windows))]
+        let description = "Exécute une commande shell (sh -c) dans le workspace et retourne \
+         stdout/stderr et le code de sortie. La commande tourne sous timeout. \
+         Paramètre : command.";
+        description.to_string()
     }
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({

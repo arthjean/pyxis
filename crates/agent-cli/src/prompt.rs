@@ -18,11 +18,15 @@ const CODEX_FINETUNED: &str = include_str!("../prompts/codex_finetuned.md");
 /// INCONNU — reçoit le prompt long (défaut sûr : mieux vaut sur-spécifier que
 /// laisser un modèle générique sans scaffold).
 pub fn select_system_prompt(slug: &str) -> &'static str {
-    if slug.to_ascii_lowercase().contains("-codex") {
+    if uses_codex_finetuned_prompt(slug) {
         CODEX_FINETUNED
     } else {
         GPT5_GENERIC
     }
+}
+
+pub fn uses_codex_finetuned_prompt(slug: &str) -> bool {
+    slug.to_ascii_lowercase().contains("-codex")
 }
 
 #[cfg(test)]

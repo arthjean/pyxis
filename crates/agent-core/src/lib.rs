@@ -450,6 +450,27 @@ mod loop_tests {
         );
     }
 
+    #[tokio::test]
+    async fn ephemeral_messages_suffix_request_never_persisted() {
+        let h = harness(vec![text_turn("fini")], false, 100_000);
+        let ctx = AgentContext::new("mock")
+            .with_context_messages(vec![Message::user("CTX")])
+            .with_ephemeral_messages(vec![Message::user("CONTROL")])
+            .push(Message::user("humain"));
+        let events = drive(ctx, h.deps).await;
+        assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
+
+        let reqs = h.requests.lock().unwrap();
+        let first = reqs.first().expect("requête provider");
+        assert_eq!(first[0].text(), "CTX");
+        assert_eq!(first[first.len() - 2].text(), "humain");
+        assert_eq!(first[first.len() - 1].text(), "CONTROL");
+
+        let synced = h.boundaries.synced.lock().unwrap();
+        assert!(synced.iter().any(|m| m.text() == "humain"));
+        assert!(!synced.iter().any(|m| m.text() == "CONTROL"));
+    }
+
     // US-006 AC4 + US-008 AC4 : erreur de contexte → withholding → compaction
     // REACTIVE, pas de terminaison prématurée, la conversation continue.
     #[tokio::test]

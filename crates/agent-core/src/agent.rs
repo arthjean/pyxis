@@ -76,6 +76,9 @@ pub struct AgentContext {
     /// (rechargés par tour, pas accumulés). Stateless-safe : le contexte projet est
     /// re-fourni à chaque tour sans polluer le transcript ni `instructions`.
     pub context_messages: Vec<Message>,
+    /// Messages de contrôle éphémères ajoutés après le transcript pour la requête
+    /// courante, sans persistance. Exemple: relance automatique d'un objectif.
+    pub ephemeral_messages: Vec<Message>,
 }
 
 impl AgentContext {
@@ -87,6 +90,7 @@ impl AgentContext {
             tools: Vec::new(),
             config: RunConfig::default(),
             context_messages: Vec::new(),
+            ephemeral_messages: Vec::new(),
         }
     }
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
@@ -105,6 +109,10 @@ impl AgentContext {
         self.context_messages = messages;
         self
     }
+    pub fn with_ephemeral_messages(mut self, messages: Vec<Message>) -> Self {
+        self.ephemeral_messages = messages;
+        self
+    }
 }
 
 fn make_request(
@@ -112,15 +120,18 @@ fn make_request(
     system: &Option<String>,
     context_messages: &[Message],
     messages: &[Message],
+    ephemeral_messages: &[Message],
     tools: &[ToolSpec],
     max_output: u32,
 ) -> CanonicalRequest {
     // US-028 : préfixe ÉPHÉMÈRE (AGENTS.md + env). Stable avant volatil pour
     // préserver le préfixe cacheable ; jamais persisté (le transcript reste
     // `messages` seul).
-    let mut all = Vec::with_capacity(context_messages.len() + messages.len());
+    let mut all =
+        Vec::with_capacity(context_messages.len() + messages.len() + ephemeral_messages.len());
     all.extend_from_slice(context_messages);
     all.extend_from_slice(messages);
+    all.extend_from_slice(ephemeral_messages);
     CanonicalRequest {
         model: model.to_string(),
         system: system.clone(),
@@ -315,7 +326,15 @@ fn rebuild_budget_after_model_switch(
 /// Lance l'agent. Renvoie un `Stream<AgentEvent>` à consommer (TUI, `-p`, Paneflow).
 pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent> + Send {
     async_stream::stream! {
-        let AgentContext { mut model, system, mut messages, tools, config, context_messages } = ctx;
+        let AgentContext {
+            mut model,
+            system,
+            mut messages,
+            tools,
+            config,
+            context_messages,
+            ephemeral_messages,
+        } = ctx;
 
         // ContextBudget calculé pour le modèle actif (recalculé si fallback overload).
         let max_context = deps.provider.max_context_for_model(&model);
@@ -334,7 +353,8 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
             &context_messages,
             &tools,
             deps.tokenizer.as_ref(),
-        );
+        )
+        .saturating_add(estimate_input(&ephemeral_messages, deps.tokenizer.as_ref()));
         let mut compaction = CompactionState::default();
         let mut pending: Option<PendingError> = None;
         let mut model_turns: u32 = 0;
@@ -424,6 +444,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         &system,
                         &context_messages,
                         &messages,
+                        &ephemeral_messages,
                         &tools,
                         config.max_output_tokens,
                     );
