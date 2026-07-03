@@ -743,9 +743,14 @@ fn handle_mcp(
     command_hardener: &agent_tools::CommandHardener,
     state: &mut AppState,
 ) {
+    if arg == "issues" {
+        show_mcp_issues(mcp, state);
+        return;
+    }
     let Some((server, action)) = arg.rsplit_once(' ') else {
         state.blocks.push(Block::Notice(
-            "Sélectionne un serveur puis une action dans le sous-menu /mcp.".into(),
+            "Sélectionne un serveur puis une action dans le sous-menu /mcp. Diagnostics: /mcp issues."
+                .into(),
         ));
         return;
     };
@@ -758,56 +763,34 @@ fn handle_mcp(
     }
     match action {
         "connect" | "reconnect" => {
-            let begin = match mcp.lock() {
-                Ok(mut r) => r.begin_connect(server),
-                Err(_) => Err(agent_mcp::McpError::Unknown(server.to_string())),
-            };
-            match begin {
-                Ok((cfg_srv, old)) => {
-                    if let Some(old) = old {
-                        tokio::spawn(async move { old.cancel().await });
-                    }
-                    state.mcp_servers = mcp_metas(mcp);
+            if let Some(cfg) = mcp_config_for(mcp, server)
+                && mcp_requires_trust(&cfg)
+            {
+                let lead =
+                    format!("Connexion bloquée avant spawn. Relance avec /mcp {server} trust.");
+                state
+                    .blocks
+                    .push(Block::Notice(mcp_trust_notice(server, &cfg, &lead)));
+                return;
+            }
+            start_mcp_connect(server, mcp, mcp_tx, command_hardener, state, None);
+        }
+        "trust" => {
+            let cfg = match mcp_config_for(mcp, server) {
+                Some(cfg) => cfg,
+                None => {
                     state
                         .blocks
-                        .push(Block::Notice(format!("MCP « {server} » : connexion…")));
-                    let tx = mcp_tx.clone();
-                    let name = server.to_string();
-                    let harden = Arc::clone(command_hardener);
-                    tokio::spawn(async move {
-                        let ev = match agent_mcp::McpConnection::connect_hardened(
-                            &name,
-                            &cfg_srv,
-                            Some(&harden),
-                        )
-                        .await
-                        {
-                            Ok(conn) => match conn.list_tools(&name).await {
-                                Ok(tools) => McpEvent::Connected { name, conn, tools },
-                                Err(e) => {
-                                    conn.cancel().await;
-                                    McpEvent::Failed {
-                                        name,
-                                        error: e.to_string(),
-                                    }
-                                }
-                            },
-                            Err(e) => McpEvent::Failed {
-                                name,
-                                error: e.to_string(),
-                            },
-                        };
-                        // Canal fermé (arrêt de l'app) → on récupère la connexion et
-                        // on la ferme pour ne pas laisser de sous-process orphelin.
-                        if let Err(mpsc::error::SendError(ev)) = tx.send(ev).await
-                            && let McpEvent::Connected { conn, .. } = ev
-                        {
-                            conn.cancel().await;
-                        }
-                    });
+                        .push(Block::Notice(format!("MCP « {server} » inconnu.")));
+                    return;
                 }
-                Err(e) => state.blocks.push(Block::Notice(format!("MCP : {e}"))),
-            }
+            };
+            state.blocks.push(Block::Notice(mcp_trust_notice(
+                server,
+                &cfg,
+                "Trust confirmé pour cette connexion.",
+            )));
+            start_mcp_connect(server, mcp, mcp_tx, command_hardener, state, Some(cfg));
         }
         "disconnect" => {
             let old = mcp.lock().ok().and_then(|mut r| r.begin_disconnect(server));
@@ -854,6 +837,181 @@ fn handle_mcp(
     }
 }
 
+fn start_mcp_connect(
+    server: &str,
+    mcp: &Arc<Mutex<agent_mcp::McpRegistry>>,
+    mcp_tx: &mpsc::Sender<McpEvent>,
+    command_hardener: &agent_tools::CommandHardener,
+    state: &mut AppState,
+    trusted_cfg: Option<agent_mcp::McpServerConfig>,
+) {
+    let begin = match mcp.lock() {
+        Ok(mut r) => r.begin_connect(server),
+        Err(_) => Err(agent_mcp::McpError::Unknown(server.to_string())),
+    };
+    match begin {
+        Ok((cfg_srv, old)) => {
+            if let Some(expected) = trusted_cfg
+                && (expected.command != cfg_srv.command
+                    || expected.args != cfg_srv.args
+                    || expected.env != cfg_srv.env)
+            {
+                if let Some(old) = old {
+                    tokio::spawn(async move { old.cancel().await });
+                }
+                if let Ok(mut r) = mcp.lock() {
+                    r.fail(server, "config MCP modifiée pendant le trust".to_string());
+                }
+                state.blocks.push(Block::Error(format!(
+                    "MCP « {server} » : config modifiée pendant le trust."
+                )));
+                state.mcp_servers = mcp_metas(mcp);
+                return;
+            }
+            if let Some(old) = old {
+                tokio::spawn(async move { old.cancel().await });
+            }
+            state.mcp_servers = mcp_metas(mcp);
+            state
+                .blocks
+                .push(Block::Notice(format!("MCP « {server} » : connexion…")));
+            let tx = mcp_tx.clone();
+            let name = server.to_string();
+            let harden = Arc::clone(command_hardener);
+            tokio::spawn(async move {
+                let ev = match agent_mcp::McpConnection::connect_hardened(
+                    &name,
+                    &cfg_srv,
+                    Some(&harden),
+                )
+                .await
+                {
+                    Ok(conn) => match conn.list_tools(&name).await {
+                        Ok(tools) => McpEvent::Connected { name, conn, tools },
+                        Err(e) => {
+                            conn.cancel().await;
+                            McpEvent::Failed {
+                                name,
+                                error: e.to_string(),
+                            }
+                        }
+                    },
+                    Err(e) => McpEvent::Failed {
+                        name,
+                        error: e.to_string(),
+                    },
+                };
+                // Canal fermé: on récupère la connexion et on ferme le sous-process.
+                if let Err(mpsc::error::SendError(ev)) = tx.send(ev).await
+                    && let McpEvent::Connected { conn, .. } = ev
+                {
+                    conn.cancel().await;
+                }
+            });
+        }
+        Err(e) => state.blocks.push(Block::Notice(format!("MCP : {e}"))),
+    }
+}
+
+fn mcp_config_for(
+    mcp: &Arc<Mutex<agent_mcp::McpRegistry>>,
+    server: &str,
+) -> Option<agent_mcp::McpServerConfig> {
+    mcp.lock()
+        .ok()
+        .and_then(|r| r.get(server).map(|s| s.config().clone()))
+}
+
+fn show_mcp_issues(mcp: &Arc<Mutex<agent_mcp::McpRegistry>>, state: &mut AppState) {
+    let Ok(reg) = mcp.lock() else {
+        state
+            .blocks
+            .push(Block::Error("MCP : registre indisponible.".into()));
+        return;
+    };
+    if reg.issues().is_empty() {
+        state
+            .blocks
+            .push(Block::Notice("MCP : aucun diagnostic de config.".into()));
+        return;
+    }
+    let mut lines = reg
+        .issues()
+        .iter()
+        .take(12)
+        .map(agent_mcp::McpConfigIssue::summary)
+        .collect::<Vec<_>>();
+    if reg.issue_count() > lines.len() {
+        lines.push(format!(
+            "{} autres diagnostics",
+            reg.issue_count() - lines.len()
+        ));
+    }
+    state.blocks.push(Block::Notice(format!(
+        "Diagnostics MCP:\n{}",
+        lines.join("\n")
+    )));
+}
+
+fn mcp_requires_trust(cfg: &agent_mcp::McpServerConfig) -> bool {
+    matches!(cfg.source.origin, agent_mcp::McpConfigOrigin::Workspace)
+        || cfg.shadows_lower_priority
+        || !mcp_sensitive_env_keys(cfg).is_empty()
+}
+
+fn mcp_sensitive_env_keys(cfg: &agent_mcp::McpServerConfig) -> Vec<&str> {
+    cfg.env
+        .keys()
+        .map(String::as_str)
+        .filter(|key| {
+            let upper = key.to_ascii_uppercase();
+            matches!(
+                upper.as_str(),
+                "PATH"
+                    | "LD_PRELOAD"
+                    | "LD_LIBRARY_PATH"
+                    | "DYLD_INSERT_LIBRARIES"
+                    | "DYLD_LIBRARY_PATH"
+                    | "NODE_OPTIONS"
+                    | "PYTHONPATH"
+                    | "RUBYOPT"
+                    | "BUNDLE_GEMFILE"
+                    | "CARGO_HOME"
+                    | "RUSTUP_HOME"
+            )
+        })
+        .collect()
+}
+
+fn mcp_trust_notice(server: &str, cfg: &agent_mcp::McpServerConfig, lead: &str) -> String {
+    let args = if cfg.args.is_empty() {
+        "(aucun)".to_string()
+    } else {
+        cfg.args.join(" ")
+    };
+    let env_keys = if cfg.env.is_empty() {
+        "(aucune)".to_string()
+    } else {
+        cfg.env.keys().cloned().collect::<Vec<_>>().join(", ")
+    };
+    let sensitive = mcp_sensitive_env_keys(cfg);
+    let sensitive = if sensitive.is_empty() {
+        "(aucune)".to_string()
+    } else {
+        sensitive.join(", ")
+    };
+    let shadow = if cfg.shadows_lower_priority {
+        "\nShadowing: masque une config MCP de priorité plus basse."
+    } else {
+        ""
+    };
+    format!(
+        "MCP « {server} » : {lead}\nSource: {}\nCommande: {}\nArgs: {args}\nEnv: {env_keys} (valeurs masquées)\nEnv sensible: {sensitive}{shadow}",
+        cfg.source.display(),
+        cfg.command
+    )
+}
+
 /// Projette le registre MCP en métadonnées d'affichage pour le sous-menu `/mcp`.
 fn mcp_metas(mcp: &Arc<Mutex<agent_mcp::McpRegistry>>) -> Vec<McpServerMeta> {
     let Ok(reg) = mcp.lock() else {
@@ -868,6 +1026,8 @@ fn mcp_metas(mcp: &Arc<Mutex<agent_mcp::McpRegistry>>) -> Vec<McpServerMeta> {
                 agent_mcp::McpServer::Connected { .. } => McpStatus::Connected,
                 agent_mcp::McpServer::Failed { .. } => McpStatus::Failed,
             },
+            source: server.config().source.short_label().to_string(),
+            needs_trust: mcp_requires_trust(server.config()),
             tool_count: server.tool_count(),
         })
         .collect()

@@ -29,12 +29,19 @@ pub struct McpConnection {
     service: RunningService<RoleClient, ()>,
 }
 
-/// Métadonnée légère d'un outil exposé (nom + description cappée). Représentation
-/// d'affichage ; le `DynTool` complet arrive avec l'intégration au registre.
+/// Métadonnée d'un outil exposé. Les schémas restent attachés ici pour permettre
+/// une future exposition modèle via adapter strict, sans refaire un handshake.
 #[derive(Debug, Clone)]
 pub struct McpToolInfo {
     pub name: String,
+    pub original_name: String,
+    pub title: Option<String>,
     pub description: String,
+    pub input_schema: serde_json::Value,
+    pub output_schema: Option<serde_json::Value>,
+    /// Les annotations MCP sont des hints fournis par le serveur distant. Elles ne
+    /// doivent jamais devenir une décision de sécurité côté client.
+    pub annotations_untrusted: bool,
 }
 
 impl McpConnection {
@@ -99,11 +106,18 @@ impl McpConnection {
         Ok(tools
             .into_iter()
             .map(|t| McpToolInfo {
-                name: t.name.into_owned(),
+                name: t.name.to_string(),
+                original_name: t.name.into_owned(),
+                title: t.title,
                 description: t
                     .description
                     .map(|d| cap(&d, DESCRIPTION_CAP))
                     .unwrap_or_default(),
+                input_schema: serde_json::Value::Object((*t.input_schema).clone()),
+                output_schema: t
+                    .output_schema
+                    .map(|schema| serde_json::Value::Object((*schema).clone())),
+                annotations_untrusted: t.annotations.is_some(),
             })
             .collect())
     }

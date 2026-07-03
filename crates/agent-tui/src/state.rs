@@ -183,6 +183,8 @@ pub enum McpStatus {
 pub struct McpServerMeta {
     pub name: String,
     pub status: McpStatus,
+    pub source: String,
+    pub needs_trust: bool,
     /// Nombre d'outils exposés (significatif seulement si `Connected`).
     pub tool_count: usize,
 }
@@ -815,10 +817,15 @@ impl AppState {
                     .filter(|m| m.name.starts_with(q))
                     .map(|m| {
                         let hint = match m.status {
-                            McpStatus::Connected => format!("✓ connecté · {} outils", m.tool_count),
-                            McpStatus::Connecting => "◯ connexion…".to_string(),
-                            McpStatus::Failed => "✗ échec".to_string(),
-                            McpStatus::Disconnected => "non connecté".to_string(),
+                            McpStatus::Connected => {
+                                format!("✓ {} · connecté · {} outils", m.source, m.tool_count)
+                            }
+                            McpStatus::Connecting => format!("◯ {} · connexion…", m.source),
+                            McpStatus::Failed => format!("✗ {} · échec", m.source),
+                            McpStatus::Disconnected if m.needs_trust => {
+                                format!("{} · trust requis", m.source)
+                            }
+                            McpStatus::Disconnected => format!("{} · non connecté", m.source),
                         };
                         MenuItem::new(&m.name, &m.name, &hint, true)
                     })
@@ -830,14 +837,32 @@ impl AppState {
                     .mcp_servers
                     .iter()
                     .find(|m| m.name == srv)
-                    .map(|m| m.status);
+                    .map(|m| (m.status, m.needs_trust));
+                let needs_trust = status.is_some_and(|(_, trust)| trust);
+                let status = status.map(|(status, _)| status);
                 let connecting = status == Some(McpStatus::Connecting);
                 if status == Some(McpStatus::Connected) {
+                    let reconnect = if needs_trust {
+                        MenuItem::new("trust", "Trust reconnect", "affiche commande et env", true)
+                    } else {
+                        MenuItem::new("reconnect", "Reconnect", "", true)
+                    };
                     vec![
                         MenuItem::new("disconnect", "Disconnect", "", true),
-                        MenuItem::new("reconnect", "Reconnect", "", true),
+                        reconnect,
                         MenuItem::new("tools", "View tools", "", true),
                     ]
+                } else if needs_trust {
+                    vec![MenuItem::new(
+                        "trust",
+                        "Trust connect",
+                        if connecting {
+                            "connexion en cours…"
+                        } else {
+                            "affiche commande et env"
+                        },
+                        !connecting,
+                    )]
                 } else {
                     vec![MenuItem::new(
                         "connect",
@@ -1252,11 +1277,15 @@ mod tests {
             McpServerMeta {
                 name: "filesystem".into(),
                 status: McpStatus::Connected,
+                source: "workspace".into(),
+                needs_trust: false,
                 tool_count: 3,
             },
             McpServerMeta {
                 name: "fetch".into(),
                 status: McpStatus::Disconnected,
+                source: "user".into(),
+                needs_trust: false,
                 tool_count: 0,
             },
         ];
@@ -1269,7 +1298,7 @@ mod tests {
         assert!(fs.hint.starts_with('✓'), "connecté → badge ✓");
         assert!(fs.hint.contains("3 outils"));
         let fetch = items.iter().find(|i| i.id == "fetch").unwrap();
-        assert_eq!(fetch.hint, "non connecté");
+        assert_eq!(fetch.hint, "user · non connecté");
     }
 
     #[test]
@@ -1278,6 +1307,8 @@ mod tests {
         s.mcp_servers = vec![McpServerMeta {
             name: "fetch".into(),
             status: McpStatus::Disconnected,
+            source: "user".into(),
+            needs_trust: false,
             tool_count: 0,
         }];
         for c in "/mcp ".chars() {
@@ -1297,11 +1328,31 @@ mod tests {
     }
 
     #[test]
+    fn mcp_workspace_server_routes_through_trust_action() {
+        let mut s = AppState::new("gpt-5", false);
+        s.mcp_servers = vec![McpServerMeta {
+            name: "local".into(),
+            status: McpStatus::Disconnected,
+            source: "workspace".into(),
+            needs_trust: true,
+            tool_count: 0,
+        }];
+        s.set_input("/mcp local ".into());
+        let items = s.menu_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "trust");
+        let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(action, InputAction::Command("/mcp local trust".into()));
+    }
+
+    #[test]
     fn mcp_connected_server_offers_disconnect_reconnect_tools() {
         let mut s = AppState::new("gpt-5", false);
         s.mcp_servers = vec![McpServerMeta {
             name: "fs".into(),
             status: McpStatus::Connected,
+            source: "workspace".into(),
+            needs_trust: false,
             tool_count: 2,
         }];
         s.set_input("/mcp fs ".into());
@@ -1315,6 +1366,8 @@ mod tests {
         s.mcp_servers = vec![McpServerMeta {
             name: "my server".into(),
             status: McpStatus::Connected,
+            source: "workspace".into(),
+            needs_trust: false,
             tool_count: 1,
         }];
         // complete() écrit le nom complet (avec espace) ; le menu doit basculer en

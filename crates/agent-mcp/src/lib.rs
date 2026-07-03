@@ -14,6 +14,9 @@ mod error;
 mod server;
 
 pub use client::{CommandHardener, McpConnection, McpToolInfo};
-pub use config::{McpConfigFile, McpServerConfig};
+pub use config::{
+    McpConfigFile, McpConfigIssue, McpConfigIssueKind, McpConfigOrigin, McpConfigSource,
+    McpServerConfig,
+};
 pub use error::McpError;
 pub use server::{McpRegistry, McpServer};

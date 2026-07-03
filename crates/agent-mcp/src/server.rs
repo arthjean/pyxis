@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use crate::client::{McpConnection, McpToolInfo};
-use crate::config::{McpConfigFile, McpServerConfig};
+use crate::config::{McpConfigFile, McpConfigIssue, McpServerConfig};
 use crate::error::McpError;
 
 /// État d'un serveur MCP. Le `conn` n'existe que dans `Connected` : impossible
@@ -60,6 +60,7 @@ impl McpServer {
 #[derive(Default)]
 pub struct McpRegistry {
     servers: BTreeMap<String, McpServer>,
+    issues: Vec<McpConfigIssue>,
 }
 
 impl McpRegistry {
@@ -70,7 +71,10 @@ impl McpRegistry {
             .into_iter()
             .map(|(name, config)| (name, McpServer::Disconnected { config }))
             .collect();
-        Self { servers }
+        Self {
+            servers,
+            issues: file.issues,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -83,6 +87,14 @@ impl McpRegistry {
 
     pub fn iter(&self) -> impl Iterator<Item = (&String, &McpServer)> {
         self.servers.iter()
+    }
+
+    pub fn issues(&self) -> &[McpConfigIssue] {
+        &self.issues
+    }
+
+    pub fn issue_count(&self) -> usize {
+        self.issues.len()
     }
 
     /// Passe un serveur en `Connecting` ; renvoie sa config (à spawner) et
@@ -174,11 +186,14 @@ mod tests {
                 command: "echo".into(),
                 args: Vec::new(),
                 env: BTreeMap::new(),
+                source: Default::default(),
+                shadows_lower_priority: false,
             },
         );
         McpRegistry::from_config(McpConfigFile {
             servers,
             skipped: 0,
+            issues: Vec::new(),
         })
     }
 

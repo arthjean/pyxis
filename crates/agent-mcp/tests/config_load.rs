@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use agent_mcp::McpConfigFile;
+use agent_mcp::{McpConfigFile, McpConfigIssueKind, McpConfigOrigin};
 
 /// Dossier temporaire unique pour un test (sans dépendance externe). Nettoyé en
 /// début ET fin de test.
@@ -21,6 +21,7 @@ fn absent_file_is_empty_config() {
     let cfg = McpConfigFile::load(&dir).unwrap();
     assert!(cfg.servers.is_empty());
     assert_eq!(cfg.skipped, 0);
+    assert!(cfg.issues.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -44,7 +45,9 @@ fn parses_stdio_server_with_args_and_env() {
     assert_eq!(fs.command, "npx");
     assert_eq!(fs.args.len(), 3);
     assert_eq!(fs.env.get("FOO").map(String::as_str), Some("bar"));
+    assert_eq!(fs.source.origin, McpConfigOrigin::Workspace);
     assert_eq!(cfg.skipped, 0);
+    assert!(cfg.issues.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -64,6 +67,67 @@ fn remote_server_without_command_is_skipped_not_fatal() {
     assert_eq!(cfg.servers.len(), 1);
     assert!(cfg.servers.contains_key("stdio-ok"));
     assert_eq!(cfg.skipped, 1);
+    assert!(matches!(
+        cfg.issues[0].kind,
+        McpConfigIssueKind::UnsupportedTransport
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn disabled_server_is_skipped_with_issue() {
+    let dir = temp_dir("disabled");
+    std::fs::write(
+        dir.join(".mcp.json"),
+        r#"{ "mcpServers": {
+            "off": { "command": "echo", "disabled": true }
+        } }"#,
+    )
+    .unwrap();
+    let cfg = McpConfigFile::load(&dir).unwrap();
+    assert!(cfg.servers.is_empty());
+    assert_eq!(cfg.skipped, 1);
+    assert!(matches!(cfg.issues[0].kind, McpConfigIssueKind::Disabled));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn empty_command_is_skipped_with_issue() {
+    let dir = temp_dir("empty-command");
+    std::fs::write(
+        dir.join(".mcp.json"),
+        r#"{ "mcpServers": {
+            "empty": { "command": "   " }
+        } }"#,
+    )
+    .unwrap();
+    let cfg = McpConfigFile::load(&dir).unwrap();
+    assert!(cfg.servers.is_empty());
+    assert_eq!(cfg.skipped, 1);
+    assert!(matches!(
+        cfg.issues[0].kind,
+        McpConfigIssueKind::EmptyCommand
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn invalid_stdio_entry_is_skipped_with_issue() {
+    let dir = temp_dir("invalid-entry");
+    std::fs::write(
+        dir.join(".mcp.json"),
+        r#"{ "mcpServers": {
+            "bad": { "command": ["not", "a", "string"] }
+        } }"#,
+    )
+    .unwrap();
+    let cfg = McpConfigFile::load(&dir).unwrap();
+    assert!(cfg.servers.is_empty());
+    assert_eq!(cfg.skipped, 1);
+    assert!(matches!(
+        cfg.issues[0].kind,
+        McpConfigIssueKind::InvalidEntry(_)
+    ));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -100,7 +164,15 @@ fn load_claude_extracts_user_scope_mcpservers_only() {
     assert_eq!(cfg.servers.len(), 1);
     assert!(cfg.servers.contains_key("exa"));
     assert!(!cfg.servers.contains_key("neon"));
+    assert_eq!(
+        cfg.servers.get("exa").unwrap().source.origin,
+        McpConfigOrigin::ClaudeUser
+    );
     assert_eq!(cfg.skipped, 1);
+    assert!(matches!(
+        cfg.issues[0].kind,
+        McpConfigIssueKind::UnsupportedTransport
+    ));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

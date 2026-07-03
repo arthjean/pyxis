@@ -284,17 +284,24 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// Découvre les serveurs MCP avant le sandbox : `<workspace>/.mcp.json` (priorité
-/// haute) fusionné sous les `mcpServers` user-scope de `~/.claude.json` (réutilise
-/// les serveurs déjà installés pour Claude Code). Best-effort : un fichier
-/// illisible ou invalide est signalé puis ignoré.
+/// haute) fusionné sous les `mcpServers` user-scope de `~/.claude.json`. Si la
+/// config workspace existe mais est invalide, on n'active pas le fallback user.
 fn read_mcp_config(workspace: &std::path::Path) -> agent_mcp::McpConfigFile {
-    let workspace_cfg = agent_mcp::McpConfigFile::load(workspace).unwrap_or_else(|e| {
-        eprintln!("[mcp] {e}");
-        agent_mcp::McpConfigFile::default()
-    });
-    let claude_cfg = std::env::var_os("HOME")
+    let workspace_file = workspace.join(".mcp.json");
+    let workspace_cfg = match agent_mcp::McpConfigFile::load(workspace) {
+        Ok(cfg) => cfg,
+        Err(e) if workspace_file.exists() => {
+            eprintln!("[mcp] workspace config invalide: {e}; user MCP ignoré");
+            return agent_mcp::McpConfigFile::default();
+        }
+        Err(e) => {
+            eprintln!("[mcp] {e}");
+            agent_mcp::McpConfigFile::default()
+        }
+    };
+    let claude_cfg = home_dir()
         .map(|home| {
-            let path = std::path::Path::new(&home).join(".claude.json");
+            let path = home.join(".claude.json");
             agent_mcp::McpConfigFile::load_claude(&path).unwrap_or_else(|e| {
                 eprintln!("[mcp] ~/.claude.json : {e}");
                 agent_mcp::McpConfigFile::default()
@@ -302,6 +309,12 @@ fn read_mcp_config(workspace: &std::path::Path) -> agent_mcp::McpConfigFile {
         })
         .unwrap_or_default();
     workspace_cfg.merge_under(claude_cfg)
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
 }
 
 /// Liste les skills disponibles dans `~/.agents/skills` (un dossier = un skill,
