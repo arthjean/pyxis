@@ -149,6 +149,7 @@ enum Menu {
     Models,
     Resume,
     Skills,
+    Files,
     ProviderAuth,
     ProviderList,
     /// Niveau 3 : actions sur un provider (connect/disconnect).
@@ -329,6 +330,8 @@ pub struct AppState {
     /// Skills disponibles (`~/.agents/skills`), sous-menu `/skills`. Lus avant le
     /// sandbox (dossier hors workspace) et injectés par agent-cli.
     pub skills: Vec<String>,
+    /// Fichiers mentionnables via `@`, bornés et fournis par agent-cli.
+    pub files: Vec<String>,
     /// Connecté au fournisseur actif (badge status line + sous-menu providers).
     pub provider_connected: bool,
     /// Serveurs MCP connus + statut (sous-menu `/mcp`), remplis par agent-cli.
@@ -392,6 +395,7 @@ impl AppState {
             completion_index: 0,
             sessions: Vec::new(),
             skills: Vec::new(),
+            files: Vec::new(),
             provider_connected: false,
             mcp_servers: Vec::new(),
             history: Vec::new(),
@@ -775,6 +779,8 @@ impl AppState {
             Menu::Models
         } else if i.starts_with("/skills ") {
             Menu::Skills
+        } else if self.active_file_query().is_some() {
+            Menu::Files
         } else if i.starts_with('/') && !i.contains(' ') {
             Menu::Commands
         } else {
@@ -825,6 +831,22 @@ impl AppState {
                     .filter(|name| name.contains(q))
                     .map(|name| MenuItem::new(name, name, "", true))
                     .collect()
+            }
+            Menu::Files => {
+                let Some((_, q)) = self.active_file_query() else {
+                    return Vec::new();
+                };
+                let mut items = self
+                    .files
+                    .iter()
+                    .filter(|path| q.is_empty() || path.contains(q))
+                    .take(20)
+                    .map(|path| MenuItem::new(path, path, "file", true))
+                    .collect::<Vec<_>>();
+                if items.is_empty() {
+                    items.push(MenuItem::new("", "Aucun fichier", "", false));
+                }
+                items
             }
             Menu::ProviderAuth => {
                 let q = self.input.strip_prefix("/providers ").unwrap_or("");
@@ -986,6 +1008,27 @@ impl AppState {
             .to_string()
     }
 
+    fn active_file_query(&self) -> Option<(usize, &str)> {
+        let prefix = self.input.get(..self.cursor).unwrap_or(&self.input);
+        let start = prefix
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map(|(idx, ch)| idx + ch.len_utf8())
+            .unwrap_or(0);
+        let token = &prefix[start..];
+        token.strip_prefix('@').map(|query| (start, query))
+    }
+
+    fn replace_file_mention(&mut self, path: &str) {
+        let Some((start, _)) = self.active_file_query() else {
+            return;
+        };
+        let replacement = format!("@{path} ");
+        self.input.replace_range(start..self.cursor, &replacement);
+        self.cursor = start + replacement.len();
+    }
+
     /// Tab : complète le fil d'Ariane vers l'item sélectionné (descend d'un
     /// niveau pour les items à sous-menu, sinon pré-remplit la commande).
     fn complete(&mut self, kind: Menu, item: &MenuItem) {
@@ -1000,6 +1043,11 @@ impl AppState {
             Menu::ProviderList if item.enabled => format!("/providers subscription {} ", item.id),
             Menu::ProviderList => format!("/providers subscription {}", item.id),
             Menu::ProviderActions => format!("/providers subscription {provider} {}", item.id),
+            Menu::Files if item.enabled => {
+                self.replace_file_mention(&item.id);
+                return;
+            }
+            Menu::Files => return,
             Menu::McpList if item.enabled => format!("/mcp {} ", item.id),
             Menu::McpActions if !item.enabled => return,
             Menu::McpActions => format!("/mcp {} {}", self.active_mcp_server(), item.id),
@@ -1036,6 +1084,11 @@ impl AppState {
                 self.set_input(format!("/{} ", item.id));
                 InputAction::None
             }
+            Menu::Files if item.enabled => {
+                self.replace_file_mention(&item.id);
+                InputAction::None
+            }
+            Menu::Files => InputAction::None,
             Menu::ProviderAuth if item.id == "subscription" => {
                 self.set_input("/providers subscription ".into());
                 InputAction::None
@@ -1545,6 +1598,30 @@ mod tests {
         assert_eq!(
             submit,
             InputAction::Submit("/frontend-design refais l'UI".into())
+        );
+    }
+
+    #[test]
+    fn file_mentions_filter_insert_and_submit_to_agent() {
+        let mut s = AppState::new("gpt-5", false);
+        s.files = vec!["crates/agent-tui/src/state.rs".into(), "README.md".into()];
+        s.set_input("@state".into());
+
+        let items = s.menu_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "crates/agent-tui/src/state.rs");
+        assert_eq!(
+            s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputAction::None
+        );
+        assert_eq!(s.input, "@crates/agent-tui/src/state.rs ");
+
+        for c in "explique".chars() {
+            s.on_key(key(c));
+        }
+        assert_eq!(
+            s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputAction::Submit("@crates/agent-tui/src/state.rs explique".into())
         );
     }
 

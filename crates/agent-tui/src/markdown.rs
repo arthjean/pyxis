@@ -298,6 +298,13 @@ impl<'t> Renderer<'t> {
         self.in_code = false;
         let code = std::mem::take(&mut self.code_buf);
         let lang = std::mem::take(&mut self.code_lang);
+        if should_unwrap_markdown_table(&lang, &code) {
+            self.lines.extend(render_markdown_with_highlight(
+                &code, self.theme, self.width, false,
+            ));
+            self.blank();
+            return;
+        }
         match self
             .highlight_code
             .then(|| crate::highlight::code_block(&code, &lang, self.theme))
@@ -362,7 +369,7 @@ impl<'t> Renderer<'t> {
     }
 }
 
-/// Largeur d'affichage d'une cellule (somme des largeurs de ses spans, en chars —
+/// Largeur d'affichage d'une cellule (somme des largeurs de ses spans, en chars:
 /// cohérent avec le reste du wrap du transcript).
 fn cell_width(cell: &[Span<'static>]) -> usize {
     cell.iter()
@@ -394,7 +401,7 @@ const MAX_CELL_WIDTH: usize = 4096;
 /// `clé: valeur` (chaque cellule sur sa ligne, préfixée de son en-tête). Best-effort
 /// sur les tables malformées (lignes ragged : cellules manquantes tolérées).
 /// Note : une table imbriquée dans un blockquote n'hérite pas de la barre `▎`
-/// (cas rare, cosmétique) — les lignes de table contournent `flush`.
+/// (cas rare, cosmétique): les lignes de table contournent `flush`.
 fn render_table(t: &TableState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let ncols = t
         .header
@@ -504,6 +511,26 @@ fn sep_line(col_w: &[usize], theme: &Theme) -> Line<'static> {
     Line::from(spans)
 }
 
+fn should_unwrap_markdown_table(lang: &str, code: &str) -> bool {
+    if !matches!(lang.trim().to_ascii_lowercase().as_str(), "markdown" | "md") {
+        return false;
+    }
+    let lines: Vec<_> = code
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.len() < 2 {
+        return false;
+    }
+    let has_separator = lines.iter().any(|line| {
+        line.chars().all(|ch| matches!(ch, '|' | '-' | ':' | ' '))
+            && line.contains('-')
+            && line.matches('|').count() >= 2
+    });
+    has_separator && lines.iter().all(|line| line.matches('|').count() >= 2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,6 +607,27 @@ mod tests {
             80,
         ));
         assert!(text.iter().any(|l| l.contains("foo bar")));
+    }
+
+    #[test]
+    fn markdown_table_fence_unwraps_only_for_plain_tables() {
+        let theme = Theme::new(true);
+        let table = flat(&render_markdown(
+            "```markdown\n| A | B |\n|---|---|\n| 1 | 2 |\n```\n",
+            &theme,
+            80,
+        ));
+        assert!(table.iter().any(|line| line.contains('│')));
+
+        let mixed = flat(&render_markdown(
+            "```markdown\n| A | B |\n|---|---|\ntext\n```\n",
+            &theme,
+            80,
+        ));
+        assert!(
+            !mixed.iter().any(|line| line.contains('│')),
+            "mixed markdown fences stay as code"
+        );
     }
 
     #[test]

@@ -9,6 +9,10 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = []
+codex_tui_parity = []
+
 # Frontend terminal (US-019). CLIENT du cœur : consomme `agent_core::AgentEvent`,
 # décide seul du rendu (jamais d'ANSI venant du cœur). Stack Ratatui + crossterm.
 # Esthétique : monochrome + un accent, épurée (pas de bordures lourdes).

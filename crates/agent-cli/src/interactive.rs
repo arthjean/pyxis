@@ -20,6 +20,11 @@ use agent_tui::{
     AppState, Block, COMMANDS, InputAction, McpServerMeta, McpStatus, SessionMeta,
     blocks_from_messages,
 };
+#[cfg(feature = "codex_tui_parity")]
+use agent_tui::{
+    BottomPane, ChatSurface, HistoryInserter, InsertHistoryMode, TerminalViewport,
+    TerminalViewportState, TranscriptMapper,
+};
 use crossterm::event::{Event, KeyEventKind, MouseEventKind};
 use futures_util::StreamExt;
 use tokio::sync::{mpsc, oneshot};
@@ -324,6 +329,10 @@ async fn event_loop(
     state.provider_connected = cfg.connected;
     state.reduced_motion = cfg.reduced_motion;
     state.skills = std::mem::take(&mut cfg.skills);
+    state.files = std::env::current_dir()
+        .ok()
+        .map(|root| workspace_file_mentions(&root, 200))
+        .unwrap_or_default();
     state.sessions = load_sessions(&sessions_dir, &current_session);
     state.mcp_servers = mcp_metas(&mcp);
     let mut goal_path = goal_path_for_session(&current_session);
@@ -342,6 +351,19 @@ async fn event_loop(
             initial_messages.len()
         )));
     }
+    #[cfg(feature = "codex_tui_parity")]
+    let mut parity_mapper = TranscriptMapper::new();
+    #[cfg(feature = "codex_tui_parity")]
+    let mut parity_surface = ChatSurface::from_messages(&initial_messages);
+    #[cfg(feature = "codex_tui_parity")]
+    let mut parity_inserter = HistoryInserter::new(InsertHistoryMode::InlineScrollback);
+    #[cfg(feature = "codex_tui_parity")]
+    let mut parity_viewport = TerminalViewportState::new(
+        TerminalViewport::new(1, 1, 1),
+        InsertHistoryMode::InlineScrollback,
+    );
+    #[cfg(feature = "codex_tui_parity")]
+    let mut parity_bottom_pane = BottomPane::new();
     // Transcript vide au démarrage → l'écran d'accueil (carte + logo) s'affiche
     // de lui-même (cf. `AppState::is_welcome`), pas de Notice à pousser.
 
@@ -390,6 +412,28 @@ async fn event_loop(
             }
             _ => {}
         }
+        #[cfg(feature = "codex_tui_parity")]
+        {
+            let size = tui.size()?;
+            parity_viewport.resize(size.width, size.height, size.height.min(12));
+            if parity_inserter.mode() == InsertHistoryMode::InlineScrollback
+                && let Some(insert) =
+                    parity_surface.drain_pending_insert(size.width, parity_inserter.mode())
+                && let Err(err) = parity_inserter.insert(tui, &insert)
+            {
+                parity_viewport.activate_legacy_fallback(err.message().to_string());
+                state.blocks.push(Block::Notice(err.message().to_string()));
+            }
+        }
+        #[cfg(feature = "codex_tui_parity")]
+        {
+            if parity_inserter.mode() == InsertHistoryMode::InlineScrollback {
+                tui.draw(|f| agent_tui::render_parity(f, &state, &parity_surface))?;
+            } else {
+                tui.draw(|f| agent_tui::render(f, &state))?;
+            }
+        }
+        #[cfg(not(feature = "codex_tui_parity"))]
         tui.draw(|f| agent_tui::render(f, &state))?;
         if state.should_quit {
             break;
@@ -409,8 +453,15 @@ async fn event_loop(
                         continue;
                     }
                     Some(Event::Paste(p)) => {
-                        if state.pending.is_none() {
-                            state.insert_str(&p);
+                        #[cfg(feature = "codex_tui_parity")]
+                        {
+                            parity_bottom_pane.route_paste(&mut state, &p);
+                        }
+                        #[cfg(not(feature = "codex_tui_parity"))]
+                        {
+                            if state.pending.is_none() {
+                                state.insert_str(&p);
+                            }
                         }
                         continue;
                     }
@@ -418,15 +469,23 @@ async fn event_loop(
                     Some(Event::Key(k)) if k.kind != KeyEventKind::Release => k,
                     Some(_) => continue, // key release, resize… → simple redraw
                 };
-                match state.on_key(k) {
+                #[cfg(feature = "codex_tui_parity")]
+                let action = parity_bottom_pane.route_key(&mut state, k);
+                #[cfg(not(feature = "codex_tui_parity"))]
+                let action = state.on_key(k);
+                match action {
                     InputAction::Submit(prompt) if !running => {
                         state.push_user(prompt.clone());
+                        #[cfg(feature = "codex_tui_parity")]
+                        parity_surface.apply_update(parity_mapper.map_user_message(prompt.clone()));
                         goal_iters = 0;
                         launch_turn(&conversation, &cfg, &deps, &agent_tx, &prompt, true);
                         running = true;
                     }
                     InputAction::Submit(prompt) => {
                         state.push_user(prompt.clone());
+                        #[cfg(feature = "codex_tui_parity")]
+                        parity_surface.apply_update(parity_mapper.map_user_message(prompt.clone()));
                         state.blocks.push(Block::Notice(
                             "Message ajouté à la file d'attente.".into(),
                         ));
@@ -509,6 +568,9 @@ async fn event_loop(
                                     }
                                     goal_iters = 0;
                                     state.push_user(g);
+                                    #[cfg(feature = "codex_tui_parity")]
+                                    parity_surface
+                                        .apply_update(parity_mapper.map_user_message(g.to_string()));
                                     launch_turn(&conversation, &cfg, &deps, &agent_tx, g, true);
                                     running = true;
                                 }
@@ -555,6 +617,11 @@ async fn event_loop(
                                                 crate::RESUME_TAINT_SCAN_MESSAGES,
                                             ));
                                             state.blocks = blocks_from_messages(&msgs);
+                                            #[cfg(feature = "codex_tui_parity")]
+                                            {
+                                                parity_mapper = TranscriptMapper::new();
+                                                parity_surface = ChatSurface::from_messages(&msgs);
+                                            }
                                             // L'historique reste global au dossier (déjà chargé).
                                             state.blocks.push(Block::Notice(format!(
                                                 "Session reprise ({} messages).",
@@ -589,6 +656,11 @@ async fn event_loop(
                                         state
                                             .blocks
                                             .push(Block::Notice("Session vide.".into()));
+                                        #[cfg(feature = "codex_tui_parity")]
+                                        {
+                                            parity_mapper = TranscriptMapper::new();
+                                            parity_surface = ChatSurface::new();
+                                        }
                                         state.sessions =
                                             load_sessions(&sessions_dir, &current_session);
                                     }
@@ -624,6 +696,11 @@ async fn event_loop(
                                     // Transcript vidé → l'écran d'accueil réapparaît,
                                     // ce qui sert de confirmation visuelle (pas de Notice).
                                     state.blocks.clear();
+                                    #[cfg(feature = "codex_tui_parity")]
+                                    {
+                                        parity_mapper = TranscriptMapper::new();
+                                        parity_surface = ChatSurface::new();
+                                    }
                                     state.sessions =
                                         load_sessions(&sessions_dir, &current_session);
                                 }
@@ -642,8 +719,8 @@ async fn event_loop(
                                             .push(Block::Notice("Déjà connecté à Codex.".into()));
                                     } else {
                                         state.blocks.push(Block::Notice(
-                                            "Reconnexion : relance le login — \
-                                             cargo run -p agent-auth --example login"
+                                            "Quitte puis relance `pyxis` : l'onboarding intégré \
+                                             reconnectera ChatGPT."
                                                 .into(),
                                         ));
                                     }
@@ -712,6 +789,12 @@ async fn event_loop(
                         AgentEvent::EndTurn | AgentEvent::Error(_) | AgentEvent::Exhausted(_)
                     );
                     state.apply(&ev);
+                    #[cfg(feature = "codex_tui_parity")]
+                    {
+                        for update in parity_mapper.map_event(&ev) {
+                            parity_surface.apply_update(update);
+                        }
+                    }
                     if stop {
                         // Boucle d'objectif : sur un EndTurn « propre » avec un goal
                         // actif, on relance tant que le marqueur de complétion n'est
@@ -1160,6 +1243,55 @@ fn load_sessions(dir: &Path, exclude: &Path) -> Vec<SessionMeta> {
         .collect()
 }
 
+fn workspace_file_mentions(root: &Path, cap: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_workspace_file_mentions(root, root, cap, &mut out);
+    out.sort();
+    out
+}
+
+fn collect_workspace_file_mentions(root: &Path, dir: &Path, cap: usize, out: &mut Vec<String>) {
+    if out.len() >= cap {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= cap {
+            break;
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false) {
+            if matches!(
+                name.as_ref(),
+                ".git" | "target" | "node_modules" | ".next" | "dist" | "build"
+            ) {
+                continue;
+            }
+            collect_workspace_file_mentions(root, &path, cap, out);
+        } else if entry.file_type().map(|ty| ty.is_file()).unwrap_or(false)
+            && is_mentionable_file_name(&name)
+            && let Ok(rel) = path.strip_prefix(root)
+        {
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+}
+
+fn is_mentionable_file_name(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    if lower == ".env" || lower.starts_with(".env.") {
+        return false;
+    }
+    !matches!(
+        Path::new(&lower).extension().and_then(|ext| ext.to_str()),
+        Some("pem" | "key" | "p12" | "pfx")
+    )
+}
+
 /// Âge lisible d'une session (« il y a 3 min »).
 fn relative_time(modified: SystemTime) -> String {
     let secs = SystemTime::now()
@@ -1201,11 +1333,12 @@ pub(crate) fn new_session_path(dir: &Path) -> PathBuf {
 mod tests {
     use super::{
         GOAL_DONE_MARKER, compose_system, count_encrypted_reasoning, scrub_encrypted_reasoning,
-        session_path_from_arg, take_goal_done,
+        session_path_from_arg, take_goal_done, workspace_file_mentions,
     };
     use agent_core::message::{ContentBlock, Message};
     use agent_tui::{AppState, Block};
     use std::path::Path;
+    use std::time::SystemTime;
 
     #[test]
     fn compose_system_pins_completion_directive() {
@@ -1221,6 +1354,28 @@ mod tests {
         assert!(with.contains("NE T'ARRÊTE PAS"), "directive de complétion");
         assert!(with.contains(GOAL_DONE_MARKER), "marqueur instruit");
         assert!(with.contains("refonds l'UI"));
+    }
+
+    #[test]
+    fn workspace_file_mentions_skips_secret_filenames() {
+        let root = std::env::temp_dir().join(format!(
+            "pyxis-file-mentions-{}",
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src").join("main.rs"), "").unwrap();
+        std::fs::write(root.join(".env"), "").unwrap();
+        std::fs::write(root.join("private.pem"), "").unwrap();
+
+        let files = workspace_file_mentions(&root, 20);
+
+        assert!(files.contains(&"src/main.rs".to_string()));
+        assert!(!files.iter().any(|path| path.contains(".env")));
+        assert!(!files.iter().any(|path| path.contains("private.pem")));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

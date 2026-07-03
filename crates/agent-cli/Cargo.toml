@@ -9,6 +9,10 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = []
+codex_tui_parity = ["agent-tui/codex_tui_parity"]
+
 # Binaire publié `pyxis` (ADR-5/ADR-8). SEUL crate qui dépend de tout : il câble
 # le cœur, le provider, les outils, la session, le sandbox et le frontend.
 [[bin]]

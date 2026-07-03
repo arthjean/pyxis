@@ -70,6 +70,63 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     }
 }
 
+#[cfg(feature = "codex_tui_parity")]
+pub fn render_parity(
+    frame: &mut Frame,
+    state: &AppState,
+    surface: &crate::history_cell::ChatSurface,
+) {
+    let theme = Theme::new(state.truecolor);
+    let area = frame.area();
+
+    let bottom_height = match &state.pending {
+        Some(p) => permission_height(p, area.width),
+        None => INPUT_HEIGHT,
+    };
+    let matches = state.menu_items();
+    let menu_open = state.pending.is_none() && !matches.is_empty();
+    let max_menu_height = area.height.saturating_sub(bottom_height).saturating_sub(1);
+    let menu_height = if menu_open {
+        ((matches.len() as u16).min(MENU_MAX_ITEMS) + 1).min(max_menu_height)
+    } else {
+        0
+    };
+    let menu = menu_open && menu_height > 0;
+
+    let chunks = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(menu_height),
+        Constraint::Length(bottom_height),
+    ])
+    .split(area);
+
+    if state.is_welcome()
+        && surface.transcript_cells().is_empty()
+        && surface.active_cell().is_none()
+    {
+        render_welcome(frame, chunks[0], state, &theme);
+    } else {
+        render_active_surface(frame, chunks[0], surface);
+    }
+    if menu {
+        render_command_menu(frame, chunks[1], state, &theme, &matches);
+    }
+    match &state.pending {
+        Some(prompt) => render_permission(frame, chunks[2], prompt, &theme),
+        None => render_input(frame, chunks[2], state, &theme),
+    }
+}
+
+#[cfg(feature = "codex_tui_parity")]
+fn render_active_surface(
+    frame: &mut Frame,
+    area: Rect,
+    surface: &crate::history_cell::ChatSurface,
+) {
+    let lines = surface.active_display_lines(area.width);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
 /// Logo de Pyxis : une **sphère de Dyson** minimaliste. La boussole donne le cap
 /// dans un espace immense ; ici, un cœur stellaire net cerné de deux anneaux de
 /// collecteurs (avec brèches, l'essaim en assemblage). Rendu en **points braille
@@ -226,6 +283,11 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         info.push(Line::from(vec![
             Span::styled("✓ codex", theme.accent()),
             Span::styled("  abonnement ChatGPT", theme.dim()),
+        ]));
+    } else {
+        info.push(Line::from(vec![
+            Span::styled("○ non connecté", theme.accent()),
+            Span::styled("  relance pyxis pour reconnecter", theme.dim()),
         ]));
     }
     info.push(Line::default());
@@ -1082,7 +1144,12 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     // Saisie : prompt accent + texte (skills surlignés). Le curseur est le VRAI
     // curseur terminal, positionné plus bas — pas de glyphe dans le buffer.
     let mut spans = vec![Span::styled("› ", theme.accent())];
-    spans.extend(input_spans(&state.input, &state.skills, theme));
+    spans.extend(input_spans(
+        &state.input,
+        &state.skills,
+        &state.files,
+        theme,
+    ));
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 
     // Curseur réel : offset byte logique → colonne terminale Unicode.
@@ -1099,7 +1166,12 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
 
 /// Découpe l'input en spans : chaque token `/<skill>` reconnu passe en
 /// surbrillance (pastille), le reste en `fg`. Les espaces sont préservés.
-fn input_spans(input: &str, skills: &[String], theme: &Theme) -> Vec<Span<'static>> {
+fn input_spans(
+    input: &str,
+    skills: &[String],
+    files: &[String],
+    theme: &Theme,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (i, part) in input.split(' ').enumerate() {
         if i > 0 {
@@ -1113,8 +1185,11 @@ fn input_spans(input: &str, skills: &[String], theme: &Theme) -> Vec<Span<'stati
         let is_skill = part
             .strip_prefix('/')
             .is_some_and(|name| skills.iter().any(|s| s == name));
+        let is_file = part
+            .strip_prefix('@')
+            .is_some_and(|path| files.iter().any(|f| f == path));
         let is_command = i == 0 && COMMANDS.iter().any(|(name, _, _)| *name == part);
-        let style = if is_skill || is_command {
+        let style = if is_skill || is_file || is_command {
             theme.skill_chip()
         } else {
             theme.fg()
@@ -1320,6 +1395,18 @@ mod tests {
         );
         assert!(out.contains("/help"), "raccourcis absents:\n{out}");
         assert!(out.contains("gpt-5.5"), "modèle absent:\n{out}");
+    }
+
+    #[test]
+    fn welcome_card_shows_disconnected_state() {
+        let mut s = AppState::new("gpt-5.5", true);
+        s.workspace = "pyxis".into();
+        let out = draw(&s, 80, 24);
+        assert!(out.contains("non connecté"), "statut auth absent:\n{out}");
+        assert!(
+            out.contains("relance pyxis"),
+            "message de reconnexion absent:\n{out}"
+        );
     }
 
     // L'accueil disparaît dès le premier message (transcript non vide).

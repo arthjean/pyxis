@@ -1,0 +1,59 @@
+# Codex TUI Port Inventory
+
+This inventory supports EP-001 of `tasks/prd-codex-tui-parity.md`. It records
+which local Codex modules Pyxis may port, how each target is classified, and
+which license obligations apply before any code is copied or adapted.
+
+## Classification
+
+| Class | Meaning | Rule |
+|---|---|---|
+| `copy` | Verbatim or near-verbatim source reuse. | Preserve Apache-2.0 notices before merge. |
+| `adapt` | Source is structurally derived from Codex with Pyxis-specific edits. | Preserve Apache-2.0 provenance before merge. |
+| `inspired` | Concepts and behavior are studied, but Pyxis code is written independently. | No copied source notice required, keep this inventory current. |
+| `skip` | Out of scope, unclear provenance, or blocked until clarification. | Do not port until reclassified. |
+
+## License Decision
+
+Pyxis remains GPL-3.0-or-later. The Apache Software Foundation documents that
+Apache-2.0 source can be included in GPLv3 projects, while the reverse direction
+is not compatible for Apache projects. The FSF license list also marks
+Apache-2.0 as compatible with GPLv3 and not GPLv2.
+
+Operational obligations for this repo:
+
+1. Keep `NOTICE-CODEX.md` when any Codex source is copied or adapted.
+2. Preserve upstream Apache-2.0 license and notice text for copied or adapted
+   files.
+3. Mark any unclear provenance as `skip`.
+4. Keep `agent-core` headless: no Ratatui, Crossterm, ANSI, or Codex UI code in
+   the core crate.
+
+Sources:
+
+- ASF GPL compatibility: https://www.apache.org/licenses/GPL-compatibility.html
+- GNU license list: https://www.gnu.org/licenses/license-list.html#apache2
+- ASF license FAQ: https://www.apache.org/foundation/license-faq.html
+
+## Feature Validation
+
+The default rollback path must keep passing through the normal workspace gates.
+The parity scaffold is behind `agent-tui/codex_tui_parity`, so EP-001 coverage
+also requires:
+
+```powershell
+cargo test -p agent-tui --features codex_tui_parity
+```
+
+## Current Inventory
+
+| Pyxis target | Codex source | Class | Notes |
+|---|---|---|---|
+| `crates/agent-tui/src/app_event.rs` | `C:\dev\codex\codex-rs\tui\src\app_event.rs` | `inspired` | Pyxis defines a smaller UI-only transcript contract over `AgentEvent`; no Codex source copied. |
+| `crates/agent-tui/src/history_cell.rs` | `C:\dev\codex\codex-rs\tui\src\history_cell\mod.rs` and `history_cell\messages.rs` | `inspired` | EP-001 only names the trait boundary. Rendering cells are future work. |
+| `crates/agent-tui/src/streaming.rs` | `C:\dev\codex\codex-rs\tui\src\streaming\controller.rs` and `streaming\table_holdback.rs` | `inspired` | Stable-prefix and tail behavior is documented, not ported. |
+| `crates/agent-tui/src/bottom_pane.rs` | `C:\dev\codex\codex-rs\tui\src\bottom_pane\mod.rs`, `bottom_pane_view.rs`, `approval_overlay.rs`, `list_selection_view.rs`, `chat_composer.rs` | `inspired` | EP-001 creates the gated module only. Full composer and views stay in later stories. |
+| `crates/agent-tui/src/insert_history.rs` | `C:\dev\codex\codex-rs\tui\src\insert_history.rs` | `inspired` | Terminal write strategy is not copied in EP-001. |
+| `crates/agent-tui/src/terminal_viewport.rs` | `C:\dev\codex\codex-rs\tui\src\tui.rs` and `insert_history.rs` | `inspired` | Viewport geometry scaffold only. |
+| Future exec/tool cells | `C:\dev\codex\codex-rs\tui\src\history_cell\exec.rs`, `mcp.rs`, `patches.rs`, `notices.rs` | `skip` | Not part of EP-001. Reclassify in EP-004 stories. |
+| Future app-server or connector surfaces | `C:\dev\codex\codex-rs\app-server\**`, connector crates, realtime/audio/pets/collab surfaces | `skip` | Explicit PRD non-goals. |
