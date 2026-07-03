@@ -1,8 +1,9 @@
 //! Proxy CONNECT local avec allow-list de hostnames (US-020 AC2). Landlock ne
 //! filtre pas le réseau (ADR-7 R3) → filtrage applicatif **best-effort** : les
 //! sous-process outils reçoivent `HTTP(S)_PROXY` pointant ici ; un client qui
-//! respecte la variable (curl, wget, la plupart) est filtré. Fail-closed : tout
-//! hostname hors allow-list est bloqué (403) et journalisé.
+//! respecte la variable pour les tunnels CONNECT est filtré. Fail-closed : tout
+//! hostname hors allow-list est bloqué (403) et journalisé. Les requêtes HTTP
+//! non-CONNECT sont refusées, pas forwardées.
 //!
 //! Best-effort assumé : un binaire qui ouvre un socket brut en ignorant
 //! `HTTP_PROXY` échappe au filtre (le confinement FS Landlock reste, lui, dur).
@@ -35,7 +36,7 @@ impl ProxyPolicy {
 pub struct ProxyHandle {
     /// Adresse `127.0.0.1:PORT` à exporter en `HTTP(S)_PROXY`.
     pub addr: String,
-    /// Journal des hôtes bloqués (AC2 « journalisé ») — lisible par le frontend.
+    /// Journal des hôtes bloqués (AC2 « journalisé »), lisible par le frontend.
     pub blocked: Arc<Mutex<Vec<String>>>,
 }
 
@@ -165,6 +166,24 @@ mod tests {
         let text = String::from_utf8_lossy(&out).to_string();
         let status = text.lines().next().unwrap_or("").to_string();
         (status, text)
+    }
+
+    #[tokio::test]
+    async fn non_connect_requests_are_rejected() {
+        let handle = spawn(ProxyPolicy::new(vec!["example.com".to_string()]))
+            .await
+            .unwrap();
+        let mut s = TcpStream::connect(&handle.addr).await.unwrap();
+        s.write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut out = [0u8; 128];
+        let n = s.read(&mut out).await.unwrap();
+        let text = String::from_utf8_lossy(&out[..n]);
+        assert!(
+            text.starts_with("HTTP/1.1 405 Method Not Allowed"),
+            "non-CONNECT accepté: {text}"
+        );
     }
 
     // US-020 AC2 : hôte autorisé tunnelisé ; hôte interdit → 403 + journalisé.

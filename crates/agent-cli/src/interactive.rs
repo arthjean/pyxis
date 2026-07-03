@@ -65,6 +65,8 @@ pub struct InteractiveConfig {
     /// Objectif de session persistant (`/goal`), composé dans le system à chaque
     /// tour. Chargé du sidecar `.pyxis/goal` au démarrage (survit au redémarrage).
     pub goal: Option<String>,
+    /// Durcissement appliqué aux sous-process MCP (env scrub + proxy).
+    pub command_hardener: agent_tools::CommandHardener,
 }
 
 /// Marqueur de complétion émis par le modèle quand l'objectif est pleinement
@@ -591,7 +593,9 @@ async fn event_loop(
                                     .blocks
                                     .push(Block::Notice(format!("Fournisseur inconnu : {other}"))),
                             },
-                            "/mcp" => handle_mcp(arg, &mcp, &mcp_tx, &mut state),
+                            "/mcp" => {
+                                handle_mcp(arg, &mcp, &mcp_tx, &cfg.command_hardener, &mut state)
+                            }
                             "/skills" => state.blocks.push(Block::Notice(
                                 "Choisis un skill dans le sous-menu /skills.".into(),
                             )),
@@ -736,6 +740,7 @@ fn handle_mcp(
     arg: &str,
     mcp: &Arc<Mutex<agent_mcp::McpRegistry>>,
     mcp_tx: &mpsc::Sender<McpEvent>,
+    command_hardener: &agent_tools::CommandHardener,
     state: &mut AppState,
 ) {
     let Some((server, action)) = arg.rsplit_once(' ') else {
@@ -768,8 +773,15 @@ fn handle_mcp(
                         .push(Block::Notice(format!("MCP « {server} » : connexion…")));
                     let tx = mcp_tx.clone();
                     let name = server.to_string();
+                    let harden = Arc::clone(command_hardener);
                     tokio::spawn(async move {
-                        let ev = match agent_mcp::McpConnection::connect(&name, &cfg_srv).await {
+                        let ev = match agent_mcp::McpConnection::connect_hardened(
+                            &name,
+                            &cfg_srv,
+                            Some(&harden),
+                        )
+                        .await
+                        {
                             Ok(conn) => match conn.list_tools(&name).await {
                                 Ok(tools) => McpEvent::Connected { name, conn, tools },
                                 Err(e) => {

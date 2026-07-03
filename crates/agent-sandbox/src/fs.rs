@@ -4,18 +4,20 @@
 //! **Doit être appelé tôt, sur le thread principal, AVANT la construction du
 //! runtime tokio** : un domaine Landlock est hérité par les threads créés
 //! *après* la restriction et par les process enfants. Ainsi les workers tokio
-//! ET les sous-process Bash héritent du confinement — sans le fragile `pre_exec`
+//! ET les sous-process Bash héritent du confinement, sans le fragile `pre_exec`
 //! post-fork (risque de deadlock malloc). `restrict_self` est irréversible.
 //!
-//! Landlock NE filtre PAS le réseau (cf. ADR-7 R3) ni les sockets D-Bus (ABI V2)
+//! Landlock NE filtre PAS le réseau (cf. ADR-7 R3) ni les sockets D-Bus
 //! → le keyring (Secret Service) et le provider (HTTPS direct) restent
 //! fonctionnels ; le réseau des outils est filtré séparément par le proxy.
 
 /// Résultat de l'application du sandbox FS, à présenter à l'utilisateur.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxStatus {
-    /// Confinement kernel effectif (écritures hors workspace refusées au kernel).
+    /// Confinement kernel effectif (politique FS complète supportée par le kernel).
     Enforced,
+    /// Landlock actif mais kernel trop ancien pour garantir toute la politique.
+    PartiallyEnforced,
     /// Kernel sans support Landlock effectif → confinement FS **non** garanti.
     NotEnforced,
     /// Plateforme non-Linux → sandbox FS désactivé (Linux-first, AC3).
@@ -27,11 +29,14 @@ impl SandboxStatus {
     pub fn warning(&self) -> Option<&'static str> {
         match self {
             SandboxStatus::Enforced => None,
+            SandboxStatus::PartiallyEnforced => Some(
+                "sandbox FS partiellement appliqué (Landlock incomplet sur ce kernel) : garanties réduites",
+            ),
             SandboxStatus::NotEnforced => Some(
-                "sandbox FS NON appliqué (kernel sans Landlock effectif) — écritures non confinées",
+                "sandbox FS NON appliqué (kernel sans Landlock effectif) : écritures non confinées",
             ),
             SandboxStatus::UnsupportedPlatform => Some(
-                "sandbox FS désactivé (hors Linux) — Pyxis est Linux-first ; écritures non confinées",
+                "sandbox FS désactivé (hors Linux) : Pyxis est Linux-first ; écritures non confinées",
             ),
         }
     }
@@ -54,21 +59,23 @@ pub fn enforce_process(workspace: &std::path::Path) -> Result<SandboxStatus, San
         RulesetCreatedAttr, RulesetStatus,
     };
 
-    let abi = ABI::V2;
+    let abi = ABI::V7;
     let status = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(abi))
         .map_err(|e| SandboxError::Landlock(e.to_string()))?
         .create()
         .map_err(|e| SandboxError::Landlock(e.to_string()))?
-        // lecture seule sur toute la hiérarchie (le provider, le keyring D-Bus et
-        // la résolution de chemins fonctionnent ; aucune écriture hors workspace).
+        // Lecture + exécution globales : le provider, le keyring D-Bus et la
+        // résolution de chemins restent fonctionnels. La confidentialité FS n'est
+        // pas l'objectif de cette politique, seulement le confinement en écriture.
         .add_rule(PathBeneath::new(
             PathFd::new("/").map_err(|e| SandboxError::Landlock(e.to_string()))?,
             AccessFs::from_read(abi),
         ))
         .map_err(|e| SandboxError::Landlock(e.to_string()))?
-        // lecture + écriture uniquement sous le workspace.
+        // Accès complet uniquement sous le workspace. ABI V7 couvre les droits de
+        // write modernes (`truncate`, `ioctl_dev`) quand le kernel les supporte.
         .add_rule(PathBeneath::new(
             PathFd::new(workspace).map_err(|e| SandboxError::Landlock(e.to_string()))?,
             AccessFs::from_all(abi),
@@ -78,7 +85,8 @@ pub fn enforce_process(workspace: &std::path::Path) -> Result<SandboxStatus, San
         .map_err(|e| SandboxError::Landlock(e.to_string()))?;
 
     Ok(match status.ruleset {
-        RulesetStatus::FullyEnforced | RulesetStatus::PartiallyEnforced => SandboxStatus::Enforced,
+        RulesetStatus::FullyEnforced => SandboxStatus::Enforced,
+        RulesetStatus::PartiallyEnforced => SandboxStatus::PartiallyEnforced,
         RulesetStatus::NotEnforced => SandboxStatus::NotEnforced,
     })
 }
@@ -95,15 +103,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn warning_present_only_when_not_enforced() {
+    fn warning_present_when_not_fully_enforced() {
         assert!(SandboxStatus::Enforced.warning().is_none());
+        assert!(SandboxStatus::PartiallyEnforced.warning().is_some());
         assert!(SandboxStatus::NotEnforced.warning().is_some());
         assert!(SandboxStatus::UnsupportedPlatform.warning().is_some());
     }
 
     // Sur Linux avec kernel Landlock, le confinement réel est prouvé par le spike
     // s5 (process isolé : restrict_self est irréversible). Ici on vérifie juste que
-    // l'appel ne panique pas et retourne un statut cohérent — SANS restreindre le
+    // l'appel ne panique pas et retourne un statut cohérent, SANS restreindre le
     // process de test (qui doit pouvoir continuer à écrire).
     #[cfg(not(target_os = "linux"))]
     #[test]

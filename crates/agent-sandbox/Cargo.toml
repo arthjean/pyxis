@@ -12,7 +12,7 @@ workspace = true
 # Sandbox d'exécution (US-020) : confinement FS kernel-level (Landlock) + proxy
 # réseau allow-list. Linux-first ; dégradation explicite ailleurs (AC3).
 [dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "process", "rt"] }
 thiserror.workspace = true
 
 # Landlock = Linux uniquement. Hors Linux, le sandbox FS dégrade en désactivé.

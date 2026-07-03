@@ -2,6 +2,7 @@
 //! `initialize` automatique, liste des outils. Le wrapping des outils en `DynTool`
 //! (intégration au registre `agent-tools`) viendra en Phase 2.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::service::RunningService;
@@ -11,6 +12,8 @@ use tokio::process::Command;
 
 use crate::config::McpServerConfig;
 use crate::error::McpError;
+
+pub type CommandHardener = Arc<dyn Fn(&mut Command) + Send + Sync>;
 
 /// Délai max d'établissement de la connexion (spawn + handshake `initialize`).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -36,11 +39,28 @@ pub struct McpToolInfo {
 
 impl McpConnection {
     /// Spawn le serveur stdio et établit le handshake MCP. `name` sert au libellé
-    /// d'erreur. L'environnement courant est hérité (PATH, etc.) + `cfg.env`.
+    /// d'erreur.
     pub async fn connect(name: &str, cfg: &McpServerConfig) -> Result<Self, McpError> {
+        Self::connect_hardened(name, cfg, None).await
+    }
+
+    /// Variante durcie : le caller peut injecter le même scrub env + proxy que les
+    /// outils Bash. `cfg.env` reste explicite, mais les clés proxy sont ignorées
+    /// pour éviter les bypass via `NO_PROXY` ou `ALL_PROXY`.
+    pub async fn connect_hardened(
+        name: &str,
+        cfg: &McpServerConfig,
+        harden: Option<&CommandHardener>,
+    ) -> Result<Self, McpError> {
         let mut command = Command::new(&cfg.command);
         command.args(&cfg.args);
+        if let Some(harden) = harden {
+            harden(&mut command);
+        }
         for (k, v) in &cfg.env {
+            if is_proxy_env_key(k) {
+                continue;
+            }
             command.env(k, v);
         }
         let transport = TokioChildProcess::new(command).map_err(|e| McpError::Spawn {
@@ -104,5 +124,27 @@ fn cap(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(max).collect()
+    }
+}
+
+fn is_proxy_env_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "http_proxy" | "https_proxy" | "all_proxy" | "no_proxy"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_env_keys_are_filtered_case_insensitively() {
+        assert!(is_proxy_env_key("HTTP_PROXY"));
+        assert!(is_proxy_env_key("https_proxy"));
+        assert!(is_proxy_env_key("All_Proxy"));
+        assert!(is_proxy_env_key("NO_PROXY"));
+        assert!(!is_proxy_env_key("PATH"));
+        assert!(!is_proxy_env_key("API_TOKEN"));
     }
 }

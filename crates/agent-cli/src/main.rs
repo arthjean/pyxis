@@ -200,7 +200,7 @@ fn run_config_from_args(args: &Args) -> anyhow::Result<RunConfig> {
     })
 }
 
-fn permission_policy(headless: bool, yes: bool, _sandbox_enforced: bool) -> CliPermissionPolicy {
+fn permission_policy(headless: bool, yes: bool, sandbox_enforced: bool) -> CliPermissionPolicy {
     if !headless {
         return CliPermissionPolicy {
             mode: PermissionMode::Default,
@@ -213,9 +213,16 @@ fn permission_policy(headless: bool, yes: bool, _sandbox_enforced: bool) -> CliP
             auto_approve_routine: false,
         };
     }
-    CliPermissionPolicy {
-        mode: PermissionMode::AcceptEdits,
-        auto_approve_routine: false,
+    if sandbox_enforced {
+        CliPermissionPolicy {
+            mode: PermissionMode::AcceptEdits,
+            auto_approve_routine: false,
+        }
+    } else {
+        CliPermissionPolicy {
+            mode: PermissionMode::Default,
+            auto_approve_routine: false,
+        }
     }
 }
 
@@ -364,6 +371,7 @@ async fn run(
     let proxy_addr = proxy.addr.clone();
     let harden: agent_tools::CommandHardener =
         Arc::new(move |cmd: &mut tokio::process::Command| set_proxy_env(cmd, &proxy_addr));
+    let mcp_harden = Arc::clone(&harden);
 
     // 3. Session persistante : un fichier JSONL par conversation (horodaté) sous
     // <workspace>/.pyxis/sessions/, listable/reprenable via `/resume`.
@@ -494,6 +502,7 @@ async fn run(
             connected: true,
             skills,
             goal,
+            command_hardener: mcp_harden,
         };
         interactive::run(
             deps,
@@ -622,7 +631,7 @@ mod tests {
     #[test]
     fn headless_yes_does_not_auto_approve_without_sandbox() {
         let p = permission_policy(true, true, false);
-        assert_eq!(p.mode, agent_tools::permission::PermissionMode::AcceptEdits);
+        assert_eq!(p.mode, agent_tools::permission::PermissionMode::Default);
         assert!(!p.auto_approve_routine);
     }
 }
