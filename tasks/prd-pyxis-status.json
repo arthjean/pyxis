@@ -185,7 +185,7 @@
       "started_at": "2026-06-15",
       "completed_at": "2026-06-15",
       "reviewed_at": null,
-      "verdict": "DONE — agent-session JsonlSession : append durable (write+flush+sync_data), entries discriminées (Message|CompactBoundary|FileHistorySnapshot), checkpoint atomique frontière+résumé (fix #8/#9), resume lazy-clear (frontière orpheline préservée), ligne tronquée ignorée. 7 tests."
+      "verdict": "DONE: agent-session JsonlSession : append durable (write+flush+sync_data), réparation de queue tronquée avant réappend, entries discriminées (Meta|Message|CompactBoundary|CompactCheckpoint|EncryptedReasoningRedacted|FileHistorySnapshot), checkpoint frontière+résumé en une entry, resume lazy-clear (frontière orpheline préservée), snapshots fichiers rejoués, schema_version future rejetée, --resume câblé au CLI. 19 tests agent-session."
     },
     {
       "id": "US-010",
@@ -417,6 +417,6 @@
     "wiring": "pyxis main() : parse args (-p/--model/--allow/--yes/--no-sandbox) → enforce_process(sandbox) AVANT runtime → load credential keyring → OpenAiChatGptProvider → proxy + harden closure → SharedSession (JsonlSession + snapshot mémoire pour continuité multi-tours) → Registry (6 outils + Approver + hardener) → Deps → dispatch headless (-p) vs interactif (tokio::select : clavier ↔ stream agent ↔ permissions).",
     "capstone_note": "agent-cli n'était pas une story formelle mais le DoD EP-005 (« pyxis offre une session interactive ») l'exige. Petite extension EP-003 : PermissionRequest.input (Value brute) pour rendre un diff dans le dialog.",
     "live_verification": "Interactif/Landlock pas testables sans terminal + token + kernel Landlock dans cet env. Arthur : `cargo run -p agent-auth --example login` puis `cargo run -p pyxis` (interactif) ou `pyxis -p \"...\" --yes`. Preview design : `cargo run -p agent-tui --example gallery`.",
-    "deferred": "Network confinement DUR (Landlock AccessNet V4 / nftables) — le proxy est best-effort (bypassable par socket brut). Scroll wrapping exact (approximation par lignes non-wrappées). Resume (--resume) non câblé au CLI (le crate agent-session le supporte). Revue adversariale non faite."
+    "deferred": "Network confinement DUR (Landlock AccessNet V4 / nftables) : le proxy est best-effort (bypassable par socket brut). Scroll wrapping exact (approximation par lignes non-wrappées). Revue adversariale non faite."
   }
 }

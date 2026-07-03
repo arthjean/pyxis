@@ -59,7 +59,7 @@ Deux divergences de nommage sont **actées explicitement** ici pour éviter tout
 - Compaction en cascade : micro + auto + full (fork de l'agent via `tokio::spawn` en mode resume, images strippées). `snip`/`collapse` reste feature-gated et hors scope MVP.
 - Sandbox Landlock FS + proxy réseau.
 - TUI streaming + diff brut + dialogs de permission.
-- Sessions JSONL append-only (`Message | CompactBoundary | FileHistorySnapshot`), append atomique + resume (rejeu du log, reconstruction d'état).
+- Sessions JSONL append-only (`Message | CompactBoundary | CompactCheckpoint | FileHistorySnapshot`), append durable + resume (réparation de queue tronquée, rejeu du log, reconstruction d'état).
 
 ### Auth au MVP — quel niveau d'OAuth ?
 

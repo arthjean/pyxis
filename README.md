@@ -208,6 +208,7 @@ pyxis "<prompt>"               # bare prompt is treated as -p
 |------|--------|
 | `--model <slug>` | Pick the model (default `gpt-5.5`). Also switchable in-session via `/models`. |
 | `--allow <host>` | Add a host to the network allow-list for tool subprocesses (repeatable). |
+| `--resume [id.jsonl\|latest]` | Reopen the latest or named session before entering the TUI, or continue it with `-p`. |
 | `--yes`, `-y` | Auto-approve tool actions (headless / trusted automation). |
 | `--no-sandbox` | Disable Landlock FS confinement (writes are no longer confined to the workspace). |
 

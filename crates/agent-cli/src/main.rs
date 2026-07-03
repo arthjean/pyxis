@@ -32,6 +32,7 @@ use crate::session::SharedSession;
 
 struct Args {
     prompt: Option<String>,
+    resume: Option<String>,
     model: String,
     allow_hosts: Vec<String>,
     yes: bool,
@@ -44,8 +45,16 @@ struct Args {
 }
 
 fn parse_args() -> Args {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from<I>(raw: I) -> Args
+where
+    I: IntoIterator<Item = String>,
+{
     let mut args = Args {
         prompt: None,
+        resume: None,
         model: agent_provider::DEFAULT_MODEL.to_string(),
         allow_hosts: Vec::new(),
         yes: false,
@@ -56,10 +65,16 @@ fn parse_args() -> Args {
         output_cost_micro_per_ktok: None,
         overload_fallback_model: None,
     };
-    let mut it = std::env::args().skip(1);
+    let mut it = raw.into_iter().peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-p" | "--print" => args.prompt = it.next(),
+            "--resume" => {
+                args.resume = match it.peek() {
+                    Some(next) if !next.starts_with('-') => it.next(),
+                    _ => Some(String::new()),
+                };
+            }
             "--model" => {
                 if let Some(m) = it.next() {
                     args.model = m;
@@ -86,6 +101,22 @@ fn parse_args() -> Args {
         }
     }
     args
+}
+
+fn resolve_resume_path(
+    sessions_dir: &std::path::Path,
+    arg: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let arg = arg.trim();
+    if arg.is_empty() || arg == "latest" {
+        let latest = agent_session::list_sessions(sessions_dir, None)
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("resume : aucune session disponible"))?;
+        return Ok(sessions_dir.join(latest.id));
+    }
+    crate::interactive::session_path_from_arg(sessions_dir, arg)
+        .ok_or_else(|| anyhow::anyhow!("resume : identifiant de session invalide"))
 }
 
 fn parse_positive_u64(raw: &str, name: &str) -> anyhow::Result<u64> {
@@ -286,14 +317,22 @@ async fn run(
     // <workspace>/.pyxis/sessions/, listable/reprenable via `/resume`.
     let sessions_dir = workspace.join(".pyxis").join("sessions");
     std::fs::create_dir_all(&sessions_dir)?;
-    let session_millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let current_session = sessions_dir.join(format!("{session_millis}.jsonl"));
+    let (current_session, initial_messages) = if let Some(resume_arg) = &args.resume {
+        let path = resolve_resume_path(&sessions_dir, resume_arg)?;
+        let resumed =
+            agent_session::resume_file(&path).map_err(|e| anyhow::anyhow!("resume : {e}"))?;
+        (path, resumed.messages)
+    } else {
+        (interactive::new_session_path(&sessions_dir), Vec::new())
+    };
     let jsonl = agent_session::JsonlSession::create_at(&current_session)
         .map_err(|e| anyhow::anyhow!("session : {e}"))?;
     let (shared_session, conversation) = SharedSession::new(jsonl);
+    if !initial_messages.is_empty() {
+        *conversation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session : snapshot empoisonné"))? = initial_messages;
+    }
 
     // Objectif de session persistant (`/goal`) : chargé du sidecar `.pyxis/goal`
     // (survit au redémarrage), composé dans le system prompt à chaque tour.
@@ -352,10 +391,12 @@ async fn run(
             prompt::select_system_prompt(&args.model),
             &tool_guidelines,
         );
+        let mut messages = conversation.lock().map(|g| g.clone()).unwrap_or_default();
+        messages.push(Message::user(prompt));
         let ctx = AgentContext {
             model: args.model,
             system: Some(interactive::compose_system(&base, goal.as_deref())),
-            messages: vec![Message::user(prompt)],
+            messages,
             tools: tool_specs,
             config: run_config,
             context_messages: context_msgs,
@@ -416,12 +457,13 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, run_config_from_args};
+    use super::{Args, parse_args_from, run_config_from_args};
 
     fn args() -> Args {
         Args {
             model: "mock".into(),
             prompt: None,
+            resume: None,
             allow_hosts: Vec::new(),
             yes: false,
             sandbox: true,
@@ -476,5 +518,35 @@ mod tests {
         args.overload_fallback_model = Some(" fallback ".into());
         let cfg = run_config_from_args(&args).unwrap();
         assert_eq!(cfg.overload_fallback_model.as_deref(), Some("fallback"));
+    }
+
+    #[test]
+    fn parse_args_reads_resume_latest() {
+        let args = parse_args_from(vec!["--resume".to_string()]);
+        assert_eq!(args.resume.as_deref(), Some(""));
+        assert!(args.prompt.is_none());
+    }
+
+    #[test]
+    fn parse_args_reads_resume_id_and_headless_prompt() {
+        let args = parse_args_from(vec![
+            "--resume".to_string(),
+            "123.jsonl".to_string(),
+            "-p".to_string(),
+            "continue".to_string(),
+        ]);
+        assert_eq!(args.resume.as_deref(), Some("123.jsonl"));
+        assert_eq!(args.prompt.as_deref(), Some("continue"));
+    }
+
+    #[test]
+    fn parse_args_resume_without_id_does_not_swallow_next_flag() {
+        let args = parse_args_from(vec![
+            "--resume".to_string(),
+            "-p".to_string(),
+            "continue".to_string(),
+        ]);
+        assert_eq!(args.resume.as_deref(), Some(""));
+        assert_eq!(args.prompt.as_deref(), Some("continue"));
     }
 }

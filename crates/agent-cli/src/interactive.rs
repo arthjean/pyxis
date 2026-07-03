@@ -186,7 +186,7 @@ fn take_goal_done(state: &mut AppState) -> bool {
     false
 }
 
-fn session_path_from_arg(sessions_dir: &Path, arg: &str) -> Option<PathBuf> {
+pub(crate) fn session_path_from_arg(sessions_dir: &Path, arg: &str) -> Option<PathBuf> {
     let candidate = Path::new(arg);
     if arg.trim().is_empty()
         || candidate.components().count() != 1
@@ -304,6 +304,14 @@ async fn event_loop(
         Some(&current_session),
         PROMPT_HISTORY_CAP,
     ));
+    let initial_messages = conversation.lock().map(|g| g.clone()).unwrap_or_default();
+    if !initial_messages.is_empty() {
+        state.blocks = blocks_from_messages(&initial_messages);
+        state.blocks.push(Block::Notice(format!(
+            "Session reprise ({} messages).",
+            initial_messages.len()
+        )));
+    }
     // Transcript vide au démarrage → l'écran d'accueil (carte + logo) s'affiche
     // de lui-même (cf. `AppState::is_welcome`), pas de Notice à pousser.
 
@@ -885,12 +893,23 @@ fn relative_time(modified: SystemTime) -> String {
 }
 
 /// Chemin d'un nouveau fichier de session (horodaté, un par conversation).
-fn new_session_path(dir: &Path) -> PathBuf {
+pub(crate) fn new_session_path(dir: &Path) -> PathBuf {
     let millis = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    dir.join(format!("{millis}.jsonl"))
+    for seq in 0..1000 {
+        let name = if seq == 0 {
+            format!("{millis}.jsonl")
+        } else {
+            format!("{millis}-{seq}.jsonl")
+        };
+        let path = dir.join(name);
+        if !path.exists() {
+            return path;
+        }
+    }
+    dir.join(format!("{millis}-overflow.jsonl"))
 }
 
 #[cfg(test)]

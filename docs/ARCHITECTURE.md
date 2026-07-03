@@ -431,14 +431,17 @@ Persistance **JSONL append-only**. Chaque ligne est une `entry` discriminée :
 
 ```rust
 enum SessionEntry {
+    Meta { schema_version: u32 },
     Message(Message),                 // tour user/assistant/tool
     CompactBoundary(CompactKind),     // marque une frontière de compaction
+    CompactCheckpoint { kind, messages },
+    EncryptedReasoningRedacted,
     FileHistorySnapshot(FileSnapshot),// état d'un fichier pour rollback/diff
 }
 ```
 
-- **Append atomique** : chaque entry est écrite intégralement ou pas du tout (pas de ligne JSONL tronquée).
-- **Resume** = on **rejoue le log** et on **reconstruit l'état** (messages, frontières de compaction, snapshots fichiers). Couplé au transcript-before-response (§3.2), une session interrompue en plein stream se rouvre proprement.
+- **Append durable par entrée** : chaque entry réussie est écrite puis `flush` + `sync_data`. Un crash peut laisser une queue partielle ; au resume elle est ignorée, et avant tout nouvel append elle est tronquée au dernier offset valide.
+- **Resume** = on **rejoue le log** et on **reconstruit l'état** (messages, frontières de compaction, snapshots fichiers). Couplé au transcript-before-response (§3.2), une session interrompue en plein stream se rouvre proprement. `schema_version` protège les futurs formats incompatibles.
 
 ---
 
