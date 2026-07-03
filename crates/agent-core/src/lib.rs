@@ -26,7 +26,7 @@ pub use deps::Deps;
 pub use error::{AgentError, ProviderFailure, ProviderFailureKind};
 pub use event::AgentEvent;
 pub use guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget};
-pub use message::{ContentBlock, Message, Role};
+pub use message::{ContentBlock, Message, Role, ToolErrorKind};
 pub use provider::{
     AuthError, CacheCapabilities, Capabilities, CapabilityLimits, ErrorClass, Provider,
     ProviderError, ProviderKind, ReasoningCapabilities, StopReason, StreamEvent, TokenUsage,
@@ -229,6 +229,7 @@ mod loop_tests {
                     content: format!("echo:{}", c.input),
                     is_error: false,
                     untrusted: true,
+                    error_kind: None,
                 })
                 .collect()
         }

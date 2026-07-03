@@ -7,7 +7,7 @@ use std::cell::{Cell, RefCell};
 use std::time::Duration;
 
 use agent_core::AgentEvent;
-use agent_core::message::{ContentBlock, Message, Role, ToolCallId};
+use agent_core::message::{ContentBlock, Message, Role, ToolCallId, ToolErrorKind};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Un élément du transcript. Le rendu choisit poids/teinte ; aucune couleur ici.
@@ -34,6 +34,7 @@ pub enum Block {
         content: String,
         untrusted: bool,
         is_error: bool,
+        error_kind: Option<ToolErrorKind>,
     },
     /// Information système discrète (compaction, budget…).
     Notice(String),
@@ -230,6 +231,7 @@ pub fn blocks_from_messages(messages: &[Message]) -> Vec<Block> {
                         content,
                         untrusted,
                         is_error,
+                        error_kind,
                     } = b
                     {
                         blocks.push(Block::ToolResult {
@@ -237,6 +239,7 @@ pub fn blocks_from_messages(messages: &[Message]) -> Vec<Block> {
                             content: content.clone(),
                             untrusted: *untrusted,
                             is_error: *is_error,
+                            error_kind: *error_kind,
                         });
                     }
                 }
@@ -499,6 +502,7 @@ impl AppState {
                     content: view.content.clone(),
                     untrusted: view.untrusted,
                     is_error: view.is_error,
+                    error_kind: view.error_kind,
                 });
             }
             AgentEvent::Compacted(_) => self.blocks.push(Block::Notice("contexte compacté".into())),
@@ -1188,6 +1192,7 @@ mod tests {
             content: "oops".into(),
             is_error: true,
             untrusted: true,
+            error_kind: None,
         }));
         assert_eq!(
             s.blocks[0],
@@ -1195,7 +1200,8 @@ mod tests {
                 call_id: "c1".into(),
                 content: "oops".into(),
                 untrusted: true,
-                is_error: true
+                is_error: true,
+                error_kind: None
             }
         );
     }

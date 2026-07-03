@@ -121,10 +121,12 @@ pub(crate) fn fingerprint(
             content,
             is_error,
             untrusted,
+            error_kind,
         } => {
             4u8.hash(&mut h);
             content.hash(&mut h);
             is_error.hash(&mut h);
+            error_kind.hash(&mut h);
             // Pas (encore) lu par `push_block`, mais inclus pour que l'invariant
             // « l'empreinte couvre tout l'état du bloc » survive à un futur badge.
             untrusted.hash(&mut h);
@@ -250,6 +252,7 @@ mod tests {
             content: "ok".into(),
             untrusted: false,
             is_error: false,
+            error_kind: None,
         };
         // Avec vs sans l'appel apparié → empreintes différentes (le diff en dépend).
         assert_ne!(

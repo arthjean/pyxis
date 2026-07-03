@@ -37,6 +37,7 @@ fn tool(s: &mut AppState, name: &str, input: serde_json::Value, out: &str) {
         content: out.into(),
         is_error: false,
         untrusted: true,
+        error_kind: None,
     }));
 }
 

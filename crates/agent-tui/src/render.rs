@@ -12,6 +12,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as Boundary, BorderType, Borders, Paragraph, Wrap};
 
+use agent_core::ToolErrorKind;
+
 use crate::cache::fingerprint;
 use crate::state::{AppState, Block, COMMANDS, MenuItem, PermissionPrompt, Status};
 use crate::theme::Theme;
@@ -548,10 +550,13 @@ fn push_block<'a>(
             call_id,
             content,
             is_error,
+            error_kind,
             ..
         } => {
             if *is_error {
-                if tool::is_user_rejection(content) {
+                if matches!(error_kind, Some(ToolErrorKind::PermissionDenied))
+                    || tool::is_user_rejection(content)
+                {
                     // Rejet volontaire (permission refusée) : ton atténué, pas
                     // rouge : ce n'est pas une erreur système (US-036).
                     push_wrapped(
@@ -1450,6 +1455,7 @@ mod tests {
             content: "Édité : src/main.rs (niveau 1 : exact)".into(),
             is_error: false,
             untrusted: false,
+            error_kind: None,
         }));
         let out = draw(&s, 60, 16);
         assert!(out.contains("Update("), "label Update absent:\n{out}");
@@ -1475,6 +1481,7 @@ mod tests {
             content: "     1\tfn main() {\n     2\t}\n".into(),
             is_error: false,
             untrusted: true,
+            error_kind: None,
         }));
         let out = draw(&s, 50, 10);
         assert!(out.contains("Read"), "verbe Read absent:\n{out}");
@@ -1490,6 +1497,7 @@ mod tests {
             content: "ancre introuvable dans src/x.rs".into(),
             is_error: true,
             untrusted: true,
+            error_kind: None,
         }));
         let out = draw(&s, 60, 8);
         assert!(out.contains("Error:"), "grammaire d'erreur absente:\n{out}");
@@ -1505,6 +1513,7 @@ mod tests {
             content: "action « edit » refusée par l'utilisateur".into(),
             is_error: true,
             untrusted: false,
+            error_kind: Some(agent_core::ToolErrorKind::PermissionDenied),
         }));
         let out = draw(&s, 64, 8);
         assert!(out.contains("refusée"), "libellé de rejet absent:\n{out}");
@@ -1550,6 +1559,7 @@ mod tests {
             content: "Édité : a.rs (niveau 1)".into(),
             is_error: false,
             untrusted: false,
+            error_kind: None,
         }));
         let out = draw(&s, 60, 12);
         assert!(
@@ -1577,6 +1587,7 @@ mod tests {
             content: "ancre introuvable dans a.rs".into(),
             is_error: true,
             untrusted: true,
+            error_kind: None,
         }));
         let out = draw(&s, 60, 10);
         assert!(out.contains("Error:"), "erreur absente:\n{out}");

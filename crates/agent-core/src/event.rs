@@ -4,7 +4,7 @@
 
 use crate::compaction::CompactKind;
 use crate::error::AgentError;
-use crate::message::ToolCallId;
+use crate::message::{ToolCallId, ToolErrorKind};
 use crate::transition::ExhaustReason;
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +44,8 @@ pub struct ToolResultView {
     pub id: ToolCallId,
     pub content: String,
     pub is_error: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<ToolErrorKind>,
     /// Sortie d'outil = untrusted par défaut (taint, US-013).
     pub untrusted: bool,
 }

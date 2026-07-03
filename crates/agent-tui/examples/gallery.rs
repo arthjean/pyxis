@@ -46,6 +46,7 @@ fn main() {
         content: "   1\tfn lex(input: &str) -> Vec<Token> {\n   2\t    todo!()\n   3\t}".into(),
         is_error: false,
         untrusted: true,
+        error_kind: None,
     }));
     s.apply(&AgentEvent::Text("Je remplace le ".into()));
     s.apply(&AgentEvent::Text("`todo!()` par un vrai lexer.".into()));

@@ -16,6 +16,7 @@ use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{Tool, ToolCtx, ToolOutput};
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EditInput {
     pub path: String,
     /// Texte à remplacer — doit être unique dans le fichier.
@@ -48,7 +49,8 @@ impl Tool for Edit {
                 "old_string": { "type": "string", "description": "Texte à remplacer (ancre unique)." },
                 "new_string": { "type": "string", "description": "Texte de remplacement." }
             },
-            "required": ["path", "old_string", "new_string"]
+            "required": ["path", "old_string", "new_string"],
+            "additionalProperties": false
         })
     }
     fn is_read_only(&self) -> bool {

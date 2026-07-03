@@ -9,6 +9,7 @@
 
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 use crate::message::{Message, ToolCallId};
 
@@ -138,14 +139,68 @@ impl ToolSpec {
         if self.name.trim().is_empty() {
             return Err(ToolSpecValidationError::EmptyName);
         }
-        if self
-            .input_schema
-            .as_object()
-            .and_then(|schema| schema.get("type"))
+        if self.name.len() > 64
+            || !self
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(ToolSpecValidationError::InvalidName {
+                tool: self.name.clone(),
+            });
+        }
+        let Some(schema) = self.input_schema.as_object() else {
+            return Err(ToolSpecValidationError::SchemaMustBeObject {
+                tool: self.name.clone(),
+            });
+        };
+        if schema
+            .get("type")
             .and_then(serde_json::Value::as_str)
             .is_none_or(|kind| kind != "object")
         {
             return Err(ToolSpecValidationError::SchemaMustBeObject {
+                tool: self.name.clone(),
+            });
+        }
+        if schema.get("additionalProperties") != Some(&serde_json::Value::Bool(false)) {
+            return Err(
+                ToolSpecValidationError::SchemaMustDenyAdditionalProperties {
+                    tool: self.name.clone(),
+                },
+            );
+        }
+        let property_names: HashSet<String> = match schema.get("properties") {
+            None => HashSet::new(),
+            Some(serde_json::Value::Object(props)) => props.keys().cloned().collect(),
+            Some(_) => {
+                return Err(ToolSpecValidationError::SchemaPropertiesMustBeObject {
+                    tool: self.name.clone(),
+                });
+            }
+        };
+        let required_names: HashSet<String> = match schema.get("required") {
+            None => HashSet::new(),
+            Some(serde_json::Value::Array(items)) => {
+                let mut names = HashSet::new();
+                for item in items {
+                    let Some(name) = item.as_str() else {
+                        return Err(ToolSpecValidationError::SchemaRequiredMustBeStringArray {
+                            tool: self.name.clone(),
+                        });
+                    };
+                    names.insert(name.to_string());
+                }
+                names
+            }
+            Some(_) => {
+                return Err(ToolSpecValidationError::SchemaRequiredMustBeStringArray {
+                    tool: self.name.clone(),
+                });
+            }
+        };
+        if property_names != required_names {
+            return Err(ToolSpecValidationError::RequiredMustMatchProperties {
                 tool: self.name.clone(),
             });
         }
@@ -157,8 +212,18 @@ impl ToolSpec {
 pub enum ToolSpecValidationError {
     #[error("tool name is empty")]
     EmptyName,
+    #[error("tool {tool} name must be <=64 chars and use only ASCII letters, digits, _ or -")]
+    InvalidName { tool: String },
     #[error("tool {tool} input_schema must be a JSON schema object")]
     SchemaMustBeObject { tool: String },
+    #[error("tool {tool} input_schema must set additionalProperties=false")]
+    SchemaMustDenyAdditionalProperties { tool: String },
+    #[error("tool {tool} input_schema properties must be an object")]
+    SchemaPropertiesMustBeObject { tool: String },
+    #[error("tool {tool} input_schema required must be an array of strings")]
+    SchemaRequiredMustBeStringArray { tool: String },
+    #[error("tool {tool} required fields must match properties for strict schema mode")]
+    RequiredMustMatchProperties { tool: String },
 }
 
 /// Requête canonique (ce que `ctx.request()` produit). Transcript client-side.
@@ -191,6 +256,14 @@ impl CanonicalRequest {
             tool.validate()
                 .map_err(CanonicalRequestValidationError::InvalidTool)?;
         }
+        let mut seen_tools = HashSet::new();
+        for tool in &self.tools {
+            if !seen_tools.insert(tool.name.as_str()) {
+                return Err(CanonicalRequestValidationError::DuplicateToolName {
+                    tool: tool.name.clone(),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -205,6 +278,8 @@ pub enum CanonicalRequestValidationError {
     InvalidMessage { index: usize, detail: String },
     #[error("tool spec is invalid: {0}")]
     InvalidTool(#[from] ToolSpecValidationError),
+    #[error("duplicate tool name: {tool}")]
+    DuplicateToolName { tool: String },
 }
 
 /// Réponse non-stream (utilitaire : titres, résumés de compaction).
@@ -342,6 +417,7 @@ mod tests {
                 content: "out".into(),
                 untrusted: true,
                 is_error: false,
+                error_kind: None,
             }],
         };
         let req = CanonicalRequest {
@@ -363,7 +439,11 @@ mod tests {
             tools: vec![ToolSpec {
                 name: "bad".into(),
                 description: String::new(),
-                input_schema: serde_json::json!({ "type": "string" }),
+                input_schema: serde_json::json!({
+                    "type": "string",
+                    "additionalProperties": false,
+                    "required": []
+                }),
             }],
             max_output_tokens: 100,
         };
@@ -372,6 +452,53 @@ mod tests {
             Err(CanonicalRequestValidationError::InvalidTool(
                 ToolSpecValidationError::SchemaMustBeObject { .. }
             ))
+        ));
+    }
+
+    #[test]
+    fn canonical_request_rejects_non_strict_tool_schemas_and_duplicate_names() {
+        let req = CanonicalRequest {
+            model: "gpt".into(),
+            system: None,
+            messages: vec![Message::user("ok")],
+            tools: vec![ToolSpec {
+                name: "read".into(),
+                description: "lit".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }),
+            }],
+            max_output_tokens: 100,
+        };
+        assert!(matches!(
+            req.validate(),
+            Err(CanonicalRequestValidationError::InvalidTool(
+                ToolSpecValidationError::SchemaMustDenyAdditionalProperties { .. }
+            ))
+        ));
+
+        let strict_tool = ToolSpec {
+            name: "read".into(),
+            description: "lit".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        };
+        let req = CanonicalRequest {
+            model: "gpt".into(),
+            system: None,
+            messages: vec![Message::user("ok")],
+            tools: vec![strict_tool.clone(), strict_tool],
+            max_output_tokens: 100,
+        };
+        assert!(matches!(
+            req.validate(),
+            Err(CanonicalRequestValidationError::DuplicateToolName { tool }) if tool == "read"
         ));
     }
 }

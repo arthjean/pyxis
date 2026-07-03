@@ -11,6 +11,7 @@ use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{Tool, ToolCtx, ToolOutput};
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WriteInput {
     pub path: String,
     pub content: String,
@@ -38,7 +39,8 @@ impl Tool for Write {
                 "path": { "type": "string", "description": "Chemin du fichier (relatif au workspace)." },
                 "content": { "type": "string", "description": "Contenu complet à écrire." }
             },
-            "required": ["path", "content"]
+            "required": ["path", "content"],
+            "additionalProperties": false
         })
     }
     // Mutation (non read-only), mais édition de fichier (non « sensible » au sens

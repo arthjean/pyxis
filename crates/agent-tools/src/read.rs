@@ -15,6 +15,7 @@ use crate::tool::{Tool, ToolCtx, ToolOutput};
 const MAX_BYTES: usize = 2_000_000;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadInput {
     pub path: String,
     /// Ligne de départ (1-indexée). Défaut : 1.
@@ -46,10 +47,11 @@ impl Tool for Read {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Chemin du fichier (relatif au workspace)." },
-                "offset": { "type": "integer", "minimum": 1, "description": "Ligne de départ (1-indexée)." },
-                "limit": { "type": "integer", "minimum": 1, "description": "Nombre de lignes maximum." }
+                "offset": { "type": ["integer", "null"], "minimum": 1, "description": "Ligne de départ (1-indexée), ou null." },
+                "limit": { "type": ["integer", "null"], "minimum": 1, "description": "Nombre de lignes maximum, ou null." }
             },
-            "required": ["path"]
+            "required": ["path", "offset", "limit"],
+            "additionalProperties": false
         })
     }
     fn is_read_only(&self) -> bool {

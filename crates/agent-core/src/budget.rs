@@ -292,7 +292,9 @@ mod tests {
             description: "lit".into(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "properties": { "path": { "type": "string" } }
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+                "additionalProperties": false
             }),
         }];
         let est = estimate_static_input(

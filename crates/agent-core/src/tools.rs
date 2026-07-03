@@ -5,7 +5,7 @@
 use tokio::sync::mpsc;
 
 use crate::event::PermissionReq;
-use crate::message::ToolCallId;
+use crate::message::{ToolCallId, ToolErrorKind};
 
 /// Un appel d'outil demandé par le modèle (args déjà réassemblés en JSON valide).
 #[derive(Debug, Clone)]
@@ -24,6 +24,7 @@ pub struct ToolOutcome {
     pub content: String,
     pub is_error: bool,
     pub untrusted: bool,
+    pub error_kind: Option<ToolErrorKind>,
 }
 
 #[derive(Debug, Clone)]

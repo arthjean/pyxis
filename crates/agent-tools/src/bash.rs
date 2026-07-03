@@ -16,6 +16,7 @@ use crate::tool::{Tool, ToolCtx, ToolOutput};
 const MAX_OUTPUT: usize = 30_000;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BashInput {
     pub command: String,
 }
@@ -41,7 +42,8 @@ impl Tool for Bash {
             "properties": {
                 "command": { "type": "string", "description": "Commande shell à exécuter." }
             },
-            "required": ["command"]
+            "required": ["command"],
+            "additionalProperties": false
         })
     }
     // Defaults fail-closed conservés : non read-only, non concurrent, SENSIBLE,

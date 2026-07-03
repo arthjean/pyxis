@@ -746,13 +746,15 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     id: c.id.clone(),
                                     content: msg.clone(),
                                     is_error: true,
+                                    error_kind: Some(crate::message::ToolErrorKind::Semantic),
                                     untrusted: false,
                                 });
-                                messages.push(Message::tool_result_with_trust(
+                                messages.push(Message::tool_result_with_metadata(
                                     c.id.clone(),
                                     msg,
                                     true,
                                     false,
+                                    Some(crate::message::ToolErrorKind::Semantic),
                                 ));
                             }
                             // reboucle : le modèle reçoit le signal et peut corriger.
@@ -802,13 +804,15 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     id: o.id.clone(),
                                     content: o.content.clone(),
                                     is_error: o.is_error,
+                                    error_kind: o.error_kind,
                                     untrusted: o.untrusted,
                                 });
-                                messages.push(Message::tool_result_with_trust(
+                                messages.push(Message::tool_result_with_metadata(
                                     o.id.clone(),
                                     o.content.clone(),
                                     o.is_error,
                                     o.untrusted,
+                                    o.error_kind,
                                 ));
                             }
                             // US-030 MidTurn : les tool_results qu'on vient d'ajouter

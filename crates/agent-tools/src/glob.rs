@@ -15,6 +15,7 @@ use crate::tool::{Tool, ToolCtx, ToolOutput};
 const MAX_MATCHES: usize = 1000;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GlobInput {
     pub pattern: String,
     /// Sous-dossier de base (relatif au workspace). Défaut : racine workspace.
@@ -43,9 +44,10 @@ impl Tool for Glob {
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "Motif glob, ex. **/*.rs" },
-                "path": { "type": "string", "description": "Sous-dossier de base (relatif au workspace)." }
+                "path": { "type": ["string", "null"], "description": "Sous-dossier de base (relatif au workspace), ou null." }
             },
-            "required": ["pattern"]
+            "required": ["pattern", "path"],
+            "additionalProperties": false
         })
     }
     fn is_read_only(&self) -> bool {

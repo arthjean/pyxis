@@ -186,8 +186,8 @@ fn tool_result_items(blocks: &[ContentBlock], input: &mut Vec<Value>) {
     }
 }
 
-/// `ToolSpec` canonique → tool `function` plat de la Responses API. `strict: null`
-/// reproduit le comportement Codex de Pi (≠ `false`, subtilité vérifiée).
+/// `ToolSpec` canonique → tool `function` plat de la Responses API. Les schémas
+/// sont validés stricts côté `agent-core` avant exposition.
 fn build_tools(tools: &[ToolSpec]) -> Value {
     let arr: Vec<Value> = tools
         .iter()
@@ -197,7 +197,7 @@ fn build_tools(tools: &[ToolSpec]) -> Value {
                 "name": t.name,
                 "description": t.description,
                 "parameters": t.input_schema,
-                "strict": Value::Null,
+                "strict": true,
             })
         })
         .collect();
@@ -309,19 +309,23 @@ mod tests {
     }
 
     #[test]
-    fn tools_map_to_flat_function_with_null_strict() {
+    fn tools_map_to_flat_function_with_strict_schema() {
         let spec = ToolSpec {
             name: "read".into(),
             description: "lit un fichier".into(),
-            input_schema: json!({ "type": "object", "properties": { "path": {"type":"string"} } }),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "path": {"type":"string"} },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
         };
         let body = build_responses_body(&req(vec![Message::user("x")], vec![spec], None), None);
         let tool = &body["tools"][0];
         assert_eq!(tool["type"], "function");
         assert_eq!(tool["name"], "read");
         assert_eq!(tool["parameters"]["properties"]["path"]["type"], "string");
-        // strict: null (≠ false) — fidélité Codex.
-        assert!(tool["strict"].is_null());
+        assert_eq!(tool["strict"], true);
     }
 
     // US-029 : clamp à 64 code-points (Unicode-safe), boundary inchangée.

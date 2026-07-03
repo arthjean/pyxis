@@ -119,6 +119,11 @@ pub trait Tool: Send + Sync {
     fn is_sensitive(&self) -> bool {
         true
     }
+    /// Une sortie untrusted récente doit-elle forcer une confirmation avant cet
+    /// outil ? Par défaut, toute mutation ou action sensible est protégée.
+    fn is_taint_sensitive(&self) -> bool {
+        self.is_sensitive() || !self.is_read_only()
+    }
     /// Sortie untrusted (taintée) — défaut pour toute sortie d'outil (OWASP
     /// LLM01).
     fn returns_untrusted(&self) -> bool {
@@ -158,6 +163,7 @@ pub trait DynTool: Send + Sync {
     fn is_concurrency_safe(&self) -> bool;
     fn is_read_only(&self) -> bool;
     fn is_sensitive(&self) -> bool;
+    fn is_taint_sensitive(&self) -> bool;
     fn returns_untrusted(&self) -> bool;
     /// Invariants comportementaux de l'outil (US-026), forwardés depuis `Tool`.
     fn behavioral_guidelines(&self) -> &[&'static str];
@@ -200,6 +206,9 @@ impl<T: Tool> DynTool for DynToolAdapter<T> {
     }
     fn is_sensitive(&self) -> bool {
         self.inner.is_sensitive()
+    }
+    fn is_taint_sensitive(&self) -> bool {
+        self.inner.is_taint_sensitive()
     }
     fn returns_untrusted(&self) -> bool {
         self.inner.returns_untrusted()

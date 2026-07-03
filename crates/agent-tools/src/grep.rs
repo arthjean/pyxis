@@ -21,6 +21,7 @@ const MAX_FILE_BYTES: u64 = 5_000_000;
 const MAX_LINE_BYTES: usize = 300;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrepInput {
     /// Expression régulière (syntaxe `regex`).
     pub pattern: String,
@@ -53,10 +54,11 @@ impl Tool for Grep {
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "Expression régulière." },
-                "path": { "type": "string", "description": "Base de recherche (relative au workspace)." },
-                "glob": { "type": "string", "description": "Filtre glob sur les noms de fichiers, ex. *.rs" }
+                "path": { "type": ["string", "null"], "description": "Base de recherche (relative au workspace), ou null." },
+                "glob": { "type": ["string", "null"], "description": "Filtre glob sur les noms de fichiers, ex. *.rs, ou null." }
             },
-            "required": ["pattern"]
+            "required": ["pattern", "path", "glob"],
+            "additionalProperties": false
         })
     }
     fn is_read_only(&self) -> bool {

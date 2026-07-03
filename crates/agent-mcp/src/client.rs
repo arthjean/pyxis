@@ -14,6 +14,7 @@ use crate::error::McpError;
 
 /// Délai max d'établissement de la connexion (spawn + handshake `initialize`).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Plafond de longueur d'une description d'outil (ARCHITECTURE §6 : un serveur ne
 /// peut pas polluer le prompt).
@@ -65,10 +66,12 @@ impl McpConnection {
 
     /// Liste les outils exposés par le serveur (descriptions cappées à 2048 chars).
     pub async fn list_tools(&self, name: &str) -> Result<Vec<McpToolInfo>, McpError> {
-        let tools = self
-            .service
-            .list_all_tools()
+        let tools = tokio::time::timeout(LIST_TOOLS_TIMEOUT, self.service.list_all_tools())
             .await
+            .map_err(|_| McpError::Connect {
+                server: name.to_string(),
+                message: format!("list_tools timeout après {}s", LIST_TOOLS_TIMEOUT.as_secs()),
+            })?
             .map_err(|e| McpError::Connect {
                 server: name.to_string(),
                 message: format!("list_tools : {e}"),

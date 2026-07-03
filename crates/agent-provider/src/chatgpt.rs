@@ -134,7 +134,7 @@ impl OpenAiChatGptProvider {
                 },
                 tool_calling: ToolCallingCapabilities {
                     parallel_tool_calls: true,
-                    strict_json_schema: false,
+                    strict_json_schema: true,
                 },
                 reasoning_options: ReasoningCapabilities {
                     encrypted_replay: true,

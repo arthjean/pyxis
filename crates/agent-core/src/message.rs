@@ -6,6 +6,20 @@ use serde::{Deserialize, Serialize};
 
 pub type ToolCallId = String;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolErrorKind {
+    UnknownTool,
+    Parse,
+    Validation,
+    OutsideWorkspace,
+    Io,
+    Rejected,
+    PermissionDenied,
+    Timeout,
+    Semantic,
+}
+
 const fn default_untrusted() -> bool {
     true
 }
@@ -44,6 +58,8 @@ pub enum ContentBlock {
         untrusted: bool,
         #[serde(default)]
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_kind: Option<ToolErrorKind>,
     },
     Image {
         media_type: String,
@@ -100,6 +116,16 @@ impl Message {
         is_error: bool,
         untrusted: bool,
     ) -> Self {
+        Self::tool_result_with_metadata(id, content, is_error, untrusted, None)
+    }
+
+    pub fn tool_result_with_metadata(
+        id: impl Into<ToolCallId>,
+        content: impl Into<String>,
+        is_error: bool,
+        untrusted: bool,
+        error_kind: Option<ToolErrorKind>,
+    ) -> Self {
         Self::single(
             Role::Tool,
             ContentBlock::ToolResult {
@@ -107,6 +133,7 @@ impl Message {
                 content: content.into(),
                 untrusted,
                 is_error,
+                error_kind,
             },
         )
     }
@@ -290,6 +317,7 @@ mod tests {
             content: "out".into(),
             untrusted: true,
             is_error: false,
+            error_kind: None,
         }]);
         assert!(msg.validate().is_err());
     }

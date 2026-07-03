@@ -3,6 +3,8 @@
 //! `ToolOutcome { is_error: true }`). Aucune ne panique : le pipeline est
 //! fail-closed (ARCHITECTURE §4.1, invariant 4).
 
+use agent_core::ToolErrorKind;
+
 /// Échec de validation d'entrée d'un outil (pré-permission, pré-exécution).
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("validation: {0}")]
@@ -39,4 +41,17 @@ pub enum ToolError {
     /// L'outil a dépassé son timeout (signalé par le Registry, pas par l'outil).
     #[error("timeout dépassé")]
     Timeout,
+}
+
+impl ToolError {
+    pub fn kind(&self) -> ToolErrorKind {
+        match self {
+            ToolError::Parse(_) => ToolErrorKind::Parse,
+            ToolError::Validation(_) => ToolErrorKind::Validation,
+            ToolError::OutsideWorkspace(_) => ToolErrorKind::OutsideWorkspace,
+            ToolError::Io(_) => ToolErrorKind::Io,
+            ToolError::Rejected(_) => ToolErrorKind::Rejected,
+            ToolError::Timeout => ToolErrorKind::Timeout,
+        }
+    }
 }

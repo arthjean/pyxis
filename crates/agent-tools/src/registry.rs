@@ -1,6 +1,6 @@
-//! `Registry` — implémente `ToolDispatch` (la frontière cœur↔outils). Partitionne
-//! un batch en concurrent (read-only safe, `buffer_unordered(10)`) vs série
-//! (mutants), et fait passer chaque appel par le **pipeline strict** (§4.3) :
+//! `Registry` : implémente `ToolDispatch` (la frontière cœur↔outils). Exécute
+//! chaque batch en segments ordonnés : reads sûrs en parallèle, mutations et
+//! confirmations en série, puis fait passer chaque appel par le **pipeline strict** (§4.3) :
 //!
 //! ```text
 //! parse+validate → permission(mode×taint) → call() sous timeout → taint → outcome
@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use agent_core::event::PermissionReq;
+use agent_core::message::ToolErrorKind;
 use agent_core::provider::ToolSpec;
 use agent_core::tools::{
     ToolDispatch, ToolDispatchEvent, ToolEventSink, ToolInvocation, ToolOutcome,
@@ -21,6 +22,7 @@ use agent_core::tools::{
 use async_trait::async_trait;
 use futures_util::stream::{self, StreamExt};
 
+use crate::error::ToolError;
 use crate::permission::{
     Approver, AutoDeny, PermCtx, PermissionMode, PermissionRequest, Resolved, resolve_permission,
 };
@@ -68,10 +70,9 @@ impl Registry {
             .tools
             .values()
             .map(|t| {
-                let mut description = t.description();
-                if description.len() > MAX_DESCRIPTION {
-                    description.truncate(MAX_DESCRIPTION);
-                }
+                let raw_description = t.description();
+                let description =
+                    truncate_utf8_prefix(&raw_description, MAX_DESCRIPTION).to_string();
                 ToolSpec {
                     name: t.name().to_string(),
                     description,
@@ -112,12 +113,16 @@ impl Registry {
     async fn run_one(&self, call: ToolInvocation, events: ToolEventSink) -> ToolOutcome {
         let id = call.id.clone();
         let Some(tool) = self.tools.get(&call.name) else {
-            return err_outcome(id, format!("outil inconnu: {}", call.name));
+            return err_outcome(
+                id,
+                format!("outil inconnu: {}", call.name),
+                ToolErrorKind::UnknownTool,
+            );
         };
 
         // 1. parse + validate (fail-closed, US-010 AC3) — pas d'exécution si KO.
         if let Err(e) = tool.precheck(&call.input) {
-            return err_outcome(id, e.to_string());
+            return err_outcome(id, e.to_string(), e.kind());
         }
 
         // 2. permission : baseline outil mise en forme par mode + taint (§4.4/4.6).
@@ -131,6 +136,7 @@ impl Registry {
             baseline,
             tool.is_read_only(),
             tool.is_sensitive(),
+            tool.is_taint_sensitive(),
             pctx.taint_recent,
         );
         match resolved {
@@ -141,12 +147,13 @@ impl Registry {
                         "permission refusée pour « {} » (mode {:?})",
                         call.name, self.mode
                     ),
+                    ToolErrorKind::PermissionDenied,
                 );
             }
             Resolved::Ask => {
                 let req = PermissionRequest {
                     tool: call.name.clone(),
-                    reason: ask_reason(pctx.taint_recent, tool.is_sensitive()),
+                    reason: ask_reason(pctx.taint_recent, tool.is_taint_sensitive()),
                     input_summary: summarize(&call.input),
                     input: call.input.clone(),
                 };
@@ -162,6 +169,7 @@ impl Registry {
                     return err_outcome(
                         id,
                         format!("action « {} » refusée par l'utilisateur", call.name),
+                        ToolErrorKind::PermissionDenied,
                     );
                 }
             }
@@ -175,13 +183,18 @@ impl Registry {
                 if untrusted {
                     self.taint.mark();
                 }
-                err_outcome_tainted(id, "timeout outil dépassé".to_string(), untrusted)
+                err_outcome_tainted(
+                    id,
+                    ToolError::Timeout.to_string(),
+                    untrusted,
+                    ToolErrorKind::Timeout,
+                )
             }
             Ok(Err(e)) => {
                 if untrusted {
                     self.taint.mark();
                 }
-                err_outcome_tainted(id, e.to_string(), untrusted)
+                err_outcome_tainted(id, e.to_string(), untrusted, e.kind())
             }
             Ok(Ok(out)) => {
                 // 4. taint : une sortie untrusted vient d'entrer dans le contexte.
@@ -193,9 +206,50 @@ impl Registry {
                     content: out.content,
                     is_error: out.is_error,
                     untrusted,
+                    error_kind: out.is_error.then_some(ToolErrorKind::Semantic),
                 }
             }
         }
+    }
+
+    fn can_run_parallel_without_permission(&self, call: &ToolInvocation) -> bool {
+        let Some(tool) = self.tools.get(&call.name) else {
+            return false;
+        };
+        if !(tool.is_concurrency_safe() && tool.is_read_only() && !tool.is_taint_sensitive()) {
+            return false;
+        }
+        if tool.precheck(&call.input).is_err() {
+            return true;
+        }
+        let pctx = PermCtx {
+            mode: self.mode,
+            taint_recent: self.taint.is_recent(),
+        };
+        let resolved = resolve_permission(
+            self.mode,
+            tool.permission(&call.input, &pctx),
+            tool.is_read_only(),
+            tool.is_sensitive(),
+            tool.is_taint_sensitive(),
+            pctx.taint_recent,
+        );
+        !matches!(resolved, Resolved::Ask)
+    }
+
+    async fn run_parallel_segment(
+        &self,
+        segment: Vec<(usize, ToolInvocation)>,
+        events: ToolEventSink,
+    ) -> Vec<(usize, ToolOutcome)> {
+        stream::iter(segment)
+            .map(|(i, call)| {
+                let events = events.clone();
+                async move { (i, self.run_one(call, events).await) }
+            })
+            .buffer_unordered(CONCURRENCY)
+            .collect()
+            .await
     }
 }
 
@@ -209,40 +263,24 @@ impl ToolDispatch for Registry {
         // Nouveau cycle de dispatch : fait décroître la fenêtre de taint.
         self.taint.begin_cycle();
 
-        // Partition concurrent (read-only + concurrency-safe) vs série (le reste).
-        // On garde l'index d'origine pour restaurer l'ordre du batch.
-        let mut concurrent: Vec<(usize, ToolInvocation)> = Vec::new();
-        let mut serial: Vec<(usize, ToolInvocation)> = Vec::new();
-        for (i, call) in calls.into_iter().enumerate() {
-            let safe = self
-                .tools
-                .get(&call.name)
-                .is_some_and(|t| t.is_concurrency_safe() && t.is_read_only());
-            if safe {
-                concurrent.push((i, call));
-            } else {
-                serial.push((i, call));
-            }
-        }
-
         let mut indexed: Vec<(usize, ToolOutcome)> = Vec::new();
+        let mut segment: Vec<(usize, ToolInvocation)> = Vec::new();
 
-        // Batch concurrent : reads en parallèle (plafond 10). Ils peuvent marquer
-        // le taint AVANT que la phase série (mutations/Bash) ne vérifie ses
-        // permissions → la défense taint intra-batch est correcte.
-        let concurrent_results: Vec<(usize, ToolOutcome)> = stream::iter(concurrent)
-            .map(|(i, call)| {
-                let events = events.clone();
-                async move { (i, self.run_one(call, events).await) }
-            })
-            .buffer_unordered(CONCURRENCY)
-            .collect()
-            .await;
-        indexed.extend(concurrent_results);
-
-        // Batch série : mutations une par une.
-        for (i, call) in serial {
+        for (i, call) in calls.into_iter().enumerate() {
+            if self.can_run_parallel_without_permission(&call) {
+                segment.push((i, call));
+                continue;
+            }
+            if !segment.is_empty() {
+                indexed.extend(
+                    self.run_parallel_segment(std::mem::take(&mut segment), events.clone())
+                        .await,
+                );
+            }
             indexed.push((i, self.run_one(call, events.clone()).await));
+        }
+        if !segment.is_empty() {
+            indexed.extend(self.run_parallel_segment(segment, events.clone()).await);
         }
 
         // Restaure l'ordre du batch (transcripts/tests déterministes).
@@ -251,13 +289,18 @@ impl ToolDispatch for Registry {
     }
 }
 
-fn err_outcome(id: agent_core::message::ToolCallId, msg: String) -> ToolOutcome {
+fn err_outcome(
+    id: agent_core::message::ToolCallId,
+    msg: String,
+    error_kind: ToolErrorKind,
+) -> ToolOutcome {
     // Erreur de pipeline (refus/inconnu/parse) : contenu maison, non taché.
     ToolOutcome {
         id,
         content: msg,
         is_error: true,
         untrusted: false,
+        error_kind: Some(error_kind),
     }
 }
 
@@ -265,12 +308,14 @@ fn err_outcome_tainted(
     id: agent_core::message::ToolCallId,
     msg: String,
     untrusted: bool,
+    error_kind: ToolErrorKind,
 ) -> ToolOutcome {
     ToolOutcome {
         id,
         content: msg,
         is_error: true,
         untrusted,
+        error_kind: Some(error_kind),
     }
 }
 
@@ -286,10 +331,21 @@ fn ask_reason(taint_recent: bool, is_sensitive: bool) -> String {
 fn summarize(input: &serde_json::Value) -> String {
     let s = input.to_string();
     if s.len() > 200 {
-        format!("{}…", &s[..200])
+        format!("{}…", truncate_utf8_prefix(&s, 200))
     } else {
         s
     }
+}
+
+fn truncate_utf8_prefix(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Builder de `Registry`. L'`Approver` par défaut est `AutoDeny` (fail-closed :
@@ -325,16 +381,18 @@ impl RegistryBuilder {
         self.ctx.harden = Some(harden);
         self
     }
-    /// Enregistre un outil natif (boxé en `DynTool`). Un nom déjà présent est
-    /// remplacé.
+    /// Enregistre un outil natif (boxé en `DynTool`). Un nom déjà présent garde
+    /// le premier outil enregistré.
     pub fn register<T: crate::tool::Tool + 'static>(mut self, tool: T) -> Self {
         let dyn_tool = into_dyn(tool);
-        self.tools.insert(dyn_tool.name().to_string(), dyn_tool);
+        self.tools
+            .entry(dyn_tool.name().to_string())
+            .or_insert(dyn_tool);
         self
     }
     /// Enregistre un `DynTool` déjà boxé (ex. futur outil MCP).
     pub fn register_dyn(mut self, tool: Box<dyn DynTool>) -> Self {
-        self.tools.insert(tool.name().to_string(), tool);
+        self.tools.entry(tool.name().to_string()).or_insert(tool);
         self
     }
     pub fn build(self) -> Registry {

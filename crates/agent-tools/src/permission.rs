@@ -1,8 +1,8 @@
 //! Modèle de permissions (5 modes, ARCHITECTURE §4.4) + défense taint (§4.6,
 //! OWASP LLM01). La décision finale combine : le mode courant, la décision
 //! *baseline* propre à l'outil, sa nature (read-only / sensible), et la présence
-//! de **taint récent**. Une action sensible (destructive/réseau) déclenchée en
-//! présence de taint récent **force `Ask`** dans tous les modes sauf
+//! de **taint récent**. Une action mutante ou sensible déclenchée en présence de
+//! taint récent **force `Ask`** dans tous les modes sauf
 //! `BypassPermissions` (invariant 3).
 //!
 //! La frontière interactive est le trait `Approver` : le pipeline ne sait pas
@@ -64,13 +64,14 @@ pub enum Resolved {
 /// 1. `BypassPermissions` → toujours `Allow` (court-circuit total).
 /// 2. `Plan` → `Allow` si l'outil est read-only, sinon `Deny` (aucune mutation).
 /// 3. Sinon : on part de la baseline outil, on la met en forme selon le mode,
-///    puis le **taint** force `Ask` pour une action sensible (sauf Bypass, déjà
+///    puis le **taint** force `Ask` pour une action mutante/sensible (sauf Bypass, déjà
 ///    traité) — invariant 3 / §4.6.
 pub fn resolve_permission(
     mode: PermissionMode,
     baseline: PermissionDecision,
     is_read_only: bool,
     is_sensitive: bool,
+    is_taint_sensitive: bool,
     taint_recent: bool,
 ) -> Resolved {
     // 1. Bypass : court-circuit (même le taint ne s'applique pas).
@@ -109,10 +110,10 @@ pub fn resolve_permission(
         },
     };
 
-    // Taint : une action sensible en contexte taché force la confirmation, quel
+    // Taint : une action mutante/sensible en contexte taché force la confirmation, quel
     // que soit le mode (hors Bypass, déjà retourné). C'est la mitigation directe
     // de l'injection indirecte (§4.6).
-    if taint_recent && is_sensitive && shaped == Resolved::Allow {
+    if taint_recent && is_taint_sensitive && shaped == Resolved::Allow {
         return Resolved::Ask;
     }
     shaped
@@ -165,19 +166,21 @@ impl Approver for AutoDeny {
 mod tests {
     use super::*;
 
-    // Bash-like : sensible, mutant. Edit-like : non sensible, mutant. Read-like :
-    // read-only, non sensible.
-    const SENSITIVE: (bool, bool) = (/*read_only*/ false, /*sensitive*/ true);
-    const EDIT: (bool, bool) = (false, false);
-    const READ: (bool, bool) = (true, false);
+    // Bash-like : sensible, mutant. Edit-like : non sensible, mutant mais protégée
+    // par le taint. Read-like : read-only, non sensible.
+    const SENSITIVE: (bool, bool, bool) = (
+        /*read_only*/ false, /*sensitive*/ true, /*taint*/ true,
+    );
+    const EDIT: (bool, bool, bool) = (false, false, true);
+    const READ: (bool, bool, bool) = (true, false, false);
 
     fn res(
         mode: PermissionMode,
         base: PermissionDecision,
-        kind: (bool, bool),
+        kind: (bool, bool, bool),
         taint: bool,
     ) -> Resolved {
-        resolve_permission(mode, base, kind.0, kind.1, taint)
+        resolve_permission(mode, base, kind.0, kind.1, kind.2, taint)
     }
 
     #[test]
@@ -290,11 +293,28 @@ mod tests {
     }
 
     #[test]
-    fn taint_does_not_force_ask_on_nonsensitive() {
-        // Une édition (non sensible) reste auto-acceptée même tachée : le taint
-        // ne vise que les actions destructive/réseau.
+    fn taint_forces_ask_on_edits_without_breaking_accept_edits() {
+        // Une édition reste auto-acceptée sans taint.
+        assert_eq!(
+            res(
+                PermissionMode::AcceptEdits,
+                PermissionDecision::Ask,
+                EDIT,
+                false
+            ),
+            Resolved::Allow
+        );
+        // Mais le taint protège aussi les mutations non sensibles au sens normal.
         assert_eq!(
             res(PermissionMode::DontAsk, PermissionDecision::Ask, EDIT, true),
+            Resolved::Ask
+        );
+    }
+
+    #[test]
+    fn taint_does_not_force_ask_on_read_only_tools() {
+        assert_eq!(
+            res(PermissionMode::DontAsk, PermissionDecision::Ask, READ, true),
             Resolved::Allow
         );
     }
