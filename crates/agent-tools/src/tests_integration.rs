@@ -15,7 +15,9 @@ use serde::Deserialize;
 use crate::error::ToolError;
 use crate::permission::{Approver, PermCtx, PermissionDecision, PermissionMode, PermissionRequest};
 use crate::registry::Registry;
-use crate::tool::{Tool, ToolCtx, ToolOutput};
+use crate::tool::{
+    MAX_COMMAND_BYTES, MAX_EDIT_FILE_BYTES, MAX_WRITE_BYTES, Tool, ToolCtx, ToolOutput,
+};
 use crate::{Bash, Edit, Glob, Grep, Read, Write};
 
 // ───────────────────────── helpers ─────────────────────────
@@ -50,6 +52,28 @@ impl TempWs {
 impl Drop for TempWs {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn symlink_file_for_test(src: &std::path::Path, dst: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(src, dst).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(src, dst).is_ok()
+    }
+}
+
+fn symlink_dir_for_test(src: &std::path::Path, dst: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(src, dst).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(src, dst).is_ok()
     }
 }
 
@@ -730,6 +754,34 @@ async fn read_missing_and_binary_files_error_cleanly() {
 }
 
 #[tokio::test]
+async fn read_rejects_symlink_escape() {
+    let ws = TempWs::new("read-symlink");
+    let outside =
+        std::env::temp_dir().join(format!("pyxis-tools-outside-read-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "SECRET\n").unwrap();
+    if !symlink_file_for_test(&outside.join("secret.txt"), &ws.path().join("leak.txt")) {
+        let _ = std::fs::remove_dir_all(&outside);
+        return;
+    }
+
+    let reg = read_registry(&ws);
+    let out = reg
+        .dispatch(vec![call(
+            "a",
+            "read",
+            serde_json::json!({"path": "leak.txt"}),
+        )])
+        .await;
+    let o = by_id(&out, "a");
+    assert!(o.is_error);
+    assert_eq!(o.error_kind, Some(ToolErrorKind::OutsideWorkspace));
+    assert!(!o.content.contains("SECRET"));
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[tokio::test]
 async fn glob_lists_matching_files() {
     // US-011 AC2 : motif → correspondances.
     let ws = TempWs::new("glob");
@@ -749,6 +801,34 @@ async fn glob_lists_matching_files() {
     assert!(o.content.contains("src/a.rs"));
     assert!(o.content.contains("src/b.rs"));
     assert!(!o.content.contains("README.md"));
+}
+
+#[tokio::test]
+async fn glob_rejects_symlink_base_escape() {
+    let ws = TempWs::new("glob-symlink");
+    let outside =
+        std::env::temp_dir().join(format!("pyxis-tools-outside-glob-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.rs"), "fn secret() {}\n").unwrap();
+    if !symlink_dir_for_test(&outside, &ws.path().join("outlink")) {
+        let _ = std::fs::remove_dir_all(&outside);
+        return;
+    }
+
+    let reg = read_registry(&ws);
+    let out = reg
+        .dispatch(vec![call(
+            "a",
+            "glob",
+            serde_json::json!({"pattern": "**/*.rs", "path": "outlink"}),
+        )])
+        .await;
+    let o = by_id(&out, "a");
+    assert!(o.is_error);
+    assert_eq!(o.error_kind, Some(ToolErrorKind::OutsideWorkspace));
+    assert!(!o.content.contains("secret.rs"));
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 #[tokio::test]
@@ -772,6 +852,34 @@ async fn grep_returns_matches_with_location() {
         o.content
     );
     assert!(o.content.contains("fn target"));
+}
+
+#[tokio::test]
+async fn grep_rejects_symlink_base_escape() {
+    let ws = TempWs::new("grep-symlink");
+    let outside =
+        std::env::temp_dir().join(format!("pyxis-tools-outside-grep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "SECRET\n").unwrap();
+    if !symlink_dir_for_test(&outside, &ws.path().join("outlink")) {
+        let _ = std::fs::remove_dir_all(&outside);
+        return;
+    }
+
+    let reg = read_registry(&ws);
+    let out = reg
+        .dispatch(vec![call(
+            "a",
+            "grep",
+            serde_json::json!({"pattern": "SECRET", "path": "outlink"}),
+        )])
+        .await;
+    let o = by_id(&out, "a");
+    assert!(o.is_error);
+    assert_eq!(o.error_kind, Some(ToolErrorKind::OutsideWorkspace));
+    assert!(!o.content.contains("SECRET"));
+    let _ = std::fs::remove_dir_all(&outside);
 }
 
 // ══════════════════════════ US-012 ══════════════════════════
@@ -800,6 +908,51 @@ async fn write_creates_file_in_workspace() {
         .await;
     assert!(!by_id(&out, "a").is_error, "{}", by_id(&out, "a").content);
     assert_eq!(ws.read("out/hello.txt"), "salut");
+}
+
+#[tokio::test]
+async fn write_rejects_symlink_target_escape() {
+    let ws = TempWs::new("write-symlink");
+    let outside =
+        std::env::temp_dir().join(format!("pyxis-tools-outside-write-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(&outside).unwrap();
+    let external = outside.join("target.txt");
+    std::fs::write(&external, "safe").unwrap();
+    if !symlink_file_for_test(&external, &ws.path().join("link.txt")) {
+        let _ = std::fs::remove_dir_all(&outside);
+        return;
+    }
+
+    let reg = mut_registry(&ws, PermissionMode::AcceptEdits);
+    let out = reg
+        .dispatch(vec![call(
+            "a",
+            "write",
+            serde_json::json!({"path": "link.txt", "content": "pwned"}),
+        )])
+        .await;
+    let o = by_id(&out, "a");
+    assert!(o.is_error);
+    assert_eq!(std::fs::read_to_string(&external).unwrap(), "safe");
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[tokio::test]
+async fn write_rejects_oversized_content() {
+    let ws = TempWs::new("write-huge");
+    let reg = mut_registry(&ws, PermissionMode::AcceptEdits);
+    let out = reg
+        .dispatch(vec![call(
+            "a",
+            "write",
+            serde_json::json!({"path": "huge.txt", "content": "x".repeat(MAX_WRITE_BYTES + 1)}),
+        )])
+        .await;
+    let o = by_id(&out, "a");
+    assert!(o.is_error);
+    assert_eq!(o.error_kind, Some(ToolErrorKind::Validation));
+    assert!(!ws.path().join("huge.txt").exists());
 }
 
 #[tokio::test]
@@ -840,6 +993,51 @@ async fn edit_unique_anchor_replaces_ambiguous_fails() {
 }
 
 #[tokio::test]
+async fn edit_rejects_symlink_target_escape() {
+    let ws = TempWs::new("edit-symlink");
+    let outside =
+        std::env::temp_dir().join(format!("pyxis-tools-outside-edit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&outside);
+    std::fs::create_dir_all(&outside).unwrap();
+    let external = outside.join("target.txt");
+    std::fs::write(&external, "safe UNIQUE\n").unwrap();
+    if !symlink_file_for_test(&external, &ws.path().join("link.txt")) {
+        let _ = std::fs::remove_dir_all(&outside);
+        return;
+    }
+
+    let reg = mut_registry(&ws, PermissionMode::AcceptEdits);
+    let out = reg
+        .dispatch(vec![call(
+            "a",
+            "edit",
+            serde_json::json!({"path": "link.txt", "old_string": "UNIQUE", "new_string": "pwned"}),
+        )])
+        .await;
+    let o = by_id(&out, "a");
+    assert!(o.is_error);
+    assert_eq!(std::fs::read_to_string(&external).unwrap(), "safe UNIQUE\n");
+    let _ = std::fs::remove_dir_all(&outside);
+}
+
+#[tokio::test]
+async fn edit_rejects_oversized_target_file() {
+    let ws = TempWs::new("edit-huge");
+    ws.write("huge.txt", &"x".repeat(MAX_EDIT_FILE_BYTES as usize + 1));
+    let reg = mut_registry(&ws, PermissionMode::AcceptEdits);
+    let out = reg
+        .dispatch(vec![call(
+            "a",
+            "edit",
+            serde_json::json!({"path": "huge.txt", "old_string": "x", "new_string": "y"}),
+        )])
+        .await;
+    let o = by_id(&out, "a");
+    assert!(o.is_error);
+    assert!(o.content.contains("trop volumineux"));
+}
+
+#[tokio::test]
 async fn bash_captures_output_untrusted() {
     // US-012 AC2 : tourne sous timeout, stdout/stderr capturés, untrusted.
     let ws = TempWs::new("bash");
@@ -872,6 +1070,47 @@ async fn bash_nonzero_exit_is_error_but_keeps_output() {
     assert!(o.is_error);
     assert!(o.content.contains("oops"));
     assert!(o.content.contains("3"));
+}
+
+#[tokio::test]
+async fn bash_timeout_is_reported_by_bash_cleanup_path() {
+    let ws = TempWs::new("bash-timeout");
+    let reg = Registry::builder(ws.path())
+        .mode(PermissionMode::BypassPermissions)
+        .approver(allow_approver())
+        .timeout(std::time::Duration::from_millis(50))
+        .register(Bash)
+        .build();
+    #[cfg(windows)]
+    let command = "Start-Sleep -Milliseconds 500";
+    #[cfg(not(windows))]
+    let command = "sleep 1";
+    let out = reg
+        .dispatch(vec![call(
+            "a",
+            "bash",
+            serde_json::json!({"command": command}),
+        )])
+        .await;
+    let o = by_id(&out, "a");
+    assert!(o.is_error);
+    assert!(o.content.contains("timeout outil dépassé"), "{}", o.content);
+}
+
+#[tokio::test]
+async fn bash_rejects_oversized_command() {
+    let ws = TempWs::new("bash-huge");
+    let reg = mut_registry(&ws, PermissionMode::BypassPermissions);
+    let out = reg
+        .dispatch(vec![call(
+            "a",
+            "bash",
+            serde_json::json!({"command": "x".repeat(MAX_COMMAND_BYTES + 1)}),
+        )])
+        .await;
+    let o = by_id(&out, "a");
+    assert!(o.is_error);
+    assert_eq!(o.error_kind, Some(ToolErrorKind::Validation));
 }
 
 #[tokio::test]
@@ -1204,6 +1443,29 @@ async fn default_registry_exposes_six_tool_specs() {
     for spec in specs {
         spec.validate().unwrap();
     }
+}
+
+#[tokio::test]
+async fn optional_tool_schema_fields_are_not_required() {
+    let reg = crate::default_registry("/tmp", PermissionMode::Default, allow_approver());
+    let specs = reg.tool_specs();
+    let required = |name: &str| {
+        specs
+            .iter()
+            .find(|s| s.name == name)
+            .and_then(|s| s.input_schema.get("required"))
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap()
+    };
+    assert_eq!(required("read"), vec!["path"]);
+    assert_eq!(required("glob"), vec!["pattern"]);
+    assert_eq!(required("grep"), vec!["pattern"]);
 }
 
 #[tokio::test]

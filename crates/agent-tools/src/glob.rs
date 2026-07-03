@@ -7,7 +7,7 @@ use serde::Deserialize;
 use walkdir::WalkDir;
 
 use crate::error::{ToolError, ValidationError};
-use crate::path::confine;
+use crate::path::{confine, ensure_existing_path_no_links};
 use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{Tool, ToolCtx, ToolOutput};
 
@@ -46,7 +46,7 @@ impl Tool for Glob {
                 "pattern": { "type": "string", "description": "Motif glob, ex. **/*.rs" },
                 "path": { "type": ["string", "null"], "description": "Sous-dossier de base (relatif au workspace), ou null." }
             },
-            "required": ["pattern", "path"],
+            "required": ["pattern"],
             "additionalProperties": false
         })
     }
@@ -76,6 +76,7 @@ impl Tool for Glob {
             Some(p) => confine(&ctx.workspace, p)?,
             None => ctx.workspace.clone(),
         };
+        ensure_existing_path_no_links(&ctx.workspace, &base, input.path.as_deref().unwrap_or("."))?;
         let workspace = ctx.workspace.clone();
         let pattern = input.pattern.clone();
 

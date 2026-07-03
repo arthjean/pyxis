@@ -9,7 +9,7 @@ use serde::Deserialize;
 use walkdir::WalkDir;
 
 use crate::error::{ToolError, ValidationError};
-use crate::path::confine;
+use crate::path::{confine, ensure_existing_path_no_links};
 use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{Tool, ToolCtx, ToolOutput};
 
@@ -57,7 +57,7 @@ impl Tool for Grep {
                 "path": { "type": ["string", "null"], "description": "Base de recherche (relative au workspace), ou null." },
                 "glob": { "type": ["string", "null"], "description": "Filtre glob sur les noms de fichiers, ex. *.rs, ou null." }
             },
-            "required": ["pattern", "path", "glob"],
+            "required": ["pattern"],
             "additionalProperties": false
         })
     }
@@ -100,6 +100,7 @@ impl Tool for Grep {
             Some(p) => confine(&ctx.workspace, p)?,
             None => ctx.workspace.clone(),
         };
+        ensure_existing_path_no_links(&ctx.workspace, &base, input.path.as_deref().unwrap_or("."))?;
         let workspace = ctx.workspace.clone();
 
         let (lines, truncated) = tokio::task::spawn_blocking(move || {

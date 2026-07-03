@@ -199,7 +199,7 @@ impl ToolSpec {
                 });
             }
         };
-        if property_names != required_names {
+        if !required_names.is_subset(&property_names) {
             return Err(ToolSpecValidationError::RequiredMustMatchProperties {
                 tool: self.name.clone(),
             });
@@ -500,5 +500,23 @@ mod tests {
             req.validate(),
             Err(CanonicalRequestValidationError::DuplicateToolName { tool }) if tool == "read"
         ));
+    }
+
+    #[test]
+    fn tool_schema_required_may_be_subset_of_properties() {
+        let spec = ToolSpec {
+            name: "read".into(),
+            description: "lit".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "offset": { "type": ["integer", "null"] }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        };
+        spec.validate().unwrap();
     }
 }

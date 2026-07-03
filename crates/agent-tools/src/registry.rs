@@ -188,7 +188,9 @@ impl Registry {
 
         // 3. call() sous timeout (un outil qui pend ne bloque pas la boucle).
         let untrusted = tool.returns_untrusted();
-        match tokio::time::timeout(self.ctx.timeout, tool.invoke(call.input, &self.ctx)).await {
+        match tokio::time::timeout(tool.timeout(&self.ctx), tool.invoke(call.input, &self.ctx))
+            .await
+        {
             Err(_elapsed) => {
                 if untrusted {
                     self.taint.mark();

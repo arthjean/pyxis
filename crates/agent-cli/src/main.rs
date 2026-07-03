@@ -200,7 +200,7 @@ fn run_config_from_args(args: &Args) -> anyhow::Result<RunConfig> {
     })
 }
 
-fn permission_policy(headless: bool, yes: bool, sandbox_enforced: bool) -> CliPermissionPolicy {
+fn permission_policy(headless: bool, yes: bool, _sandbox_enforced: bool) -> CliPermissionPolicy {
     if !headless {
         return CliPermissionPolicy {
             mode: PermissionMode::Default,
@@ -215,7 +215,7 @@ fn permission_policy(headless: bool, yes: bool, sandbox_enforced: bool) -> CliPe
     }
     CliPermissionPolicy {
         mode: PermissionMode::AcceptEdits,
-        auto_approve_routine: sandbox_enforced,
+        auto_approve_routine: false,
     }
 }
 
@@ -606,10 +606,10 @@ mod tests {
     }
 
     #[test]
-    fn headless_yes_accepts_routine_only_when_sandbox_enforced() {
+    fn headless_yes_accepts_edits_but_not_sensitive_actions() {
         let p = permission_policy(true, true, true);
         assert_eq!(p.mode, agent_tools::permission::PermissionMode::AcceptEdits);
-        assert!(p.auto_approve_routine);
+        assert!(!p.auto_approve_routine);
     }
 
     #[test]

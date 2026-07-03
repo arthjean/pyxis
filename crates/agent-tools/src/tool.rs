@@ -17,6 +17,14 @@ use serde::de::DeserializeOwned;
 use crate::error::{ToolError, ValidationError};
 use crate::permission::{PermCtx, PermissionDecision};
 
+/// Plafonds globaux des outils natifs. Ces limites bornent les allocations avant
+/// qu'un payload modèle puisse devenir un problème mémoire ou disque.
+pub const MAX_TOOL_INPUT_BYTES: usize = 4_000_000;
+pub const MAX_WRITE_BYTES: usize = 2_000_000;
+pub const MAX_EDIT_FILE_BYTES: u64 = 5_000_000;
+pub const MAX_EDIT_ANCHOR_BYTES: usize = 200_000;
+pub const MAX_COMMAND_BYTES: usize = 16_000;
+
 /// Durcissement opaque d'une commande shell (Bash) : closure injectée par
 /// l'agent-cli, qui applique le sandbox réseau (env `HTTP_PROXY`). Opaque ici
 /// pour garder `agent-tools` découplé d'`agent-sandbox` ; le confinement FS
@@ -33,6 +41,8 @@ pub struct ToolCtx {
     pub workspace: PathBuf,
     /// Timeout appliqué par le Registry autour de `call()`.
     pub timeout: Duration,
+    /// Marge accordée aux outils qui doivent nettoyer après leur timeout interne.
+    pub cleanup_grace: Duration,
     /// Durcissement de commande (sandbox réseau Bash), injecté par l'agent-cli.
     pub harden: Option<CommandHardener>,
 }
@@ -42,6 +52,7 @@ impl std::fmt::Debug for ToolCtx {
         f.debug_struct("ToolCtx")
             .field("workspace", &self.workspace)
             .field("timeout", &self.timeout)
+            .field("cleanup_grace", &self.cleanup_grace)
             .field("harden", &self.harden.as_ref().map(|_| "<fn>"))
             .finish()
     }
@@ -52,6 +63,7 @@ impl ToolCtx {
         Self {
             workspace: workspace.into(),
             timeout: Duration::from_secs(120),
+            cleanup_grace: Duration::from_secs(2),
             harden: None,
         }
     }
@@ -148,6 +160,12 @@ pub trait Tool: Send + Sync {
         PermissionDecision::Ask
     }
 
+    /// Timeout externe appliqué par le Registry. Les outils qui gèrent un timeout
+    /// interne, comme `bash`, peuvent demander une marge pour nettoyer.
+    fn timeout(&self, ctx: &ToolCtx) -> Duration {
+        ctx.timeout
+    }
+
     /// Exécution. Le Registry l'enveloppe déjà dans un `timeout` : un `call` qui
     /// pend ne bloque pas la boucle.
     async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError>;
@@ -172,6 +190,7 @@ pub trait DynTool: Send + Sync {
     fn precheck(&self, raw: &serde_json::Value) -> Result<(), ToolError>;
     /// Décision baseline de l'outil (raw déjà validé par `precheck`).
     fn permission(&self, raw: &serde_json::Value, ctx: &PermCtx) -> PermissionDecision;
+    fn timeout(&self, ctx: &ToolCtx) -> Duration;
     /// Parse + `call`. Enveloppé dans un timeout par le Registry.
     async fn invoke(&self, raw: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError>;
 }
@@ -217,6 +236,12 @@ impl<T: Tool> DynTool for DynToolAdapter<T> {
         self.inner.behavioral_guidelines()
     }
     fn precheck(&self, raw: &serde_json::Value) -> Result<(), ToolError> {
+        let estimated = estimate_json_bytes(raw);
+        if estimated > MAX_TOOL_INPUT_BYTES {
+            return Err(ToolError::Validation(ValidationError::new(format!(
+                "entrée outil trop volumineuse: {estimated} octets estimés > {MAX_TOOL_INPUT_BYTES}"
+            ))));
+        }
         let input: T::Input =
             serde_json::from_value(raw.clone()).map_err(|e| ToolError::Parse(e.to_string()))?;
         self.inner.validate_input(&input)?;
@@ -230,6 +255,9 @@ impl<T: Tool> DynTool for DynToolAdapter<T> {
             Err(_) => PermissionDecision::Deny,
         }
     }
+    fn timeout(&self, ctx: &ToolCtx) -> Duration {
+        self.inner.timeout(ctx)
+    }
     async fn invoke(&self, raw: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let input: T::Input =
             serde_json::from_value(raw).map_err(|e| ToolError::Parse(e.to_string()))?;
@@ -240,4 +268,18 @@ impl<T: Tool> DynTool for DynToolAdapter<T> {
 /// Boîte un outil natif en `DynTool` prêt pour le Registry.
 pub fn into_dyn<T: Tool + 'static>(tool: T) -> Box<dyn DynTool> {
     Box::new(DynToolAdapter::new(tool))
+}
+
+fn estimate_json_bytes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null => 4,
+        serde_json::Value::Bool(_) => 5,
+        serde_json::Value::Number(n) => n.to_string().len(),
+        serde_json::Value::String(s) => s.len(),
+        serde_json::Value::Array(items) => items.iter().map(estimate_json_bytes).sum(),
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| key.len() + estimate_json_bytes(value))
+            .sum(),
+    }
 }

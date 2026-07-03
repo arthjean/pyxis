@@ -11,9 +11,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::error::{ToolError, ValidationError};
-use crate::path::{confine, ensure_real_path_confined};
+use crate::path::{confine, ensure_existing_path_no_links, replace_file_confined};
 use crate::permission::{PermCtx, PermissionDecision};
-use crate::tool::{Tool, ToolCtx, ToolOutput};
+use crate::tool::{MAX_EDIT_ANCHOR_BYTES, MAX_EDIT_FILE_BYTES, Tool, ToolCtx, ToolOutput};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,6 +76,18 @@ impl Tool for Edit {
                 "old_string == new_string : édition sans effet",
             ));
         }
+        if input.old_string.len() > MAX_EDIT_ANCHOR_BYTES {
+            return Err(ValidationError::new(format!(
+                "old_string trop volumineux: {} octets > {MAX_EDIT_ANCHOR_BYTES}",
+                input.old_string.len()
+            )));
+        }
+        if input.new_string.len() > MAX_EDIT_ANCHOR_BYTES {
+            return Err(ValidationError::new(format!(
+                "new_string trop volumineux: {} octets > {MAX_EDIT_ANCHOR_BYTES}",
+                input.new_string.len()
+            )));
+        }
         Ok(())
     }
     fn permission(&self, _input: &Self::Input, _ctx: &PermCtx) -> PermissionDecision {
@@ -84,7 +96,17 @@ impl Tool for Edit {
 
     async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let path = confine(&ctx.workspace, &input.path)?;
-        ensure_real_path_confined(&ctx.workspace, &path, &input.path)?;
+        ensure_existing_path_no_links(&ctx.workspace, &path, &input.path)?;
+        let meta = tokio::fs::metadata(&path)
+            .await
+            .map_err(|e| ToolError::Io(format!("{}: {e}", input.path)))?;
+        if meta.len() > MAX_EDIT_FILE_BYTES {
+            return Err(ToolError::Rejected(format!(
+                "{} est trop volumineux pour edit: {} octets > {MAX_EDIT_FILE_BYTES}",
+                input.path,
+                meta.len()
+            )));
+        }
         let content = tokio::fs::read_to_string(&path)
             .await
             .map_err(|e| ToolError::Io(format!("{}: {e}", input.path)))?;
@@ -114,10 +136,7 @@ impl Tool for Edit {
             }
         };
 
-        ensure_real_path_confined(&ctx.workspace, &path, &input.path)?;
-        tokio::fs::write(&path, updated.as_bytes())
-            .await
-            .map_err(|e| ToolError::Io(format!("{}: {e}", input.path)))?;
+        replace_file_confined(&ctx.workspace, &path, &input.path, updated.as_bytes()).await?;
         Ok(ToolOutput::text(format!(
             "Édité : {} ({})",
             input.path,

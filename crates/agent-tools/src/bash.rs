@@ -10,7 +10,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::error::{ToolError, ValidationError};
 use crate::permission::{PermCtx, PermissionDecision};
-use crate::tool::{Tool, ToolCtx, ToolOutput};
+use crate::tool::{MAX_COMMAND_BYTES, Tool, ToolCtx, ToolOutput};
 
 /// Borne de capture (évite un flood de prompt sur une sortie géante).
 const MAX_OUTPUT: usize = 30_000;
@@ -64,10 +64,21 @@ impl Tool for Bash {
         if input.command.trim().is_empty() {
             return Err(ValidationError::new("commande vide"));
         }
+        let bytes = input.command.len();
+        if bytes > MAX_COMMAND_BYTES {
+            return Err(ValidationError::new(format!(
+                "commande trop longue: {bytes} octets > {MAX_COMMAND_BYTES}"
+            )));
+        }
         Ok(())
     }
     fn permission(&self, _input: &Self::Input, _ctx: &PermCtx) -> PermissionDecision {
         PermissionDecision::Ask
+    }
+    fn timeout(&self, ctx: &ToolCtx) -> std::time::Duration {
+        ctx.timeout
+            .checked_add(ctx.cleanup_grace)
+            .unwrap_or(ctx.timeout)
     }
 
     async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
@@ -128,31 +139,40 @@ impl Tool for Bash {
             }
         });
 
-        let inner_timeout = ctx
-            .timeout
-            .checked_sub(std::time::Duration::from_millis(25))
-            .unwrap_or(ctx.timeout);
-        let (status, timed_out) = match tokio::time::timeout(inner_timeout, child.wait()).await {
+        let mut cleanup_timed_out = false;
+        let (status, timed_out) = match tokio::time::timeout(ctx.timeout, child.wait()).await {
             Ok(res) => (
                 Some(res.map_err(|e| ToolError::Io(format!("attente du shell: {e}")))?),
                 false,
             ),
             Err(_) => {
-                if let Some(pid) = pid {
-                    kill_process_tree(pid).await;
-                }
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                let cleanup = async {
+                    if let Some(pid) = pid {
+                        kill_process_tree(pid).await;
+                    }
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                };
+                cleanup_timed_out = tokio::time::timeout(ctx.cleanup_grace, cleanup)
+                    .await
+                    .is_err();
                 (None, true)
             }
         };
 
-        let stdout = stdout_task
-            .await
-            .map_err(|e| ToolError::Io(format!("lecture stdout: {e}")))?;
-        let stderr = stderr_task
-            .await
-            .map_err(|e| ToolError::Io(format!("lecture stderr: {e}")))?;
+        let (stdout, stderr) = if cleanup_timed_out {
+            stdout_task.abort();
+            stderr_task.abort();
+            (Capture::default(), Capture::default())
+        } else {
+            let stdout = stdout_task
+                .await
+                .map_err(|e| ToolError::Io(format!("lecture stdout: {e}")))?;
+            let stderr = stderr_task
+                .await
+                .map_err(|e| ToolError::Io(format!("lecture stderr: {e}")))?;
+            (stdout, stderr)
+        };
 
         let mut body = String::new();
         let stdout_text = String::from_utf8_lossy(&stdout.bytes);
@@ -187,6 +207,9 @@ impl Tool for Bash {
                 body.push('\n');
             }
             body.push_str("[timeout outil dépassé]");
+            if cleanup_timed_out {
+                body.push_str("\n[cleanup process-tree incomplet après timeout]");
+            }
             return Ok(ToolOutput::error(body));
         }
 

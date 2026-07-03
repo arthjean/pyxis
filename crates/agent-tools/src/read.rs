@@ -4,9 +4,10 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use tokio::io::AsyncReadExt;
 
 use crate::error::ToolError;
-use crate::path::confine;
+use crate::path::{confine, ensure_existing_path_no_links};
 use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{Tool, ToolCtx, ToolOutput};
 
@@ -50,7 +51,7 @@ impl Tool for Read {
                 "offset": { "type": ["integer", "null"], "minimum": 1, "description": "Ligne de départ (1-indexée), ou null." },
                 "limit": { "type": ["integer", "null"], "minimum": 1, "description": "Nombre de lignes maximum, ou null." }
             },
-            "required": ["path", "offset", "limit"],
+            "required": ["path"],
             "additionalProperties": false
         })
     }
@@ -69,7 +70,12 @@ impl Tool for Read {
 
     async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let path = confine(&ctx.workspace, &input.path)?;
-        let meta = tokio::fs::metadata(&path)
+        ensure_existing_path_no_links(&ctx.workspace, &path, &input.path)?;
+        let file = tokio::fs::File::open(&path)
+            .await
+            .map_err(|e| ToolError::Io(format!("{}: {e}", input.path)))?;
+        let meta = file
+            .metadata()
             .await
             .map_err(|e| ToolError::Io(format!("{}: {e}", input.path)))?;
         if meta.is_dir() {
@@ -78,7 +84,9 @@ impl Tool for Read {
                 input.path
             )));
         }
-        let bytes = tokio::fs::read(&path)
+        let mut bytes = Vec::new();
+        file.take((MAX_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
             .await
             .map_err(|e| ToolError::Io(format!("{}: {e}", input.path)))?;
         if bytes.contains(&0) {
@@ -89,20 +97,14 @@ impl Tool for Read {
         }
         // US-026 : au-delà de MAX_BYTES, lecture PARTIELLE (tête du fichier, coupée
         // sur une frontière de caractère) + hint de pagination, au lieu d'un rejet sec.
-        let full = String::from_utf8_lossy(&bytes);
         let oversize = bytes.len() > MAX_BYTES;
-        let text: &str = if oversize {
-            let mut cut = MAX_BYTES;
-            while cut > 0 && !full.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            &full[..cut]
-        } else {
-            full.as_ref()
-        };
+        if oversize {
+            bytes.truncate(MAX_BYTES);
+        }
+        let full = String::from_utf8_lossy(&bytes);
         let start = input.offset.unwrap_or(1).max(1);
         Ok(ToolOutput::text(render_read(
-            text,
+            full.as_ref(),
             start,
             input.limit,
             oversize,

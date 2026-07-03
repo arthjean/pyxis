@@ -5,10 +5,10 @@
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use crate::error::ToolError;
-use crate::path::{confine, ensure_existing_ancestor_confined, ensure_real_path_confined};
+use crate::error::{ToolError, ValidationError};
+use crate::path::{confine, replace_file_confined};
 use crate::permission::{PermCtx, PermissionDecision};
-use crate::tool::{Tool, ToolCtx, ToolOutput};
+use crate::tool::{MAX_WRITE_BYTES, Tool, ToolCtx, ToolOutput};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,23 +55,23 @@ impl Tool for Write {
     fn returns_untrusted(&self) -> bool {
         false
     }
+    fn validate_input(&self, input: &Self::Input) -> Result<(), ValidationError> {
+        let bytes = input.content.len();
+        if bytes > MAX_WRITE_BYTES {
+            return Err(ValidationError::new(format!(
+                "content trop volumineux: {bytes} octets > {MAX_WRITE_BYTES}"
+            )));
+        }
+        Ok(())
+    }
     fn permission(&self, _input: &Self::Input, _ctx: &PermCtx) -> PermissionDecision {
         PermissionDecision::Ask
     }
 
     async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let path = confine(&ctx.workspace, &input.path)?;
-        if let Some(parent) = path.parent() {
-            ensure_existing_ancestor_confined(&ctx.workspace, parent, &input.path)?;
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| ToolError::Io(format!("création du dossier parent: {e}")))?;
-        }
-        ensure_real_path_confined(&ctx.workspace, &path, &input.path)?;
         let bytes = input.content.len();
-        tokio::fs::write(&path, input.content.as_bytes())
-            .await
-            .map_err(|e| ToolError::Io(format!("{}: {e}", input.path)))?;
+        replace_file_confined(&ctx.workspace, &path, &input.path, input.content.as_bytes()).await?;
         Ok(ToolOutput::text(format!(
             "Fichier écrit : {} ({bytes} octets)",
             input.path

@@ -101,6 +101,164 @@ pub fn ensure_real_path_confined(
     Ok(())
 }
 
+/// Vérifie que tous les composants existants de `target` sont des chemins réels
+/// sous le workspace, sans symlink ni reparse point. Les outils natifs refusent
+/// volontairement les liens pour éviter qu'un checkout contrôle l'accès à des
+/// fichiers hors workspace.
+pub fn ensure_existing_path_no_links(
+    workspace: &Path,
+    target: &Path,
+    display_path: &str,
+) -> Result<(), ToolError> {
+    walk_existing_components(workspace, target, display_path, false)?;
+    ensure_real_path_confined(workspace, target, display_path)
+}
+
+/// Vérifie un chemin à créer ou remplacer. Les parents existants ne doivent pas
+/// contenir de liens ; la cible est vérifiée aussi si elle existe déjà.
+pub fn ensure_creatable_path_no_links(
+    workspace: &Path,
+    target: &Path,
+    display_path: &str,
+) -> Result<(), ToolError> {
+    walk_existing_components(workspace, target, display_path, true)?;
+    ensure_real_path_confined(workspace, target, display_path)
+}
+
+/// Remplace un fichier par un contenu borné sans écrire à travers un symlink
+/// final. Le fichier temporaire est créé dans le même parent avec `create_new`,
+/// puis renommé sur la cible après une dernière vérification.
+pub async fn replace_file_confined(
+    workspace: &Path,
+    target: &Path,
+    display_path: &str,
+    bytes: &[u8],
+) -> Result<(), ToolError> {
+    if let Some(parent) = target.parent() {
+        ensure_existing_ancestor_confined(workspace, parent, display_path)?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| ToolError::Io(format!("création du dossier parent: {e}")))?;
+        ensure_existing_path_no_links(workspace, parent, display_path)?;
+    }
+    ensure_creatable_path_no_links(workspace, target, display_path)?;
+
+    let parent = target
+        .parent()
+        .ok_or_else(|| ToolError::OutsideWorkspace(display_path.into()))?;
+    let stem = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp = parent.join(format!(".{stem}.pyxis-tmp-{}-{nonce}", std::process::id()));
+
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .await
+            .map_err(|e| ToolError::Io(format!("{}: {e}", tmp.display())))?;
+        file.write_all(bytes)
+            .await
+            .map_err(|e| ToolError::Io(format!("{}: {e}", tmp.display())))?;
+        file.flush()
+            .await
+            .map_err(|e| ToolError::Io(format!("{}: {e}", tmp.display())))?;
+    }
+
+    ensure_creatable_path_no_links(workspace, target, display_path)?;
+    match std::fs::symlink_metadata(target) {
+        Ok(meta) => {
+            if is_link_like(&meta) {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(ToolError::OutsideWorkspace(display_path.into()));
+            }
+            if meta.is_dir() {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(ToolError::Rejected(format!(
+                    "{display_path} est un répertoire, pas un fichier"
+                )));
+            }
+            tokio::fs::remove_file(target)
+                .await
+                .map_err(|e| ToolError::Io(format!("{}: {e}", target.display())))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(ToolError::Io(format!("{}: {e}", target.display())));
+        }
+    }
+
+    tokio::fs::rename(&tmp, target).await.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        ToolError::Io(format!("{}: {e}", display_path))
+    })?;
+    Ok(())
+}
+
+fn walk_existing_components(
+    workspace: &Path,
+    target: &Path,
+    display_path: &str,
+    allow_missing_leaf: bool,
+) -> Result<(), ToolError> {
+    let root_lex = lexical_normalize(workspace);
+    let root_real =
+        std::fs::canonicalize(workspace).map_err(|e| ToolError::Io(format!("workspace: {e}")))?;
+    let rel = target
+        .strip_prefix(&root_lex)
+        .map_err(|_| ToolError::OutsideWorkspace(display_path.into()))?;
+    let mut probe = root_real.clone();
+    let components: Vec<_> = rel.components().collect();
+    for (idx, comp) in components.iter().enumerate() {
+        probe.push(comp.as_os_str());
+        match std::fs::symlink_metadata(&probe) {
+            Ok(meta) => {
+                if is_link_like(&meta) {
+                    return Err(ToolError::OutsideWorkspace(display_path.into()));
+                }
+                let real = std::fs::canonicalize(&probe)
+                    .map_err(|e| ToolError::Io(format!("{}: {e}", probe.display())))?;
+                if !real.starts_with(&root_real) {
+                    return Err(ToolError::OutsideWorkspace(display_path.into()));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let missing_leaf = idx + 1 == components.len();
+                if allow_missing_leaf && missing_leaf {
+                    return Ok(());
+                }
+                return Err(ToolError::Io(format!("{}: {e}", probe.display())));
+            }
+            Err(e) => return Err(ToolError::Io(format!("{}: {e}", probe.display()))),
+        }
+    }
+    Ok(())
+}
+
+fn is_link_like(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Normalise un chemin absolu lexicalement (résout `.`/`..`).
 fn lexical_normalize(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
