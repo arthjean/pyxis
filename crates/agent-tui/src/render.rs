@@ -41,7 +41,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     // Menu de commandes slash : popup intercalé entre transcript et input (jamais
     // pendant un dialog de permission). +1 ligne pour le rappel des raccourcis.
     let matches = state.menu_items();
-    let menu_open = state.pending.is_none() && !matches.is_empty();
+    let menu_open = state.pending.is_none() && !state.shutdown_in_progress() && !matches.is_empty();
     let max_menu_height = area.height.saturating_sub(bottom_height).saturating_sub(1);
     let menu_height = if menu_open {
         ((matches.len() as u16).min(MENU_MAX_ITEMS) + 1).min(max_menu_height)
@@ -86,7 +86,7 @@ pub fn render_parity(
         None => input_height(state),
     };
     let matches = state.menu_items();
-    let menu_open = state.pending.is_none() && !matches.is_empty();
+    let menu_open = state.pending.is_none() && !state.shutdown_in_progress() && !matches.is_empty();
     let max_menu_height = area.height.saturating_sub(bottom_height).saturating_sub(1);
     let menu_height = if menu_open {
         ((matches.len() as u16).min(MENU_MAX_ITEMS) + 1).min(max_menu_height)
@@ -1188,17 +1188,19 @@ fn strip_md(line: &str) -> String {
 }
 
 fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let footer_height = u16::from(!state.shutdown_in_progress());
     let (progress_area, composer_area, footer_area) = if progress_visible(state) {
         let rows = Layout::vertical([
             Constraint::Length(PROGRESS_HEIGHT),
             Constraint::Length(PROGRESS_GAP_HEIGHT),
             Constraint::Length(3),
-            Constraint::Length(1),
+            Constraint::Length(footer_height),
         ])
         .split(area);
         (Some(rows[0]), rows[2], rows[3])
     } else {
-        let rows = Layout::vertical([Constraint::Length(3), Constraint::Length(1)]).split(area);
+        let rows = Layout::vertical([Constraint::Length(3), Constraint::Length(footer_height)])
+            .split(area);
         (None, rows[0], rows[1])
     };
 
@@ -1219,26 +1221,37 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     };
 
     let mut spans = vec![Span::styled("› ", theme.fg().add_modifier(Modifier::BOLD))];
-    spans.extend(input_spans(
-        &state.input,
-        &state.skills,
-        &state.files,
-        theme,
-    ));
+    if state.shutdown_in_progress() {
+        spans.push(Span::styled("Shutting down...", theme.dim()));
+    } else {
+        spans.extend(input_spans(
+            &state.input,
+            &state.skills,
+            &state.files,
+            theme,
+        ));
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 
-    let cursor_prefix = state.input.get(..state.cursor).unwrap_or(&state.input);
-    let col = inner
-        .x
-        .saturating_add(2)
-        .saturating_add(measure::width(cursor_prefix) as u16)
-        .min(inner.right().saturating_sub(1));
-    frame.set_cursor_position((col, inner.y));
+    if !state.shutdown_in_progress() {
+        let cursor_prefix = state.input.get(..state.cursor).unwrap_or(&state.input);
+        let col = inner
+            .x
+            .saturating_add(2)
+            .saturating_add(measure::width(cursor_prefix) as u16)
+            .min(inner.right().saturating_sub(1));
+        frame.set_cursor_position((col, inner.y));
+    }
 
-    render_status_line(frame, footer_area, state, theme);
+    if !state.shutdown_in_progress() {
+        render_status_line(frame, footer_area, state, theme);
+    }
 }
 
 fn input_height(state: &AppState) -> u16 {
+    if state.shutdown_in_progress() {
+        return 3;
+    }
     if progress_visible(state) {
         INPUT_HEIGHT + PROGRESS_HEIGHT + PROGRESS_GAP_HEIGHT
     } else {
@@ -2194,6 +2207,27 @@ mod tests {
         assert!(
             out.contains("ctrl+c again to quit"),
             "ctrl+c again hint missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn shutdown_feedback_replaces_composer_and_hides_footer() {
+        let mut s = AppState::new("gpt-5", true);
+        s.set_input("draft".into());
+        s.show_shutdown_in_progress();
+        let out = draw(&s, 80, 8);
+        assert!(
+            out.contains("› Shutting down..."),
+            "shutdown placeholder missing:\n{out}"
+        );
+        assert!(!out.contains("draft"), "draft should be hidden:\n{out}");
+        assert!(
+            !out.contains("ctrl+c"),
+            "footer hint should be hidden:\n{out}"
+        );
+        assert!(
+            !out.contains("gpt-5"),
+            "status line should be hidden:\n{out}"
         );
     }
 

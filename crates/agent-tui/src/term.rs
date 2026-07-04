@@ -9,7 +9,8 @@ use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 #[cfg(feature = "codex_tui_parity")]
-use crossterm::terminal::{Clear, ClearType, size};
+use crossterm::terminal::size;
+use crossterm::terminal::{Clear, ClearType};
 #[cfg(not(feature = "codex_tui_parity"))]
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -73,6 +74,12 @@ pub fn enter() -> io::Result<Tui> {
             Err(e)
         }
     }
+}
+
+pub fn clear(tui: &mut Tui) -> io::Result<()> {
+    tui.clear()?;
+    execute!(tui.backend_mut(), Clear(ClearType::All), MoveTo(0, 0))?;
+    Ok(())
 }
 
 /// Restaure le terminal (à appeler en sortie, y compris sur erreur).

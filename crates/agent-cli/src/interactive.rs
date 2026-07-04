@@ -320,6 +320,24 @@ fn write_goal_iters(path: &Path, value: u32) -> std::io::Result<()> {
     std::fs::write(path, value.to_string())
 }
 
+fn show_shutdown_feedback(
+    state: &mut AppState,
+    active_turn: &mut ActiveTurn,
+    pending_resp: &mut Option<oneshot::Sender<bool>>,
+    running: &mut bool,
+    turn_start: &mut Option<Instant>,
+) {
+    if let Some(resp) = pending_resp.take() {
+        let _ = resp.send(false);
+    }
+    active_turn.abort();
+    *running = false;
+    *turn_start = None;
+    state.end_turn();
+    state.show_shutdown_in_progress();
+    state.should_quit = true;
+}
+
 fn remove_if_exists(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => {}
@@ -377,7 +395,9 @@ pub async fn run(
         mcp,
     )
     .await;
+    let clear_result = agent_tui::clear(&mut tui);
     agent_tui::leave(&mut tui)?;
+    clear_result?;
     result
 }
 
@@ -883,14 +903,26 @@ async fn event_loop(
                             "/skills" => state.blocks.push(Block::Notice(
                                 "Choose a skill in the /skills submenu.".into(),
                             )),
-                            "/quit" => state.should_quit = true,
+                            "/quit" => show_shutdown_feedback(
+                                &mut state,
+                                &mut active_turn,
+                                &mut pending_resp,
+                                &mut running,
+                                &mut turn_start,
+                            ),
                             other => state
                                 .blocks
                                 .push(Block::Notice(format!("Unknown command: {other}"))),
                         }
                         state.scroll = 0;
                     }
-                    InputAction::Quit => state.should_quit = true,
+                    InputAction::Quit => show_shutdown_feedback(
+                        &mut state,
+                        &mut active_turn,
+                        &mut pending_resp,
+                        &mut running,
+                        &mut turn_start,
+                    ),
                     InputAction::Interrupt if running => {
                         if let Some(resp) = pending_resp.take() {
                             let _ = resp.send(false);

@@ -389,6 +389,7 @@ pub struct AppState {
     history_pos: Option<usize>,
     draft: String,
     pub should_quit: bool,
+    shutdown_in_progress: bool,
     quit_shortcut_expires_at: Option<Instant>,
     // ── Progression vivante (EP-013) ────────────────────────────────────────────
     /// Tick d'animation du spinner, avancé par la boucle (~10 fps) tant qu'un tour
@@ -452,6 +453,7 @@ impl AppState {
             history_pos: None,
             draft: String::new(),
             should_quit: false,
+            shutdown_in_progress: false,
             quit_shortcut_expires_at: None,
             spinner_tick: 0,
             turn_elapsed: None,
@@ -521,6 +523,18 @@ impl AppState {
 
     pub fn clear_quit_shortcut_hint(&mut self) {
         self.quit_shortcut_expires_at = None;
+    }
+
+    pub fn shutdown_in_progress(&self) -> bool {
+        self.shutdown_in_progress
+    }
+
+    pub fn show_shutdown_in_progress(&mut self) {
+        self.shutdown_in_progress = true;
+        self.pending = None;
+        self.status = Status::Idle;
+        self.completion_index = 0;
+        self.clear_quit_shortcut_hint();
     }
 
     fn arm_quit_shortcut(&mut self) {
@@ -1110,7 +1124,7 @@ impl AppState {
     /// d'accueil (carte + logo) au lieu du fil. Repart à l'accueil après `/new`
     /// ou `/clear`, qui vident `blocks`.
     pub fn is_welcome(&self) -> bool {
-        self.blocks.is_empty()
+        self.blocks.is_empty() && !self.shutdown_in_progress
     }
 
     /// Provider ciblé par le niveau 3 (`/providers subscription <provider> …`).
@@ -2151,6 +2165,25 @@ mod tests {
         assert_eq!(action, InputAction::Quit);
         assert!(s.should_quit);
         assert!(!s.quit_shortcut_hint_visible());
+    }
+
+    #[test]
+    fn shutdown_feedback_clears_modal_and_footer_hint() {
+        let mut s = AppState::new("gpt-5", false);
+        s.pending = Some(PermissionPrompt::new(
+            "bash",
+            "needs approval",
+            crate::diff::Diff::default(),
+        ));
+        s.arm_quit_shortcut();
+
+        s.show_shutdown_in_progress();
+
+        assert!(s.shutdown_in_progress());
+        assert!(s.pending.is_none());
+        assert_eq!(s.status, Status::Idle);
+        assert!(!s.quit_shortcut_hint_visible());
+        assert!(!s.is_welcome());
     }
 
     #[test]
