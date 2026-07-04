@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block as Boundary, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block as Boundary, BorderType, Borders, Clear, Paragraph, Wrap};
 use unicode_segmentation::UnicodeSegmentation;
 
 use agent_core::ToolErrorKind;
@@ -80,6 +80,11 @@ pub fn render_parity(
 ) {
     let theme = Theme::new(state.truecolor);
     let area = frame.area();
+
+    if state.transcript_overlay_open() {
+        render_transcript_overlay(frame, area, state, surface, &theme);
+        return;
+    }
 
     let bottom_height = match &state.pending {
         Some(p) => permission_height(p, area.width),
@@ -186,6 +191,154 @@ fn render_parity_transcript(
     };
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     render_scroll_pill(frame, area, state, theme);
+}
+
+#[cfg(feature = "codex_tui_parity")]
+fn render_transcript_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    surface: &crate::history_cell::ChatSurface,
+    theme: &Theme,
+) {
+    frame.render_widget(Clear, area);
+    if area.width == 0 || area.height == 0 {
+        state.set_transcript_overlay_metrics(0, 1);
+        return;
+    }
+
+    let top_height = area.height.saturating_sub(3);
+    let top = Rect::new(area.x, area.y, area.width, top_height);
+    let hints = Rect::new(
+        area.x,
+        area.y + top_height,
+        area.width,
+        area.height - top_height,
+    );
+
+    render_transcript_overlay_view(frame, top, state, surface, theme);
+    render_transcript_overlay_hints(frame, hints, theme);
+}
+
+#[cfg(feature = "codex_tui_parity")]
+fn render_transcript_overlay_view(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    surface: &crate::history_cell::ChatSurface,
+    theme: &Theme,
+) {
+    if area.height == 0 {
+        state.set_transcript_overlay_metrics(0, 1);
+        return;
+    }
+
+    let header = Rect::new(area.x, area.y, area.width, 1);
+    let header_fill = "/ ".repeat((area.width as usize).saturating_add(1) / 2);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(header_fill, theme.faint()))),
+        header,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "/ T R A N S C R I P T",
+            theme.dim(),
+        ))),
+        header,
+    );
+
+    let separator_y = area.bottom().saturating_sub(1);
+    let content = Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        separator_y.saturating_sub(area.y.saturating_add(1)),
+    );
+    state.set_transcript_overlay_metrics(0, content.height);
+
+    let all_lines = surface.transcript_lines(content.width);
+    let max_off = all_lines.len().saturating_sub(content.height as usize);
+    state.set_transcript_overlay_metrics(max_off, content.height);
+    let scroll = state.transcript_overlay_scroll().min(max_off);
+    let offset = max_off.saturating_sub(scroll);
+    let visible = if content.height == 0 {
+        Vec::new()
+    } else {
+        all_lines
+            .into_iter()
+            .skip(offset)
+            .take(content.height as usize)
+            .collect()
+    };
+    frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), content);
+
+    let separator = Rect::new(area.x, separator_y, area.width, 1);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(separator.width as usize),
+            theme.faint(),
+        ))),
+        separator,
+    );
+    render_transcript_overlay_percent(frame, separator, offset, max_off, theme);
+}
+
+#[cfg(feature = "codex_tui_parity")]
+fn render_transcript_overlay_percent(
+    frame: &mut Frame,
+    area: Rect,
+    offset: usize,
+    max_off: usize,
+    theme: &Theme,
+) {
+    if area.width == 0 {
+        return;
+    }
+    let percent = if max_off == 0 {
+        100
+    } else {
+        ((offset as f32 / max_off as f32) * 100.0).round() as u8
+    };
+    let text = format!(" {percent}% ");
+    let width = (measure::width(&text) as u16).min(area.width);
+    let x = area.x + area.width.saturating_sub(width);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, theme.dim()))).alignment(Alignment::Right),
+        Rect::new(x, area.y, width, 1),
+    );
+}
+
+#[cfg(feature = "codex_tui_parity")]
+fn render_transcript_overlay_hints(frame: &mut Frame, area: Rect, theme: &Theme) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let lines = [
+        vec![
+            Span::styled(" ↑/↓", theme.fg().add_modifier(Modifier::BOLD)),
+            Span::styled(" or ", theme.faint()),
+            Span::styled("j/k", theme.fg().add_modifier(Modifier::BOLD)),
+            Span::styled(" scroll   ", theme.dim()),
+            Span::styled("PgUp/PgDn", theme.fg().add_modifier(Modifier::BOLD)),
+            Span::styled(" page   ", theme.dim()),
+            Span::styled("Home/End", theme.fg().add_modifier(Modifier::BOLD)),
+            Span::styled(" jump", theme.dim()),
+        ],
+        vec![
+            Span::styled(" ctrl+t", theme.fg().add_modifier(Modifier::BOLD)),
+            Span::styled(" close   ", theme.dim()),
+            Span::styled("q", theme.fg().add_modifier(Modifier::BOLD)),
+            Span::styled(" close   ", theme.dim()),
+            Span::styled("ctrl+c", theme.fg().add_modifier(Modifier::BOLD)),
+            Span::styled(" close", theme.dim()),
+        ],
+    ];
+
+    for (idx, spans) in lines.into_iter().enumerate().take(area.height as usize) {
+        let line_area = Rect::new(area.x, area.y + idx as u16, area.width, 1);
+        frame.render_widget(Paragraph::new(clip(spans, area.width as usize)), line_area);
+    }
 }
 
 /// Logo de Pyxis : une **sphère de Dyson** minimaliste. La boussole donne le cap
@@ -1754,6 +1907,43 @@ mod tests {
             prompt_row >= 16,
             "welcome composer should be anchored at the bottom:\n{out}"
         );
+    }
+
+    #[cfg(feature = "codex_tui_parity")]
+    #[test]
+    fn parity_transcript_overlay_shows_full_transcript_surface() {
+        let mut state = AppState::new("gpt-5", true);
+        state.open_transcript_overlay();
+        let messages = vec![
+            agent_core::Message::assistant(vec![agent_core::ContentBlock::ToolUse {
+                id: "read-1".into(),
+                name: "read".into(),
+                input: serde_json::json!({ "path": "README.md" }),
+            }]),
+            agent_core::Message::tool_result(
+                "read-1",
+                (1..=18)
+                    .map(|idx| format!("{idx}\tline {idx}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                false,
+            ),
+        ];
+        let surface = crate::history_cell::ChatSurface::from_messages(&messages);
+
+        let bottom = draw_parity(&state, &surface, 60, 12);
+        assert!(bottom.contains("T R A N S C R I P T"), "{bottom}");
+        assert!(bottom.contains("ctrl+t"), "{bottom}");
+        assert!(bottom.contains("line 18"), "{bottom}");
+        assert!(
+            !bottom.contains("›"),
+            "composer should be hidden:\n{bottom}"
+        );
+
+        state.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        let top = draw_parity(&state, &surface, 60, 12);
+        assert!(top.contains("$ Get-Content -Raw README.md"), "{top}");
+        assert!(top.contains("line 1"), "{top}");
     }
 
     #[test]

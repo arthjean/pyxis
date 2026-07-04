@@ -870,8 +870,8 @@ fn strip_read_line_numbers(content: &str) -> String {
     let mut out = Vec::new();
     for line in content.lines() {
         if let Some((prefix, body)) = line.split_once('\t')
-            && !prefix.is_empty()
-            && prefix.chars().all(|ch| ch.is_ascii_digit())
+            && !prefix.trim().is_empty()
+            && prefix.trim().chars().all(|ch| ch.is_ascii_digit())
         {
             out.push(body.to_string());
         } else {
@@ -1102,7 +1102,7 @@ mod tests {
         }));
         let result = mapper.map_event(&AgentEvent::ToolResult(ToolResultView {
             id: "call-1".into(),
-            content: "1\t# Pyxis\n2\t\n3\tcontent".into(),
+            content: "     1\t# Pyxis\n     2\t\n     3\tcontent".into(),
             is_error: false,
             error_kind: None,
             untrusted: true,

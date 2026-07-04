@@ -407,6 +407,12 @@ pub struct AppState {
     /// Nouveaux blocs arrivés pendant que l'utilisateur a remonté le transcript
     /// (pill « revenir en bas », US-046). Remis à 0 dès le retour au bas.
     pub unseen: usize,
+    /// Overlay transcript complet, ouvert par Ctrl+T. Son scroll est séparé du
+    /// scroll du fil principal pour revenir exactement où l'utilisateur était.
+    transcript_overlay_open: bool,
+    transcript_overlay_scroll: usize,
+    transcript_overlay_scroll_max: Cell<usize>,
+    transcript_overlay_page_height: Cell<usize>,
     /// Début du stream live courant : index de bloc et compteur de caractères.
     /// Utilisé pour retirer les deltas abandonnés quand le core retry/recover.
     stream_start: Option<(usize, usize)>,
@@ -424,6 +430,25 @@ pub enum InputAction {
     Permission(bool),
     ScrollUp,
     ScrollDown,
+}
+
+fn is_ctrl_key(key: &KeyEvent, expected: char) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Char(c)
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && c.eq_ignore_ascii_case(&expected)
+    )
+}
+
+fn is_plain_char_key(key: &KeyEvent, expected: char) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Char(c)
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+                && c.eq_ignore_ascii_case(&expected)
+    )
 }
 
 impl AppState {
@@ -460,6 +485,10 @@ impl AppState {
             turn_chars: 0,
             reduced_motion: false,
             unseen: 0,
+            transcript_overlay_open: false,
+            transcript_overlay_scroll: 0,
+            transcript_overlay_scroll_max: Cell::new(0),
+            transcript_overlay_page_height: Cell::new(10),
             stream_start: None,
         }
     }
@@ -842,6 +871,52 @@ impl AppState {
         if self.scroll == 0 {
             self.unseen = 0;
         }
+    }
+
+    pub fn transcript_overlay_open(&self) -> bool {
+        self.transcript_overlay_open
+    }
+
+    pub fn transcript_overlay_scroll(&self) -> usize {
+        self.transcript_overlay_scroll
+    }
+
+    pub fn open_transcript_overlay(&mut self) {
+        self.transcript_overlay_open = true;
+        self.transcript_overlay_scroll = 0;
+    }
+
+    pub fn close_transcript_overlay(&mut self) {
+        self.transcript_overlay_open = false;
+    }
+
+    pub fn set_transcript_overlay_metrics(&self, max_scroll: usize, page_height: u16) {
+        self.transcript_overlay_scroll_max.set(max_scroll);
+        self.transcript_overlay_page_height
+            .set((page_height as usize).max(1));
+    }
+
+    fn transcript_overlay_scroll_up(&mut self, n: usize) {
+        self.transcript_overlay_scroll = self
+            .transcript_overlay_scroll
+            .saturating_add(n)
+            .min(self.transcript_overlay_scroll_max.get());
+    }
+
+    fn transcript_overlay_scroll_down(&mut self, n: usize) {
+        self.transcript_overlay_scroll = self.transcript_overlay_scroll.saturating_sub(n);
+    }
+
+    fn transcript_overlay_page_height(&self) -> usize {
+        self.transcript_overlay_page_height.get().max(1)
+    }
+
+    fn jump_transcript_overlay_top(&mut self) {
+        self.transcript_overlay_scroll = self.transcript_overlay_scroll_max.get();
+    }
+
+    fn jump_transcript_overlay_bottom(&mut self) {
+        self.transcript_overlay_scroll = 0;
     }
 
     /// Nombre de blocs reconstruits au dernier rendu (instrumentation US-041) : 0 =
@@ -1277,14 +1352,19 @@ impl AppState {
 
     /// Gestion clavier. En attente de permission, seules o/n/Enter/Esc/Ctrl+C comptent.
     pub fn on_key(&mut self, key: KeyEvent) -> InputAction {
-        let is_ctrl_c = matches!(
-            key.code,
-            KeyCode::Char(c)
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && c.eq_ignore_ascii_case(&'c')
-        );
+        let is_ctrl_c = is_ctrl_key(&key, 'c');
+        let is_ctrl_t = is_ctrl_key(&key, 't');
         if !is_ctrl_c {
             self.clear_quit_shortcut_hint();
+        }
+
+        if self.transcript_overlay_open {
+            return self.on_transcript_overlay_key(key, is_ctrl_t, is_ctrl_c);
+        }
+
+        if is_ctrl_t && !self.shutdown_in_progress {
+            self.open_transcript_overlay();
+            return InputAction::None;
         }
 
         if self.pending.is_some() {
@@ -1448,6 +1528,47 @@ impl AppState {
             }
             _ => InputAction::None,
         }
+    }
+
+    fn on_transcript_overlay_key(
+        &mut self,
+        key: KeyEvent,
+        is_ctrl_t: bool,
+        is_ctrl_c: bool,
+    ) -> InputAction {
+        if is_ctrl_t || is_ctrl_c || is_plain_char_key(&key, 'q') || key.code == KeyCode::Esc {
+            self.close_transcript_overlay();
+            self.clear_quit_shortcut_hint();
+            return InputAction::None;
+        }
+
+        let page = self.transcript_overlay_page_height();
+        match key.code {
+            KeyCode::Up if key.modifiers.is_empty() => self.transcript_overlay_scroll_up(1),
+            KeyCode::Down if key.modifiers.is_empty() => self.transcript_overlay_scroll_down(1),
+            KeyCode::PageUp => self.transcript_overlay_scroll_up(page),
+            KeyCode::PageDown => self.transcript_overlay_scroll_down(page),
+            KeyCode::Home => self.jump_transcript_overlay_top(),
+            KeyCode::End => self.jump_transcript_overlay_bottom(),
+            KeyCode::Char(' ') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.transcript_overlay_scroll_up(page)
+            }
+            KeyCode::Char(' ') if key.modifiers.is_empty() => {
+                self.transcript_overlay_scroll_down(page)
+            }
+            _ if is_plain_char_key(&key, 'k') => self.transcript_overlay_scroll_up(1),
+            _ if is_plain_char_key(&key, 'j') => self.transcript_overlay_scroll_down(1),
+            _ if is_ctrl_key(&key, 'b') => self.transcript_overlay_scroll_up(page),
+            _ if is_ctrl_key(&key, 'f') => self.transcript_overlay_scroll_down(page),
+            _ if is_ctrl_key(&key, 'u') => {
+                self.transcript_overlay_scroll_up((page.saturating_add(1)) / 2)
+            }
+            _ if is_ctrl_key(&key, 'd') => {
+                self.transcript_overlay_scroll_down((page.saturating_add(1)) / 2)
+            }
+            _ => {}
+        }
+        InputAction::None
     }
 }
 
@@ -2234,6 +2355,66 @@ mod tests {
         assert!(!s.menu_open());
         assert!(!s.should_quit);
         assert!(!s.quit_shortcut_hint_visible());
+    }
+
+    #[test]
+    fn ctrl_t_opens_and_closes_transcript_overlay() {
+        let mut s = AppState::new("gpt-5", false);
+        s.input = "draft".into();
+        s.cursor = s.input.len();
+
+        assert_eq!(
+            s.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+            InputAction::None
+        );
+        assert!(s.transcript_overlay_open());
+        assert_eq!(s.input, "draft");
+
+        assert_eq!(
+            s.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+            InputAction::None
+        );
+        assert!(!s.transcript_overlay_open());
+        assert_eq!(s.input, "draft");
+    }
+
+    #[test]
+    fn transcript_overlay_routes_pager_keys_without_editing_input() {
+        let mut s = AppState::new("gpt-5", false);
+        s.set_transcript_overlay_metrics(120, 20);
+        s.open_transcript_overlay();
+        s.input = "draft".into();
+        s.cursor = s.input.len();
+
+        assert_eq!(
+            s.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            InputAction::None
+        );
+        assert_eq!(s.transcript_overlay_scroll(), 20);
+
+        assert_eq!(
+            s.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            InputAction::None
+        );
+        assert_eq!(s.transcript_overlay_scroll(), 10);
+
+        assert_eq!(
+            s.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            InputAction::None
+        );
+        assert_eq!(s.transcript_overlay_scroll(), 120);
+
+        assert_eq!(
+            s.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            InputAction::None
+        );
+        assert_eq!(s.input, "draft");
+
+        assert_eq!(
+            s.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            InputAction::None
+        );
+        assert!(!s.transcript_overlay_open());
     }
 
     // US-044/045 : cycle de vie de la progression d'un tour.

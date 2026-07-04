@@ -418,18 +418,83 @@ impl UserCell {
 
 impl HistoryCell for UserCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let lines = text_lines(&self.text, Style::default().add_modifier(Modifier::BOLD));
-        render_prefixed(
+        let text = sanitize(&self.text);
+        let text = trim_trailing_blank_user_lines(&text);
+        if text.is_empty() {
+            return Vec::new();
+        }
+
+        let user_style = user_message_style();
+        let lines = text_lines(&text, user_message_body_style());
+        let mut out = Vec::new();
+        out.push(user_message_padding_line(user_style));
+        out.extend(style_user_message_lines(render_prefixed(
             &lines,
-            Span::styled("› ", Style::default().add_modifier(Modifier::DIM)),
-            Span::raw("  "),
+            Span::styled("› ", user_message_prefix_style()),
+            Span::styled("  ", user_style),
             width,
-        )
+        )));
+        out.push(user_message_padding_line(user_style));
+        out
     }
 
     fn raw_lines(&self) -> Vec<Line<'static>> {
         raw_lines_from_source(&self.text)
     }
+}
+
+fn user_message_style() -> Style {
+    Style::default().bg(user_message_bg())
+}
+
+fn user_message_bg() -> Color {
+    Color::Rgb(0x32, 0x32, 0x36)
+}
+
+fn user_message_body_style() -> Style {
+    Style::default()
+        .fg(Color::Rgb(0xee, 0xee, 0xf0))
+        .bg(user_message_bg())
+}
+
+fn user_message_prefix_style() -> Style {
+    Style::default()
+        .fg(Color::Rgb(0xb8, 0xb8, 0xbf))
+        .bg(user_message_bg())
+        .add_modifier(Modifier::BOLD)
+}
+
+fn user_message_padding_line(style: Style) -> Line<'static> {
+    let mut line = Line::from("");
+    line.style = style;
+    line
+}
+
+fn trim_trailing_blank_user_lines(text: &str) -> String {
+    let mut lines = text.lines().collect::<Vec<_>>();
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+fn style_user_message_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let style = user_message_style();
+    lines
+        .into_iter()
+        .map(|mut line| {
+            line.style = line.style.patch(style);
+            line.spans = line
+                .spans
+                .into_iter()
+                .map(|mut span| {
+                    span.style = span.style.patch(style);
+                    span
+                })
+                .collect();
+            line
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -528,20 +593,12 @@ impl ReasoningCell {
 
 impl HistoryCell for ReasoningCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines = vec![Line::from(Span::styled(
-            "reasoning",
-            Style::default().add_modifier(Modifier::ITALIC | Modifier::DIM),
-        ))];
-        if !self.text.trim().is_empty() {
-            lines.extend(text_lines(
-                &self.text,
-                Style::default().add_modifier(Modifier::ITALIC | Modifier::DIM),
-            ));
-        }
+        let display = reasoning_display_text(&self.text);
+        let lines = reasoning_summary_lines(&display, width);
         render_prefixed(
             &lines,
-            Span::styled("· ", Style::default().add_modifier(Modifier::DIM)),
-            Span::raw("  "),
+            Span::styled("• ", reasoning_prefix_style()),
+            Span::styled("  ", reasoning_prefix_style()),
             width,
         )
     }
@@ -549,6 +606,87 @@ impl HistoryCell for ReasoningCell {
     fn raw_lines(&self) -> Vec<Line<'static>> {
         raw_lines_from_source(&self.text)
     }
+}
+
+fn reasoning_display_text(text: &str) -> String {
+    let clean = bounded_sanitize(text, MAX_MARKDOWN_SOURCE_CHARS);
+    let trimmed = clean.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if let Some((header, after_header)) = split_first_bold_markdown(trimmed) {
+        let summary = after_header.trim();
+        if summary.is_empty() {
+            return header;
+        }
+        return summary.to_string();
+    }
+
+    trimmed.to_string()
+}
+
+fn split_first_bold_markdown(text: &str) -> Option<(String, &str)> {
+    let bytes = text.as_bytes();
+    let mut open = 0usize;
+    while open + 1 < bytes.len() {
+        if bytes[open] == b'*' && bytes[open + 1] == b'*' {
+            let start = open + 2;
+            let mut close = start;
+            while close + 1 < bytes.len() {
+                if bytes[close] == b'*' && bytes[close + 1] == b'*' {
+                    let header = text[start..close].trim();
+                    if header.is_empty() {
+                        return None;
+                    }
+                    return Some((header.to_string(), &text[(close + 2)..]));
+                }
+                close += 1;
+            }
+            return None;
+        }
+        open += 1;
+    }
+    None
+}
+
+fn reasoning_summary_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    if text.trim().is_empty() {
+        return vec![Line::from(Span::styled(
+            "Thinking",
+            reasoning_summary_style(),
+        ))];
+    }
+
+    let theme = Theme::new(true);
+    let content_width = safe_width_usize(width).saturating_sub(2).max(1);
+    crate::markdown::render_markdown(text, &theme, content_width)
+        .into_iter()
+        .map(style_reasoning_line)
+        .collect()
+}
+
+fn style_reasoning_line(mut line: Line<'static>) -> Line<'static> {
+    let style = reasoning_summary_style();
+    line.spans = line
+        .spans
+        .into_iter()
+        .map(|mut span| {
+            span.style = span.style.patch(style);
+            span
+        })
+        .collect();
+    line
+}
+
+fn reasoning_summary_style() -> Style {
+    Style::default()
+        .fg(Color::Rgb(0xa8, 0xa8, 0xb0))
+        .add_modifier(Modifier::ITALIC)
+}
+
+fn reasoning_prefix_style() -> Style {
+    Style::default().fg(Color::Rgb(0x6f, 0x6f, 0x78))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -834,10 +972,10 @@ impl ExecCall {
             return render_prefixed(
                 &[Line::from(Span::styled(
                     "(no output)",
-                    Style::default().add_modifier(Modifier::DIM),
+                    exec_output_chrome_style(),
                 ))],
-                Span::styled("  └ ", Style::default().add_modifier(Modifier::DIM)),
-                Span::raw("    "),
+                Span::styled("  └ ", exec_output_chrome_style()),
+                Span::styled("    ", exec_output_chrome_style()),
                 width,
             );
         }
@@ -850,18 +988,21 @@ impl ExecCall {
         let lines = bounded_output_lines(&self.output, line_limit)
             .into_iter()
             .map(|line| {
-                Line::from(Span::styled(
-                    line,
-                    Style::default().add_modifier(Modifier::DIM),
-                ))
+                let style = if is_output_hint_line(&line) {
+                    exec_output_chrome_style()
+                } else {
+                    exec_output_body_style(self.failed())
+                };
+                Line::from(Span::styled(line, style))
             })
             .collect::<Vec<_>>();
-        render_prefixed(
+        let prefixed = render_prefixed(
             &lines,
-            Span::styled("  └ ", Style::default().add_modifier(Modifier::DIM)),
-            Span::raw("    "),
+            Span::styled("  └ ", exec_output_chrome_style()),
+            Span::styled("    ", exec_output_chrome_style()),
             width,
-        )
+        );
+        truncate_output_screen_lines(prefixed, line_limit)
     }
 
     fn transcript_status_line(&self) -> String {
@@ -4037,11 +4178,13 @@ fn bound_exec_output_buffer(text: &str) -> String {
 
 fn bounded_output_lines(output: &str, line_limit: usize) -> Vec<String> {
     let clean = bound_exec_output_buffer(output);
-    let lines = clean
-        .lines()
-        .map(str::trim_end)
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let lines = compact_output_preview_lines(
+        clean
+            .lines()
+            .map(str::trim_end)
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+    );
     let total = lines.len();
     if total <= line_limit {
         return lines;
@@ -4057,6 +4200,62 @@ fn bounded_output_lines(output: &str, line_limit: usize) -> Vec<String> {
     ));
     out.extend(lines.iter().skip(total.saturating_sub(tail_lines)).cloned());
     out
+}
+
+fn compact_output_preview_lines(lines: Vec<String>) -> Vec<String> {
+    lines
+        .into_iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect()
+}
+
+fn exec_output_body_style(is_error: bool) -> Style {
+    if is_error {
+        Style::default()
+            .fg(Color::Rgb(0xd0, 0x6a, 0x6a))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Rgb(0xb8, 0xb8, 0xbf))
+    }
+}
+
+fn exec_output_chrome_style() -> Style {
+    Style::default().fg(Color::Rgb(0x78, 0x78, 0x84))
+}
+
+fn is_output_hint_line(line: &str) -> bool {
+    line.starts_with('…') || line.starts_with("[lines ") || line.starts_with("[file truncated")
+}
+
+fn truncate_output_screen_lines(lines: Vec<Line<'static>>, max_lines: usize) -> Vec<Line<'static>> {
+    let total = lines.len();
+    if total <= max_lines || max_lines == 0 {
+        return lines;
+    }
+
+    if max_lines == 1 {
+        return vec![output_screen_ellipsis_line(total)];
+    }
+
+    let head_lines = max_lines / 2;
+    let tail_lines = max_lines.saturating_sub(head_lines + 1);
+    let mut out = Vec::new();
+    out.extend(lines.iter().take(head_lines).cloned());
+    out.push(output_screen_ellipsis_line(
+        total.saturating_sub(head_lines + tail_lines),
+    ));
+    out.extend(lines.iter().skip(total.saturating_sub(tail_lines)).cloned());
+    out
+}
+
+fn output_screen_ellipsis_line(omitted: usize) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("    ", exec_output_chrome_style()),
+        Span::styled(
+            format!("… +{omitted} lines (ctrl + t to view transcript)"),
+            exec_output_chrome_style(),
+        ),
+    ])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4143,8 +4342,8 @@ fn strip_numbered_read_output(content: &str) -> String {
     let mut out = Vec::new();
     for line in content.lines() {
         if let Some((prefix, body)) = line.split_once('\t')
-            && !prefix.is_empty()
-            && prefix.chars().all(|ch| ch.is_ascii_digit())
+            && !prefix.trim().is_empty()
+            && prefix.trim().chars().all(|ch| ch.is_ascii_digit())
         {
             out.push(body.to_string());
         } else {
@@ -4317,8 +4516,73 @@ mod tests {
         let text = flatten(&cells.display_lines(40));
         assert!(text.iter().any(|line| line.starts_with('›')));
         assert!(text.iter().any(|line| line.starts_with('●')));
-        assert!(text.iter().any(|line| line.contains("reasoning")));
+        assert!(text.iter().any(|line| line.contains("checking")));
         assert!(cells.desired_height(0) >= 1);
+    }
+
+    #[test]
+    fn user_cell_renders_in_background_block() {
+        let cell = UserCell::new("hello world");
+        let lines = cell.display_lines(40);
+        let flat = flatten(&lines);
+
+        assert_eq!(flat.len(), 3);
+        assert_eq!(flat[0], "");
+        assert!(flat[1].starts_with("› hello world"));
+        assert_eq!(flat[2], "");
+        assert_eq!(lines[0].style.bg, Some(user_message_bg()));
+        assert_eq!(lines[1].style.bg, Some(user_message_bg()));
+        assert_eq!(lines[2].style.bg, Some(user_message_bg()));
+    }
+
+    #[test]
+    fn user_cell_trims_trailing_blank_message_lines() {
+        let cell = UserCell::new("line one\n\n   \n\t \n");
+        let rendered = flatten(&cell.display_lines(80));
+
+        assert!(rendered.iter().any(|line| line.contains("line one")));
+        assert_eq!(
+            rendered
+                .iter()
+                .rev()
+                .take_while(|line| line.trim().is_empty())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn reasoning_cell_hides_markdown_header_in_display() {
+        let cell = ReasoningCell::new(
+            "**Running tests and reviewing files**\n\nI will inspect the repo and run cargo test.",
+        );
+
+        let text = flatten(&cell.display_lines(80)).join("\n");
+
+        assert!(text.contains("I will inspect the repo"));
+        assert!(!text.contains("Running tests and reviewing files"));
+        assert!(!text.contains("**"));
+        assert!(!text.contains("reasoning"));
+    }
+
+    #[test]
+    fn reasoning_cell_uses_header_when_summary_is_missing() {
+        let cell = ReasoningCell::new("**Reading project context**");
+
+        let text = flatten(&cell.display_lines(80)).join("\n");
+
+        assert!(text.contains("Reading project context"));
+        assert!(!text.contains("**"));
+    }
+
+    #[test]
+    fn reasoning_cell_preserves_raw_transcript_source() {
+        let source = "**Planning**\n\nDetailed reasoning.";
+        let cell = ReasoningCell::new(source);
+
+        let raw = flatten(&cell.raw_lines()).join("\n");
+
+        assert_eq!(raw, source);
     }
 
     #[test]
@@ -5045,7 +5309,13 @@ mod tests {
         let first = surface
             .drain_pending_insert(80, InsertHistoryMode::InlineScrollback)
             .expect("first insert");
-        assert_ne!(first.lines[0].as_str(), "");
+        assert_eq!(first.lines[0].as_str(), "");
+        assert!(
+            first
+                .lines
+                .iter()
+                .any(|line| line.as_str().contains("first block"))
+        );
 
         surface.apply_update(TranscriptUpdate {
             lifecycle: TranscriptLifecycle::Completed,
@@ -5181,6 +5451,64 @@ mod tests {
         assert!(text.contains("9"));
         assert!(text.contains("10"));
         assert!(!text.lines().any(|line| line.trim() == "5"));
+    }
+
+    #[test]
+    fn exec_output_preview_drops_blank_lines() {
+        let mut surface = ChatSurface::new();
+        let id = TranscriptItemId::derived("exec", "call-1");
+        let output = "# Pyxis\n\n\n## Install\n\n[lines 1-4 of 4; offset=5 to continue]";
+
+        surface.apply_update(exec_command_update(
+            TranscriptLifecycle::Started,
+            Some(id.clone()),
+            "Get-Content -Raw README.md",
+            TranscriptItemStatus::Running,
+        ));
+        surface.apply_update(exec_output_update(
+            TranscriptLifecycle::Completed,
+            Some(id),
+            output,
+            false,
+            TranscriptItemStatus::Complete,
+        ));
+
+        let lines = flatten(&surface.display_lines(80));
+
+        assert!(lines.iter().any(|line| line.contains("# Pyxis")));
+        assert!(lines.iter().any(|line| line.contains("## Install")));
+        assert!(!lines.iter().any(|line| line.trim().is_empty()));
+        assert!(!lines.iter().any(|line| line.trim() == "└"));
+    }
+
+    #[test]
+    fn exec_output_truncates_after_wrapping() {
+        let mut surface = ChatSurface::new();
+        let id = TranscriptItemId::derived("exec", "call-1");
+        let output = "this-is-a-long-output-token-without-breaks".repeat(8);
+
+        surface.apply_update(exec_command_update(
+            TranscriptLifecycle::Started,
+            Some(id.clone()),
+            "cat huge.log",
+            TranscriptItemStatus::Running,
+        ));
+        surface.apply_update(exec_output_update(
+            TranscriptLifecycle::Completed,
+            Some(id),
+            &output,
+            false,
+            TranscriptItemStatus::Complete,
+        ));
+
+        let lines = surface.display_lines(24);
+        let text = flatten(&lines).join("\n");
+
+        assert!(
+            lines.len() <= TOOL_CALL_MAX_LINES + 1,
+            "wrapped output should stay capped: {text}"
+        );
+        assert!(text.contains("ctrl + t to view transcript"));
     }
 
     #[test]
@@ -5526,6 +5854,24 @@ mod tests {
                 .drain_pending_insert(80, InsertHistoryMode::InlineScrollback)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn replay_strips_padded_read_line_numbers() {
+        let messages = vec![
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "c1".into(),
+                name: "read".into(),
+                input: serde_json::json!({ "path": "a.rs" }),
+            }]),
+            Message::tool_result("c1", "     1\tfn main() {}\n     2\t", false),
+        ];
+
+        let surface = ChatSurface::from_messages(&messages);
+        let text = flatten(&surface.display_lines(80)).join("\n");
+
+        assert!(text.contains("fn main() {}"));
+        assert!(!text.contains("     1"));
     }
 
     #[test]
