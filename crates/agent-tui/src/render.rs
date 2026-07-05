@@ -22,7 +22,7 @@ use crate::theme::Theme;
 use crate::tool;
 
 const INDENT: &str = "  ";
-/// Zone de saisie : box bordée (3 lignes) + ligne de statut (1).
+/// Zone de saisie : composer à séparateurs (3 lignes) + ligne de statut (1).
 const INPUT_HEIGHT: u16 = 4;
 const PROGRESS_HEIGHT: u16 = 1;
 const PROGRESS_GAP_HEIGHT: u16 = 1;
@@ -345,7 +345,7 @@ fn render_transcript_overlay_hints(frame: &mut Frame, area: Rect, theme: &Theme)
 /// dans un espace immense ; ici, un cœur stellaire net cerné de deux anneaux de
 /// collecteurs (avec brèches, l'essaim en assemblage). Rendu en **points braille
 /// tramés** (stippling, façon
-/// pixel-dust), monochrome ; l'accent teal reste réservé à l'UI. Champ continu
+/// pixel-dust), monochrome ; l'accent bleu ciel reste réservé à l'UI. Champ continu
 /// (résolution-indépendant), pas un bitmap figé.
 const LOGO_COLS: usize = 20;
 const LOGO_ROWS: usize = 10;
@@ -487,6 +487,11 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         Span::styled("◆ ", theme.faint()),
         Span::styled(state.model.clone(), theme.dim()),
     ];
+    if let Some(effort) = &state.reasoning_effort
+        && !effort.trim().is_empty()
+    {
+        meta.push(Span::styled(format!(" [{}]", effort.trim()), theme.faint()));
+    }
     if !state.workspace.is_empty() {
         meta.push(Span::styled("  ·  ", theme.faint()));
         meta.push(Span::styled(state.workspace.clone(), theme.dim()));
@@ -511,6 +516,9 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         Span::styled("  ·  ", theme.faint()),
         Span::styled("/models", theme.accent()),
         Span::styled("  ·  ", theme.faint()),
+        Span::styled("/effort", theme.accent()),
+    ]));
+    info.push(Line::from(vec![
         Span::styled("/permissions", theme.accent()),
         Span::styled("  ·  ", theme.faint()),
         Span::styled("/goal", theme.accent()),
@@ -810,7 +818,7 @@ fn push_block<'a>(
             );
         }
         Block::Assistant { text, streaming } => {
-            // Markdown rendu, ANCRÉ par une puce teal ; corps aligné à 2 colonnes
+            // Markdown rendu, ANCRÉ par une puce bleu ciel ; corps aligné à 2 colonnes
             // (gouttière suspendue : puce sur la 1re sous-ligne, reste indenté). La
             // largeur de CONTENU (hors gouttière) sert à dimensionner les tables
             // markdown (US-043) — même valeur que le wrap d'`emit_block`.
@@ -1361,10 +1369,28 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         render_progress_line(frame, progress_area, state, theme);
     }
 
-    let fill = (0..composer_area.height)
-        .map(|_| Line::from(Span::raw(" ".repeat(composer_area.width as usize))))
-        .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(fill).style(theme.composer()), composer_area);
+    let rule = Line::from(Span::styled(
+        "─".repeat(composer_area.width as usize),
+        theme.composer_rule(),
+    ));
+    frame.render_widget(
+        Paragraph::new(rule.clone()),
+        Rect {
+            x: composer_area.x,
+            y: composer_area.y,
+            width: composer_area.width,
+            height: 1,
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(rule),
+        Rect {
+            x: composer_area.x,
+            y: composer_area.bottom().saturating_sub(1),
+            width: composer_area.width,
+            height: 1,
+        },
+    );
 
     let inner = Rect {
         x: composer_area.x,
@@ -1460,7 +1486,7 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     if let Some(effort) = &state.reasoning_effort
         && !effort.trim().is_empty()
     {
-        left.push(Span::styled(format!(" {}", effort.trim()), theme.dim()));
+        left.push(Span::styled(format!(" [{}]", effort.trim()), theme.dim()));
     }
     if !state.workspace.is_empty() {
         left.push(Span::styled(" · ", theme.faint()));
@@ -1658,6 +1684,36 @@ mod tests {
         let out = draw(&s, 40, 12);
         assert!(out.contains("Bonjour depuis Pyxis"), "{out}");
         assert!(out.contains("›"), "prompt de saisie absent");
+    }
+
+    #[test]
+    fn composer_uses_rules_without_filled_background() {
+        let mut s = AppState::new("gpt-5", true);
+        s.set_input("Try something".into());
+        let mut term = Terminal::new(TestBackend::new(48, 10)).unwrap();
+        term.draw(|f| render(f, &s)).unwrap();
+        let buf = term.backend().buffer();
+        let prompt_y = (0..buf.area().height)
+            .find(|y| (0..buf.area().width).any(|x| buf[(x, *y)].symbol() == "›"))
+            .expect("composer prompt should render");
+        assert!(prompt_y > 0, "composer should have a top rule");
+        assert!(
+            prompt_y + 1 < buf.area().height,
+            "composer should have a bottom rule"
+        );
+        let last_x = buf.area().width.saturating_sub(1);
+
+        assert_eq!(buf[(0, prompt_y - 1)].symbol(), "─");
+        assert_eq!(buf[(last_x, prompt_y - 1)].symbol(), "─");
+        assert_eq!(buf[(0, prompt_y + 1)].symbol(), "─");
+        assert_eq!(buf[(last_x, prompt_y + 1)].symbol(), "─");
+        for x in 0..buf.area().width {
+            assert_eq!(
+                buf[(x, prompt_y)].bg,
+                Color::Reset,
+                "composer input row should keep the terminal background at column {x}"
+            );
+        }
     }
 
     // Écran d'accueil : carte avec logo braille (Dyson) + identité, transcript vide.

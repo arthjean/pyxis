@@ -1,7 +1,7 @@
 //! Rendu markdown → lignes ratatui stylées (réponses de l'assistant). Parse via
 //! pulldown-cmark (CommonMark + strikethrough/tables) et mappe les events vers des
 //! `Span` en réutilisant la palette du `Theme` : headers et code inline = accent
-//! (teal), gras/italique via modifiers, listes en puces. Les code-blocks sont
+//! (bleu ciel), gras/italique via modifiers, listes en puces. Les code-blocks sont
 //! colorés syntaxiquement (US-042, via `highlight`), les tables alignées et les
 //! blockquotes préfixées d'une barre `▎` atténuée (US-043).
 //!

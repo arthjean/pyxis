@@ -316,11 +316,14 @@ mod tests {
 
         let insert = PendingHistoryInsert::inline_scrollback_lines([Line::from(Span::styled(
             "accent",
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(Color::Rgb(0x6c, 0xcb, 0xff)),
         ))]);
         let lines = insert.ratatui_lines();
 
         assert_eq!(insert.lines[0].as_str(), "accent");
-        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Cyan));
+        assert_eq!(
+            lines[0].spans[0].style.fg,
+            Some(Color::Rgb(0x6c, 0xcb, 0xff))
+        );
     }
 }

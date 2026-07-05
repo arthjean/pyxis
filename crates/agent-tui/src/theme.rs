@@ -1,4 +1,4 @@
-//! Palette de rendu (US-032). Esthétique **monochrome + un accent (teal)** : la
+//! Palette de rendu (US-032). Esthétique **monochrome + un accent bleu ciel orbital** : la
 //! hiérarchie passe par le poids et la teinte, pas par la couleur. La couleur est
 //! RÉSERVÉE au fonctionnel : les tons de diff (ajout/suppression) et `success`. En
 //! l'absence de truecolor (AC4), tout dégrade en 16 couleurs / modifiers sans
@@ -8,7 +8,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
-/// Palette : grayscale + un accent (teal) + tons fonctionnels (erreur, diff,
+/// Palette : graphite + un accent bleu ciel + tons fonctionnels (erreur, diff,
 /// succès). `truecolor` pilote la dégradation.
 pub struct Theme {
     truecolor: bool,
@@ -29,64 +29,62 @@ impl Theme {
 
     pub fn fg(&self) -> Style {
         if self.truecolor {
-            Style::default().fg(Color::Rgb(0xe4, 0xe4, 0xe4))
+            Style::default().fg(Color::Rgb(0xf2, 0xf0, 0xea))
         } else {
             Style::default()
         }
     }
     pub fn dim(&self) -> Style {
         if self.truecolor {
-            Style::default().fg(Color::Rgb(0x8a, 0x8a, 0x8a))
+            Style::default().fg(Color::Rgb(0x8e, 0x94, 0x9e))
         } else {
             Style::default().add_modifier(Modifier::DIM)
         }
     }
     pub fn faint(&self) -> Style {
         if self.truecolor {
-            Style::default().fg(Color::Rgb(0x4e, 0x4e, 0x4e))
+            Style::default().fg(Color::Rgb(0x50, 0x57, 0x62))
         } else {
             Style::default().add_modifier(Modifier::DIM)
         }
     }
     pub fn accent(&self) -> Style {
         if self.truecolor {
-            Style::default().fg(Color::Rgb(0x6f, 0xd0, 0xc8))
+            Style::default().fg(Color::Rgb(0x6c, 0xcb, 0xff))
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         }
     }
     pub fn error(&self) -> Style {
         if self.truecolor {
-            Style::default().fg(Color::Rgb(0xd0, 0x6a, 0x6a))
+            Style::default().fg(Color::Rgb(0xff, 0x6b, 0x78))
         } else {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
         }
     }
-    /// Fond de la ligne sélectionnée (menu de commandes) : voile teal sombre en
+    /// Fond de la ligne sélectionnée (menu de commandes) : voile bleu sombre en
     /// truecolor, vidéo inverse en 16 couleurs.
     pub fn selection(&self) -> Style {
         if self.truecolor {
-            Style::default().bg(Color::Rgb(0x1c, 0x2e, 0x2c))
+            Style::default().bg(Color::Rgb(0x0f, 0x23, 0x34))
         } else {
             Style::default().add_modifier(Modifier::REVERSED)
         }
     }
-    /// Fond du composer Codex-like: bloc plein, pas de filet coloré.
-    pub fn composer(&self) -> Style {
+    /// Trait horizontal du composer, visible sans enfermer l'input dans un bloc.
+    pub fn composer_rule(&self) -> Style {
         if self.truecolor {
-            Style::default()
-                .fg(Color::Rgb(0xe4, 0xe4, 0xe4))
-                .bg(Color::Rgb(0x33, 0x33, 0x35))
+            Style::default().fg(Color::Rgb(0x2a, 0x2f, 0x37))
         } else {
-            Style::default().add_modifier(Modifier::REVERSED)
+            Style::default().add_modifier(Modifier::DIM)
         }
     }
-    /// Surbrillance d'un `/skill` inséré dans l'input : pastille teal sur fond sombre.
+    /// Surbrillance d'un `/skill` inséré dans l'input : pastille bleu ciel sur fond sombre.
     pub fn skill_chip(&self) -> Style {
         if self.truecolor {
             Style::default()
-                .fg(Color::Rgb(0x6f, 0xd0, 0xc8))
-                .bg(Color::Rgb(0x1c, 0x2e, 0x2c))
+                .fg(Color::Rgb(0x6c, 0xcb, 0xff))
+                .bg(Color::Rgb(0x0f, 0x23, 0x34))
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
@@ -98,7 +96,7 @@ impl Theme {
     /// Succès / confirmation (ex. objectif atteint).
     pub fn success(&self) -> Style {
         if self.truecolor {
-            Style::default().fg(Color::Rgb(0x5a, 0xb0, 0x7a))
+            Style::default().fg(Color::Rgb(0x78, 0xc9, 0x8a))
         } else {
             Style::default().fg(Color::Green)
         }
@@ -108,8 +106,8 @@ impl Theme {
     pub fn diff_add(&self) -> Style {
         if self.truecolor {
             Style::default()
-                .fg(Color::Rgb(0xb8, 0xe8, 0xc4))
-                .bg(Color::Rgb(0x10, 0x2a, 0x18))
+                .fg(Color::Rgb(0xbd, 0xec, 0xc9))
+                .bg(Color::Rgb(0x11, 0x28, 0x16))
         } else {
             Style::default().fg(Color::Green)
         }
@@ -118,8 +116,8 @@ impl Theme {
     pub fn diff_remove(&self) -> Style {
         if self.truecolor {
             Style::default()
-                .fg(Color::Rgb(0xf0, 0xc0, 0xc8))
-                .bg(Color::Rgb(0x2c, 0x12, 0x16))
+                .fg(Color::Rgb(0xff, 0xc7, 0xcf))
+                .bg(Color::Rgb(0x30, 0x13, 0x17))
         } else {
             Style::default().fg(Color::Red)
         }
@@ -128,8 +126,8 @@ impl Theme {
     pub fn diff_add_word(&self) -> Style {
         if self.truecolor {
             Style::default()
-                .fg(Color::Rgb(0xe8, 0xff, 0xee))
-                .bg(Color::Rgb(0x24, 0x5a, 0x34))
+                .fg(Color::Rgb(0xf5, 0xff, 0xf7))
+                .bg(Color::Rgb(0x2a, 0x6a, 0x39))
         } else {
             Style::default()
                 .fg(Color::Green)
@@ -140,8 +138,8 @@ impl Theme {
     pub fn diff_remove_word(&self) -> Style {
         if self.truecolor {
             Style::default()
-                .fg(Color::Rgb(0xff, 0xe0, 0xe6))
-                .bg(Color::Rgb(0x6a, 0x24, 0x30))
+                .fg(Color::Rgb(0xff, 0xf0, 0xf2))
+                .bg(Color::Rgb(0x7b, 0x2a, 0x35))
         } else {
             Style::default()
                 .fg(Color::Red)

@@ -1,6 +1,6 @@
 //! Aperçu du redesign de la zone de saisie (US-019, itération UI) :
-//! `cargo run -p agent-tui --example input`. Rend la box + status line dans
-//! plusieurs états via `TestBackend`, sans terminal réel — pour eyeball
+//! `cargo run -p agent-tui --example input`. Rend le composer + status line dans
+//! plusieurs états via `TestBackend`, sans terminal réel, pour eyeball
 //! l'esthétique avant de la voir en live.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -27,9 +27,10 @@ fn dump(state: &AppState, w: u16, h: u16, label: &str) {
 }
 
 fn base() -> AppState {
-    let mut s = AppState::new("gpt-5", true);
+    let mut s = AppState::new("gpt-5.5", true);
     s.workspace = "pyxis".into();
     s.provider_connected = true;
+    s.reasoning_effort = Some("medium".into());
     s.skills = vec![
         "frontend-design".into(),
         "meta-code".into(),
@@ -56,7 +57,7 @@ fn main() {
     b.context_pct = Some(38);
     dump(&b, w, 8, "saisie en cours");
 
-    // 3. L'agent réfléchit : la bordure s'allume (accent teal).
+    // 3. L'agent réfléchit : une ligne Codex-like s'affiche au-dessus.
     let mut c = base();
     c.push_user("refactore le parsing dans src/lexer.rs");
     c.apply(&AgentEvent::Reasoning("je lis le fichier d'abord".into()));
@@ -64,7 +65,7 @@ fn main() {
         "J'ouvre `src/lexer.rs` pour repérer le `todo!()`.".into(),
     ));
     c.context_pct = Some(64);
-    dump(&c, w, 10, "agent en réflexion · bordure accent");
+    dump(&c, w, 10, "agent en réflexion · status au-dessus");
 
     // 4. Menu de commandes slash (saisie « / », 2e ligne sélectionnée).
     let mut d = base();
@@ -80,7 +81,14 @@ fn main() {
     e.completion_index = 1;
     dump(&e, w, 12, "sous-menu /models");
 
-    // 6. Sous-menu /resume : conversations passées du workspace.
+    // 6. Sous-menu de sélection d'effort.
+    let mut e2 = base();
+    e2.context_pct = Some(15);
+    e2.input = "/effort ".into();
+    e2.completion_index = 3;
+    dump(&e2, w, 12, "sous-menu /effort");
+
+    // 7. Sous-menu /resume : conversations passées du workspace.
     let mut f = base();
     f.context_pct = Some(15);
     f.input = "/resume ".into();
@@ -103,19 +111,19 @@ fn main() {
     ];
     dump(&f, w, 12, "sous-menu /resume (conversations passées)");
 
-    // 7. /providers niveau 1 : type d'authentification.
+    // 8. /providers niveau 1 : type d'authentification.
     let mut g = base();
     g.context_pct = Some(15);
     g.input = "/providers ".into();
     dump(&g, w, 9, "/providers — niveau 1 (auth)");
 
-    // 8. /providers niveau 2 : choix du fournisseur (badge connecté sur Codex).
+    // 9. /providers niveau 2 : choix du fournisseur (badge connecté sur Codex).
     let mut h = base();
     h.context_pct = Some(15);
     h.input = "/providers subscription ".into();
     dump(&h, w, 9, "/providers subscription — niveau 2 (badge)");
 
-    // 9. /providers niveau 3 : actions (connecté → Connect grisé, Disconnect actif).
+    // 10. /providers niveau 3 : actions (connecté → Connect grisé, Disconnect actif).
     let mut k = base();
     k.context_pct = Some(15);
     k.input = "/providers subscription codex ".into();
@@ -126,20 +134,20 @@ fn main() {
         "/providers subscription codex — niveau 3 (actions)",
     );
 
-    // 10. Sous-menu /skills (liste des skills du dossier ~/.agents/skills).
+    // 11. Sous-menu /skills (liste des skills du dossier ~/.agents/skills).
     let mut l = base();
     l.context_pct = Some(15);
     l.input = "/skills ".into();
     dump(&l, w, 9, "/skills (sous-menu des skills)");
 
-    // 11. Skill inséré dans le message → `/frontend-design` en surbrillance.
+    // 12. Skill inséré dans le message → `/frontend-design` en surbrillance.
     let mut m = base();
     m.context_pct = Some(15);
     m.input = "/frontend-design refais l'input".into();
     m.cursor = m.input.len();
     dump(&m, w, 8, "skill inséré (surbrillance en vrai terminal)");
 
-    // 12. Commande /goal → le `/goal` est surligné (comme un skill).
+    // 13. Commande /goal → le `/goal` est surligné (comme un skill).
     let mut n = base();
     n.context_pct = Some(15);
     n.input = "/goal vivre de mes produits".into();

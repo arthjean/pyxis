@@ -45,6 +45,18 @@ const USER_SHELL_TOOL_CALL_MAX_LINES: usize = 50;
 const RAW_TOOL_OUTPUT_WIDTH: usize = 120;
 const SESSION_HEADER_MAX_INNER_WIDTH: usize = 56;
 
+fn accent_style() -> Style {
+    Style::default().fg(Color::Rgb(0x6c, 0xcb, 0xff))
+}
+
+fn secondary_accent_style() -> Style {
+    Style::default().fg(Color::Rgb(0x8f, 0xa7, 0xff))
+}
+
+fn fault_style() -> Style {
+    Style::default().fg(Color::Rgb(0xff, 0x6b, 0x78))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryRenderMode {
     Rich,
@@ -1327,9 +1339,7 @@ impl HistoryCell for SessionHeaderCell {
             ),
             Span::styled(
                 self.model.clone(),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
+                accent_style().add_modifier(Modifier::BOLD),
             ),
         ];
         if let Some(reasoning) = self
@@ -1343,13 +1353,13 @@ impl HistoryCell for SessionHeaderCell {
         }
         if self.show_fast_status {
             model_spans.push(Span::raw("   "));
-            model_spans.push(Span::styled("fast", Style::default().fg(Color::Magenta)));
+            model_spans.push(Span::styled("fast", secondary_accent_style()));
         }
         model_spans.push(Span::styled(
             "   ",
             Style::default().add_modifier(Modifier::DIM),
         ));
-        model_spans.push(Span::styled("/model", Style::default().fg(Color::Cyan)));
+        model_spans.push(Span::styled("/model", accent_style()));
         model_spans.push(Span::styled(
             " to change",
             Style::default().add_modifier(Modifier::DIM),
@@ -1384,9 +1394,7 @@ impl HistoryCell for SessionHeaderCell {
                 ),
                 Span::styled(
                     "YOLO mode",
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
+                    secondary_accent_style().add_modifier(Modifier::BOLD),
                 ),
             ]));
         }
@@ -1705,9 +1713,7 @@ impl PlanStepStatus {
     fn style(self) -> Style {
         match self {
             Self::Completed => Style::default().add_modifier(Modifier::DIM | Modifier::CROSSED_OUT),
-            Self::InProgress => Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            Self::InProgress => accent_style().add_modifier(Modifier::BOLD),
             Self::Pending => Style::default().add_modifier(Modifier::DIM),
         }
     }
@@ -2214,10 +2220,7 @@ impl HistoryCell for RequestUserInputCell {
             ),
         ];
         if self.interrupted {
-            header.push(Span::styled(
-                " (interrupted)",
-                Style::default().fg(Color::Cyan),
-            ));
+            header.push(Span::styled(" (interrupted)", accent_style()));
         }
 
         let mut lines = vec![Line::from(header)];
@@ -2243,10 +2246,7 @@ impl HistoryCell for RequestUserInputCell {
             };
             if question.is_secret {
                 lines.extend(render_prefixed(
-                    &[Line::from(Span::styled(
-                        "••••••",
-                        Style::default().fg(Color::Cyan),
-                    ))],
+                    &[Line::from(Span::styled("••••••", accent_style()))],
                     Span::styled("    answer: ", Style::default().add_modifier(Modifier::DIM)),
                     Span::styled("            ", Style::default().add_modifier(Modifier::DIM)),
                     width,
@@ -2257,10 +2257,7 @@ impl HistoryCell for RequestUserInputCell {
             let (options, note) = Self::split_answer(answer);
             for option in options {
                 lines.extend(render_prefixed(
-                    &[Line::from(Span::styled(
-                        option,
-                        Style::default().fg(Color::Cyan),
-                    ))],
+                    &[Line::from(Span::styled(option, accent_style()))],
                     Span::styled("    answer: ", Style::default().add_modifier(Modifier::DIM)),
                     Span::styled("            ", Style::default().add_modifier(Modifier::DIM)),
                     width,
@@ -2268,10 +2265,7 @@ impl HistoryCell for RequestUserInputCell {
             }
             if let Some(note) = note {
                 lines.extend(render_prefixed(
-                    &[Line::from(Span::styled(
-                        note,
-                        Style::default().fg(Color::Cyan),
-                    ))],
+                    &[Line::from(Span::styled(note, accent_style()))],
                     Span::styled("    note: ", Style::default().add_modifier(Modifier::DIM)),
                     Span::styled("          ", Style::default().add_modifier(Modifier::DIM)),
                     width,
@@ -2284,9 +2278,9 @@ impl HistoryCell for RequestUserInputCell {
             lines.extend(render_prefixed(
                 &[Line::from(Span::styled(
                     format!("interrupted with {unanswered} unanswered"),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                    accent_style().add_modifier(Modifier::DIM),
                 ))],
-                Span::styled("  ↳ ", Style::default().fg(Color::Cyan)),
+                Span::styled("  ↳ ", accent_style()),
                 Span::styled("    ", Style::default().add_modifier(Modifier::DIM)),
                 width,
             ));
@@ -2599,12 +2593,10 @@ impl PatchApplyFailureCell {
 impl HistoryCell for PatchApplyFailureCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = vec![Line::from(vec![
-            Span::styled("✘ ", Style::default().fg(Color::Magenta)),
+            Span::styled("✘ ", fault_style()),
             Span::styled(
                 "Failed to apply patch",
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
+                fault_style().add_modifier(Modifier::BOLD),
             ),
         ])];
         if !self.stderr.trim().is_empty() {
@@ -2727,7 +2719,7 @@ impl SpecialNoticeCell {
                 Span::styled(self.title.clone(), Style::default().fg(Color::Red)),
             ]),
             SpecialNoticeKind::SafetyAccess => Line::from(vec![
-                Span::styled("ⓘ ", Style::default().fg(Color::Cyan)),
+                Span::styled("ⓘ ", accent_style()),
                 Span::styled(
                     self.title.clone(),
                     Style::default().add_modifier(Modifier::BOLD),
@@ -2757,9 +2749,7 @@ impl HistoryCell for SpecialNoticeCell {
                     ),
                     Span::styled(
                         link.url.clone(),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::UNDERLINED),
+                        accent_style().add_modifier(Modifier::UNDERLINED),
                     ),
                 ])],
                 Span::raw("  "),
@@ -3685,9 +3675,9 @@ fn format_mcp_invocation(invocation: &McpInvocation) -> Line<'static> {
         .unwrap_or_default();
 
     Line::from(vec![
-        Span::styled(invocation.server.clone(), Style::default().fg(Color::Cyan)),
+        Span::styled(invocation.server.clone(), accent_style()),
         Span::raw("."),
-        Span::styled(invocation.tool.clone(), Style::default().fg(Color::Cyan)),
+        Span::styled(invocation.tool.clone(), accent_style()),
         Span::raw("("),
         Span::styled(args, Style::default().add_modifier(Modifier::DIM)),
         Span::raw(")"),
@@ -4115,11 +4105,9 @@ fn command_spans(command: &str) -> Vec<Span<'static>> {
         let (body, trailing_space) = split_trailing_space(token);
         if !body.is_empty() {
             let style = if first_token {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
+                accent_style().add_modifier(Modifier::BOLD)
             } else if body.starts_with('-') {
-                Style::default().fg(Color::Magenta)
+                secondary_accent_style()
             } else {
                 Style::default()
             };
