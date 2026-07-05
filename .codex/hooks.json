@@ -1,0 +1,82 @@
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "_paneflow_managed": true,
+        "hooks": [
+          {
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& 'C:/Program Files/PaneFlow/bin/paneflow-ai-hook.exe' PermissionRequest\"",
+            "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& 'C:/Program Files/PaneFlow/bin/paneflow-ai-hook.exe' PermissionRequest\"",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "_paneflow_managed": true,
+        "hooks": [
+          {
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& 'C:/Program Files/PaneFlow/bin/paneflow-ai-hook.exe' PostToolUse\"",
+            "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& 'C:/Program Files/PaneFlow/bin/paneflow-ai-hook.exe' PostToolUse\"",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "_paneflow_managed": true,
+        "hooks": [
+          {
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& 'C:/Program Files/PaneFlow/bin/paneflow-ai-hook.exe' PreToolUse\"",
+            "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& 'C:/Program Files/PaneFlow/bin/paneflow-ai-hook.exe' PreToolUse\"",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "_paneflow_managed": true,
+        "hooks": [
+          {
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& 'C:/Program Files/PaneFlow/bin/paneflow-ai-hook.exe' SessionStart\"",
+            "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& 'C:/Program Files/PaneFlow/bin/paneflow-ai-hook.exe' SessionStart\"",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "_paneflow_managed": true,
+        "hooks": [
+          {
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& 'C:/Program Files/PaneFlow/bin/paneflow-ai-hook.exe' Stop\"",
+            "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& 'C:/Program Files/PaneFlow/bin/paneflow-ai-hook.exe' Stop\"",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "_paneflow_managed": true,
+        "hooks": [
+          {
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& 'C:/Program Files/PaneFlow/bin/paneflow-ai-hook.exe' UserPromptSubmit\"",
+            "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& 'C:/Program Files/PaneFlow/bin/paneflow-ai-hook.exe' UserPromptSubmit\"",
+            "timeout": 5,
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  }
+}
