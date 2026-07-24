@@ -62,7 +62,7 @@ You need a Rust toolchain (1.95+) and a Linux desktop session with a Secret Serv
 
 ```bash
 # 1. Build from source
-git clone https://github.com/ArthurDEV44/pyxis.git
+git clone https://github.com/arthjean/pyxis.git
 cd pyxis
 cargo build --release          # produces target/release/pyxis
 
