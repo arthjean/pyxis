@@ -157,6 +157,11 @@ const GOAL_CONTINUE_PROMPT: &str = "Continue the session goal. If work remains, 
     keep going. If it is fully completed and verified, end your reply with \
     <<GOAL_DONE>> alone on the final line.";
 
+/// Granularité du lecteur clavier. Assez courte pour rester imperceptible à la
+/// frappe, assez longue pour ne pas monopoliser la file d'événements crossterm
+/// pendant qu'un autre appel y lit la réponse du terminal.
+const KEY_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 const MCP_DISABLED_NOTICE: &str =
     "MCP: config diagnostics only. MCP tool execution is not exposed in this build.";
 
@@ -467,6 +472,10 @@ async fn event_loop(
     #[cfg(feature = "codex_tui_parity")]
     let mut parity_surface = ChatSurface::from_messages(&initial_messages);
     #[cfg(feature = "codex_tui_parity")]
+    #[cfg(feature = "codex_tui_parity")]
+    let mut viewport_sync_enabled = true;
+    #[cfg(feature = "codex_tui_parity")]
+    let mut last_logged_geometry: Option<String> = None;
     let mut parity_inserter = HistoryInserter::new(InsertHistoryMode::InlineScrollback);
     #[cfg(feature = "codex_tui_parity")]
     let mut parity_viewport = TerminalViewportState::new(
@@ -478,10 +487,24 @@ async fn event_loop(
     // Transcript vide au démarrage → l'écran d'accueil (carte + logo) s'affiche
     // de lui-même (cf. `AppState::is_welcome`), pas de Notice à pousser.
 
-    // Thread lecteur clavier → mpsc (crossterm read() est bloquant).
+    // Thread lecteur clavier → mpsc. `poll` puis `read` (jamais `read` seul) :
+    // un `read` bloquant retient les événements INTERNES de crossterm (dont la
+    // réponse à la requête de position curseur) dans son tampon local jusqu'à la
+    // prochaine frappe. Or ratatui interroge le curseur à chaque redimensionnement
+    // du viewport inline : la réponse n'arrivait jamais, la requête expirait, et le
+    // `draw` remontait une erreur fatale. `poll` range ces événements dans la file
+    // interne partagée, où `cursor::position()` les retrouve.
     let (key_tx, mut key_rx) = mpsc::channel::<Event>(64);
     std::thread::spawn(move || {
-        while let Ok(ev) = crossterm::event::read() {
+        loop {
+            match crossterm::event::poll(KEY_POLL_INTERVAL) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => break,
+            }
+            let Ok(ev) = crossterm::event::read() else {
+                break;
+            };
             if key_tx.blocking_send(ev).is_err() {
                 break;
             }
@@ -526,7 +549,32 @@ async fn event_loop(
         }
         #[cfg(feature = "codex_tui_parity")]
         {
+            // Terminal agrandi : le viewport inline garde sa hauteur d'origine et
+            // laisse le composer ancré au milieu de l'écran tant qu'on ne l'a pas
+            // reconstruit. Un échec (terminal qui ne répond pas à la requête de
+            // position) ne doit pas tuer la session : on abandonne le réalignement
+            // et on continue avec le viewport périmé.
+            if viewport_sync_enabled
+                && let Err(err) = agent_tui::sync_inline_viewport(tui)
+            {
+                viewport_sync_enabled = false;
+                agent_tui::debug_log::log(&format!("sync: disabled after error: {err}"));
+                state.blocks.push(Block::Notice(format!(
+                    "Viewport resize disabled: {err}. Restart Pyxis after resizing."
+                )));
+            }
             let size = tui.size()?;
+            if agent_tui::debug_log::enabled() {
+                let viewport = tui.get_frame().area();
+                let line = format!(
+                    "frame: screen={}x{} viewport=(x{} y{} w{} h{}) sync_enabled={viewport_sync_enabled}",
+                    size.width, size.height, viewport.x, viewport.y, viewport.width, viewport.height
+                );
+                if last_logged_geometry.as_deref() != Some(line.as_str()) {
+                    agent_tui::debug_log::log(&line);
+                    last_logged_geometry = Some(line);
+                }
+            }
             parity_viewport.resize(size.width, size.height, size.height);
             if parity_inserter.mode() == InsertHistoryMode::InlineScrollback
                 && let Some(insert) =
@@ -579,7 +627,13 @@ async fn event_loop(
                     }
                     // frappe normale ; on ignore les répétitions de relâche.
                     Some(Event::Key(k)) if k.kind != KeyEventKind::Release => k,
-                    Some(_) => continue, // key release, resize… → simple redraw
+                    Some(other) => {
+                        // key release, resize… → simple redraw
+                        if let Event::Resize(w, h) = other {
+                            agent_tui::debug_log::log(&format!("event: resize {w}x{h}"));
+                        }
+                        continue;
+                    }
                 };
                 #[cfg(feature = "codex_tui_parity")]
                 let action = parity_bottom_pane.route_key(&mut state, k);

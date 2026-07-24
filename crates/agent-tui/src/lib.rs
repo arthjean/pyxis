@@ -82,5 +82,7 @@ pub use state::{
 pub use streaming::{StreamController, StreamView};
 pub use term::{Tui, clear, enter, leave, supports_truecolor};
 #[cfg(feature = "codex_tui_parity")]
+pub use term::{inline_viewport_stale, sync_inline_viewport};
+#[cfg(feature = "codex_tui_parity")]
 pub use terminal_viewport::{TerminalViewport, TerminalViewportState};
 pub use theme::Theme;
