@@ -53,6 +53,12 @@ pub enum SandboxError {
 /// Applique le confinement FS process-wide : RW sous `workspace`, read-only
 /// ailleurs. À appeler sur le thread principal avant le runtime async.
 #[cfg(target_os = "linux")]
+/// Devices dont l'usage reste autorisé sous confinement : voir la justification à
+/// leur ajout dans `enforce_process`. Écrire dans `/dev/null` est sans effet, et
+/// `/dev/tty` est déjà le terminal de l'utilisateur, hérité via stdout.
+#[cfg(target_os = "linux")]
+const STANDARD_DEVICES: &[&str] = &["/dev/tty", "/dev/null"];
+
 pub fn enforce_process(workspace: &std::path::Path) -> Result<SandboxStatus, SandboxError> {
     use landlock::{
         ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
@@ -60,7 +66,7 @@ pub fn enforce_process(workspace: &std::path::Path) -> Result<SandboxStatus, San
     };
 
     let abi = ABI::V7;
-    let status = Ruleset::default()
+    let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(abi))
         .map_err(|e| SandboxError::Landlock(e.to_string()))?
@@ -80,7 +86,25 @@ pub fn enforce_process(workspace: &std::path::Path) -> Result<SandboxStatus, San
             PathFd::new(workspace).map_err(|e| SandboxError::Landlock(e.to_string()))?,
             AccessFs::from_all(abi),
         ))
-        .map_err(|e| SandboxError::Landlock(e.to_string()))?
+        .map_err(|e| SandboxError::Landlock(e.to_string()))?;
+
+    // Devices standard : sans eux, le confinement casse des usages qu'il n'a jamais
+    // visés. `/dev/tty` porte l'ioctl `TIOCGWINSZ` que crossterm interroge pour la
+    // taille du terminal — refusé, il retombe sur `tput` et lit 80x24, ce qui fige
+    // le TUI dans un coin de l'écran. `/dev/null` est la poubelle d'écriture qu'une
+    // partie de l'outillage (git en tête) ouvre systématiquement. Le droit
+    // `IoctlDev` ne peut être accordé qu'ici : il est attaché au descripteur à son
+    // ouverture, donc un fichier ouvert après l'enforcement ne l'obtient jamais.
+    for device in STANDARD_DEVICES {
+        let Ok(fd) = PathFd::new(device) else {
+            continue;
+        };
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(fd, AccessFs::from_file(abi)))
+            .map_err(|e| SandboxError::Landlock(e.to_string()))?;
+    }
+
+    let status = ruleset
         .restrict_self()
         .map_err(|e| SandboxError::Landlock(e.to_string()))?;
 
