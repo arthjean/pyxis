@@ -11,6 +11,8 @@
 
 use agent_core::message::ToolCallId;
 use async_trait::async_trait;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 /// The 5 permission modes (ARCHITECTURE 4.4).
@@ -163,6 +165,124 @@ pub fn resolve_permission(
     shaped
 }
 
+/// Can the answer to a confirmation be remembered for the session (US-008), and
+/// under which key? Produced by the tool itself, which alone knows what
+/// identifies one of its calls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalMemo {
+    /// Rememberable under this EXACT token sequence.
+    Key(Vec<String>),
+    /// Rememberable answers exist for this tool, but not for this call. The
+    /// reason is shown to the user.
+    Refused(&'static str),
+    /// This tool has no notion of a repeatable call: no option is offered.
+    NotApplicable,
+}
+
+/// Session approval key. Holds the exact argv token sequence and the directory
+/// the command would run in: the same command elsewhere is not the same act.
+///
+/// Comparison is derived (elementwise on `Vec<String>`), so a remembered answer
+/// can never be reached by a command that merely shares a string prefix
+/// (CVE-2026-22708).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ApprovalKey {
+    pub tool: String,
+    pub tokens: Vec<String>,
+    pub cwd: PathBuf,
+}
+
+impl ApprovalKey {
+    pub fn new(tool: impl Into<String>, tokens: &[String], cwd: impl AsRef<Path>) -> Self {
+        Self {
+            tool: tool.into(),
+            tokens: tokens.to_vec(),
+            cwd: cwd.as_ref().to_path_buf(),
+        }
+    }
+
+    /// Human-readable form for the inspection surface (`/approvals`).
+    pub fn display(&self) -> String {
+        self.tokens.join(" ")
+    }
+}
+
+/// One remembered answer, as exposed to the inspection surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalEntry {
+    pub tool: String,
+    pub command: String,
+    pub allow: bool,
+}
+
+/// Answers remembered for the current session. IN MEMORY ONLY: nothing is
+/// written to disk and nothing survives the process, which is a security choice
+/// (a persistent allow-list is the vector of CVE-2026-22708), not a limitation.
+#[derive(Debug, Clone, Default)]
+pub struct ApprovalMemory {
+    inner: Arc<RwLock<HashMap<ApprovalKey, bool>>>,
+}
+
+impl ApprovalMemory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Remembered answer for this exact key, `None` when never answered.
+    pub fn lookup(&self, key: &ApprovalKey) -> Option<bool> {
+        match self.inner.read() {
+            Ok(map) => map.get(key).copied(),
+            Err(poisoned) => poisoned.into_inner().get(key).copied(),
+        }
+    }
+
+    pub fn remember(&self, key: ApprovalKey, allow: bool) {
+        match self.inner.write() {
+            Ok(mut map) => {
+                map.insert(key, allow);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().insert(key, allow);
+            }
+        }
+    }
+
+    /// Snapshot for display, sorted for a stable rendering.
+    pub fn entries(&self) -> Vec<ApprovalEntry> {
+        let map = match self.inner.read() {
+            Ok(map) => map.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let mut entries: Vec<ApprovalEntry> = map
+            .into_iter()
+            .map(|(key, allow)| ApprovalEntry {
+                tool: key.tool.clone(),
+                command: key.display(),
+                allow,
+            })
+            .collect();
+        entries.sort_by(|a, b| (&a.tool, &a.command).cmp(&(&b.tool, &b.command)));
+        entries
+    }
+
+    /// Forgets everything and returns how many answers were dropped.
+    pub fn clear(&self) -> usize {
+        match self.inner.write() {
+            Ok(mut map) => {
+                let n = map.len();
+                map.clear();
+                n
+            }
+            Err(poisoned) => {
+                let mut map = poisoned.into_inner();
+                let n = map.len();
+                map.clear();
+                n
+            }
+        }
+    }
+}
+
 /// Confirmation request presented to the user (through the `Approver`).
 #[derive(Debug, Clone)]
 pub struct PermissionRequest {
@@ -177,14 +297,54 @@ pub struct PermissionRequest {
     /// Raw structured input: lets the frontend render a rich preview
     /// (diff for `edit`, command for `bash`) in the permission dialog.
     pub input: serde_json::Value,
+    /// May the answer be remembered for the session (US-009 AC1)? The frontend
+    /// only offers the option when this is true.
+    pub memoizable: bool,
+    /// Why remembering is unavailable, when there is a reason worth showing
+    /// (US-009 AC2). `None` = the tool simply has no rememberable form.
+    pub memo_refused: Option<String>,
+}
+
+/// Answer to a confirmation: what to do now, and whether to remember it for the
+/// session. `remember` is ignored when the request is not memoizable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApprovalResponse {
+    pub allow: bool,
+    pub remember: bool,
+}
+
+impl ApprovalResponse {
+    pub const ALLOW_ONCE: Self = Self {
+        allow: true,
+        remember: false,
+    };
+    pub const DENY_ONCE: Self = Self {
+        allow: false,
+        remember: false,
+    };
+    pub const ALLOW_SESSION: Self = Self {
+        allow: true,
+        remember: true,
+    };
+    pub const DENY_SESSION: Self = Self {
+        allow: false,
+        remember: true,
+    };
+
+    pub const fn once(allow: bool) -> Self {
+        Self {
+            allow,
+            remember: false,
+        }
+    }
 }
 
 /// Interactive boundary: the pipeline delegates confirmation here. The CLI/TUI
 /// provides a real implementation (prompt); tests a scripted double.
 #[async_trait]
 pub trait Approver: Send + Sync {
-    /// Returns `true` when the action is allowed.
-    async fn approve(&self, req: &PermissionRequest) -> bool;
+    /// Decides the action and the scope of that decision.
+    async fn approve(&self, req: &PermissionRequest) -> ApprovalResponse;
 }
 
 /// Automatic approver. By default it accepts routine requests but
@@ -216,8 +376,9 @@ impl Default for AutoApprove {
 
 #[async_trait]
 impl Approver for AutoApprove {
-    async fn approve(&self, req: &PermissionRequest) -> bool {
-        !req.taint_forced || self.approve_tainted
+    async fn approve(&self, req: &PermissionRequest) -> ApprovalResponse {
+        // Never remembers: an automatic answer must not build an allow-list.
+        ApprovalResponse::once(!req.taint_forced || self.approve_tainted)
     }
 }
 
@@ -228,8 +389,8 @@ pub struct AutoDeny;
 
 #[async_trait]
 impl Approver for AutoDeny {
-    async fn approve(&self, _req: &PermissionRequest) -> bool {
-        false
+    async fn approve(&self, _req: &PermissionRequest) -> ApprovalResponse {
+        ApprovalResponse::DENY_ONCE
     }
 }
 
@@ -401,6 +562,49 @@ mod tests {
             res(PermissionMode::DontAsk, PermissionDecision::Ask, READ, true),
             Resolved::Allow
         );
+    }
+
+    fn key(tokens: &[&str]) -> ApprovalKey {
+        let tokens: Vec<String> = tokens.iter().map(|t| (*t).to_string()).collect();
+        ApprovalKey::new("bash", &tokens, "/ws")
+    }
+
+    #[test]
+    fn memory_matches_the_exact_token_sequence() {
+        // US-008 AC1/AC2: `git status` remembered never covers `git status-x`,
+        // `git status --short` nor `git push --force`.
+        let memory = ApprovalMemory::new();
+        memory.remember(key(&["git", "status"]), true);
+        assert_eq!(memory.lookup(&key(&["git", "status"])), Some(true));
+        assert_eq!(memory.lookup(&key(&["git", "status-x"])), None);
+        assert_eq!(memory.lookup(&key(&["git", "status", "--short"])), None);
+        assert_eq!(memory.lookup(&key(&["git", "push", "--force"])), None);
+    }
+
+    #[test]
+    fn memory_is_scoped_to_the_working_directory() {
+        let memory = ApprovalMemory::new();
+        let tokens = vec!["ls".to_string()];
+        memory.remember(ApprovalKey::new("bash", &tokens, "/a"), true);
+        assert_eq!(
+            memory.lookup(&ApprovalKey::new("bash", &tokens, "/b")),
+            None
+        );
+    }
+
+    #[test]
+    fn memory_is_session_scoped_and_clearable() {
+        // US-008 AC4: nothing is persisted, so a fresh memory knows nothing.
+        let memory = ApprovalMemory::new();
+        memory.remember(key(&["ls"]), true);
+        memory.remember(key(&["rm", "-rf", "target"]), false);
+        let entries = memory.entries();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].command, "ls");
+        assert!(entries[0].allow);
+        assert_eq!(memory.clear(), 2);
+        assert!(memory.entries().is_empty());
+        assert!(ApprovalMemory::new().entries().is_empty());
     }
 
     #[test]

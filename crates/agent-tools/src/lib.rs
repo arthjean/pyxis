@@ -36,8 +36,9 @@ pub use error::{ToolError, ValidationError};
 pub use glob::Glob;
 pub use grep::Grep;
 pub use permission::{
-    Approver, AutoApprove, AutoDeny, PermCtx, PermissionDecision, PermissionMode,
-    PermissionModeState, PermissionRequest, Resolved, resolve_permission,
+    ApprovalEntry, ApprovalKey, ApprovalMemo, ApprovalMemory, ApprovalResponse, Approver,
+    AutoApprove, AutoDeny, PermCtx, PermissionDecision, PermissionMode, PermissionModeState,
+    PermissionRequest, Resolved, resolve_permission,
 };
 pub use read::Read;
 pub use registry::{Registry, RegistryBuilder};

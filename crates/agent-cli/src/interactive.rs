@@ -419,12 +419,12 @@ fn write_goal_iters(path: &Path, value: u32) -> std::io::Result<()> {
 fn show_shutdown_feedback(
     state: &mut AppState,
     active_turn: &mut ActiveTurn,
-    pending_resp: &mut Option<oneshot::Sender<bool>>,
+    pending_resp: &mut Option<oneshot::Sender<agent_tools::permission::ApprovalResponse>>,
     running: &mut bool,
     turn_start: &mut Option<Instant>,
 ) {
     if let Some(resp) = pending_resp.take() {
-        let _ = resp.send(false);
+        let _ = resp.send(agent_tools::permission::ApprovalResponse::DENY_ONCE);
     }
     active_turn.abort();
     *running = false;
@@ -596,7 +596,7 @@ async fn event_loop(
     } else {
         0
     };
-    let mut pending_resp: Option<oneshot::Sender<bool>> = None;
+    let mut pending_resp: Option<oneshot::Sender<agent_tools::permission::ApprovalResponse>> = None;
     let mut queued_prompts: VecDeque<String> = VecDeque::new();
 
     // Spinner animation tick (US-044). 100 ms is about 10 fps: fluid and nearly free
@@ -1138,7 +1138,7 @@ async fn event_loop(
                     ),
                     InputAction::Interrupt if running => {
                         if let Some(resp) = pending_resp.take() {
-                            let _ = resp.send(false);
+                            let _ = resp.send(agent_tools::permission::ApprovalResponse::DENY_ONCE);
                         }
                         // US-001: no more brutal `abort()` nor fabricated `Interrupted`
                         // here. We signal, and the turn closes when the
@@ -1149,7 +1149,9 @@ async fn event_loop(
                     InputAction::Interrupt => {}
                     InputAction::Permission(allow) => {
                         if let Some(resp) = pending_resp.take() {
-                            let _ = resp.send(allow);
+                            let _ = resp.send(
+                                agent_tools::permission::ApprovalResponse::once(allow),
+                            );
                         }
                         #[cfg(feature = "codex_tui_parity")]
                         parity_surface.apply_update(parity_mapper.map_approval_decision(allow));

@@ -557,6 +557,12 @@ pub struct PermissionPrompt {
     pub call_id: Option<ToolCallId>,
     pub mode: Option<String>,
     pub taint_forced: bool,
+    /// The answer can be remembered for the session (US-009 AC1): the dialog
+    /// then offers the session options.
+    pub memoizable: bool,
+    /// Why remembering is unavailable, when there is a reason worth showing
+    /// (US-009 AC2).
+    pub memo_note: Option<String>,
 }
 
 impl PermissionPrompt {
@@ -572,6 +578,8 @@ impl PermissionPrompt {
             call_id: None,
             mode: None,
             taint_forced: false,
+            memoizable: false,
+            memo_note: None,
         }
     }
 }

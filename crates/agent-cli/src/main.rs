@@ -785,9 +785,13 @@ async fn run(
         Arc::new(TuiApprover::new(perm_tx))
     };
 
+    // US-008: session approval memory, shared with the frontend like the
+    // permission mode. In memory only: nothing is written to disk.
+    let approvals = agent_tools::permission::ApprovalMemory::new();
     let registry = Registry::builder(&workspace)
         .mode_state(permission_mode.clone())
         .approver(approver)
+        .approvals(approvals.clone())
         .initial_taint_recent(initial_taint_recent)
         .command_hardener(harden)
         .register(Read)

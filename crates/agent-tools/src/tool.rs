@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 
 use crate::error::{ToolError, ValidationError};
-use crate::permission::{PermCtx, PermissionDecision};
+use crate::permission::{ApprovalMemo, PermCtx, PermissionDecision};
 
 /// Global caps of the native tools. These limits bound allocations before
 /// a model payload can become a memory or disk problem.
@@ -186,6 +186,12 @@ pub trait Tool: Send + Sync {
         PermissionDecision::Ask
     }
 
+    /// Key identifying this call for the session approval memory (US-008).
+    /// Fail-closed default: no answer is ever remembered for this tool.
+    fn approval_memo(&self, _input: &Self::Input) -> ApprovalMemo {
+        ApprovalMemo::NotApplicable
+    }
+
     /// External timeout applied by the Registry. Tools that manage an internal
     /// timeout, such as `bash`, can ask for grace to clean up.
     fn timeout(&self, ctx: &ToolCtx) -> Duration {
@@ -216,6 +222,8 @@ pub trait DynTool: Send + Sync {
     fn precheck(&self, raw: &serde_json::Value, ctx: &ToolCtx) -> Result<(), ToolError>;
     /// Baseline decision of the tool (raw already validated by `precheck`).
     fn permission(&self, raw: &serde_json::Value, ctx: &PermCtx) -> PermissionDecision;
+    /// Session approval key of this call (US-008), forwarded from `Tool`.
+    fn approval_memo(&self, raw: &serde_json::Value) -> ApprovalMemo;
     fn timeout(&self, ctx: &ToolCtx) -> Duration;
     /// Parse + `call`. Wrapped in a timeout by the Registry.
     async fn invoke(&self, raw: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError>;
@@ -279,6 +287,13 @@ impl<T: Tool> DynTool for DynToolAdapter<T> {
         match serde_json::from_value::<T::Input>(raw.clone()) {
             Ok(input) => self.inner.permission(&input, ctx),
             Err(_) => PermissionDecision::Deny,
+        }
+    }
+    fn approval_memo(&self, raw: &serde_json::Value) -> ApprovalMemo {
+        // Same race, same posture: an unparsable input is not rememberable.
+        match serde_json::from_value::<T::Input>(raw.clone()) {
+            Ok(input) => self.inner.approval_memo(&input),
+            Err(_) => ApprovalMemo::NotApplicable,
         }
     }
     fn timeout(&self, ctx: &ToolCtx) -> Duration {

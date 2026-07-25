@@ -103,6 +103,16 @@ impl Tool for Bash {
             }
         }
     }
+    /// US-008: an answer is remembered under the EXACT argv token sequence. A
+    /// command carrying a shell construct is never rememberable, and says why.
+    fn approval_memo(&self, input: &Self::Input) -> crate::permission::ApprovalMemo {
+        use crate::permission::ApprovalMemo;
+        match crate::command::classify(&input.command) {
+            crate::command::CommandClass::SideEffectFree(tokens)
+            | crate::command::CommandClass::Argv(tokens) => ApprovalMemo::Key(tokens),
+            crate::command::CommandClass::Opaque(reason) => ApprovalMemo::Refused(reason),
+        }
+    }
     fn timeout(&self, ctx: &ToolCtx) -> std::time::Duration {
         ctx.timeout
             .checked_add(ctx.cleanup_grace)

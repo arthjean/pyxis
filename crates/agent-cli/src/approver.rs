@@ -6,13 +6,13 @@
 //! Fail-closed: when the channel is closed (TUI gone) or the answer lost, we
 //! **refuse** by default.
 
-use agent_tools::permission::{Approver, PermissionRequest};
+use agent_tools::permission::{ApprovalResponse, Approver, PermissionRequest};
 use agent_tui::{PermissionPrompt, diff};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
 /// Message sent to the TUI loop: the request + the answer channel.
-pub type PermissionMsg = (PermissionRequest, oneshot::Sender<bool>);
+pub type PermissionMsg = (PermissionRequest, oneshot::Sender<ApprovalResponse>);
 
 pub struct TuiApprover {
     tx: mpsc::Sender<PermissionMsg>,
@@ -26,12 +26,13 @@ impl TuiApprover {
 
 #[async_trait]
 impl Approver for TuiApprover {
-    async fn approve(&self, req: &PermissionRequest) -> bool {
+    async fn approve(&self, req: &PermissionRequest) -> ApprovalResponse {
         let (resp_tx, resp_rx) = oneshot::channel();
         if self.tx.send((req.clone(), resp_tx)).await.is_err() {
-            return false; // TUI closed -> fail-closed
+            return ApprovalResponse::DENY_ONCE; // TUI closed -> fail-closed
         }
-        resp_rx.await.unwrap_or(false) // answer lost -> fail-closed
+        // Answer lost -> fail-closed, and nothing remembered.
+        resp_rx.await.unwrap_or(ApprovalResponse::DENY_ONCE)
     }
 }
 
@@ -67,6 +68,8 @@ pub fn to_prompt(req: &PermissionRequest) -> PermissionPrompt {
     prompt.call_id = Some(req.call_id.clone());
     prompt.mode = Some(req.mode.clone());
     prompt.taint_forced = req.taint_forced;
+    prompt.memoizable = req.memoizable;
+    prompt.memo_note = req.memo_refused.clone();
     prompt
 }
 
@@ -83,7 +86,27 @@ mod tests {
             mode: "Default".into(),
             input_summary: input.to_string(),
             input,
+            memoizable: false,
+            memo_refused: None,
         }
+    }
+
+    #[test]
+    fn memoization_metadata_reaches_the_prompt() {
+        // US-009 AC1/AC2: the dialog knows whether it may offer the session
+        // options, and why it may not.
+        let mut r = req("bash", serde_json::json!({ "command": "git status" }));
+        r.memoizable = true;
+        assert!(to_prompt(&r).memoizable);
+
+        let mut r = req("bash", serde_json::json!({ "command": "ls $HOME" }));
+        r.memo_refused = Some("the command contains a substitution or a variable".into());
+        let p = to_prompt(&r);
+        assert!(!p.memoizable);
+        assert_eq!(
+            p.memo_note.as_deref(),
+            Some("the command contains a substitution or a variable")
+        );
     }
 
     #[test]

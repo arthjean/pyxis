@@ -24,14 +24,16 @@ use futures_util::stream::{self, StreamExt};
 
 use crate::error::ToolError;
 use crate::permission::{
-    Approver, AutoDeny, PermCtx, PermissionMode, PermissionModeState, PermissionRequest, Resolved,
-    resolve_permission,
+    ApprovalKey, ApprovalMemo, ApprovalMemory, Approver, AutoDeny, PermCtx, PermissionMode,
+    PermissionModeState, PermissionRequest, Resolved, resolve_permission,
 };
 use crate::taint::TaintTracker;
 use crate::tool::{DynTool, ToolCtx, into_dyn};
 
 /// Tool description capped at exposure time (a tool does not pollute the prompt).
 const MAX_DESCRIPTION: usize = 2048;
+/// Reason shown when the taint defense forbids remembering an answer (US-008 AC5).
+const TAINT_NOT_MEMOIZABLE: &str = "untrusted content was read in this turn";
 /// Concurrency cap of the read-only batch (ARCHITECTURE 4.2).
 const CONCURRENCY: usize = 10;
 
@@ -41,6 +43,7 @@ pub struct Registry {
     tools: HashMap<String, Box<dyn DynTool>>,
     mode: PermissionModeState,
     approver: Arc<dyn Approver>,
+    approvals: ApprovalMemory,
     taint: TaintTracker,
     ctx: ToolCtx,
 }
@@ -51,10 +54,16 @@ impl Registry {
             tools: HashMap::new(),
             mode: PermissionModeState::default(),
             approver: None,
+            approvals: ApprovalMemory::new(),
             taint_window: crate::taint::DEFAULT_WINDOW,
             initial_taint_recent: false,
             ctx: ToolCtx::new(workspace),
         }
+    }
+
+    /// Answers remembered for this session (US-009 inspection surface).
+    pub fn approvals(&self) -> ApprovalMemory {
+        self.approvals.clone()
     }
 
     pub fn mode(&self) -> PermissionMode {
@@ -162,30 +171,68 @@ impl Registry {
             }
             Resolved::Ask => {
                 let taint_forced = pctx.taint_recent && tool.is_taint_sensitive();
-                let req = PermissionRequest {
-                    call_id: id.clone(),
-                    tool: call.name.clone(),
-                    reason: ask_reason(taint_forced),
-                    taint_forced,
-                    mode: format!("{mode:?}"),
-                    input_summary: summarize(&call.input),
-                    input: call.input.clone(),
+                // US-008: a remembered answer applies only outside a tainted
+                // context. The taint defense outranks the memory, in both
+                // directions: it re-asks, and it forbids remembering.
+                let memo = tool.approval_memo(&call.input);
+                let (key, memo_refused) = match (&memo, taint_forced) {
+                    (_, true) => (None, Some(TAINT_NOT_MEMOIZABLE.to_string())),
+                    (ApprovalMemo::Key(tokens), false) => (
+                        Some(ApprovalKey::new(&call.name, tokens, &self.ctx.workspace)),
+                        None,
+                    ),
+                    (ApprovalMemo::Refused(reason), false) => (None, Some((*reason).to_string())),
+                    (ApprovalMemo::NotApplicable, false) => (None, None),
                 };
-                events.emit(ToolDispatchEvent::PermissionAsk(PermissionReq {
-                    call_id: id.clone(),
-                    tool: req.tool.clone(),
-                    reason: req.reason.clone(),
-                    taint_forced: req.taint_forced,
-                    input_summary: req.input_summary.clone(),
-                    input: req.input.clone(),
-                    mode: req.mode.clone(),
-                }));
-                if !self.approver.approve(&req).await {
-                    return err_outcome(
-                        id,
-                        format!("action \"{}\" rejected by user", call.name),
-                        ToolErrorKind::PermissionDenied,
-                    );
+                match key.as_ref().and_then(|k| self.approvals.lookup(k)) {
+                    // Remembered allow: no question, the user already answered
+                    // for this exact token sequence in this directory.
+                    Some(true) => {}
+                    Some(false) => {
+                        return err_outcome(
+                            id,
+                            format!(
+                                "action \"{}\" refused for this session by the user (remembered answer)",
+                                call.name
+                            ),
+                            ToolErrorKind::PermissionDenied,
+                        );
+                    }
+                    None => {
+                        let req = PermissionRequest {
+                            call_id: id.clone(),
+                            tool: call.name.clone(),
+                            reason: ask_reason(taint_forced),
+                            taint_forced,
+                            mode: format!("{mode:?}"),
+                            input_summary: summarize(&call.input),
+                            input: call.input.clone(),
+                            memoizable: key.is_some(),
+                            memo_refused,
+                        };
+                        events.emit(ToolDispatchEvent::PermissionAsk(PermissionReq {
+                            call_id: id.clone(),
+                            tool: req.tool.clone(),
+                            reason: req.reason.clone(),
+                            taint_forced: req.taint_forced,
+                            input_summary: req.input_summary.clone(),
+                            input: req.input.clone(),
+                            mode: req.mode.clone(),
+                        }));
+                        let answer = self.approver.approve(&req).await;
+                        if answer.remember
+                            && let Some(key) = key
+                        {
+                            self.approvals.remember(key, answer.allow);
+                        }
+                        if !answer.allow {
+                            return err_outcome(
+                                id,
+                                format!("action \"{}\" rejected by user", call.name),
+                                ToolErrorKind::PermissionDenied,
+                            );
+                        }
+                    }
                 }
             }
             Resolved::Allow => {}
@@ -395,6 +442,7 @@ pub struct RegistryBuilder {
     tools: HashMap<String, Box<dyn DynTool>>,
     mode: PermissionModeState,
     approver: Option<Arc<dyn Approver>>,
+    approvals: ApprovalMemory,
     taint_window: u64,
     initial_taint_recent: bool,
     ctx: ToolCtx,
@@ -411,6 +459,12 @@ impl RegistryBuilder {
     }
     pub fn approver(mut self, approver: Arc<dyn Approver>) -> Self {
         self.approver = Some(approver);
+        self
+    }
+    /// Session approval memory shared with the frontend (`/approvals`), like
+    /// the permission mode. Defaults to a memory owned by the registry alone.
+    pub fn approvals(mut self, approvals: ApprovalMemory) -> Self {
+        self.approvals = approvals;
         self
     }
     pub fn taint_window(mut self, window: u64) -> Self {
@@ -450,6 +504,7 @@ impl RegistryBuilder {
             tools: self.tools,
             mode: self.mode,
             approver: self.approver.unwrap_or_else(|| Arc::new(AutoDeny)),
+            approvals: self.approvals,
             taint: TaintTracker::new(self.taint_window),
             ctx: self.ctx,
         };
