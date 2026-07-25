@@ -438,6 +438,32 @@ fn context_indicator() {
     );
 }
 
+/// US-004 AC6: fed by real counters, the indicator must not push the status line
+/// past a narrow terminal. The frame is captured at `NARROW` width, so any
+/// overflow would show up as a truncated or wrapped line in the snapshot.
+#[test]
+fn context_indicator_narrow() {
+    let mut s = conversation();
+    s.apply(&AgentEvent::ModelTurn(agent_core::ModelTurnView {
+        index: 1,
+        input_tokens: 184_220,
+        output_tokens: 12_900,
+        context_tokens: Some(231_200),
+        context_window: Some(272_000),
+        estimated_context_tokens: None,
+    }));
+    s.reasoning_effort = Some("high".into());
+    assert_eq!(
+        s.context_pct,
+        Some(85),
+        "alimenté par les compteurs backend"
+    );
+    insta::assert_snapshot!(
+        "context_indicator_narrow",
+        harness::frame("context_indicator_narrow", &s, NARROW, H)
+    );
+}
+
 // ──────────────────────── Interruption and errors ────────────────────────
 
 #[test]

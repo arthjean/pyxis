@@ -601,7 +601,20 @@ pub struct AppState {
     /// Workspace name (current directory) shown in the status line; empty = hidden.
     pub workspace: String,
     /// Fraction of context consumed (0-100). `None` = unknown -> segment hidden.
+    /// Fed by `AgentEvent::ModelTurn` (US-004), and only when the backend
+    /// reported a usage AND the window of the active model is known: an
+    /// estimated fill is worse than no fill.
     pub context_pct: Option<u8>,
+    /// Context occupied at the last round-trip, as measured by the backend
+    /// (US-004). `None` = not reported.
+    pub context_tokens: Option<u32>,
+    /// Context window of the active model when the backend declares one
+    /// (US-001). `None` = unknown.
+    pub context_window: Option<u32>,
+    /// Tokens cumulated since the start of the session, as carried by
+    /// `ModelTurn` (real when the backend reports them, estimated otherwise).
+    pub total_input_tokens: u64,
+    pub total_output_tokens: u64,
     /// Subscription quota state (US-003). `None` as long as the backend has
     /// served nothing: nothing is then displayed.
     pub quota: Option<agent_core::quota::QuotaSnapshot>,
@@ -638,9 +651,12 @@ pub struct AppState {
     /// Elapsed time of the current turn (`None` outside a turn); fed by the loop
     /// (which owns the clock): `render` never reads the time.
     pub turn_elapsed: Option<Duration>,
-    /// Cumulated characters (text + reasoning) of the current turn -> token
-    /// estimate (/4). On a `/goal` loop, cumulates every re-prompt (total cost
-    /// view): reset only on the rising edge of `running` (`begin_turn`).
+    /// Cumulated characters (text + reasoning) of the current turn. Bookkeeping
+    /// for `stream_start`, which rewinds the counter when the core abandons a
+    /// stream; it is NOT a consumption measure and feeds no display (US-004:
+    /// the indicator comes from the backend counters only). On a `/goal` loop it
+    /// cumulates every re-prompt: reset only on the rising edge of `running`
+    /// (`begin_turn`).
     pub turn_chars: usize,
     /// Reduced motion (`NO_COLOR` / `PYXIS_REDUCED_MOTION`): spinner degraded to a pulsing dot.
     pub reduced_motion: bool,
@@ -742,6 +758,10 @@ impl AppState {
             model: model.into(),
             workspace: String::new(),
             context_pct: None,
+            context_tokens: None,
+            context_window: None,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
             quota: None,
             reasoning_effort: None,
             permission_mode: DEFAULT_PERMISSION_MODE_ID.to_string(),
@@ -1120,9 +1140,9 @@ impl AppState {
                 });
             }
             AgentEvent::Compacted(_) => self.blocks.push(Block::Notice("context compacted".into())),
-            // Turn accounting (US-017): machine contract, no rendering. The
-            // context counter has its own source.
-            AgentEvent::ModelTurn(_) => {}
+            // Turn accounting (US-017, US-004): no block in the transcript, but
+            // this IS the source of the consumption indicator.
+            AgentEvent::ModelTurn(view) => self.observe_model_turn(view),
             AgentEvent::Quota(snapshot) => self.quota = Some(*snapshot),
             AgentEvent::TurnDiff(view) => self.blocks.push(Block::Notice(turn_diff_summary(view))),
             AgentEvent::PermissionAsk(req) => self
@@ -1160,6 +1180,28 @@ impl AppState {
                 // least "content arrived" without inflating the counter per token.
                 self.unseen = self.unseen.max(1);
             }
+        }
+    }
+
+    /// US-004: the consumption indicator is fed by the backend counters and by
+    /// the real window of the model, never by a local estimate. A round-trip
+    /// without a reported usage leaves the last known measure in place (the
+    /// context did not shrink) rather than displaying a fabricated value; as
+    /// long as no usage has ever arrived, the indicator stays absent.
+    fn observe_model_turn(&mut self, view: &agent_core::ModelTurnView) {
+        self.total_input_tokens = view.input_tokens;
+        self.total_output_tokens = view.output_tokens;
+        if let Some(window) = view.context_window {
+            self.context_window = Some(window);
+        }
+        if let Some(tokens) = view.context_tokens {
+            self.context_tokens = Some(tokens);
+        }
+        if let (Some(tokens), Some(window)) = (self.context_tokens, self.context_window)
+            && window > 0
+        {
+            let pct = (u64::from(tokens) * 100).div_ceil(u64::from(window));
+            self.context_pct = Some(pct.min(100) as u8);
         }
     }
 
@@ -3136,6 +3178,48 @@ mod tests {
             s.turn_elapsed.is_none(),
             "indicateurs disparus en fin de tour"
         );
+    }
+
+    fn model_turn(index: u32, context_tokens: Option<u32>, window: Option<u32>) -> AgentEvent {
+        AgentEvent::ModelTurn(agent_core::ModelTurnView {
+            index,
+            input_tokens: u64::from(index) * 1_000,
+            output_tokens: u64::from(index) * 100,
+            context_tokens,
+            context_window: window,
+            estimated_context_tokens: None,
+        })
+    }
+
+    // US-004 AC1 + AC2: the indicator is fed by the backend counters and the
+    // model window, and stays absent as long as one of the two is missing. No
+    // block is added to the transcript.
+    #[test]
+    fn context_indicator_comes_from_backend_counters() {
+        let mut s = AppState::new("gpt-5", true);
+        s.apply(&model_turn(1, None, None));
+        assert_eq!(s.context_pct, None, "aucune mesure: indicateur absent");
+        assert!(s.blocks.is_empty(), "comptabilité: aucun bloc");
+
+        s.apply(&model_turn(2, Some(50_000), None));
+        assert_eq!(s.context_pct, None, "fenêtre inconnue: toujours absent");
+
+        s.apply(&model_turn(3, Some(50_000), Some(200_000)));
+        assert_eq!(s.context_pct, Some(25));
+        assert_eq!(s.total_input_tokens, 3_000);
+        assert_eq!(s.total_output_tokens, 300);
+    }
+
+    // US-004 AC4: after a compaction the next round-trip reports a lower
+    // occupancy, and the indicator follows it down.
+    #[test]
+    fn context_indicator_follows_compaction_downwards() {
+        let mut s = AppState::new("gpt-5", true);
+        s.apply(&model_turn(1, Some(160_000), Some(200_000)));
+        assert_eq!(s.context_pct, Some(80));
+        s.apply(&AgentEvent::Compacted(agent_core::CompactKind::Auto));
+        s.apply(&model_turn(2, Some(20_000), Some(200_000)));
+        assert_eq!(s.context_pct, Some(10), "le remplissage redescend");
     }
 
     // US-046: `unseen` only counts the blocks that arrived while scrolled up, and resets
