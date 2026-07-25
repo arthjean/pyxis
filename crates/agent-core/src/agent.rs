@@ -48,6 +48,11 @@ pub struct RunConfig {
     pub cost_budget: Option<CostBudget>,
     /// Optional fallback model after a provider overload.
     pub overload_fallback_model: Option<String>,
+    /// Calibration probe (US-002): when enabled, every model round-trip carries
+    /// the local estimate of its input next to the backend measure, so a client
+    /// can compare them. Off by default: the estimate costs a tokenizer pass
+    /// over the whole transcript.
+    pub usage_probe: bool,
 }
 
 impl Default for RunConfig {
@@ -63,6 +68,7 @@ impl Default for RunConfig {
             token_budget: None,
             cost_budget: None,
             overload_fallback_model: None,
+            usage_probe: false,
         }
     }
 }
@@ -584,6 +590,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     let mut acc = Accumulator::new();
                     let mut stream_err: Option<ProviderError> = None;
                     let mut last_usage: Option<TokenUsage> = None;
+                    let mut estimated_input: Option<u32> = None;
                     let mut interrupted = false;
                     loop {
                         // US-001: cancellation is polled FIRST (`biased`) -> as soon
@@ -614,18 +621,15 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 }
                             }
                             Ok(StreamEvent::Usage { usage }) => {
-                                // Observability probe (US-021 AC3 / US-029): compares
-                                // real backend usage to the local estimate. Env-gated,
-                                // default OFF -> path and output unchanged in prod.
-                                if std::env::var_os("PYXIS_DEBUG_USAGE").is_some() {
-                                    let est_in = estimate_input(&messages, deps.tokenizer.as_ref())
-                                        .saturating_add(static_input_tokens);
-                                    eprintln!(
-                                        "[usage] backend input={} output={} | estimé_local input≈{} (ratio réel/estimé={:.3})",
-                                        usage.input,
-                                        usage.output,
-                                        est_in,
-                                        usage.input as f64 / (est_in.max(1) as f64),
+                                // Calibration probe (US-021 AC3 / US-029): the core
+                                // COMPUTES the local estimate when the run asks for
+                                // it and carries it in `ModelTurn`; WRITING it is a
+                                // client decision (US-002 AC5, invariant 1). Off by
+                                // default -> no tokenizer pass on the hot path.
+                                if config.usage_probe {
+                                    estimated_input = Some(
+                                        estimate_input(&messages, deps.tokenizer.as_ref())
+                                            .saturating_add(static_input_tokens),
                                     );
                                 }
                                 budget.observe_usage(usage);
@@ -788,6 +792,11 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         index: model_turns,
                         input_tokens: usage_budget.spent_input(),
                         output_tokens: usage_budget.spent_output(),
+                        // US-002: real occupancy of the window, absent when the
+                        // provider reported nothing (never reported as zero).
+                        context_tokens: last_usage.map(|usage| usage.input),
+                        context_window: deps.provider.context_window_for_model(&model),
+                        estimated_context_tokens: estimated_input,
                     });
 
                     let transition = post_stream_transition(&acc);

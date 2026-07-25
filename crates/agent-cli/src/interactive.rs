@@ -1171,6 +1171,14 @@ async fn event_loop(
                             | AgentEvent::Error(_)
                             | AgentEvent::Exhausted(_)
                     );
+                    // Calibration probe (US-002): in interactive mode the TUI owns
+                    // the terminal, so the line goes to the debug log, never to a
+                    // process output.
+                    if let AgentEvent::ModelTurn(view) = &ev
+                        && let Some(line) = crate::jsonl::usage_probe_line(view)
+                    {
+                        agent_tui::debug_log::log(&line);
+                    }
                     state.apply(&ev);
                     #[cfg(feature = "codex_tui_parity")]
                     {

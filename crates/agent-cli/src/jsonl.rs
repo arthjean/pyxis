@@ -37,6 +37,21 @@ pub fn output_format_from_arg(arg: &str) -> Option<OutputFormat> {
     }
 }
 
+/// Calibration line of the usage probe (US-002, `PYXIS_DEBUG_USAGE`). The core
+/// carries the backend measure and the local estimate in `ModelTurn`; deciding
+/// where to write them belongs to the binary (invariant 1). `None` as soon as
+/// one of the two sides is missing: a ratio against an absent measure would
+/// mean nothing.
+pub fn usage_probe_line(view: &agent_core::ModelTurnView) -> Option<String> {
+    let (measured, estimated) = (view.context_tokens?, view.estimated_context_tokens?);
+    Some(format!(
+        "[usage] turn={} backend input={measured} | local estimate≈{estimated} \
+         (ratio real/estimated={:.3})",
+        view.index,
+        f64::from(measured) / f64::from(estimated.max(1)),
+    ))
+}
+
 /// Event line. `event` is flattened: the shape of `AgentEvent`
 /// (`{"type": ..., "data": ...}`) stays visible as is, augmented with the `schema`.
 #[derive(Serialize)]
@@ -103,6 +118,12 @@ impl EventWriter {
             self.model_turns = self.model_turns.max(view.index);
             self.input_tokens = view.input_tokens;
             self.output_tokens = view.output_tokens;
+            // Calibration probe: stderr, so the text output on stdout stays
+            // identical byte for byte, and only when the probe is enabled (the
+            // core then fills the estimate).
+            if let Some(line) = usage_probe_line(view) {
+                eprintln!("{line}");
+            }
         }
         if self.format != OutputFormat::Json {
             return;
@@ -236,12 +257,44 @@ mod tests {
                 index,
                 input_tokens: u64::from(index) * 100,
                 output_tokens: u64::from(index) * 10,
+                ..ModelTurnView::default()
             }));
         }
 
         assert_eq!(writer.model_turns, 3);
         assert_eq!(writer.input_tokens, 300);
         assert_eq!(writer.output_tokens, 30);
+    }
+
+    /// US-002: the probe only says something when it can compare the two sides.
+    #[test]
+    fn usage_probe_needs_both_sides() {
+        let base = ModelTurnView {
+            index: 4,
+            input_tokens: 10,
+            output_tokens: 2,
+            ..ModelTurnView::default()
+        };
+        assert!(
+            usage_probe_line(&base).is_none(),
+            "sonde inactive: aucune ligne"
+        );
+        assert!(
+            usage_probe_line(&ModelTurnView {
+                context_tokens: Some(1_000),
+                ..base
+            })
+            .is_none(),
+            "mesure sans estimation: rien à comparer"
+        );
+        let line = usage_probe_line(&ModelTurnView {
+            context_tokens: Some(1_000),
+            estimated_context_tokens: Some(500),
+            ..base
+        })
+        .expect("sonde active");
+        assert!(line.contains("turn=4"), "{line}");
+        assert!(line.contains("ratio real/estimated=2.000"), "{line}");
     }
 
     #[test]

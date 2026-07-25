@@ -1104,6 +1104,106 @@ mod loop_tests {
         );
     }
 
+    // ───────── US-002 / US-003: consumption and quota in the contract ─────────
+
+    fn model_turns(events: &[AgentEvent]) -> Vec<crate::ModelTurnView> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ModelTurn(view) => Some(*view),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn text_turn_with(events: Vec<StreamEvent>) -> MockTurn {
+        let mut all = events;
+        all.push(StreamEvent::TextDelta {
+            text: "réponse".into(),
+        });
+        all.push(StreamEvent::Done {
+            stop: StopReason::EndTurn,
+        });
+        MockTurn::Stream(all)
+    }
+
+    /// US-002 AC1: the end-of-round-trip event carries the real occupancy of the
+    /// window and the window of the active model, next to the counters already
+    /// present.
+    #[tokio::test]
+    async fn model_turn_carries_backend_usage_and_model_window() {
+        let h = harness(
+            vec![text_turn_with(vec![StreamEvent::Usage {
+                usage: TokenUsage {
+                    input: 600,
+                    output: 5,
+                },
+            }])],
+            false,
+            10_000,
+        );
+        let events = drive(
+            AgentContext::new("windowed").push(Message::user("go")),
+            h.deps,
+        )
+        .await;
+        let turns = model_turns(&events);
+        assert_eq!(turns.len(), 1, "{events:?}");
+        assert_eq!(turns[0].context_tokens, Some(600));
+        assert_eq!(turns[0].context_window, Some(2_000));
+        assert_eq!(
+            turns[0].estimated_context_tokens, None,
+            "sonde inactive par défaut"
+        );
+    }
+
+    /// US-002 AC3 and AC4: without a reported usage the measure is declared
+    /// absent instead of being reported as zero, and an unknown window stays
+    /// `None` so that no percentage can be computed in the core.
+    #[tokio::test]
+    async fn model_turn_reports_absent_measure_and_unknown_window() {
+        let h = harness(vec![text_turn_with(Vec::new())], false, 10_000);
+        let events = drive(AgentContext::new("mock").push(Message::user("go")), h.deps).await;
+        let turns = model_turns(&events);
+        assert_eq!(turns.len(), 1, "{events:?}");
+        assert_eq!(
+            turns[0].context_tokens, None,
+            "mesure absente, jamais rapportée à zéro"
+        );
+        assert_eq!(turns[0].context_window, None, "fenêtre inconnue");
+        assert!(
+            turns[0].input_tokens > 0,
+            "les compteurs cumulés gardent leur repli estimé"
+        );
+    }
+
+    /// US-002 AC5: the calibration probe is now data carried by the event; the
+    /// core computes it on demand and writes nothing.
+    #[tokio::test]
+    async fn usage_probe_travels_as_data_when_enabled() {
+        let h = harness(
+            vec![text_turn_with(vec![StreamEvent::Usage {
+                usage: TokenUsage {
+                    input: 600,
+                    output: 5,
+                },
+            }])],
+            false,
+            10_000,
+        );
+        let ctx = AgentContext::new("windowed")
+            .with_config(RunConfig {
+                usage_probe: true,
+                ..RunConfig::default()
+            })
+            .push(Message::user("go"));
+        let turns = model_turns(&drive(ctx, h.deps).await);
+        assert!(
+            turns[0].estimated_context_tokens.is_some(),
+            "sonde active: l'estimation locale accompagne la mesure"
+        );
+    }
+
     // ───────── US-014: loop guardrails + budgets (kill-switch) ─────────
 
     use crate::transition::ExhaustReason;

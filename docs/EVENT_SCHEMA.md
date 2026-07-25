@@ -51,13 +51,30 @@ contrat que consomme aussi la TUI.
 | `tool_output_delta` | `{id, chunk}` | Fragment de sortie d'un outil encore en cours. Informatif : le transcript ne retient que `tool_result`. |
 | `tool_result` | `{id, content, is_error, error_kind?, untrusted}` | Résultat d'outil. `untrusted` vaut `true` pour tout contenu externe. |
 | `compacted` | `"micro"` \| `"auto"` \| `"reactive"` | Une compaction de contexte a eu lieu. |
-| `model_turn` | `{index, input_tokens, output_tokens}` | Un aller-retour modèle vient de finir. `index` est 1-based ; les compteurs sont **cumulés depuis le début du run**, réels quand le provider rapporte son usage, estimés localement sinon. |
+| `model_turn` | `{index, input_tokens, output_tokens, context_tokens?, context_window?, estimated_context_tokens?}` | Un aller-retour modèle vient de finir. `index` est 1-based ; `input_tokens` et `output_tokens` sont **cumulés depuis le début du run**, réels quand le provider rapporte son usage, estimés localement sinon. Voir plus bas. |
 | `turn_diff` | `{files:[…]}` | Diff agrégé du tour. Jamais émis quand rien n'a changé. Voir plus bas. |
 | `permission_ask` | `{call_id, tool, reason, taint_forced, input_summary, input, mode}` | Demande d'autorisation. En headless, l'approbateur refuse par défaut. |
 | `end_turn` | — | Le tour s'est terminé normalement. |
 | `interrupted` | — | Le tour a été interrompu ; le transcript est déjà réconcilié. |
 | `exhausted` | détail | Arrêt déterministe : budget, plafond de tours, boucle d'outils. |
 | `error` | détail | Erreur d'agent. Émise **avant** la sortie du processus. |
+
+### `model_turn`
+
+```json
+{"schema":1,"type":"model_turn","data":{
+  "index":2,"input_tokens":18422,"output_tokens":1290,
+  "context_tokens":12040,"context_window":272000
+}}
+```
+
+`context_tokens` est le remplissage **réel** de la fenêtre à cet aller-retour, tel
+que le backend l'a rapporté. Le champ est **absent** quand le provider ne rapporte
+aucun usage : la mesure manque, ce qui ne se confond pas avec zéro. `context_window`
+est la fenêtre déclarée par le backend pour le modèle actif, **absente** tant
+qu'elle est inconnue. Le cœur ne calcule aucun pourcentage : rapporter l'un à
+l'autre est une décision de présentation. `estimated_context_tokens` n'apparaît
+que lorsque la sonde de calibration est active (`PYXIS_DEBUG_USAGE`).
 
 ### `turn_diff`
 

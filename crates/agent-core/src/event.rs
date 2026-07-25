@@ -76,12 +76,28 @@ pub struct ToolResultView {
 /// End of a model round-trip (US-017). The counters are CUMULATED since the
 /// start of the run: they are the ones driving the budget, so real when the
 /// provider reports its `usage`, locally estimated otherwise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ModelTurnView {
     /// 1-based index of the model turn that just ended.
     pub index: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Input tokens of THIS round-trip as reported by the backend, i.e. the
+    /// context actually occupied (US-002). `None` when the provider reported no
+    /// usage: the measure is absent, which is not the same as zero, and a client
+    /// must then display nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u32>,
+    /// Context window of the active model, when the backend declares one
+    /// (US-001). `None` = unknown. The core deliberately computes NO percentage:
+    /// relating one to the other is a presentation decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    /// Local estimate of the same input, produced only when the calibration
+    /// probe is enabled (`RunConfig::usage_probe`). Exists to be compared to
+    /// `context_tokens`; `None` in the nominal case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_context_tokens: Option<u32>,
 }
 
 /// Aggregated diff of a turn (US-018). An empty one is never emitted.

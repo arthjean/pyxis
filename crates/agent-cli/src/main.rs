@@ -332,6 +332,9 @@ fn run_config_from_args(args: &Args, config: &settings::Config) -> anyhow::Resul
         token_budget,
         cost_budget,
         overload_fallback_model,
+        // US-002: the calibration probe is decided by the binary, and it is the
+        // binary that writes its output. The core only computes the estimate.
+        usage_probe: std::env::var_os("PYXIS_DEBUG_USAGE").is_some(),
         ..RunConfig::default()
     })
 }
