@@ -1,15 +1,15 @@
-//! Smoke test LIVE de l'adapter abonnement ChatGPT (Responses API, SSE).
+//! LIVE smoke test of the ChatGPT subscription adapter (Responses API, SSE).
 //!
-//! `cargo run -p agent-provider --example smoke -- "ton prompt" [model]`
+//! `cargo run -p agent-provider --example smoke -- "your prompt" [model]`
 //!
-//! Relit la credential du keyring (écrite par `agent-auth --example login`),
-//! ouvre un flux réel contre le backend ChatGPT, et imprime le texte token par
-//! token (raisonnement en grisé sur stderr). C'est la vérification de bout en
-//! bout « ça marche avec mon abonnement » — il n'y a pas encore de CLI (EP-005).
+//! Reads back the credential from the keyring (written by `agent-auth --example login`),
+//! opens a real stream against the ChatGPT backend, and prints the text token by
+//! token (reasoning greyed out on stderr). This is the end-to-end
+//! "it works with my subscription" check: there is no CLI yet (EP-005).
 //!
-//! ⚠️ Le slug `model` dépend de ce que ton abonnement expose côté backend Codex
-//! (défaut `DEFAULT_MODEL`). En cas de `400 ... not supported`, passe le bon id
-//! en 2e arg (slugs versionnés : `gpt-5.4`, `gpt-5.5`…).
+//! Note: the `model` slug depends on what your subscription exposes on the Codex backend
+//! (default `DEFAULT_MODEL`). On a `400 ... not supported`, pass the right id
+//! as the 2nd arg (versioned slugs: `gpt-5.4`, `gpt-5.5`, ...).
 
 use agent_auth::{Credential, ProviderId, store};
 use agent_core::message::Message;
@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 use std::io::Write;
                 std::io::stdout().flush().ok();
             }
-            // raisonnement en grisé sur stderr (n'encombre pas la sortie).
+            // reasoning greyed out on stderr (does not clutter the output).
             StreamEvent::ReasoningDelta { text } => eprint!("\x1b[2m{text}\x1b[0m"),
             StreamEvent::ToolCallStart { name, .. } => eprintln!("\n[tool: {name}]"),
             StreamEvent::Usage { usage } => {

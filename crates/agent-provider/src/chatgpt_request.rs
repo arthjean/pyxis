@@ -1,27 +1,27 @@
-//! Construction du corps de requête Responses API (backend ChatGPT/Codex) depuis
-//! le `CanonicalRequest` (Anthropic-like, transcript client-side). Transcrit
-//! verbatim du wire format Pi (`openai-codex-responses.ts` +
-//! `openai-responses-shared.ts`, vérifié contre le code).
+//! Building of the Responses API request body (ChatGPT/Codex backend) from
+//! the `CanonicalRequest` (Anthropic-like, client-side transcript). Transcribed
+//! verbatim from the Pi wire format (`openai-codex-responses.ts` +
+//! `openai-responses-shared.ts`, checked against the code).
 //!
-//! Invariants load-bearing :
-//! - `store: false` TOUJOURS (le backend rejette `true`).
-//! - system prompt → `instructions` (string), JAMAIS un item `input[]`.
-//! - SSE **stateless** : pas de `previous_response_id` → contexte complet dans
-//!   `input[]` à chaque tour (mappe le canonique, ARCHITECTURE/PROVIDERS §4.1).
-//! - pas de `max_output_tokens` : le backend ChatGPT/Codex le rejette, même si
-//!   `CanonicalRequest` le conserve pour les budgets internes.
-//! - `call_id` corrèle `function_call` ↔ `function_call_output`.
+//! Load-bearing invariants:
+//! - `store: false` ALWAYS (the backend rejects `true`).
+//! - system prompt -> `instructions` (string), NEVER an `input[]` item.
+//! - **stateless** SSE: no `previous_response_id` -> full context in
+//!   `input[]` on every turn (maps the canonical model, ARCHITECTURE/PROVIDERS 4.1).
+//! - no `max_output_tokens`: the ChatGPT/Codex backend rejects it, even though
+//!   `CanonicalRequest` keeps it for the internal budgets.
+//! - `call_id` correlates `function_call` <-> `function_call_output`.
 //!
-//! Les reasoning items chiffrés sont réinjectés avant leurs `function_call` quand
-//! le transcript en contient. Les blocs orphelins restent sautés pour éviter une
-//! paire reasoning/call invalide.
+//! The encrypted reasoning items are reinjected before their `function_call` when
+//! the transcript contains any. Orphan blocks stay skipped, to avoid an
+//! invalid reasoning/call pair.
 //!
-//! US-003 — garde-fou d'appariement : un `function_call` sans
-//! `function_call_output` fait rejeter la requête ENTIÈRE par le backend, donc une
-//! session interrompue avant ce garde-fou reste inexploitable jusqu'à un `/new`.
-//! La construction répare en mémoire (résultat synthétique pour l'appel orphelin,
-//! résultat orphelin écarté) et ne réécrit JAMAIS le `.jsonl` sur disque. Les
-//! anomalies réparées sont tracées sous `PYXIS_DEBUG_TRANSCRIPT`.
+//! US-003: pairing guardrail. A `function_call` without a
+//! `function_call_output` makes the backend reject the WHOLE request, so a
+//! session interrupted before this guardrail stayed unusable until a `/new`.
+//! The building repairs in memory (synthetic result for the orphan call,
+//! orphan result discarded) and NEVER rewrites the `.jsonl` on disk. The
+//! repaired anomalies are traced under `PYXIS_DEBUG_TRANSCRIPT`.
 
 use std::collections::HashSet;
 
@@ -52,13 +52,13 @@ impl Default for ResponsesBodyOptions<'_> {
     }
 }
 
-/// Construit le corps JSON complet de la requête Responses (SSE).
+/// Builds the complete JSON body of the Responses request (SSE).
 pub fn build_responses_body(req: &CanonicalRequest, options: ResponsesBodyOptions<'_>) -> Value {
     let instructions = req.system.as_deref().unwrap_or(DEFAULT_INSTRUCTIONS);
 
     let mut body = json!({
         "model": req.model,
-        // load-bearing : le backend Codex rejette store:true.
+        // load-bearing: the Codex backend rejects store:true.
         "store": false,
         "stream": true,
         "instructions": instructions,
@@ -80,38 +80,38 @@ pub fn build_responses_body(req: &CanonicalRequest, options: ResponsesBodyOption
     body
 }
 
-/// Borne d'une clé de cache : 64 CODE-POINTS Unicode (US-029). Clamp Unicode-safe
-/// (jamais une coupe mid-codepoint), pas une borne d'octets.
+/// Bound of a cache key: 64 Unicode CODE POINTS (US-029). Unicode-safe clamp
+/// (never a mid-codepoint cut), not a byte bound.
 const CACHE_KEY_MAX_CODEPOINTS: usize = 64;
 
-/// Clampe une clé de cache à 64 code-points (US-029). Une clé déjà ≤ 64 est
-/// inchangée (boundary). `chars().take()` garantit l'absence de coupe au milieu
-/// d'un code-point.
+/// Clamps a cache key to 64 code points (US-029). A key already <= 64 is
+/// unchanged (boundary). `chars().take()` guarantees no cut in the middle
+/// of a code point.
 pub fn clamp_cache_key(key: &str) -> String {
     key.chars().take(CACHE_KEY_MAX_CODEPOINTS).collect()
 }
 
-/// Injecte `prompt_cache_key` (clampé) dans un body déjà construit (US-029). Le
-/// backend ChatGPT réutilise son cache de préfixe quand la clé est STABLE par
-/// session → latence et tokens d'entrée réduits sur les tours répétés.
+/// Injects `prompt_cache_key` (clamped) into an already built body (US-029). The
+/// ChatGPT backend reuses its prefix cache when the key is STABLE per
+/// session -> reduced latency and input tokens on repeated turns.
 pub fn inject_cache_key(body: &mut Value, session_id: &str) {
     body["prompt_cache_key"] = json!(clamp_cache_key(session_id));
 }
 
-/// Trace d'anomalie de transcript (US-003). Silencieuse par défaut : la sortie
-/// standard d'erreur est partagée avec le TUI. Même convention que
-/// `PYXIS_DEBUG_USAGE` côté boucle.
+/// Transcript anomaly trace (US-003). Silent by default: standard
+/// error output is shared with the TUI. Same convention as
+/// `PYXIS_DEBUG_USAGE` on the loop side.
 fn trace_transcript_anomaly(detail: &str) {
     if std::env::var_os("PYXIS_DEBUG_TRANSCRIPT").is_some() {
         eprintln!("[transcript] {detail}");
     }
 }
 
-/// Convertit le transcript canonique en `input[]` de la Responses API.
+/// Converts the canonical transcript into the `input[]` of the Responses API.
 fn build_input(messages: &[Message]) -> Value {
-    // US-003 — appariement calculé sur le transcript ENTIER avant émission : un
-    // résultat peut arriver plusieurs messages après son appel. Sur un transcript
-    // sain, les deux ensembles rendent la construction strictement inchangée.
+    // US-003: pairing computed on the WHOLE transcript before emission: a
+    // result can arrive several messages after its call. On a healthy transcript,
+    // both sets leave the building strictly unchanged.
     let unanswered = unanswered_tool_calls(messages);
     let orphan_calls: HashSet<&str> = unanswered.iter().map(String::as_str).collect();
     let known_calls: HashSet<&str> = messages
@@ -126,7 +126,7 @@ fn build_input(messages: &[Message]) -> Value {
     let mut input: Vec<Value> = Vec::new();
     for msg in messages {
         match msg.role {
-            // Le system prompt vit dans `instructions`, pas dans input[].
+            // The system prompt lives in `instructions`, not in input[].
             Role::System => {}
             Role::User => {
                 let content = user_content(&msg.content);
@@ -145,7 +145,7 @@ fn build_input(messages: &[Message]) -> Value {
     Value::Array(input)
 }
 
-/// Blocs d'un message user → parts `input_text` / `input_image`.
+/// Blocks of a user message -> `input_text` / `input_image` parts.
 fn user_content(blocks: &[ContentBlock]) -> Vec<Value> {
     let mut content = Vec::new();
     for b in blocks {
@@ -171,16 +171,16 @@ fn user_content(blocks: &[ContentBlock]) -> Vec<Value> {
                     "image_url": format!("data:{media_type};base64,{data}"),
                 }));
             }
-            // tool_use / tool_result ne sont pas portés par un message user.
+            // tool_use / tool_result are not carried by a user message.
             _ => {}
         }
     }
     content
 }
 
-/// Un message assistant produit : un item `message` (texte concaténé) puis un
-/// item `function_call` par `tool_use`. Les blocs `thinking` affichables ne sont
-/// pas réinjectés ; seuls les blocs chiffrés opaques le sont.
+/// An assistant message produces: a `message` item (concatenated text) then one
+/// `function_call` item per `tool_use`. Displayable `thinking` blocks are not
+/// reinjected; only the opaque encrypted blocks are.
 fn assistant_items(blocks: &[ContentBlock], orphan_calls: &HashSet<&str>, input: &mut Vec<Value>) {
     let mut text = String::new();
     for b in blocks {
@@ -195,10 +195,10 @@ fn assistant_items(blocks: &[ContentBlock], orphan_calls: &HashSet<&str>, input:
             "content": [ { "type": "output_text", "text": text, "annotations": [] } ],
         }));
     }
-    // US-031 (replay isolé) : reasoning items chiffrés réémis AVANT les function_calls
-    // (paire `rs`/`fc` cohérente, sinon 400). Un reasoning ORPHELIN (message sans
-    // function_call) est SAUTÉ. Présent uniquement si `reasoning_replay` est actif
-    // (sinon les blocs n'existent pas → chemin plat inchangé).
+    // US-031 (isolated replay): encrypted reasoning items re-emitted BEFORE the function_calls
+    // (coherent `rs`/`fc` pair, otherwise a 400). An ORPHAN reasoning (message without a
+    // function_call) is SKIPPED. Present only when `reasoning_replay` is active
+    // (otherwise the blocks do not exist -> flat path unchanged).
     let has_tool_use = blocks
         .iter()
         .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
@@ -228,14 +228,14 @@ fn assistant_items(blocks: &[ContentBlock], orphan_calls: &HashSet<&str>, input:
                 "type": "function_call",
                 "call_id": id,
                 "name": name,
-                // arguments est une STRING JSON dans la Responses API.
+                // arguments is a JSON STRING in the Responses API.
                 "arguments": args.to_string(),
             }));
         }
     }
-    // US-003 : réparation APRÈS les appels du message, jamais entre deux d'entre
-    // eux. Le résultat synthétique est notre propre texte → émis brut, sans
-    // enveloppe untrusted.
+    // US-003: repair AFTER the calls of the message, never between two of
+    // them. The synthetic result is our own text -> emitted raw, without an
+    // untrusted envelope.
     for b in blocks {
         if let ContentBlock::ToolUse { id, .. } = b
             && orphan_calls.contains(id.as_str())
@@ -252,7 +252,7 @@ fn assistant_items(blocks: &[ContentBlock], orphan_calls: &HashSet<&str>, input:
     }
 }
 
-/// Blocs `tool_result` (role Tool) → items `function_call_output`.
+/// `tool_result` blocks (Tool role) -> `function_call_output` items.
 fn tool_result_items(blocks: &[ContentBlock], known_calls: &HashSet<&str>, input: &mut Vec<Value>) {
     for b in blocks {
         if let ContentBlock::ToolResult {
@@ -263,8 +263,8 @@ fn tool_result_items(blocks: &[ContentBlock], known_calls: &HashSet<&str>, input
             error_kind,
         } = b
         {
-            // US-003 : un résultat sans appel correspondant est refusé par le
-            // backend au même titre qu'un appel sans résultat. Il est écarté.
+            // US-003: a result without a matching call is refused by the
+            // backend just like a call without a result. It is discarded.
             if !known_calls.contains(tool_use_id.as_str()) {
                 trace_transcript_anomaly(&format!(
                     "tool result {tool_use_id} has no matching call: dropped"
@@ -309,8 +309,8 @@ fn untrusted_tool_output_payload(
     .to_string()
 }
 
-/// `ToolSpec` canonique → tool `function` plat de la Responses API. Les schémas
-/// sont validés stricts côté `agent-core` avant exposition.
+/// Canonical `ToolSpec` -> flat `function` tool of the Responses API. The schemas
+/// are strictly validated on the `agent-core` side before exposure.
 fn build_tools(tools: &[ToolSpec]) -> Value {
     let arr: Vec<Value> = tools
         .iter()
@@ -363,7 +363,7 @@ mod tests {
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], json!(true));
         assert!(body.get("max_output_tokens").is_none());
-        // pas de previous_response_id (SSE stateless).
+        // no previous_response_id (stateless SSE).
         assert!(body.get("previous_response_id").is_none());
     }
 
@@ -375,7 +375,7 @@ mod tests {
             Some("Tu es Pyxis."),
         ));
         assert_eq!(body["instructions"], "Tu es Pyxis.");
-        // aucun item role:system dans input
+        // no role:system item in input
         let input = body["input"].as_array().unwrap();
         assert!(input.iter().all(|i| i["role"] != "system"));
     }
@@ -442,14 +442,14 @@ mod tests {
         let body = request_body(&req(vec![assistant, tool], vec![], None));
         let input = body["input"].as_array().unwrap();
 
-        // message assistant (output_text) + function_call + function_call_output
+        // assistant message (output_text) + function_call + function_call_output
         let msg = input.iter().find(|i| i["type"] == "message").unwrap();
         assert_eq!(msg["content"][0]["type"], "output_text");
 
         let fc = input.iter().find(|i| i["type"] == "function_call").unwrap();
         assert_eq!(fc["call_id"], "call_42");
         assert_eq!(fc["name"], "bash");
-        // arguments est une STRING JSON.
+        // arguments is a JSON STRING.
         assert_eq!(fc["arguments"], "{\"cmd\":\"ls\"}");
 
         let out = input
@@ -464,8 +464,8 @@ mod tests {
 
     #[test]
     fn trusted_tool_result_stays_raw_for_provider() {
-        // Le résultat est apparié à son appel : depuis US-003, un résultat orphelin
-        // est écarté de la requête (cf. `orphan_tool_result_is_dropped`).
+        // The result is paired with its call: since US-003, an orphan result
+        // is dropped from the request (see `orphan_tool_result_is_dropped`).
         let assistant = Message::assistant(vec![tool_use("call_1")]);
         let tool = Message::tool_result_with_trust("call_1", "confirmed", false, false);
         let body = request_body(&req(vec![assistant, tool], vec![], None));
@@ -498,21 +498,21 @@ mod tests {
         assert_eq!(tool["strict"], true);
     }
 
-    // US-029 : clamp à 64 code-points (Unicode-safe), boundary inchangée.
+    // US-029: clamp to 64 code points (Unicode-safe), boundary unchanged.
     #[test]
     fn cache_key_clamps_to_64_codepoints() {
-        // ASCII court → inchangé.
+        // short ASCII -> unchanged.
         assert_eq!(clamp_cache_key("abc"), "abc");
-        // UUID v4 (36 chars) → inchangé (≤ 64, boundary).
+        // UUID v4 (36 chars) -> unchanged (<= 64, boundary).
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         assert_eq!(clamp_cache_key(uuid), uuid);
-        // 64 chars exactement → inchangé.
+        // exactly 64 chars -> unchanged.
         let exactly64: String = "x".repeat(64);
         assert_eq!(clamp_cache_key(&exactly64).chars().count(), 64);
-        // > 64 ASCII → 64.
+        // > 64 ASCII -> 64.
         let long: String = "y".repeat(100);
         assert_eq!(clamp_cache_key(&long).chars().count(), 64);
-        // > 64 multi-octets (emoji) → 64 CODE-POINTS (pas octets), UTF-8 valide.
+        // > 64 multi-byte (emoji) -> 64 CODE POINTS (not bytes), valid UTF-8.
         let emojis: String = "🦀".repeat(70);
         let clamped = clamp_cache_key(&emojis);
         assert_eq!(clamped.chars().count(), 64);
@@ -525,7 +525,7 @@ mod tests {
         assert!(body.get("prompt_cache_key").is_none());
         inject_cache_key(&mut body, "session-abc");
         assert_eq!(body["prompt_cache_key"], "session-abc");
-        // clé > 64 → clampée dans le body.
+        // key > 64 -> clamped in the body.
         inject_cache_key(&mut body, &"z".repeat(80));
         assert_eq!(
             body["prompt_cache_key"].as_str().unwrap().chars().count(),
@@ -569,7 +569,7 @@ mod tests {
         assert_eq!(with["include"], json!(["reasoning.encrypted_content"]));
     }
 
-    // US-031 : reasoning réémis AVANT son function_call ; orphelin (sans tool_use) sauté.
+    // US-031: reasoning re-emitted BEFORE its function_call; orphan (without tool_use) skipped.
     #[test]
     fn reasoning_replayed_before_function_call_orphan_skipped() {
         let assistant = Message::assistant(vec![
@@ -594,7 +594,7 @@ mod tests {
         assert_eq!(input[rs]["id"], "rs_1");
         assert_eq!(input[rs]["encrypted_content"], "ENC");
 
-        // reasoning ORPHELIN (message sans tool_use) → sauté (pas de 400).
+        // ORPHAN reasoning (message without tool_use) -> skipped (no 400).
         let orphan = Message::assistant(vec![
             ContentBlock::Text {
                 text: "just text".into(),
@@ -632,8 +632,8 @@ mod tests {
             .collect()
     }
 
-    // US-003 AC1 : un appel sans résultat reçoit un `function_call_output`
-    // synthétique plutôt que d'être émis seul (400 garanti sinon).
+    // US-003 AC1: a call without a result gets a synthetic
+    // `function_call_output` rather than being emitted alone (a guaranteed 400 otherwise).
     #[test]
     fn orphan_tool_call_gets_a_synthetic_output() {
         let assistant = Message::assistant(vec![tool_use("call_orphan")]);
@@ -647,9 +647,9 @@ mod tests {
         assert_eq!(out["output"], INTERRUPTED_TOOL_RESULT);
     }
 
-    // US-003 AC3 : forme exacte d'une session reprise après une interruption
-    // antérieure — l'appel orphelin est AU MILIEU du transcript, suivi du nouveau
-    // message utilisateur. Le résultat synthétique doit s'insérer entre les deux.
+    // US-003 AC3: exact shape of a session resumed after an earlier
+    // interruption: the orphan call is IN THE MIDDLE of the transcript, followed by the new
+    // user message. The synthetic result must be inserted between the two.
     #[test]
     fn resumed_corrupted_session_is_repaired_in_place() {
         let body = request_body(&req(
@@ -674,8 +674,8 @@ mod tests {
         assert_eq!(body["input"][3]["content"][0]["text"], "reprends");
     }
 
-    // US-003 AC4 : sur un transcript SAIN, la sortie est celle produite avant le
-    // garde-fou — ni item ajouté, ni ordre changé.
+    // US-003 AC4: on a HEALTHY transcript, the output is the one produced before the
+    // guardrail: no item added, no order changed.
     #[test]
     fn healthy_transcript_is_untouched_by_the_guardrail() {
         let assistant = Message::assistant(vec![
@@ -704,8 +704,8 @@ mod tests {
         );
     }
 
-    // US-003 AC5 : un résultat sans appel correspondant est écarté (le backend le
-    // rejette symétriquement).
+    // US-003 AC5: a result without a matching call is discarded (the backend
+    // rejects it symmetrically).
     #[test]
     fn orphan_tool_result_is_dropped() {
         let body = request_body(&req(
@@ -719,8 +719,8 @@ mod tests {
         assert_eq!(item_types(&body), vec!["message"]);
     }
 
-    // Réparation partielle : seul l'appel orphelin est complété, et son résultat
-    // synthétique vient APRÈS les appels du message, jamais entre deux d'entre eux.
+    // Partial repair: only the orphan call is completed, and its synthetic
+    // result comes AFTER the calls of the message, never between two of them.
     #[test]
     fn only_the_orphan_call_of_a_mixed_message_is_repaired() {
         let assistant = Message::assistant(vec![tool_use("answered"), tool_use("orphan")]);
@@ -743,7 +743,7 @@ mod tests {
 
     #[test]
     fn assistant_text_and_calls_order() {
-        // texte d'abord (message), puis function_call — comme Pi.
+        // text first (message), then function_call, like Pi.
         let assistant = Message::assistant(vec![
             ContentBlock::ToolUse {
                 id: "c1".into(),

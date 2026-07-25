@@ -9,10 +9,10 @@ publish = false
 [lints]
 workspace = true
 
-# Implémente le trait `Provider` du cœur (agent-core) : adapter `OpenAiChatGpt`
-# (Responses API sur le backend ChatGPT, SSE stateless, ADR-10). Auth déléguée à
-# `agent-auth`. Pas de dépendance TUI. Réseau via reqwest + eventsource-stream
-# (PROVIDERS §1.1, sans SDK).
+# Implements the `Provider` trait of the core (agent-core): `OpenAiChatGpt` adapter
+# (Responses API on the ChatGPT backend, stateless SSE, ADR-10). Auth delegated to
+# `agent-auth`. No TUI dependency. Networking through reqwest + eventsource-stream
+# (PROVIDERS 1.1, without an SDK).
 [dependencies]
 agent-core.workspace = true
 agent-auth.workspace = true
@@ -25,8 +25,8 @@ tokio.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
 eventsource-stream.workspace = true
 thiserror.workspace = true
-# US-029 : génération du session_id (UUID v4) pour prompt_cache_key. `rand` est
-# déjà épinglé au workspace (agent-auth) → aucune nouvelle crate téléchargée.
+# US-029: generation of the session_id (UUID v4) for prompt_cache_key. `rand` is
+# already pinned at the workspace level (agent-auth) -> no new crate downloaded.
 rand.workspace = true
 
 [dev-dependencies]

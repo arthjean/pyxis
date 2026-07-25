@@ -1,11 +1,11 @@
-//! Mapping des events SSE de la Responses API (backend ChatGPT/Codex) vers le
-//! vocabulaire canonique `StreamEvent` (PROVIDERS §2). Stateful : suit le
-//! function call actif et accumule ses arguments pour garantir l'invariant
-//! « `args_json` complet & valide à `ToolCallEnd` ».
+//! Mapping of the SSE events of the Responses API (ChatGPT/Codex backend) into the
+//! canonical `StreamEvent` vocabulary (PROVIDERS 2). Stateful: tracks the
+//! active function call and accumulates its arguments to guarantee the invariant
+//! "`args_json` complete & valid at `ToolCallEnd`".
 //!
-//! Types d'events transcrits verbatim de Pi (`openai-responses-shared.ts` +
-//! `openai-codex-responses.ts`). Les events non pertinents (created, part.added,
-//! content_part.added…) sont silencieusement ignorés — comme Pi.
+//! Event types transcribed verbatim from Pi (`openai-responses-shared.ts` +
+//! `openai-codex-responses.ts`). The irrelevant events (created, part.added,
+//! content_part.added, ...) are silently ignored, like Pi.
 
 use agent_core::provider::{ProviderError, StopReason, StreamEvent, TokenUsage};
 use serde_json::Value;
@@ -16,16 +16,16 @@ struct ActiveCall {
     args: String,
 }
 
-/// Mapper à état pour un flux de réponse. Réinstancié à chaque tour.
+/// Stateful mapper for one response stream. Reinstantiated on every turn.
 #[derive(Default)]
 pub struct CodexEventMapper {
     active: HashMap<String, ActiveCall>,
     output_index_to_item: HashMap<u64, String>,
     last_active_item: Option<String>,
-    /// Au moins un tool call a-t-il été émis ? (override stop `completed`→`ToolUse`).
+    /// Has at least one tool call been emitted? (overrides stop `completed` -> `ToolUse`).
     saw_tool_call: bool,
-    /// US-031 : capturer les reasoning items chiffrés pour replay ? Le mapper brut
-    /// garde un défaut OFF ; le provider ChatGPT l'active explicitement.
+    /// US-031: capture the encrypted reasoning items for replay? The raw mapper
+    /// keeps an OFF default; the ChatGPT provider enables it explicitly.
     replay: bool,
 }
 
@@ -34,7 +34,7 @@ impl CodexEventMapper {
         Self::default()
     }
 
-    /// Construit un mapper avec le replay reasoning (US-031) activé ou non.
+    /// Builds a mapper with the reasoning replay (US-031) enabled or not.
     pub fn with_replay(replay: bool) -> Self {
         Self {
             replay,
@@ -42,10 +42,10 @@ impl CodexEventMapper {
         }
     }
 
-    /// Traduit un payload `data:` SSE (un event Responses JSON) en 0..n
-    /// `StreamEvent`. Un event terminal (`response.completed`/`.done`/
-    /// `.incomplete`) émet `Usage?` puis `Done`. Une erreur (`error`/
-    /// `response.failed`) remonte une `ProviderError` typée — jamais de panic.
+    /// Translates an SSE `data:` payload (one JSON Responses event) into 0..n
+    /// `StreamEvent`. A terminal event (`response.completed`/`.done`/
+    /// `.incomplete`) emits `Usage?` then `Done`. An error (`error`/
+    /// `response.failed`) surfaces a typed `ProviderError`, never a panic.
     pub fn ingest(&mut self, data: &str) -> Result<Vec<StreamEvent>, ProviderError> {
         let data = data.trim();
         if data.is_empty() {
@@ -77,7 +77,7 @@ impl CodexEventMapper {
                 Ok(Vec::new())
             }
             "response.function_call_arguments.done" => {
-                // Source d'autorité des arguments complets (remplace l'accumulé).
+                // Authoritative source of the complete arguments (replaces the accumulated ones).
                 if let (Some(key), Some(args)) = (
                     self.event_item_key(&v, "function_call_arguments.done")?,
                     v.get("arguments").and_then(Value::as_str),
@@ -93,7 +93,7 @@ impl CodexEventMapper {
             }
             "error" => Err(stream_error(&v)),
             "response.failed" => Err(failed_error(&v)),
-            // created, content_part.added, reasoning_summary_part.added, … → ignorés.
+            // created, content_part.added, reasoning_summary_part.added, ... -> ignored.
             _ => Ok(Vec::new()),
         }
     }
@@ -116,7 +116,7 @@ impl CodexEventMapper {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        // arguments souvent "" à l'ouverture ; on accumule la suite.
+        // arguments often "" at opening time; we accumulate what follows.
         let args = item
             .get("arguments")
             .and_then(Value::as_str)
@@ -143,8 +143,8 @@ impl CodexEventMapper {
             .get("item")
             .and_then(|i| i.get("type"))
             .and_then(Value::as_str);
-        // US-031 : reasoning item chiffré, capturé uniquement si replay actif.
-        // `encrypted_content`/`id` opaques.
+        // US-031: encrypted reasoning item, captured only when replay is active.
+        // `encrypted_content`/`id` opaque.
         if item_type == Some("reasoning") {
             if !self.replay {
                 return Ok(Vec::new());
@@ -158,7 +158,7 @@ impl CodexEventMapper {
                 .get("encrypted_content")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            // un reasoning sans contenu chiffré n'est pas réinjectable → ignoré.
+            // a reasoning without encrypted content is not reinjectable -> ignored.
             if id.is_empty() || enc.is_empty() {
                 return Ok(Vec::new());
             }
@@ -170,7 +170,7 @@ impl CodexEventMapper {
         if item_type != Some("function_call") {
             return Ok(Vec::new());
         }
-        // arguments finaux : priorité à l'item.done, sinon l'accumulé.
+        // final arguments: item.done takes priority, otherwise the accumulated ones.
         let item_args = v
             .get("item")
             .and_then(|i| i.get("arguments"))
@@ -189,7 +189,7 @@ impl CodexEventMapper {
             _ => active.args,
         };
         let mut out = Vec::new();
-        // Un seul ToolCallDelta portant l'intégralité → invariant JSON garanti.
+        // A single ToolCallDelta carrying everything -> JSON invariant guaranteed.
         if !args.is_empty() {
             out.push(StreamEvent::ToolCallDelta {
                 id: active.call_id.clone(),
@@ -303,8 +303,8 @@ impl CodexEventMapper {
         match status {
             "incomplete" => StopReason::MaxTokens,
             "failed" | "cancelled" => StopReason::Refusal,
-            // completed / in_progress / queued / absent → fin normale ;
-            // override ToolUse si des appels d'outils ont été émis.
+            // completed / in_progress / queued / absent -> normal end;
+            // overridden to ToolUse when tool calls were emitted.
             _ if self.saw_tool_call => StopReason::ToolUse,
             _ => StopReason::EndTurn,
         }
@@ -322,8 +322,8 @@ fn item_id(item: &Value) -> Option<&str> {
     item.get("id").and_then(Value::as_str)
 }
 
-/// `response.usage` → `TokenUsage`. `input_tokens` inclut les cached (on garde la
-/// taille de contexte complète pour le seuil de compaction, ARCHITECTURE §3.3).
+/// `response.usage` -> `TokenUsage`. `input_tokens` includes the cached ones (we keep the
+/// full context size for the compaction threshold, ARCHITECTURE 3.3).
 fn parse_usage(usage: &Value) -> Option<TokenUsage> {
     let input = usage.get("input_tokens").and_then(Value::as_u64)? as u32;
     let output = usage.get("output_tokens").and_then(Value::as_u64)? as u32;
@@ -349,8 +349,8 @@ fn failed_error(v: &Value) -> ProviderError {
     classify_failed_message(code, message)
 }
 
-/// Distingue un dépassement de contexte (→ withholding/compaction réactive) d'une
-/// erreur de flux générique.
+/// Distinguishes a context overflow (-> withholding/reactive compaction) from a
+/// generic stream error.
 fn classify_message(code: &str, message: &str) -> ProviderError {
     let hay = format!("{code} {message}").to_lowercase();
     if hay.contains("context") && (hay.contains("length") || hay.contains("long")) {
@@ -498,7 +498,7 @@ mod tests {
         assert!(ev.contains(&StreamEvent::ToolCallEnd {
             id: "call_7".into()
         }));
-        // stop = ToolUse car un appel d'outil a été émis.
+        // stop = ToolUse because a tool call was emitted.
         assert_eq!(
             ev.last(),
             Some(&StreamEvent::Done {
@@ -506,7 +506,7 @@ mod tests {
             })
         );
 
-        // invariant : args_json concaténé = JSON valide.
+        // invariant: concatenated args_json = valid JSON.
         let args: String = ev
             .iter()
             .filter_map(|e| match e {
@@ -613,7 +613,7 @@ mod tests {
 
     #[test]
     fn args_only_in_item_done_still_emitted() {
-        // backend qui n'envoie pas de deltas : args uniquement dans output_item.done.
+        // backend that sends no deltas: args only in output_item.done.
         let ev = ingest_all(&[
             r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"c1","id":"fc","name":"x","arguments":""}}"#,
             r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","id":"fc","name":"x","arguments":"{\"a\":1}"}}"#,
@@ -735,13 +735,13 @@ mod tests {
         ));
     }
 
-    // US-031 : reasoning item chiffré capturé uniquement si replay actif.
+    // US-031: encrypted reasoning item captured only when replay is active.
     #[test]
     fn reasoning_item_captured_only_when_replay_on() {
         let done = r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"ENC"}}"#;
-        // OFF (défaut) → ignoré (chemin plat).
+        // OFF (default) -> ignored (flat path).
         assert!(CodexEventMapper::new().ingest(done).unwrap().is_empty());
-        // ON → EncryptedReasoning émis.
+        // ON -> EncryptedReasoning emitted.
         let ev = CodexEventMapper::with_replay(true).ingest(done).unwrap();
         assert_eq!(
             ev,
@@ -750,7 +750,7 @@ mod tests {
                 encrypted_content: "ENC".into()
             }]
         );
-        // reasoning sans contenu chiffré → ignoré même en ON (non réinjectable).
+        // reasoning without encrypted content -> ignored even when ON (not reinjectable).
         let empty =
             r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_2"}}"#;
         assert!(
@@ -768,7 +768,7 @@ mod tests {
             m.ingest("{not json").unwrap_err(),
             ProviderError::Decode(_)
         ));
-        // ligne vide → no-op.
+        // empty line -> no-op.
         assert!(m.ingest("").unwrap().is_empty());
     }
 }

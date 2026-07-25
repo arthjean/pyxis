@@ -1,22 +1,22 @@
-//! Gestion de la credential OAuth de l'abonnement ChatGPT pour l'adapter :
-//! refresh **rotatif** sous verrou, persistance keyring, et fabrication des
-//! en-têtes d'inférence (délègue à `agent-auth`).
+//! Management of the ChatGPT subscription OAuth credential for the adapter:
+//! **rotating** refresh under a lock, keyring persistence, and building of the
+//! inference headers (delegates to `agent-auth`).
 //!
-//! `Provider::stream` prend `&self` → la credential vit derrière un
-//! `tokio::sync::Mutex` (interior mutability ; refresh réseau possible sous lock).
+//! `Provider::stream` takes `&self` -> the credential lives behind a
+//! `tokio::sync::Mutex` (interior mutability; a network refresh can happen under the lock).
 
 use agent_auth::oauth::openai_chatgpt::{self, AuthError, RequestSpec};
 use agent_auth::{Credential, OAuthCredential};
 use agent_core::provider::ProviderError;
 
-/// Marge de refresh : on rafraîchit 60 s AVANT l'expiration pour éviter une course
-/// expiry/requête (Pi vise le bord exact ; la marge est plus robuste).
+/// Refresh margin: we refresh 60 s BEFORE expiry to avoid an
+/// expiry/request race (Pi aims at the exact edge; the margin is more robust).
 const REFRESH_MARGIN_MS: u64 = 60_000;
 
 pub struct CredentialManager {
     state: tokio::sync::Mutex<CredentialState>,
     http: reqwest::Client,
-    /// Clé keyring où réécrire la credential rafraîchie (refresh rotatif).
+    /// Keyring key where the refreshed credential is rewritten (rotating refresh).
     keyring_account: String,
 }
 
@@ -41,18 +41,18 @@ impl CredentialManager {
         }
     }
 
-    /// Garantit un access token frais (refresh + réécriture keyring si nécessaire)
-    /// et retourne la spec de requête d'inférence (URL + en-têtes propriétaires).
+    /// Guarantees a fresh access token (refresh + keyring rewrite when needed)
+    /// and returns the inference request spec (URL + proprietary headers).
     pub async fn request_spec(&self) -> Result<RequestSpec, ProviderError> {
         self.fresh_spec(openai_chatgpt::responses_request).await
     }
 
-    /// Idem `request_spec` pour la découverte du catalogue de modèles (`/models`).
+    /// Same as `request_spec` for the model catalog discovery (`/models`).
     pub async fn models_spec(&self) -> Result<RequestSpec, ProviderError> {
         self.fresh_spec(openai_chatgpt::models_request).await
     }
 
-    /// Garantit un access token frais puis fabrique la spec via `build`.
+    /// Guarantees a fresh access token then builds the spec through `build`.
     async fn fresh_spec(
         &self,
         build: fn(&OAuthCredential) -> Result<RequestSpec, AuthError>,
@@ -75,7 +75,7 @@ impl CredentialManager {
         build(cred).map_err(convert_auth_err)
     }
 
-    /// Force un refresh même si l'horloge locale pense encore le token valide.
+    /// Forces a refresh even when the local clock still believes the token is valid.
     pub async fn force_refresh(&self) -> Result<(), ProviderError> {
         let mut state = self.state.lock().await;
         if state.cred.is_none() {
@@ -85,8 +85,8 @@ impl CredentialManager {
             .await
     }
 
-    /// Invalide la credential en mémoire. Utilisé par le logout interactif après
-    /// suppression keyring pour empêcher une résurrection au prochain refresh.
+    /// Invalidates the in-memory credential. Used by the interactive logout after
+    /// the keyring deletion, to prevent a resurrection on the next refresh.
     pub async fn disconnect(&self) {
         let mut state = self.state.lock().await;
         state.cred = None;
@@ -115,8 +115,8 @@ impl CredentialManager {
         Ok(())
     }
 
-    /// Réécrit la credential rafraîchie dans le keyring (op bloquante → hors
-    /// runtime async).
+    /// Rewrites the refreshed credential into the keyring (blocking op -> outside the
+    /// async runtime).
     async fn persist(&self, cred: &OAuthCredential) -> Result<(), ProviderError> {
         let account = self.keyring_account.clone();
         let blob = Credential::Oauth(cred.clone());
@@ -135,9 +135,9 @@ fn disconnected_error() -> ProviderError {
     }
 }
 
-/// Mappe une erreur d'auth vers `ProviderError` en préservant la sémantique de
-/// retry : un refresh rejeté en 401/403 (refresh révoqué / client Codex coupé) est
-/// **fatal** (`Http` → `Auth` côté `classify_error`), pas un retry transitoire.
+/// Maps an auth error into a `ProviderError` while preserving the retry
+/// semantics: a refresh rejected with a 401/403 (revoked refresh / Codex client cut off) is
+/// **fatal** (`Http` -> `Auth` on the `classify_error` side), not a transient retry.
 fn convert_auth_err(e: AuthError) -> ProviderError {
     match e {
         AuthError::Http(re) => match re.status() {

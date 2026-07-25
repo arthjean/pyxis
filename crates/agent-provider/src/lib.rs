@@ -1,14 +1,14 @@
-//! `agent-provider` — adapters implémentant le trait `Provider` du cœur
-//! (`agent-core`). Cible MVP : `OpenAiChatGpt` — abonnement ChatGPT via la
-//! Responses API sur le backend ChatGPT/Codex (ADR-10), SSE stateless.
+//! `agent-provider`: adapters implementing the core `Provider` trait
+//! (`agent-core`). MVP target: `OpenAiChatGpt`, the ChatGPT subscription through the
+//! Responses API on the ChatGPT/Codex backend (ADR-10), stateless SSE.
 //!
-//! Le canonique (Anthropic-like, transcript client-side) et le vocabulaire
-//! `StreamEvent` vivent dans `agent-core` (invariant 1 : le cœur ne dépend pas
-//! des adapters ; il consomme `dyn Provider`). Réseau maison : `reqwest` +
-//! `eventsource-stream`, sans SDK (PROVIDERS §1.1).
+//! The canonical model (Anthropic-like, client-side transcript) and the
+//! `StreamEvent` vocabulary live in `agent-core` (invariant 1: the core does not depend
+//! on the adapters; it consumes `dyn Provider`). In-house networking: `reqwest` +
+//! `eventsource-stream`, without an SDK (PROVIDERS 1.1).
 //!
-//! Les autres providers (Anthropic, OpenAI Chat BYOK, Gemini…) s'ajouteront
-//! ensuite, chacun comme un module ici. Ollama est hors scope (retiré).
+//! The other providers (Anthropic, OpenAI Chat BYOK, Gemini, ...) will be added
+//! later, each as a module here. Ollama is out of scope (dropped).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod chatgpt;

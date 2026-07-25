@@ -1,21 +1,21 @@
-//! Catalogue de modèles **découvert à chaud** sur le backend ChatGPT/Codex
-//! (`GET /models`). Le backend renvoie exactement les modèles accessibles au
-//! compte connecté (il applique lui-même `available_in_plans`) et filtre sur le
-//! `client_version` annoncé (cf. `agent_auth::oauth::openai_chatgpt::CODEX_CLIENT_VERSION`).
+//! Model catalog **discovered at runtime** on the ChatGPT/Codex backend
+//! (`GET /models`). The backend returns exactly the models accessible to the
+//! connected account (it applies `available_in_plans` itself) and filters on the
+//! announced `client_version` (see `agent_auth::oauth::openai_chatgpt::CODEX_CLIENT_VERSION`).
 //!
-//! Remplace une table de slugs figée dans le binaire : la liste blanche du backend
-//! bouge (retraits/ajouts fréquents), donc la seule source correcte est le backend.
+//! Replaces a slug table frozen in the binary: the backend allow-list
+//! moves (frequent removals/additions), so the only correct source is the backend.
 
 use serde::Deserialize;
 
-/// Modèle présentable à l'utilisateur, réduit aux champs dont le client a besoin.
+/// Model presentable to the user, reduced to the fields the client needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogModel {
     pub slug: String,
     pub display_name: String,
-    /// Effort de raisonnement appliqué à défaut de choix explicite.
+    /// Reasoning effort applied when no explicit choice is made.
     pub default_reasoning_effort: Option<String>,
-    /// Efforts acceptés par ce modèle (`low`…`ultra` selon le modèle).
+    /// Efforts accepted by this model (`low` to `ultra` depending on the model).
     pub supported_reasoning_efforts: Vec<String>,
 }
 
@@ -30,11 +30,11 @@ struct WireModel {
     slug: String,
     #[serde(default)]
     display_name: Option<String>,
-    /// `list` (visible dans le sélecteur), `hide` ou `none` (usage interne, ex.
+    /// `list` (visible in the selector), `hide` or `none` (internal use, e.g.
     /// `codex-auto-review`).
     #[serde(default)]
     visibility: Option<String>,
-    /// Ordre d'affichage voulu par le backend (croissant, 1 = tête de liste).
+    /// Display order wanted by the backend (ascending, 1 = top of the list).
     #[serde(default)]
     priority: i32,
     #[serde(default)]
@@ -48,9 +48,9 @@ struct WireReasoningLevel {
     effort: String,
 }
 
-/// Parse la réponse `/models` : ne garde que les modèles sélectionnables et
-/// respecte l'ordre `priority` du backend. Tolérant aux champs inconnus (le
-/// backend en ajoute régulièrement).
+/// Parses the `/models` response: keeps only the selectable models and
+/// respects the backend `priority` order. Tolerant to unknown fields (the
+/// backend adds some regularly).
 pub fn parse_catalog(body: &str) -> Result<Vec<CatalogModel>, serde_json::Error> {
     let mut wire: Vec<WireModel> = serde_json::from_str::<WireCatalog>(body)?
         .models
@@ -77,7 +77,7 @@ pub fn parse_catalog(body: &str) -> Result<Vec<CatalogModel>, serde_json::Error>
 mod tests {
     use super::*;
 
-    /// Extrait réel de la réponse backend (2026-07-24), champs inconnus inclus.
+    /// Real excerpt of the backend response (2026-07-24), unknown fields included.
     const SAMPLE: &str = r#"{
       "models": [
         {"slug":"gpt-5.4","display_name":"GPT-5.4","visibility":"list","priority":16,

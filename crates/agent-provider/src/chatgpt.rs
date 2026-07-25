@@ -1,13 +1,13 @@
-//! Adapter `OpenAiChatGpt` — abonnement ChatGPT via la Responses API sur le
-//! backend ChatGPT/Codex (ADR-10). Implémente `agent_core::Provider`.
+//! `OpenAiChatGpt` adapter: ChatGPT subscription through the Responses API on the
+//! ChatGPT/Codex backend (ADR-10). Implements `agent_core::Provider`.
 //!
-//! **SSE stateless** : `server_side_state = false` → pas de `previous_response_id`,
-//! contexte complet reconstruit côté client à chaque tour → mappe proprement le
-//! canonique (PROVIDERS §4.1, le piège WebSocket+state est explicitement évité).
+//! **Stateless SSE**: `server_side_state = false` -> no `previous_response_id`,
+//! full context rebuilt on the client side every turn -> maps cleanly onto the
+//! canonical model (PROVIDERS 4.1, the WebSocket+state trap is explicitly avoided).
 //!
-//! Le backend peut recevoir `include: ["reasoning.encrypted_content"]` quand le
-//! replay reasoning est activé explicitement. Par défaut, ce chemin reste OFF
-//! jusqu'à validation live du wire post-rename.
+//! The backend can receive `include: ["reasoning.encrypted_content"]` when
+//! reasoning replay is explicitly enabled. By default, that path stays OFF
+//! until the post-rename wire format is validated live.
 
 use std::sync::RwLock;
 use std::time::Duration;
@@ -30,22 +30,22 @@ use crate::chatgpt_events::CodexEventMapper;
 use crate::chatgpt_request::{ResponsesBodyOptions, build_responses_body, inject_cache_key};
 use crate::credential::CredentialManager;
 
-/// Clé keyring de la credential abonnement ChatGPT (refresh rotatif réécrit ici).
+/// Keyring key of the ChatGPT subscription credential (rotating refresh rewritten here).
 pub const KEYRING_ACCOUNT: &str = "oauth:openai_chatgpt";
 
-/// Fenêtre de contexte par défaut (modèles GPT-5.x du backend Codex). **Valeur
-/// volatile/à ajuster** : n'affecte QUE les seuils de compaction ; un dépassement
-/// réel déclenche la compaction réactive (413, withholding). Conservatrice.
+/// Default context window (GPT-5.x models of the Codex backend). **Volatile
+/// value, to be adjusted**: it ONLY affects the compaction thresholds; a real
+/// overflow triggers reactive compaction (413, withholding). Conservative.
 pub const DEFAULT_MAX_CONTEXT: u32 = 256_000;
 
-/// Effort de raisonnement par défaut (Codex CLI ≈ "medium").
+/// Default reasoning effort (Codex CLI is roughly "medium").
 pub const DEFAULT_REASONING_EFFORT: &str = "medium";
 
-/// Slug de modèle par défaut. Le backend Codex (abonnement ChatGPT) impose une
-/// liste blanche de slugs VERSIONNÉS qu'il fait évoluer (retraits fréquents) : le
-/// slug générique `gpt-5` est rejeté en 400 ("not supported when using Codex with
-/// a ChatGPT account"). **Valeur volatile** — surchargeable via `--model` ou la
-/// commande `/models` en session (voir `agent_tui::MODELS`).
+/// Default model slug. The Codex backend (ChatGPT subscription) enforces an
+/// allow-list of VERSIONED slugs that it keeps changing (frequent removals): the
+/// generic `gpt-5` slug is rejected with a 400 ("not supported when using Codex with
+/// a ChatGPT account"). **Volatile value**, overridable through `--model` or the
+/// `/models` command in session (see `agent_tui::MODELS`).
 pub const DEFAULT_MODEL: &str = "gpt-5.5";
 
 #[derive(Debug, Clone, Copy)]
@@ -84,23 +84,23 @@ fn reasoning_effort_for_request(effort: &str) -> &str {
     }
 }
 
-/// Borne du corps d'erreur HTTP capturé (évite un message géant en log).
+/// Bound of the captured HTTP error body (avoids a giant message in the logs).
 const MAX_ERR_BODY: usize = 2000;
 
-/// Budget total de la découverte du catalogue (`/models`). Hors chemin critique :
-/// un backend lent ne doit jamais retarder la session, le catalogue embarqué prend
-/// le relais.
+/// Total budget of the catalog discovery (`/models`). Off the critical path:
+/// a slow backend must never delay the session, the bundled catalog takes
+/// over.
 const MODELS_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Timeout d'ÉTABLISSEMENT de connexion (US-022). Un backend qui n'établit jamais
-/// la connexion (proxy d'entreprise, DNS noir) échoue ici plutôt que de geler ;
-/// l'erreur `reqwest` est mappée `Transport` → classifiée `Retryable`. Pi : 20 s.
+/// Connection ESTABLISHMENT timeout (US-022). A backend that never establishes
+/// the connection (corporate proxy, blackholed DNS) fails here rather than freezing;
+/// the `reqwest` error is mapped to `Transport` -> classified `Retryable`. Pi: 20 s.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Idle timeout per-event par défaut (US-022). Un stream SSE OUVERT qui n'émet
-/// plus aucun event (backend silencieux, queue) est annulé après ce délai →
-/// `Stream("idle timeout")` (Retryable). Configurable par session (`with_idle_timeout`,
-/// env `PYXIS_IDLE_TIMEOUT_SECS`). Pi : 20 s (header) ; Codex CLI : 300 s/event.
+/// Default per-event idle timeout (US-022). An OPEN SSE stream that emits
+/// no more events (silent backend, queue) is cancelled after this delay ->
+/// `Stream("idle timeout")` (Retryable). Configurable per session (`with_idle_timeout`,
+/// env `PYXIS_IDLE_TIMEOUT_SECS`). Pi: 20 s (header); Codex CLI: 300 s/event.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct OpenAiChatGptProvider {
@@ -108,23 +108,23 @@ pub struct OpenAiChatGptProvider {
     http: reqwest::Client,
     capabilities: Capabilities,
     reasoning_effort: Option<String>,
-    /// Délai max sans event SSE avant annulation (US-022). Voir `DEFAULT_IDLE_TIMEOUT`.
+    /// Max delay without an SSE event before cancelling (US-022). See `DEFAULT_IDLE_TIMEOUT`.
     idle_timeout: Duration,
-    /// Identifiant de session STABLE (UUID v4), envoyé en `prompt_cache_key` à
-    /// chaque requête (US-029) → le backend réutilise son cache de préfixe.
+    /// STABLE session identifier (UUID v4), sent as `prompt_cache_key` on
+    /// every request (US-029) -> the backend reuses its prefix cache.
     session_id: RwLock<String>,
-    /// US-031 : réinjecter les reasoning items chiffrés en mode stateless.
+    /// US-031: reinject the encrypted reasoning items in stateless mode.
     reasoning_replay: bool,
 }
 
-/// Génère un UUID v4 (RFC 4122) depuis 16 octets aléatoires. Évite la crate `uuid`
-/// (réutilise `rand`, déjà au workspace).
+/// Generates a UUID v4 (RFC 4122) from 16 random bytes. Avoids the `uuid` crate
+/// (reuses `rand`, already in the workspace).
 fn new_session_id() -> String {
     use rand::RngCore;
     let mut b = [0u8; 16];
     rand::rng().fill_bytes(&mut b);
     b[6] = (b[6] & 0x0F) | 0x40; // version 4
-    b[8] = (b[8] & 0x3F) | 0x80; // variant RFC 4122
+    b[8] = (b[8] & 0x3F) | 0x80; // RFC 4122 variant
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         b[0],
@@ -147,13 +147,13 @@ fn new_session_id() -> String {
 }
 
 impl OpenAiChatGptProvider {
-    /// Construit l'adapter depuis une credential OAuth déjà chargée (par la CLI,
-    /// depuis le keyring). `max_context` pilote la compaction ; `reasoning_effort`
-    /// = `None` omet le champ `reasoning`.
+    /// Builds the adapter from an already loaded OAuth credential (by the CLI,
+    /// from the keyring). `max_context` drives the compaction; `reasoning_effort`
+    /// = `None` omits the `reasoning` field.
     pub fn new(cred: OAuthCredential, max_context: u32, reasoning_effort: Option<String>) -> Self {
-        // US-022 : `connect_timeout` borne l'établissement TCP/TLS. Un échec de
-        // `build()` (backend TLS indisponible) retombe sur le client par défaut —
-        // jamais de panic (lint `panic = deny`).
+        // US-022: `connect_timeout` bounds the TCP/TLS establishment. A `build()`
+        // failure (TLS backend unavailable) falls back on the default client:
+        // never a panic (`panic = deny` lint).
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
@@ -165,10 +165,10 @@ impl OpenAiChatGptProvider {
             capabilities: Capabilities {
                 vision: true,
                 tools: true,
-                // caching implicite côté backend, non contrôlé explicitement.
+                // implicit caching on the backend side, not explicitly controlled.
                 prompt_caching: false,
                 reasoning: true,
-                // CLÉ : SSE stateless → le canonique client-side mappe (PROVIDERS §4.1).
+                // KEY: stateless SSE -> the client-side canonical model maps (PROVIDERS 4.1).
                 server_side_state: false,
                 max_context,
                 limits: CapabilityLimits {
@@ -193,7 +193,7 @@ impl OpenAiChatGptProvider {
         }
     }
 
-    /// Constructeur de confort : défauts MVP (`DEFAULT_MAX_CONTEXT`, effort medium).
+    /// Convenience constructor: MVP defaults (`DEFAULT_MAX_CONTEXT`, medium effort).
     pub fn from_credential(cred: OAuthCredential) -> Self {
         Self::new(
             cred,
@@ -202,8 +202,8 @@ impl OpenAiChatGptProvider {
         )
     }
 
-    /// Surcharge l'idle timeout SSE (US-022). `Duration::ZERO` est ignoré (garde
-    /// le défaut) pour qu'une valeur d'env aberrante ne désactive pas le watchdog.
+    /// Overrides the SSE idle timeout (US-022). `Duration::ZERO` is ignored (keeps
+    /// the default) so that an absurd env value does not disable the watchdog.
     pub fn with_idle_timeout(mut self, idle: Duration) -> Self {
         if !idle.is_zero() {
             self.idle_timeout = idle;
@@ -211,7 +211,7 @@ impl OpenAiChatGptProvider {
         self
     }
 
-    /// Active/désactive le replay des reasoning items chiffrés (US-031).
+    /// Enables/disables the replay of encrypted reasoning items (US-031).
     pub fn with_reasoning_replay(mut self, on: bool) -> Self {
         self.reasoning_replay = on;
         self.capabilities.reasoning_options.encrypted_replay = on;
@@ -232,10 +232,10 @@ impl OpenAiChatGptProvider {
             .unwrap_or_else(|_| new_session_id())
     }
 
-    /// Catalogue des modèles offerts au compte connecté (`GET /models`), trié par
-    /// priorité backend. Découverte à chaud : jamais une liste figée dans le
-    /// binaire (le backend retire/ajoute des slugs sans préavis). Hors du trait
-    /// `Provider` : la notion de catalogue est propre à cet adapter.
+    /// Catalog of the models offered to the connected account (`GET /models`), sorted by
+    /// backend priority. Discovered at runtime: never a list frozen in the
+    /// binary (the backend removes/adds slugs without notice). Outside the
+    /// `Provider` trait: the notion of a catalog is specific to this adapter.
     pub async fn list_models(&self) -> Result<Vec<crate::models::CatalogModel>, ProviderError> {
         let spec = self.creds.models_spec().await?;
         let mut req = self.http.get(&spec.url).timeout(MODELS_TIMEOUT);
@@ -265,11 +265,11 @@ impl OpenAiChatGptProvider {
     }
 }
 
-/// Watchdog SSE (US-022) : enveloppe un flux d'events canoniques d'un timeout
-/// per-event. Tant qu'un event arrive avant `idle`, il est relayé tel quel ; un
-/// silence > `idle` (backend gelé) coupe le flux avec `Stream("idle timeout")`
-/// (classifié `Retryable` → la boucle agent retry/abandonne, jamais de gel). Une
-/// erreur amont est relayée puis termine le flux (parité avec le chemin direct).
+/// SSE watchdog (US-022): wraps a canonical event stream in a per-event
+/// timeout. As long as an event arrives before `idle`, it is relayed as is; a
+/// silence > `idle` (frozen backend) cuts the stream with `Stream("idle timeout")`
+/// (classified `Retryable` -> the agent loop retries/gives up, never freezes). An
+/// upstream error is relayed then ends the stream (parity with the direct path).
 fn idle_guarded<S>(
     mut inner: S,
     idle: Duration,
@@ -280,12 +280,12 @@ where
     async_stream::stream! {
         loop {
             match tokio::time::timeout(idle, inner.next()).await {
-                // pas d'event depuis `idle` → backend silencieux.
+                // no event since `idle` -> silent backend.
                 Err(_elapsed) => {
                     yield Err(ProviderError::Stream("idle timeout".to_string()));
                     return;
                 }
-                Ok(None) => break, // fin de flux normale.
+                Ok(None) => break, // normal end of stream.
                 Ok(Some(item)) => {
                     let stop = item.is_err();
                     yield item;
@@ -298,11 +298,11 @@ where
     }
 }
 
-/// Borne la phase HEADERS d'une requête (US-022 durcissement). `reqwest::send()`
-/// se résout à la réception des headers de réponse → ce timeout NE coupe PAS le
-/// long stream SSE qui suit (couvert séparément par `idle_guarded`). Un dépassement
-/// (`Elapsed`) devient `Stream("header timeout")` → classifié `Retryable`, parité
-/// avec l'idle timeout. Une erreur réseau de `send()` reste `Transport` (Retryable).
+/// Bounds the HEADERS phase of a request (US-022 hardening). `reqwest::send()`
+/// resolves when the response headers are received -> this timeout does NOT cut the
+/// long SSE stream that follows (covered separately by `idle_guarded`). An overrun
+/// (`Elapsed`) becomes `Stream("header timeout")` -> classified `Retryable`, parity
+/// with the idle timeout. A network error from `send()` stays `Transport` (Retryable).
 async fn send_with_header_timeout(
     rb: reqwest::RequestBuilder,
     timeout: Duration,
@@ -351,17 +351,17 @@ fn should_retry_with_originator_fallback_env(
     matches!(status, 400 | 403) && message.to_ascii_lowercase().contains("originator")
 }
 
-/// Marqueurs d'un 429 TERMINAL (quota d'abonnement épuisé), dérivés de Pi
-/// (`isTerminalRateLimitError`). Un 429 portant l'un d'eux ne doit JAMAIS être
-/// retryé : la session ne grille pas ses tentatives ni ne harcèle un compte bloqué
-/// (US-023, edge case #2). Comparaison ASCII lowercase (le corps est du JSON
-/// d'erreur backend).
+/// Markers of a TERMINAL 429 (subscription quota exhausted), derived from Pi
+/// (`isTerminalRateLimitError`). A 429 carrying one of them must NEVER be
+/// retried: the session neither burns its attempts nor harasses a blocked account
+/// (US-023, edge case #2). ASCII lowercase comparison (the body is backend error
+/// JSON).
 ///
-/// On garde uniquement les signaux NON-AMBIGUS : les sous-chaînes nues `"billing"`
-/// et `"available balance"` de Pi sont écartées (un 429 transitoire « rate limited;
-/// see billing dashboard » serait droppé à tort). Biais assumé vers le faux-négatif :
-/// un terminal raté retombe en `RateLimited` → retry BORNÉ (`max_retries` + cap 60 s),
-/// dégradation sûre ; un faux-positif tuerait la session sans recours.
+/// We only keep the UNAMBIGUOUS signals: Pi's bare substrings `"billing"`
+/// and `"available balance"` are ruled out (a transient 429 saying "rate limited;
+/// see billing dashboard" would be wrongly dropped). Deliberate bias toward false negatives:
+/// a missed terminal falls back to `RateLimited` -> BOUNDED retry (`max_retries` + 60 s cap),
+/// a safe degradation; a false positive would kill the session with no recourse.
 const TERMINAL_RATE_LIMIT_MARKERS: &[&str] = &[
     "gousagelimiterror",
     "freeusagelimiterror",
@@ -371,8 +371,8 @@ const TERMINAL_RATE_LIMIT_MARKERS: &[&str] = &[
     "quota exceeded",
 ];
 
-/// Vrai si le corps d'un 429 dénote un quota épuisé (terminal), pas une surcharge
-/// transitoire. Voir `TERMINAL_RATE_LIMIT_MARKERS`.
+/// True when the body of a 429 denotes an exhausted quota (terminal), not a transient
+/// overload. See `TERMINAL_RATE_LIMIT_MARKERS`.
 pub fn is_terminal_rate_limit(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     TERMINAL_RATE_LIMIT_MARKERS
@@ -477,16 +477,16 @@ fn sanitize_error_body(body: &str) -> String {
     text
 }
 
-/// Parse le délai serveur d'un `Retry-After` en millisecondes (US-023), dans
-/// l'ordre de priorité de Pi : `retry-after-ms` (ms exactes) > `Retry-After`
-/// (secondes entières) > `Retry-After` (date HTTP IMF-fixdate, delta vs `now_ms`).
-/// `now_ms` est injecté pour la testabilité. `None` si aucun en-tête exploitable.
+/// Parses the server delay of a `Retry-After` into milliseconds (US-023), in
+/// Pi's priority order: `retry-after-ms` (exact ms) > `Retry-After`
+/// (whole seconds) > `Retry-After` (IMF-fixdate HTTP date, delta vs `now_ms`).
+/// `now_ms` is injected for testability. `None` when no header is usable.
 ///
-/// NB : la valeur RENVOYÉE n'est PAS plafonnée ici (elle reflète le serveur brut) ;
-/// le plafond `MAX_RETRY_AFTER_MS` est appliqué par le consommateur (`retry_delay`,
-/// agent-core). Tout futur consommateur de `retry_after_ms` doit re-borner.
+/// NB: the RETURNED value is NOT capped here (it reflects the raw server value);
+/// the `MAX_RETRY_AFTER_MS` cap is applied by the consumer (`retry_delay`,
+/// agent-core). Any future consumer of `retry_after_ms` must re-bound it.
 fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap, now_ms: u64) -> Option<u64> {
-    // 1) `retry-after-ms` : millisecondes exactes, prioritaire.
+    // 1) `retry-after-ms`: exact milliseconds, takes priority.
     if let Some(ms) = headers
         .get("retry-after-ms")
         .and_then(|v| v.to_str().ok())
@@ -495,7 +495,7 @@ fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap, now_ms: u64) -> Op
     {
         return Some(ms.max(0.0) as u64);
     }
-    // 2) `Retry-After` : secondes entières, sinon date HTTP.
+    // 2) `Retry-After`: whole seconds, otherwise an HTTP date.
     let raw = headers
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
@@ -504,15 +504,15 @@ fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap, now_ms: u64) -> Op
     if let Some(secs) = raw.parse::<f64>().ok().filter(|s| s.is_finite()) {
         return Some((secs.max(0.0) * 1000.0) as u64);
     }
-    // 3) date HTTP absolue → delta positif jusqu'à l'échéance.
+    // 3) absolute HTTP date -> positive delta until the deadline.
     let target_ms = parse_imf_fixdate_ms(raw)?;
     Some(target_ms.saturating_sub(now_ms))
 }
 
-/// Parse une date HTTP IMF-fixdate (`"Tue, 15 Nov 1994 08:12:31 GMT"`, RFC 7231)
-/// en ms epoch. Format unique émis par les backends OpenAI ; les variantes legacy
-/// (RFC 850 / asctime) ne sont pas gérées (renvoie `None`). Évite une dépendance
-/// date externe (offline-safe).
+/// Parses an IMF-fixdate HTTP date (`"Tue, 15 Nov 1994 08:12:31 GMT"`, RFC 7231)
+/// into epoch ms. The only format emitted by the OpenAI backends; the legacy variants
+/// (RFC 850 / asctime) are not handled (returns `None`). Avoids an external date
+/// dependency (offline-safe).
 fn parse_imf_fixdate_ms(s: &str) -> Option<u64> {
     let rest = s.trim().split_once(", ")?.1; // "15 Nov 1994 08:12:31 GMT"
     let mut it = rest.split(' ');
@@ -544,8 +544,8 @@ fn parse_imf_fixdate_ms(s: &str) -> Option<u64> {
     Some((secs as u64) * 1000)
 }
 
-/// Jours depuis 1970-01-01 (algorithme de Howard Hinnant, domaine public). Exact
-/// sur toute la plage grégorienne proleptique.
+/// Days since 1970-01-01 (Howard Hinnant's algorithm, public domain). Exact
+/// over the whole proleptic Gregorian range.
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
@@ -573,9 +573,9 @@ impl Provider for OpenAiChatGptProvider {
         &self,
         req: CanonicalRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
-        // 1. credential fraîche (refresh + keyring si besoin) → URL + en-têtes.
+        // 1. fresh credential (refresh + keyring when needed) -> URL + headers.
         let spec = self.creds.request_spec().await?;
-        // 2. corps Responses (SSE stateless).
+        // 2. Responses body (stateless SSE).
         let profile = model_profile(&req.model, self.capabilities.max_context);
         let reasoning_effort = if profile.supports_reasoning {
             req.reasoning_effort
@@ -594,11 +594,11 @@ impl Provider for OpenAiChatGptProvider {
                 text_verbosity: profile.text_verbosity,
             },
         );
-        // US-029 : clé de cache stable par session → réutilisation du cache backend.
+        // US-029: stable per-session cache key -> reuse of the backend cache.
         let prompt_cache_key = self.prompt_cache_key();
         inject_cache_key(&mut body, &prompt_cache_key);
 
-        // 3. POST. `.json()` pose content-type ; on ajoute les en-têtes propriétaires
+        // 3. POST. `.json()` sets the content-type; we add the proprietary headers
         //    (Authorization, chatgpt-account-id, originator, OpenAI-Beta, accept).
         let build_request = |originator_override: Option<&str>| {
             let mut rb = self.http.post(&spec.url).json(&body);
@@ -616,15 +616,15 @@ impl Provider for OpenAiChatGptProvider {
             }
             rb
         };
-        // US-022 (durcissement) : borne la phase HEADERS. `connect_timeout` couvre
-        // l'établissement TCP/TLS et `idle_guarded` le stream OUVERT, mais entre les
-        // deux `send()` attend les headers de réponse sans borne : un backend qui
-        // handshake puis retient ses headers (proxy bloqué, queue) gèlerait la boucle
-        // sans signal. `send()` se résout à la réception des headers → ce timeout NE
-        // coupe PAS le long stream SSE qui suit.
+        // US-022 (hardening): bounds the HEADERS phase. `connect_timeout` covers
+        // the TCP/TLS establishment and `idle_guarded` the OPEN stream, but between the
+        // two `send()` waits for the response headers without a bound: a backend that
+        // handshakes then withholds its headers (blocked proxy, queue) would freeze the loop
+        // without a signal. `send()` resolves when the headers are received -> this timeout
+        // does NOT cut the long SSE stream that follows.
         let mut resp = send_with_header_timeout(build_request(None), CONNECT_TIMEOUT).await?;
 
-        // 4. statut. 413 → erreur de contexte (withholding/compaction réactive).
+        // 4. status. 413 -> context error (withholding/reactive compaction).
         if !resp.status().is_success() {
             let first_err = http_error_from_response(resp).await;
             if let ProviderError::Http {
@@ -647,13 +647,13 @@ impl Provider for OpenAiChatGptProvider {
             }
         }
 
-        // 5. flux SSE → StreamEvent canoniques (jamais d'ANSI, jamais de panic).
-        //    Mapping stateful (un event SSE → 0..n StreamEvent) dans un async_stream,
-        //    puis watchdog `idle_guarded` : le timeout enveloppe `inner.next()`, donc
-        //    un `es.next()` qui stalle (backend muet) déclenche l'idle timeout, sans
-        //    couper pendant le drain d'events déjà bufferisés (US-022).
+        // 5. SSE stream -> canonical StreamEvent (never ANSI, never a panic).
+        //    Stateful mapping (one SSE event -> 0..n StreamEvent) in an async_stream,
+        //    then the `idle_guarded` watchdog: the timeout wraps `inner.next()`, so
+        //    an `es.next()` that stalls (mute backend) triggers the idle timeout, without
+        //    cutting while draining already buffered events (US-022).
         let mut es = resp.bytes_stream().eventsource();
-        let replay = self.reasoning_replay; // Copy → capturé dans le stream 'static.
+        let replay = self.reasoning_replay; // Copy -> captured in the 'static stream.
         let mapped = async_stream::stream! {
             let mut mapper = CodexEventMapper::with_replay(replay);
             let mut saw_terminal = false;
@@ -687,7 +687,7 @@ impl Provider for OpenAiChatGptProvider {
     }
 
     async fn complete(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError> {
-        // Réutilise le chemin stream et agrège (titres / résumés de compaction).
+        // Reuses the stream path and aggregates (titles / compaction summaries).
         let stream = self.stream(req).await?;
         futures_util::pin_mut!(stream);
         let mut text = String::new();
@@ -730,19 +730,19 @@ impl Provider for OpenAiChatGptProvider {
             } => match *status {
                 401 | 403 if is_auth_expired(message) => ErrorClass::Auth(AuthError::Expired),
                 401 | 403 => ErrorClass::Auth(AuthError::Invalid),
-                // 429 quota épuisé (corps GoUsageLimitError/billing/…) → TERMINAL :
-                // jamais retryé (US-023). Un 429 transitoire reste `RateLimited`.
+                // 429 with an exhausted quota (GoUsageLimitError/billing/... body) -> TERMINAL:
+                // never retried (US-023). A transient 429 stays `RateLimited`.
                 429 if is_terminal_rate_limit(message) => ErrorClass::InvalidRequest,
                 429 => ErrorClass::RateLimited,
                 529 => ErrorClass::Overloaded(529),
                 s if s >= 500 => ErrorClass::Retryable,
                 _ => ErrorClass::InvalidRequest,
             },
-            // Transitoires : transport, flux coupé, chunk garbled → retry transverse.
+            // Transient: transport, cut stream, garbled chunk -> cross-cutting retry.
             ProviderError::Transport(_) | ProviderError::Stream(_) | ProviderError::Decode(_) => {
                 ErrorClass::Retryable
             }
-            // N'atteint pas classify (is_context_error géré en amont) ; fail-safe.
+            // Does not reach classify (is_context_error handled upstream); fail-safe.
             ProviderError::ContextLengthExceeded => ErrorClass::InvalidRequest,
         }
     }
@@ -843,7 +843,7 @@ mod tests {
         ));
     }
 
-    // US-029 : session_id = UUID v4 bien formé, stable par instance, unique.
+    // US-029: session_id = well-formed UUID v4, stable per instance, unique.
     #[test]
     fn session_id_is_uuid_v4_shaped() {
         let id = new_session_id();
@@ -856,7 +856,7 @@ mod tests {
             "variant RFC 4122"
         );
         assert_ne!(new_session_id(), new_session_id(), "deux UUID diffèrent");
-        // un provider porte un session_id UUID stocké à la construction.
+        // a provider carries a session_id UUID stored at construction time.
         assert_eq!(provider().prompt_cache_key().len(), 36);
     }
 
@@ -902,9 +902,9 @@ mod tests {
         ));
     }
 
-    // US-023 : un 429 « quota épuisé » (corps GoUsageLimitError/billing) est
-    // TERMINAL (InvalidRequest, jamais retryé) ; un 429 transitoire reste
-    // RateLimited (retryé).
+    // US-023: a 429 with an "exhausted quota" (GoUsageLimitError/billing body) is
+    // TERMINAL (InvalidRequest, never retried); a transient 429 stays
+    // RateLimited (retried).
     #[test]
     fn terminal_429_is_not_retried() {
         let p = provider();
@@ -927,13 +927,13 @@ mod tests {
                 "terminal 429 expected for: {body}"
             );
         }
-        // surcharge transitoire : pas de marqueur → retryable.
+        // transient overload: no marker -> retryable.
         assert!(matches!(
             p.classify_error(&terminal("Too Many Requests, slow down")),
             ErrorClass::RateLimited
         ));
-        // régression : un 429 transitoire mentionnant « billing » NE doit PAS être
-        // classé terminal (sous-chaîne nue écartée — biais faux-négatif sûr).
+        // regression: a transient 429 mentioning "billing" must NOT be
+        // classified terminal (bare substring ruled out, safe false-negative bias).
         assert!(matches!(
             p.classify_error(&terminal(
                 "rate limited; see your billing dashboard for limits"
@@ -1002,24 +1002,24 @@ mod tests {
         ));
     }
 
-    // US-023 : parsing `Retry-After` dans les 3 formats (ms exactes, secondes
-    // entières, date HTTP), `retry-after-ms` prioritaire.
+    // US-023: `Retry-After` parsing in the 3 formats (exact ms, whole
+    // seconds, HTTP date), `retry-after-ms` taking priority.
     #[test]
     fn parse_retry_after_all_formats() {
         use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 
-        // ms exactes prioritaires (même si `Retry-After` secondes est présent).
+        // exact ms take priority (even when a `Retry-After` in seconds is present).
         let mut h = HeaderMap::new();
         h.insert("retry-after-ms", HeaderValue::from_static("1500"));
         h.insert(RETRY_AFTER, HeaderValue::from_static("9"));
         assert_eq!(parse_retry_after_ms(&h, 0), Some(1500));
 
-        // secondes entières → ms.
+        // whole seconds -> ms.
         let mut h = HeaderMap::new();
         h.insert(RETRY_AFTER, HeaderValue::from_static("2"));
         assert_eq!(parse_retry_after_ms(&h, 0), Some(2000));
 
-        // date HTTP absolue → delta vs now. 30 s epoch, now 20 s → 10 s restantes.
+        // absolute HTTP date -> delta vs now. 30 s epoch, now 20 s -> 10 s left.
         let mut h = HeaderMap::new();
         h.insert(
             RETRY_AFTER,
@@ -1027,32 +1027,32 @@ mod tests {
         );
         assert_eq!(parse_retry_after_ms(&h, 20_000), Some(10_000));
 
-        // échéance déjà passée → 0 (saturating), jamais négatif.
+        // deadline already past -> 0 (saturating), never negative.
         assert_eq!(parse_retry_after_ms(&h, 40_000), Some(0));
 
-        // aucun en-tête → None.
+        // no header -> None.
         assert_eq!(parse_retry_after_ms(&HeaderMap::new(), 0), None);
     }
 
     #[test]
     fn imf_fixdate_epoch_anchor() {
-        // ancre : 1970-01-01T00:00:00Z = 0 ms.
+        // anchor: 1970-01-01T00:00:00Z = 0 ms.
         assert_eq!(
             parse_imf_fixdate_ms("Thu, 01 Jan 1970 00:00:00 GMT"),
             Some(0)
         );
-        // un jour plus tard = 86_400_000 ms.
+        // one day later = 86_400_000 ms.
         assert_eq!(
             parse_imf_fixdate_ms("Fri, 02 Jan 1970 00:00:00 GMT"),
             Some(86_400_000)
         );
-        // format invalide → None (pas de panic).
+        // invalid format -> None (no panic).
         assert_eq!(parse_imf_fixdate_ms("pas une date"), None);
         assert_eq!(days_from_civil(1970, 1, 1), 0);
     }
 
-    // US-022 : un stream OUVERT mais silencieux déclenche l'idle timeout (Retryable),
-    // sans gel. Timeout court (réel) → test rapide et déterministe.
+    // US-022: an OPEN but silent stream triggers the idle timeout (Retryable),
+    // without freezing. Short (real) timeout -> fast and deterministic test.
     #[tokio::test]
     async fn idle_timeout_fires_on_silent_stream() {
         let silent = futures_util::stream::pending::<Result<StreamEvent, ProviderError>>().boxed();
@@ -1065,16 +1065,16 @@ mod tests {
         );
     }
 
-    // US-022 (durcissement) : un backend qui ACCEPTE la connexion puis RETIENT ses
-    // headers (proxy bloqué, queue) doit déclencher le header timeout, pas geler la
-    // boucle. Serveur local qui accepte puis dort sans répondre ; timeout court (réel).
+    // US-022 (hardening): a backend that ACCEPTS the connection then WITHHOLDS its
+    // headers (blocked proxy, queue) must trigger the header timeout, not freeze the
+    // loop. Local server that accepts then sleeps without answering; short (real) timeout.
     #[tokio::test]
     async fn header_timeout_fires_when_backend_withholds_response() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind localhost");
         let addr = listener.local_addr().expect("local addr");
-        // accepte la socket et la garde ouverte SANS jamais écrire de réponse.
+        // accepts the socket and keeps it open WITHOUT ever writing a response.
         tokio::spawn(async move {
             if let Ok((sock, _)) = listener.accept().await {
                 tokio::time::sleep(Duration::from_secs(30)).await;
@@ -1089,8 +1089,8 @@ mod tests {
         );
     }
 
-    // US-022 : un flux qui émet des events sous le délai les relaie intacts, et la
-    // fin de flux (None) termine proprement.
+    // US-022: a stream emitting events under the delay relays them intact, and the
+    // end of stream (None) terminates cleanly.
     #[tokio::test]
     async fn idle_guard_passes_events_through() {
         let inner = futures_util::stream::iter(vec![
@@ -1112,8 +1112,8 @@ mod tests {
         ));
     }
 
-    // US-022 : une erreur amont est relayée puis termine le flux (parité avec le
-    // chemin direct : `yield Err` puis `return`).
+    // US-022: an upstream error is relayed then ends the stream (parity with the
+    // direct path: `yield Err` then `return`).
     #[tokio::test]
     async fn idle_guard_propagates_and_stops_on_error() {
         let inner = futures_util::stream::iter(vec![
