@@ -12,6 +12,6 @@ workspace = true
 tokio = { workspace = true }
 anyhow = { workspace = true }
 
-# Landlock = Linux only. Hors Linux, le sandbox FS dégrade explicitement (US-005 AC3).
+# Landlock = Linux only. Outside Linux, the FS sandbox degrades explicitly (US-005 AC3).
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { workspace = true }

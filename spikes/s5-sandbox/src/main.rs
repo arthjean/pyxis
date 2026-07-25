@@ -1,12 +1,12 @@
-//! US-005 — Spike sandbox : Landlock FS (kernel) + proxy réseau allow-list.
+//! US-005: sandbox spike, Landlock FS (kernel) + allow-list network proxy.
 //!
-//! Deux preuves, deux sous-commandes (Landlock `restrict_self` est IRRÉVERSIBLE
-//! pour le thread, donc on isole chaque preuve dans son propre process) :
-//!   - `s5-sandbox landlock` : une écriture hors workspace est refusée au kernel.
-//!   - `s5-sandbox proxy`     : un hôte hors allow-list est bloqué par le proxy.
+//! Two proofs, two subcommands (Landlock `restrict_self` is IRREVERSIBLE
+//! for the thread, so each proof is isolated in its own process):
+//!   - `s5-sandbox landlock`: a write outside the workspace is refused by the kernel.
+//!   - `s5-sandbox proxy`   : a host outside the allow-list is blocked by the proxy.
 //!
-//! Landlock NE filtre PAS le réseau (cf. ADR-7 R3) : le filtrage par hostname est
-//! un proxy applicatif best-effort. Ce spike tranche sa faisabilité solo.
+//! Landlock does NOT filter the network (see ADR-7 R3): hostname filtering is
+//! a best-effort application-level proxy. This spike settles its feasibility solo.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod proxy;
@@ -16,8 +16,8 @@ fn main() -> anyhow::Result<()> {
     match mode.as_str() {
         "landlock" => run_landlock_entry(),
         "proxy" => {
-            // tokio construit à la main : on garde `landlock` hors runtime
-            // multi-thread (restrict_self est par-thread).
+            // tokio built by hand: we keep `landlock` outside the multi-thread
+            // runtime (restrict_self is per-thread).
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(proxy::demo())
         }
@@ -37,7 +37,7 @@ fn run_landlock_entry() -> anyhow::Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 fn run_landlock_entry() -> anyhow::Result<()> {
-    // US-005 AC3 : dégradation explicite hors Linux.
+    // US-005 AC3: explicit degradation outside Linux.
     eprintln!(
         "[sandbox] Landlock indisponible hors Linux — sandbox FS DÉSACTIVÉ (avertissement). \
          Pyxis est Linux-first ; macOS Seatbelt / Windows en Phase 3."
@@ -55,20 +55,20 @@ mod sandbox_fs {
     use std::io::Write;
     use std::path::{Path, PathBuf};
 
-    /// Applique une politique Landlock : lecture seule partout, lecture+écriture
-    /// uniquement sous `workdir`. Best-effort sur l'ABI (le kernel d'Arthur > V2).
+    /// Applies a Landlock policy: read only everywhere, read+write
+    /// only under `workdir`. Best-effort on the ABI (the dev kernel is > V2).
     fn enforce(workdir: &Path) -> Result<RulesetStatus> {
         let abi = ABI::V2;
         let restriction = Ruleset::default()
             .set_compatibility(CompatLevel::BestEffort)
             .handle_access(AccessFs::from_all(abi))?
             .create()?
-            // lecture seule sur toute la hiérarchie...
+            // read only over the whole hierarchy...
             .add_rule(PathBeneath::new(
                 PathFd::new("/")?,
                 AccessFs::from_read(abi),
             ))?
-            // ...mais écriture autorisée sous le workspace uniquement.
+            // ...but writing allowed under the workspace only.
             .add_rule(PathBeneath::new(
                 PathFd::new(workdir)?,
                 AccessFs::from_all(abi),
@@ -87,7 +87,7 @@ mod sandbox_fs {
             bail!("Landlock NotEnforced — kernel sans support effectif. Verdict no-go FS.");
         }
 
-        // 1) Écriture DANS le workspace → doit réussir.
+        // 1) Write INSIDE the workspace -> must succeed.
         let inside = workdir.join("inside.txt");
         std::fs::File::create(&inside)
             .and_then(|mut f| f.write_all(b"ok"))
@@ -97,7 +97,7 @@ mod sandbox_fs {
             inside.display()
         );
 
-        // 2) Écriture HORS workspace → doit être refusée au kernel (EACCES).
+        // 2) Write OUTSIDE the workspace -> must be refused by the kernel (EACCES).
         let outside = Path::new("/tmp").join("pyxis_spike_OUTSIDE.txt");
         match std::fs::File::create(&outside).and_then(|mut f| f.write_all(b"escape")) {
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {

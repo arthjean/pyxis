@@ -1,12 +1,12 @@
-//! Proxy CONNECT local avec allow-list de hostnames (filtrage réseau best-effort
-//! applicatif — Landlock ne sait pas le faire, cf. ADR-7 R3).
+//! Local CONNECT proxy with a hostname allow-list (best-effort application-level
+//! network filtering: Landlock cannot do it, see ADR-7 R3).
 //!
-//! `demo()` est auto-contenu et déterministe (aucun accès Internet requis) :
-//! il monte un upstream TCP local, route un hôte autorisé à travers le proxy
-//! (tunnel établi) et un hôte interdit (403 + journalisation), puis asserte les
-//! deux issues. La résolution DNS est stubbée via `resolve` pour la repro ; un
-//! vrai proxy résoudrait via le DNS système — la logique de sécurité (le check
-//! d'allow-list sur le hostname demandé) est, elle, identique.
+//! `demo()` is self-contained and deterministic (no Internet access required):
+//! it brings up a local TCP upstream, routes an allowed host through the proxy
+//! (tunnel established) and a forbidden host (403 + logging), then asserts both
+//! outcomes. DNS resolution is stubbed through `resolve` for reproducibility; a
+//! real proxy would resolve through the system DNS. The security logic (the
+//! allow-list check on the requested hostname) is identical either way.
 
 use anyhow::{Result, bail};
 use std::collections::HashMap;
@@ -15,9 +15,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 pub struct ProxyConfig {
-    /// Hostnames explicitement autorisés (fail-closed : tout le reste est bloqué).
+    /// Explicitly allowed hostnames (fail-closed: everything else is blocked).
     pub allow: Vec<String>,
-    /// host -> addr concrète. DNS stubbé pour la démo auto-contenue.
+    /// host -> concrete addr. DNS stubbed for the self-contained demo.
     pub resolve: HashMap<String, String>,
 }
 
@@ -27,10 +27,10 @@ impl ProxyConfig {
     }
 }
 
-/// Traite une connexion cliente : lit la requête CONNECT, applique l'allow-list,
-/// tunnelise si autorisé, renvoie 403 sinon.
+/// Handles a client connection: reads the CONNECT request, applies the allow-list,
+/// tunnels when allowed, returns a 403 otherwise.
 async fn handle_conn(mut client: TcpStream, cfg: Arc<ProxyConfig>) -> Result<()> {
-    // Lire jusqu'à la fin des en-têtes (CRLFCRLF).
+    // Read up to the end of the headers (CRLFCRLF).
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
     loop {
@@ -89,7 +89,7 @@ async fn handle_conn(mut client: TcpStream, cfg: Arc<ProxyConfig>) -> Result<()>
     Ok(())
 }
 
-/// Petit upstream TCP : annonce une bannière connue dès qu'un client se connecte.
+/// Small TCP upstream: announces a known banner as soon as a client connects.
 async fn spawn_upstream() -> Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?.to_string();
@@ -118,7 +118,7 @@ async fn spawn_proxy(cfg: Arc<ProxyConfig>) -> Result<String> {
     Ok(addr)
 }
 
-/// Envoie une requête CONNECT au proxy et retourne (ligne de statut, corps reçu).
+/// Sends a CONNECT request to the proxy and returns (status line, received body).
 async fn connect_through(proxy_addr: &str, target_host: &str) -> Result<(String, String)> {
     let mut s = TcpStream::connect(proxy_addr).await?;
     let req = format!("CONNECT {target_host}:443 HTTP/1.1\r\nHost: {target_host}\r\n\r\n");
@@ -126,13 +126,13 @@ async fn connect_through(proxy_addr: &str, target_host: &str) -> Result<(String,
 
     let mut out = Vec::new();
     let mut tmp = [0u8; 512];
-    // Quelques lectures suffisent pour la démo (status + éventuelle bannière upstream).
+    // A few reads are enough for the demo (status + possible upstream banner).
     for _ in 0..4 {
         match tokio::time::timeout(std::time::Duration::from_millis(400), s.read(&mut tmp)).await {
             Ok(Ok(0)) => break,
             Ok(Ok(n)) => out.extend_from_slice(&tmp[..n]),
             Ok(Err(e)) => return Err(e.into()),
-            Err(_) => break, // timeout : on a lu ce qu'il y avait
+            Err(_) => break, // timeout: we read what there was
         }
     }
     let text = String::from_utf8_lossy(&out).to_string();
@@ -155,7 +155,7 @@ pub async fn demo() -> Result<()> {
         cfg.allow
     );
 
-    // Cas 1 : hôte autorisé → tunnel établi + bannière upstream.
+    // Case 1: allowed host -> tunnel established + upstream banner.
     let (status_ok, body_ok) = connect_through(&proxy_addr, "api.allowed.test").await?;
     println!("[proxy] autorisé  -> status={status_ok:?}");
     if !status_ok.contains("200") {
@@ -165,7 +165,7 @@ pub async fn demo() -> Result<()> {
         bail!("tunnel établi mais bannière upstream absente — copie bidirectionnelle KO");
     }
 
-    // Cas 2 : hôte interdit → 403, jamais de connexion upstream (unhappy path).
+    // Case 2: forbidden host -> 403, never an upstream connection (unhappy path).
     let (status_blocked, _) = connect_through(&proxy_addr, "evil.exfil.test").await?;
     println!("[proxy] interdit  -> status={status_blocked:?}");
     if !status_blocked.contains("403") {

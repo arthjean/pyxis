@@ -16,7 +16,7 @@ path = "src/lib.rs"
 name = "s4-tui-stream"
 path = "src/main.rs"
 
-# crossterm utilisé via `ratatui::crossterm` (réexport) — pas de skew de version.
+# crossterm used through `ratatui::crossterm` (re-export): no version skew.
 [dependencies]
 ratatui = { workspace = true }
 anyhow = { workspace = true }

@@ -1,11 +1,11 @@
-//! US-004 — Rendu TUI streaming brut (Ratatui).
+//! US-004: raw streaming TUI rendering (Ratatui).
 //!
-//! Prouve le tube `agent-core → canal → agent-tui` : le cœur n'émet que des
-//! `AgentEvent` structurés (jamais d'ANSI), le frontend décide seul du rendu.
-//! Esthétique cible : monochrome + un accent, aucune bordure ASCII lourde.
+//! Proves the `agent-core -> channel -> agent-tui` pipe: the core only emits
+//! structured `AgentEvent` (never ANSI), the frontend alone decides the rendering.
+//! Target aesthetics: monochrome + one accent, no heavy ASCII border.
 //!
-//! La logique de rendu (`ui`) est pure et testée via `TestBackend` — la fluidité
-//! subjective (token-par-token, sans scintillement) se vérifie en interactif.
+//! The rendering logic (`ui`) is pure and tested through `TestBackend`; the
+//! subjective smoothness (token by token, without flicker) is checked interactively.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use ratatui::Frame;
@@ -14,8 +14,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-/// Contrat cœur → client (sous-ensemble de l'`AgentEvent` de l'archi §10.1).
-/// Aucune décision de présentation, aucune séquence ANSI.
+/// Core -> client contract (subset of the `AgentEvent` of architecture 10.1).
+/// No presentation decision, no ANSI sequence.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     Text(String),
@@ -23,7 +23,7 @@ pub enum AgentEvent {
     EndTurn,
 }
 
-/// État de rendu côté client.
+/// Client-side rendering state.
 pub struct AppState {
     pub transcript: String,
     pub input: String,
@@ -41,8 +41,8 @@ impl AppState {
         }
     }
 
-    /// Applique un événement cœur. Le reasoning n'est pas rendu dans ce spike
-    /// (décodage suffisant, cf. ROADMAP : « rendu du raisonnement non requis »).
+    /// Applies a core event. Reasoning is not rendered in this spike
+    /// (decoding is enough, see the ROADMAP: "reasoning rendering not required").
     pub fn apply(&mut self, ev: &AgentEvent) {
         match ev {
             AgentEvent::Text(t) => self.transcript.push_str(t),
@@ -52,15 +52,15 @@ impl AppState {
     }
 }
 
-/// Détection truecolor → dégradation monochrome propre si absent (AC3).
+/// Truecolor detection -> clean monochrome degradation when absent (AC3).
 pub fn supports_truecolor() -> bool {
     std::env::var("COLORTERM")
         .map(|v| v.contains("truecolor") || v.contains("24bit"))
         .unwrap_or(false)
 }
 
-/// Rendu pur : transcript streamé en haut, champ de saisie en bas. Monochrome ;
-/// un seul accent (le marqueur de prompt) si truecolor, sinon gras.
+/// Pure rendering: streamed transcript on top, input field at the bottom. Monochrome;
+/// a single accent (the prompt marker) in truecolor, bold otherwise.
 pub fn ui(frame: &mut Frame, state: &AppState) {
     let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(frame.area());
 
@@ -82,7 +82,7 @@ pub fn ui(frame: &mut Frame, state: &AppState) {
     frame.render_widget(input, chunks[1]);
 }
 
-/// Découpe un texte en « tokens » (mots + espace) pour simuler un flux.
+/// Splits a text into "tokens" (words + space) to simulate a stream.
 pub fn tokenize(s: &str) -> Vec<String> {
     s.split_inclusive(' ').map(str::to_string).collect()
 }
@@ -105,14 +105,14 @@ mod tests {
         out
     }
 
-    // AC1 (version déterministe) : les tokens streamés s'accumulent et se rendent.
+    // AC1 (deterministic version): the streamed tokens accumulate and render.
     #[test]
     fn streamed_text_renders_into_buffer() {
         let (w, h) = (40, 10);
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut state = AppState::new(false);
 
-        // Simule l'arrivée token-par-token, en redessinant à chaque token.
+        // Simulates the token-by-token arrival, redrawing on every token.
         for tok in tokenize("Bonjour depuis Pyxis en streaming") {
             state.apply(&AgentEvent::Text(tok));
             terminal.draw(|f| ui(f, &state)).unwrap();
@@ -126,7 +126,7 @@ mod tests {
         assert!(text.contains("›"), "marqueur de prompt absent");
     }
 
-    // AC2 : un redimensionnement en cours de stream ne corrompt pas le rendu.
+    // AC2: a resize mid-stream does not corrupt the rendering.
     #[test]
     fn resize_midstream_reflows_without_corruption() {
         let mut terminal = Terminal::new(TestBackend::new(50, 8)).unwrap();
@@ -137,7 +137,7 @@ mod tests {
         ));
         terminal.draw(|f| ui(f, &state)).unwrap();
 
-        // étroitisse le terminal en plein "stream"
+        // narrows the terminal in the middle of the "stream"
         terminal.backend_mut().resize(24, 12);
         state.apply(&AgentEvent::Text(
             " et encore du texte ajouté après le resize".into(),
@@ -149,7 +149,7 @@ mod tests {
             text.contains("resize"),
             "le texte post-resize doit apparaître"
         );
-        // pas de panic = pas de corruption d'indices ; le wrap a recalculé.
+        // no panic = no index corruption; the wrap recomputed.
     }
 
     #[test]

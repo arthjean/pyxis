@@ -1,8 +1,8 @@
-//! Runner US-004 : interactif si stdout est un TTY (pour la vérif visuelle
-//! d'Arthur), sinon dump headless du buffer rendu (preuve exécutable sans TTY).
+//! US-004 runner: interactive when stdout is a TTY (for the visual check),
+//! otherwise a headless dump of the rendered buffer (runnable proof without a TTY).
 //!
-//! Le « cœur » (un thread feeder) n'émet que des `AgentEvent` via un canal mpsc —
-//! jamais d'ANSI. Le TUI consomme le canal et rend.
+//! The "core" (a feeder thread) only emits `AgentEvent` through an mpsc channel,
+//! never ANSI. The TUI consumes the channel and renders.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use anyhow::Result;
@@ -21,7 +21,7 @@ fn main() -> Result<()> {
     }
 }
 
-/// Rendu unique vers un backend de test, imprimé en clair — exécutable sans TTY.
+/// Single render toward a test backend, printed as plain text: runnable without a TTY.
 fn run_headless_dump() -> Result<()> {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -55,7 +55,7 @@ fn run_headless_dump() -> Result<()> {
     Ok(())
 }
 
-/// Boucle interactive : feeder en thread (émet des AgentEvent), rendu Ratatui.
+/// Interactive loop: feeder in a thread (emits AgentEvent), Ratatui rendering.
 fn run_interactive() -> Result<()> {
     use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
@@ -99,7 +99,7 @@ fn run_interactive() -> Result<()> {
                         }
                         _ => {}
                     },
-                    Event::Resize(_, _) => {} // le prochain draw reflow tout seul
+                    Event::Resize(_, _) => {} // the next draw reflows by itself
                     _ => {}
                 }
             }

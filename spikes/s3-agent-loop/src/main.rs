@@ -1,8 +1,8 @@
-//! Runner live de la boucle : Ollama (devstral, tool-capable) avec un outil `bash`.
-//! Best-effort — le modèle local peut ou non émettre le tool call ; la preuve
-//! rigoureuse de la state machine vit dans les tests (`ScriptedProvider`).
+//! Live runner of the loop: Ollama (devstral, tool-capable) with a `bash` tool.
+//! Best-effort: the local model may or may not emit the tool call; the rigorous
+//! proof of the state machine lives in the tests (`ScriptedProvider`).
 //!
-//! Env : OLLAMA_BASE, OLLAMA_MODEL (défaut devstral-small-2:24b).
+//! Env: OLLAMA_BASE, OLLAMA_MODEL (default devstral-small-2:24b).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use anyhow::Result;

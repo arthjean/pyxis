@@ -1,3 +1,3 @@
-# mold = link plus rapide (présent dans l'env d'Arthur). sccache absent → non câblé ici.
+# mold = faster linking (present in the dev environment). sccache absent -> not wired here.
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]

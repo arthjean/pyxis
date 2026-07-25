@@ -1,15 +1,15 @@
-//! US-001 — Spike accès provider (go/no-go auth).
+//! US-001: provider access spike (auth go/no-go).
 //!
-//! Détermine avec quelles credentials l'utilisateur final parle au modèle SANS
-//! être bloqué — le go/no-go de Phase 0 (cf. docs/PROVIDERS.md §6, ADR-7 R1).
+//! Determines with which credentials the end user talks to the model WITHOUT
+//! being blocked: the Phase 0 go/no-go (see docs/PROVIDERS.md 6, ADR-7 R1).
 //!
-//! Trois legs :
-//!   - `ollama`    : local, aucune credential → preuve exécutable ici.
-//!   - `openai`    : API key au token (OPENAI_API_KEY) → streaming + usage (coût).
-//!   - `anthropic` : sonde le blocage des outils tiers ; capture le message exact.
+//! Three legs:
+//!   - `ollama`: local, no credential -> runnable proof right here.
+//!   - `openai`: token API key (OPENAI_API_KEY) -> streaming + usage (cost).
+//!   - `anthropic`: probes the blocking of third-party tools; captures the exact message.
 //!
-//! Les legs OpenAI/Anthropic lisent leurs clés en env : tu les lances, le verdict
-//! se complète. Le leg Ollama tranche déjà le chemin non-bloqué du MVP.
+//! The OpenAI/Anthropic legs read their keys from the env: you run them, and the verdict
+//! completes. The Ollama leg already settles the unblocked path of the MVP.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use anyhow::Result;
@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Streame un endpoint OpenAI-compat, agrège texte + usage. Retourne (chars, usage?).
+/// Streams an OpenAI-compatible endpoint, aggregates text + usage. Returns (chars, usage?).
 async fn run_openai_compat(
     base: &str,
     key: Option<&str>,
@@ -138,7 +138,7 @@ async fn leg_openai() -> Result<()> {
 
 async fn leg_anthropic() -> Result<()> {
     println!("=== leg ANTHROPIC (sonde du blocage outils tiers) ===");
-    // Deux credentials possibles : token API (sk-ant-...) OU token d'abonnement OAuth.
+    // Two possible credentials: API token (sk-ant-...) OR OAuth subscription token.
     let api_key = std::env::var("ANTHROPIC_API_KEY").ok();
     let oauth = std::env::var("ANTHROPIC_OAUTH_TOKEN").ok();
 
@@ -168,7 +168,7 @@ async fn leg_anthropic() -> Result<()> {
     if let Some(k) = &api_key {
         req = req.header("x-api-key", k.as_str());
     } else if let Some(t) = &oauth {
-        // chemin abonnement : Authorization Bearer (le cas qu'Anthropic bloque)
+        // subscription path: Authorization Bearer (the case Anthropic blocks)
         req = req
             .header("authorization", format!("Bearer {t}"))
             .header("anthropic-beta", "oauth-2025-04-20");
@@ -204,7 +204,7 @@ async fn leg_anthropic() -> Result<()> {
     Ok(())
 }
 
-/// Classification minimale (la taxonomie ErrorClass complète relève de US-015).
+/// Minimal classification (the full ErrorClass taxonomy belongs to US-015).
 fn classify_http(status: u16, body: &str) -> &'static str {
     if body.contains("only authorized for use with Claude Code") {
         return "Auth::ThirdPartyBlocked";

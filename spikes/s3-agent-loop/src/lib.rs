@@ -1,13 +1,13 @@
-//! US-003 — Boucle minimale stream → outil Bash → réinjection → reboucle.
+//! US-003: minimal loop stream -> Bash tool -> reinjection -> loop back.
 //!
-//! Valide la state machine à transitions typées dans sa forme **la plus réduite**
-//! (cf. docs/ROADMAP.md Phase 0) : `enum Transition` exhaustif, dispatch d'un seul
-//! outil (`bash`) sous `tokio::time::timeout`, réinjection du résultat, reboucle
-//! jusqu'à `end_turn`. Les transitions Compact/Recover de l'archi complète
-//! (US-006/US-008) sont hors scope ici, par décision de la roadmap.
+//! Validates the state machine with typed transitions in its **most reduced** form
+//! (see docs/ROADMAP.md Phase 0): exhaustive `enum Transition`, dispatch of a single
+//! tool (`bash`) under `tokio::time::timeout`, reinjection of the result, loop back
+//! until `end_turn`. The Compact/Recover transitions of the full architecture
+//! (US-006/US-008) are out of scope here, by roadmap decision.
 //!
-//! `Provider` est un trait injectable (cf. invariant « deps injectables ») : la
-//! boucle est testable sans API réelle via `ScriptedProvider`.
+//! `Provider` is an injectable trait (see the "injectable deps" invariant): the
+//! loop is testable without a real API through `ScriptedProvider`.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use futures_util::stream::BoxStream;
@@ -16,10 +16,10 @@ use std::time::Duration;
 
 pub use spike_canon::{AdapterError, StopReason, StreamEvent};
 
-// ───────────────────────────── Provider injectable ──────────────────────────
+// ───────────────────────────── Injectable provider ──────────────────────────
 
-/// Source de `StreamEvent` (réelle ou scriptée). Object-safe : la boucle prend
-/// `&dyn Provider`.
+/// Source of `StreamEvent` (real or scripted). Object-safe: the loop takes
+/// a `&dyn Provider`.
 pub trait Provider: Send + Sync {
     fn stream(
         &self,
@@ -27,7 +27,7 @@ pub trait Provider: Send + Sync {
     ) -> BoxStream<'static, Result<StreamEvent, AdapterError>>;
 }
 
-/// Provider scripté pour les tests : rend une liste d'events figée par tour.
+/// Scripted provider for the tests: returns a fixed list of events per turn.
 pub struct ScriptedProvider {
     turns: std::sync::Mutex<std::collections::VecDeque<Vec<StreamEvent>>>,
 }
@@ -61,7 +61,7 @@ impl Provider for ScriptedProvider {
     }
 }
 
-/// Provider live OpenAI-compat (Ollama / OpenAI), via `spike_canon`.
+/// Live OpenAI-compatible provider (Ollama / OpenAI), through `spike_canon`.
 pub struct LiveProvider {
     pub base: String,
     pub api_key: Option<String>,
@@ -96,7 +96,7 @@ impl Provider for LiveProvider {
     }
 }
 
-// ───────────────────────────── Accumulateur de tour ─────────────────────────
+// ───────────────────────────── Turn accumulator ─────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct ToolCall {
@@ -110,7 +110,7 @@ struct PartialCall {
     args: String,
 }
 
-/// Accumule les `StreamEvent` d'un tour en un état décisionnel.
+/// Accumulates the `StreamEvent` of a turn into a decision state.
 #[derive(Default)]
 pub struct Accumulator {
     pub text: String,
@@ -172,23 +172,23 @@ impl Accumulator {
     }
 }
 
-// ──────────────────────────── State machine typée ───────────────────────────
+// ──────────────────────────── Typed state machine ───────────────────────────
 
-/// Transition exhaustive (forme réduite Phase 0). Le `match` du driver force le
-/// traitement de tous les cas → contrôle de flux vérifié à la compilation.
+/// Exhaustive transition (reduced Phase 0 form). The driver `match` forces
+/// every case to be handled -> control flow checked at compile time.
 #[derive(Debug)]
 pub enum Transition {
-    /// Le modèle a fini sans tool_use → rendre la main.
+    /// The model finished without tool_use -> hand back control.
     EndTurn,
-    /// Le modèle demande des outils → exécuter puis reboucler.
+    /// The model asks for tools -> run them then loop back.
     RunTools(Vec<ToolCall>),
-    /// Plafond de tours / max_tokens.
+    /// Turn cap / max_tokens.
     Exhausted(String),
-    /// Erreur fatale → propager.
+    /// Fatal error -> propagate.
     Fail(String),
 }
 
-/// Pur, sans I/O → testable unitairement (nœud de la testabilité headless).
+/// Pure, no I/O -> unit-testable (the crux of headless testability).
 pub fn decide_transition(acc: &Accumulator) -> Transition {
     let calls = acc.tool_calls();
     if !calls.is_empty() && matches!(acc.stop, Some(StopReason::ToolUse)) {
@@ -198,25 +198,25 @@ pub fn decide_transition(acc: &Accumulator) -> Transition {
         Some(StopReason::EndTurn) | Some(StopReason::StopSequence) | None => Transition::EndTurn,
         Some(StopReason::MaxTokens) => Transition::Exhausted("max_tokens".to_string()),
         Some(StopReason::Refusal) => Transition::Fail("refusal".to_string()),
-        // ToolUse annoncé mais aucun call assemblé → fail-closed vers EndTurn.
+        // ToolUse announced but no call assembled -> fail-closed to EndTurn.
         Some(StopReason::ToolUse) => Transition::EndTurn,
     }
 }
 
-// ─────────────────────────────── Outil Bash ─────────────────────────────────
+// ─────────────────────────────── Bash tool ─────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct ToolInvocation {
     pub name: String,
     pub args: String,
     pub output: String,
-    /// Toute sortie d'outil est untrusted par défaut (taint = US-013).
+    /// Every tool output is untrusted by default (taint = US-013).
     pub untrusted: bool,
     pub timed_out: bool,
 }
 
-/// Exécute `bash -c <cmd>` sous timeout. Un outil qui pend ne fige pas la boucle :
-/// le timeout reprend la main (`kill_on_drop` tue le process orphelin).
+/// Runs `bash -c <cmd>` under a timeout. A tool that hangs does not freeze the loop:
+/// the timeout takes control back (`kill_on_drop` kills the orphan process).
 pub async fn exec_bash(id_name: &str, args_json: &str, timeout: Duration) -> ToolInvocation {
     let cmd = serde_json::from_str::<serde_json::Value>(args_json)
         .ok()
@@ -285,7 +285,7 @@ pub struct RunOutcome {
     pub ended: EndState,
 }
 
-/// La boucle complète : stream → décision → (outil → réinjection → reboucle) | fin.
+/// The full loop: stream -> decision -> (tool -> reinjection -> loop back) | end.
 pub async fn run_agent(
     provider: &dyn Provider,
     system: Option<&str>,
@@ -315,7 +315,7 @@ pub async fn run_agent(
         }
         turns += 1;
 
-        // transcript-before-response serait ici (US-006/US-009) — hors scope spike.
+        // transcript-before-response would go here (US-006/US-009): out of spike scope.
         let mut acc = Accumulator::new();
         let mut stream = provider.stream(messages.clone());
         let mut stream_err = None;
@@ -363,7 +363,7 @@ pub async fn run_agent(
                 };
             }
             Transition::RunTools(calls) => {
-                // message assistant (avec tool_calls) ajouté au transcript
+                // assistant message (with tool_calls) added to the transcript
                 let tool_calls_json: Vec<serde_json::Value> = calls
                     .iter()
                     .map(|c| {
@@ -380,7 +380,7 @@ pub async fn run_agent(
                     "tool_calls": tool_calls_json,
                 }));
 
-                // exécution + réinjection de chaque résultat
+                // execution + reinjection of each result
                 for call in calls {
                     let inv = exec_bash(&call.name, &call.args_json, tool_timeout).await;
                     messages.push(serde_json::json!({
@@ -390,7 +390,7 @@ pub async fn run_agent(
                     }));
                     invocations.push(inv);
                 }
-                // reboucle : le modèle voit les résultats
+                // loop back: the model sees the results
             }
         }
     }
@@ -429,7 +429,7 @@ mod tests {
         ]
     }
 
-    // AC1 + AC3 : tool_use → exécution → réinjection → reboucle → end_turn propre.
+    // AC1 + AC3: tool_use -> execution -> reinjection -> loop back -> clean end_turn.
     #[tokio::test]
     async fn loop_runs_tool_then_ends() {
         let provider = ScriptedProvider::new(vec![
@@ -452,7 +452,7 @@ mod tests {
         assert_eq!(out.final_text, "Voilà, c'est fait.");
     }
 
-    // AC2 : un outil qui dépasse le timeout ne fige pas la boucle.
+    // AC2: a tool exceeding the timeout does not freeze the loop.
     #[tokio::test]
     async fn tool_timeout_does_not_freeze_loop() {
         let provider = ScriptedProvider::new(vec![

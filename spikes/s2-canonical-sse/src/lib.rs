@@ -1,21 +1,21 @@
-//! US-002 — Couche canonique : un flux SSE provider → `StreamEvent` typés.
+//! US-002: canonical layer, a provider SSE stream -> typed `StreamEvent`.
 //!
-//! Prouve que la couche maison (`reqwest` + `eventsource-stream`, sans SDK) tient.
-//! Le vocabulaire `StreamEvent` est celui figé dans `docs/PROVIDERS.md §2`
-//! (Anthropic-like). L'adapter ici cible le wire format **OpenAI Chat Completions**
-//! (le même que sert Ollama en mode `/v1/chat/completions`), réutilisé par S1 et S3.
+//! Proves that the in-house layer (`reqwest` + `eventsource-stream`, without an SDK) holds up.
+//! The `StreamEvent` vocabulary is the one frozen in `docs/PROVIDERS.md 2`
+//! (Anthropic-like). The adapter here targets the **OpenAI Chat Completions** wire
+//! format (the same one Ollama serves in `/v1/chat/completions` mode), reused by S1 and S3.
 //!
-//! Invariant clé : à `ToolCallEnd`, la concaténation des `ToolCallDelta.args_json`
-//! d'un même id forme un JSON complet et valide (cf. `PROVIDERS.md §2`).
+//! Key invariant: at `ToolCallEnd`, the concatenation of the `ToolCallDelta.args_json`
+//! of a same id forms a complete and valid JSON (see `PROVIDERS.md 2`).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use futures_util::stream::BoxStream;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
-// ───────────────────────────── Vocabulaire canonique ─────────────────────────
+// ───────────────────────────── Canonical vocabulary ─────────────────────────
 
-/// Le seul vocabulaire de streaming que le cœur connaît (cf. `PROVIDERS.md §2`).
+/// The only streaming vocabulary the core knows (see `PROVIDERS.md 2`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEvent {
     TextDelta { text: String },
@@ -55,16 +55,16 @@ impl StopReason {
     }
 }
 
-/// Erreur d'adapter classifiée — jamais un panic (US-002 AC2/AC3).
+/// Classified adapter error, never a panic (US-002 AC2/AC3).
 #[derive(Debug, Clone)]
 pub enum AdapterError {
-    /// Échec transport/connexion (Ollama éteint, DNS, refus).
+    /// Transport/connection failure (Ollama down, DNS, refusal).
     Transport(String),
-    /// Réponse HTTP non-2xx (porte le code pour classification ultérieure).
+    /// Non-2xx HTTP response (carries the code for later classification).
     Http { status: u16, body: String },
-    /// Chunk JSON malformé — ignoré ou remonté sans crasher le parseur.
+    /// Malformed JSON chunk: ignored or surfaced without crashing the parser.
     Json(String),
-    /// Flux coupé en milieu de message.
+    /// Stream cut in the middle of a message.
     Stream(String),
 }
 
@@ -80,9 +80,9 @@ impl std::fmt::Display for AdapterError {
 }
 impl std::error::Error for AdapterError {}
 
-// ───────────────────────── Adapter OpenAI Chat (stateful) ────────────────────
+// ───────────────────────── OpenAI Chat adapter (stateful) ────────────────────
 
-/// Désérialisation du wire format OpenAI Chat Completions (chunk de stream).
+/// Deserialization of the OpenAI Chat Completions wire format (stream chunk).
 #[derive(Deserialize)]
 struct Chunk {
     #[serde(default)]
@@ -103,8 +103,8 @@ struct Choice {
 struct Delta {
     #[serde(default)]
     content: Option<String>,
-    // Variantes de reasoning selon provider (OpenAI o-series n'expose rien ;
-    // certains modèles via Ollama exposent `reasoning_content`).
+    // Reasoning variants depending on the provider (the OpenAI o-series exposes nothing;
+    // some models through Ollama expose `reasoning_content`).
     #[serde(default)]
     reasoning: Option<String>,
     #[serde(default)]
@@ -141,8 +141,8 @@ struct RawUsage {
     total_tokens: u32,
 }
 
-/// Adapter à état : réassemble les tool calls fragmentés par `index` et garantit
-/// l'invariant `args_json` complet à `ToolCallEnd`.
+/// Stateful adapter: reassembles the tool calls fragmented by `index` and guarantees
+/// the complete `args_json` invariant at `ToolCallEnd`.
 #[derive(Default)]
 pub struct OpenAiChatAdapter {
     index_to_id: HashMap<u32, String>,
@@ -167,8 +167,8 @@ impl OpenAiChatAdapter {
         }
     }
 
-    /// Traduit un `data:` SSE (un chunk JSON) en 0..n `StreamEvent` canoniques.
-    /// `[DONE]` ne produit rien : `Done` est émis sur `finish_reason`.
+    /// Translates an SSE `data:` (one JSON chunk) into 0..n canonical `StreamEvent`.
+    /// `[DONE]` produces nothing: `Done` is emitted on `finish_reason`.
     pub fn ingest(&mut self, data: &str) -> Result<Vec<StreamEvent>, AdapterError> {
         let data = data.trim();
         if data.is_empty() || data == "[DONE]" {
@@ -247,9 +247,9 @@ impl OpenAiChatAdapter {
     }
 }
 
-// ───────────────────────────── Streaming live (reqwest) ──────────────────────
+// ───────────────────────────── Live streaming (reqwest) ──────────────────────
 
-/// Construit le corps de requête OpenAI-compat (stream + usage).
+/// Builds the OpenAI-compatible request body (stream + usage).
 pub fn build_body(
     model: &str,
     messages: serde_json::Value,
@@ -267,8 +267,8 @@ pub fn build_body(
     body
 }
 
-/// Ouvre un flux `StreamEvent` depuis un endpoint OpenAI-compat `/chat/completions`.
-/// `base_url` = ex. `http://localhost:11434/v1` (Ollama) ou `https://api.openai.com/v1`.
+/// Opens a `StreamEvent` stream from an OpenAI-compatible `/chat/completions` endpoint.
+/// `base_url` = e.g. `http://localhost:11434/v1` (Ollama) or `https://api.openai.com/v1`.
 pub async fn stream_chat(
     base_url: &str,
     api_key: Option<&str>,
@@ -311,10 +311,10 @@ pub async fn stream_chat(
                             yield Ok(e);
                         }
                     }
-                    // Chunk malformé : erreur typée, le parseur ne crashe pas (AC3).
+                    // Malformed chunk: typed error, the parser does not crash (AC3).
                     Err(e) => yield Err(e),
                 },
-                // Flux coupé en milieu de message : classifié, pas de panic (AC2).
+                // Stream cut in the middle of a message: classified, no panic (AC2).
                 Err(e) => {
                     yield Err(AdapterError::Stream(e.to_string()));
                     return;
@@ -381,24 +381,24 @@ mod tests {
     #[test]
     fn tool_call_fragmented_reassembles_to_valid_json_at_end() {
         let mut a = OpenAiChatAdapter::new();
-        // 1er fragment : id + name + début d'args
+        // 1st fragment: id + name + start of args
         let _ = a
             .ingest(
                 r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"bash","arguments":"{\"cmd\":\""}}]},"finish_reason":null}]}"#,
             )
             .unwrap();
-        // 2e fragment : suite d'args, SANS id (résolu par index)
+        // 2nd fragment: rest of the args, WITHOUT an id (resolved by index)
         let _ = a
             .ingest(
                 r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"echo hi\"}"}}]},"finish_reason":null}]}"#,
             )
             .unwrap();
-        // clôture
+        // closing
         let end = a
             .ingest(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#)
             .unwrap();
 
-        // On rejoue tout pour reconstituer le flux complet et vérifier l'invariant.
+        // We replay everything to rebuild the full stream and check the invariant.
         let mut a2 = OpenAiChatAdapter::new();
         let mut all = Vec::new();
         for c in [
@@ -409,7 +409,7 @@ mod tests {
             all.extend(a2.ingest(c).unwrap());
         }
 
-        // Start présent, End présent (issu du dernier chunk), Done = ToolUse.
+        // Start present, End present (from the last chunk), Done = ToolUse.
         assert!(all.contains(&StreamEvent::ToolCallStart {
             id: "call_1".into(),
             name: "bash".into()
@@ -421,7 +421,7 @@ mod tests {
             stop: StopReason::ToolUse
         }));
 
-        // Invariant : args_json concaténé = JSON valide.
+        // Invariant: concatenated args_json = valid JSON.
         let args: String = all
             .iter()
             .filter_map(|e| match e {

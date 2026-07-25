@@ -1,8 +1,8 @@
-# Workspace JETABLE de Phase 0 (EP-001). Ces crates prouvent une hypothèse,
-# pas une feature finie — ils ne survivront pas tels quels au MVP (cf.
-# docs/ROADMAP.md « Phase 0 », DoD EP-001). Le futur workspace MVP vivra à la
-# racine du repo avec des crates `agent-*` ; ces spikes sont préfixés `s*` et
-# `canon` pour qu'aucune ligne de MVP ne soit confondue avec eux.
+# THROWAWAY Phase 0 workspace (EP-001). These crates prove a hypothesis,
+# not a finished feature: they will not survive as is into the MVP (see
+# docs/ROADMAP.md "Phase 0", EP-001 DoD). The future MVP workspace will live at the
+# root of the repo with `agent-*` crates; these spikes are prefixed `s*` and
+# `canon` so that no MVP line can be confused with them.
 [workspace]
 resolver = "3"
 members = [
@@ -31,8 +31,8 @@ ratatui = "0.29"
 crossterm = "0.28"
 landlock = "0.4"
 
-# Lints clippy obligatoires (mandat global Arthur). Throwaway ≠ sale :
-# panic/unimplemented/dbg = deny ; unwrap/expect = warn (pas deny, cf. CLAUDE.md).
+# Mandatory clippy lints (global mandate). Throwaway does not mean sloppy:
+# panic/unimplemented/dbg = deny; unwrap/expect = warn (not deny, see CLAUDE.md).
 [workspace.lints.clippy]
 panic = "deny"
 unimplemented = "deny"

@@ -1,11 +1,11 @@
-//! Runner live de la couche canonique : streame un provider OpenAI-compat et
-//! imprime chaque `StreamEvent` décodé. Par défaut : Ollama local (aucun secret).
+//! Live runner of the canonical layer: streams an OpenAI-compatible provider and
+//! prints every decoded `StreamEvent`. By default: local Ollama (no secret).
 //!
-//! Usage :
+//! Usage:
 //!   s2-canonical-sse ["prompt"]
-//! Env :
-//!   OLLAMA_BASE   (défaut http://localhost:11434/v1)
-//!   OLLAMA_MODEL  (défaut devstral-small-2:24b)
+//! Env:
+//!   OLLAMA_BASE   (default http://localhost:11434/v1)
+//!   OLLAMA_MODEL  (default devstral-small-2:24b)
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use anyhow::Result;
