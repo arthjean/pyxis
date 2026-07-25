@@ -1,27 +1,27 @@
-//! Contexte projet injecté comme messages `user` ÉPHÉMÈRES par tour (US-028) :
-//! AGENTS.md (découvert cwd→`.git`) puis bloc `<environment>`. Lu AVANT le sandbox
-//! (comme skills/mcp) car la remontée d'ancêtres devient inaccessible une fois
-//! Landlock posé. Le contenu est ré-injecté à chaque requête mais jamais persisté
-//! (cf. `agent_core::AgentContext::context_messages`).
+//! Project context injected as EPHEMERAL `user` messages per turn (US-028):
+//! AGENTS.md (discovered from cwd up to `.git`) then the `<environment>` block. Read BEFORE the sandbox
+//! (like skills/mcp) because walking up the ancestors becomes inaccessible once
+//! Landlock is in place. The content is re-injected on every request but never persisted
+//! (see `agent_core::AgentContext::context_messages`).
 
 use std::path::Path;
 
 use agent_core::message::Message;
 
-/// Budget d'octets du bloc AGENTS.md concaténé (borne le prompt). Aligné sur le
-/// défaut historique de Codex (`project_doc_max_bytes`, 32 KiB).
+/// Byte budget of the concatenated AGENTS.md block (bounds the prompt). Aligned on the
+/// historical Codex default (`project_doc_max_bytes`, 32 KiB).
 const AGENTS_BUDGET: usize = 32_000;
 
-/// Noms de fichiers d'instructions, par priorité. `CLAUDE.md` est un fallback
-/// toléré (AC US-028) pour les dépôts encore en convention Claude Code.
+/// Instruction file names, by priority. `CLAUDE.md` is a tolerated
+/// fallback (US-028 AC) for repositories still on the Claude Code convention.
 const CANDIDATES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
 
-/// Profondeur max de remontée d'ancêtres (backstop quand aucun `.git` n'est trouvé).
+/// Max ancestor-walking depth (backstop when no `.git` is found).
 const MAX_WALK_DEPTH: usize = 24;
 
-/// Construit les messages de contexte éphémères : AGENTS.md (si présent) PUIS
-/// environnement. Stable (AGENTS.md) avant volatil (date) → préfixe cacheable.
-/// `date` est fourni par le harness (cf. [`today_utc`]).
+/// Builds the ephemeral context messages: AGENTS.md (when present) THEN
+/// environment. Stable (AGENTS.md) before volatile (date) -> cacheable prefix.
+/// `date` is provided by the harness (see [`today_utc`]).
 pub fn messages(workspace: &Path, date: &str) -> Vec<Message> {
     let mut out = Vec::new();
     if let Some(agents) = discover_agents_md(workspace) {
@@ -31,18 +31,18 @@ pub fn messages(workspace: &Path, date: &str) -> Vec<Message> {
     out
 }
 
-/// Découvre et concatène les AGENTS.md de `start` jusqu'au répertoire contenant
-/// `.git` (inclus). Ordre de sortie parent→cwd (le plus proche en dernier → prime
-/// à la lecture), priorité au plus proche sous budget. `None` si rien trouvé.
+/// Discovers and concatenates the AGENTS.md from `start` up to the directory containing
+/// `.git` (included). Output order parent -> cwd (the closest last -> wins
+/// on reading), priority to the closest one within budget. `None` when nothing is found.
 fn discover_agents_md(start: &Path) -> Option<String> {
     let mut dirs: Vec<&Path> = Vec::new();
     let mut cur: Option<&Path> = Some(start);
     let mut depth = 0usize;
     while let Some(d) = cur {
         dirs.push(d);
-        // S'arrête à la racine du dépôt (`.git`) OU à un cap de profondeur : hors
-        // d'un repo, la remontée grimperait sinon jusqu'à `/`, ramassant un AGENTS.md
-        // planté en ancêtre (surface d'injection, OWASP LLM01).
+        // Stops at the repository root (`.git`) OR at a depth cap: outside
+        // a repo, the walk would otherwise climb up to `/`, picking up an AGENTS.md
+        // planted in an ancestor (injection surface, OWASP LLM01).
         if d.join(".git").exists() || depth >= MAX_WALK_DEPTH {
             break;
         }
@@ -50,7 +50,7 @@ fn discover_agents_md(start: &Path) -> Option<String> {
         cur = d.parent();
     }
 
-    // Collecte du plus PROCHE au plus loin (priorité au proche sous budget).
+    // Collected from the CLOSEST to the farthest (priority to the closest within budget).
     let mut kept: Vec<String> = Vec::new();
     let mut total = 0usize;
     for d in dirs.iter().copied() {
@@ -66,9 +66,9 @@ fn discover_agents_md(start: &Path) -> Option<String> {
     if kept.is_empty() {
         return None;
     }
-    kept.reverse(); // → parent→cwd (le plus proche en dernier)
+    kept.reverse(); // -> parent to cwd (the closest last)
     let mut body = kept.join("\n\n");
-    // backstop dur (char-safe) si une seule section dépasse le budget.
+    // hard backstop (char-safe) when a single section exceeds the budget.
     if body.len() > AGENTS_BUDGET {
         let mut cut = AGENTS_BUDGET;
         while cut > 0 && !body.is_char_boundary(cut) {
@@ -83,14 +83,14 @@ fn discover_agents_md(start: &Path) -> Option<String> {
     ))
 }
 
-/// Lit le premier fichier d'instructions non vide d'un répertoire (AGENTS.md, puis
-/// fallback CLAUDE.md). `None` si aucun n'existe ou tous vides. Durci : rejette les
-/// symlinks et non-fichiers (symlink → secret/device) et lit AU PLUS `AGENTS_BUDGET`
-/// octets (un fichier géant ne sature pas la RAM avant la borne — DoS au démarrage).
+/// Reads the first non-empty instruction file of a directory (AGENTS.md, then
+/// CLAUDE.md as a fallback). `None` when none exists or all are empty. Hardened: rejects
+/// symlinks and non-files (symlink -> secret/device) and reads AT MOST `AGENTS_BUDGET`
+/// bytes (a giant file does not saturate the RAM before the bound: startup DoS).
 fn read_instructions(dir: &Path) -> Option<String> {
     for name in CANDIDATES {
         let path = dir.join(name);
-        // `symlink_metadata` ne suit PAS le lien : un symlink a `is_file() == false`.
+        // `symlink_metadata` does NOT follow the link: a symlink has `is_file() == false`.
         match std::fs::symlink_metadata(&path) {
             Ok(m) if m.is_file() => {}
             _ => continue,
@@ -105,8 +105,8 @@ fn read_instructions(dir: &Path) -> Option<String> {
     None
 }
 
-/// Lit au plus `cap` octets d'un fichier (borne mémoire). UTF-8 lossy (un AGENTS.md
-/// non-UTF8 ne fait pas échouer la lecture).
+/// Reads at most `cap` bytes of a file (memory bound). Lossy UTF-8 (a non-UTF8
+/// AGENTS.md does not make the read fail).
 fn read_capped(path: &Path, cap: usize) -> Option<String> {
     use std::io::Read;
     let f = std::fs::File::open(path).ok()?;
@@ -115,8 +115,8 @@ fn read_capped(path: &Path, cap: usize) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Bloc environnement (US-028) : cwd, shell, date, fuseau. Message `user` injecté
-/// chaque tour. Shell aligné sur l'outil `bash`; fuseau best-effort depuis l'env.
+/// Environment block (US-028): cwd, shell, date, timezone. `user` message injected
+/// every turn. Shell aligned on the `bash` tool; timezone best-effort from the env.
 fn environment_block(workspace: &Path, date: &str) -> String {
     let shell = default_shell();
     let timezone = std::env::var("TZ").unwrap_or_else(|_| "UTC".to_string());
@@ -129,15 +129,15 @@ fn environment_block(workspace: &Path, date: &str) -> String {
     )
 }
 
-/// Shell annoncé au modèle. Source unique partagée avec l'outil `bash` (US-014) :
-/// annoncer `$SHELL` alors que `sh` exécutait produisait des commandes bâties sur
-/// une syntaxe indisponible.
+/// Shell announced to the model. Single source shared with the `bash` tool (US-014):
+/// announcing `$SHELL` while `sh` was executing produced commands built on
+/// unavailable syntax.
 fn default_shell() -> String {
     agent_tools::shell::resolve().label
 }
 
-/// Date UTC `YYYY-MM-DD` (fournie au bloc environnement). Calculée sans dépendance
-/// externe via l'algorithme de Howard Hinnant.
+/// UTC date `YYYY-MM-DD` (given to the environment block). Computed without an external
+/// dependency through Howard Hinnant's algorithm.
 pub fn today_utc() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -147,8 +147,8 @@ pub fn today_utc() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// `(année, mois, jour)` civils depuis un nombre de jours epoch (inverse de
-/// `days_from_civil`, Howard Hinnant, domaine public).
+/// Civil `(year, month, day)` from a number of epoch days (inverse of
+/// `days_from_civil`, Howard Hinnant, public domain).
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
@@ -170,7 +170,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pyxis-ctx-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        // marqueur de racine pour borner la remontée d'ancêtres.
+        // root marker to bound the ancestor walk.
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         dir
     }
@@ -180,7 +180,7 @@ mod tests {
         let ws = tmp("agents");
         std::fs::write(ws.join("AGENTS.md"), "Use bun, never npm.").unwrap();
         let msgs = messages(&ws, "2026-06-17");
-        // 2 messages : AGENTS.md puis environnement.
+        // 2 messages: AGENTS.md then environment.
         assert_eq!(msgs.len(), 2);
         let agents = msgs[0].text();
         assert!(agents.contains("# AGENTS.md instructions"));
@@ -226,7 +226,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlink_agents_md_is_rejected() {
-        // durcissement : un AGENTS.md symlink vers un secret ne doit PAS être lu.
+        // hardening: an AGENTS.md symlinked to a secret must NOT be read.
         let ws = tmp("symlink");
         std::fs::write(ws.join("secret.txt"), "SECRET_CONTENT").unwrap();
         std::os::unix::fs::symlink(ws.join("secret.txt"), ws.join("AGENTS.md")).unwrap();
@@ -247,7 +247,7 @@ mod tests {
 
     #[test]
     fn env_block_announces_the_shell_that_will_execute() {
-        // US-014 AC3 : une seule source pour l'annonce et pour l'exécution.
+        // US-014 AC3: a single source for the announcement and for the execution.
         let ws = tmp("shell");
         let block = environment_block(&ws, "2026-06-17");
         let shell = agent_tools::shell::resolve();
@@ -262,7 +262,7 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(31), (1970, 2, 1));
         assert_eq!(civil_from_days(365), (1971, 1, 1));
-        // today_utc renvoie un format YYYY-MM-DD plausible.
+        // today_utc returns a plausible YYYY-MM-DD format.
         let today = today_utc();
         assert_eq!(today.len(), 10);
         assert_eq!(today.as_bytes()[4], b'-');

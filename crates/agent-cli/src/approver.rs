@@ -1,17 +1,17 @@
-//! `TuiApprover` — pont entre le pipeline d'outils (`agent_tools::Approver`) et le
-//! frontend : envoie la demande de permission à la boucle TUI et attend la
-//! réponse (oneshot). Traduit la `PermissionRequest` en `PermissionPrompt`
-//! (avec aperçu diff pour `edit`) consommé par le rendu.
+//! `TuiApprover`: bridge between the tool pipeline (`agent_tools::Approver`) and the
+//! frontend: sends the permission request to the TUI loop and waits for the
+//! answer (oneshot). Translates the `PermissionRequest` into a `PermissionPrompt`
+//! (with a diff preview for `edit`) consumed by the rendering.
 //!
-//! Fail-closed : si le canal est fermé (TUI partie) ou la réponse perdue, on
-//! **refuse** par défaut.
+//! Fail-closed: when the channel is closed (TUI gone) or the answer lost, we
+//! **refuse** by default.
 
 use agent_tools::permission::{Approver, PermissionRequest};
 use agent_tui::{PermissionPrompt, diff};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
-/// Message envoyé à la boucle TUI : la demande + le canal de réponse.
+/// Message sent to the TUI loop: the request + the answer channel.
 pub type PermissionMsg = (PermissionRequest, oneshot::Sender<bool>);
 
 pub struct TuiApprover {
@@ -29,15 +29,15 @@ impl Approver for TuiApprover {
     async fn approve(&self, req: &PermissionRequest) -> bool {
         let (resp_tx, resp_rx) = oneshot::channel();
         if self.tx.send((req.clone(), resp_tx)).await.is_err() {
-            return false; // TUI fermée → fail-closed
+            return false; // TUI closed -> fail-closed
         }
-        resp_rx.await.unwrap_or(false) // réponse perdue → fail-closed
+        resp_rx.await.unwrap_or(false) // answer lost -> fail-closed
     }
 }
 
-/// Construit le prompt visuel depuis la demande : titre adapté à l'outil + aperçu
-/// via le MÊME moteur de diff que le transcript (`diff::from_tool` pour `edit` /
-/// `write` ; lignes de contexte pour `bash` / inconnu). US-039.
+/// Builds the visual prompt from the request: title adapted to the tool + preview
+/// through the SAME diff engine as the transcript (`diff::from_tool` for `edit` /
+/// `write`; context lines for `bash` / unknown). US-039.
 pub fn to_prompt(req: &PermissionRequest) -> PermissionPrompt {
     let v = &req.input;
     let str_field = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default();
@@ -55,8 +55,8 @@ pub fn to_prompt(req: &PermissionRequest) -> PermissionPrompt {
             "bash".to_string(),
             diff::note([str_field("command").to_string()]),
         ),
-        // `note` attend une ligne par item : on splitte (un résumé multi-lignes ne
-        // doit pas se retrouver en un seul `Row::Context` avec des `\n` embarqués).
+        // `note` expects one line per item: we split (a multi-line summary must
+        // not end up in a single `Row::Context` with embedded `\n`).
         other => (
             other.to_string(),
             diff::note(req.input_summary.lines().map(str::to_string)),

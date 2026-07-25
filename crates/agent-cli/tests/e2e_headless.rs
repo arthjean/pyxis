@@ -1,21 +1,21 @@
-//! Harness d'intégration bout en bout (US-007, `tasks/prd-harness-parity.md`).
+//! End-to-end integration harness (US-007, `tasks/prd-harness-parity.md`).
 //!
-//! Ce que ce harness vérifie, et que les tests unitaires de chaque crate ne
-//! peuvent pas voir : le **câblage**. Un tour complet traverse ici le cœur
-//! (`agent-core`), le décodeur SSE et le constructeur de requête réels
-//! (`agent-provider`), le registre d'outils réel (`agent-tools`) et la
-//! persistance JSONL réelle (`agent-session`), sur un répertoire temporaire.
+//! What this harness checks, and what the unit tests of each crate cannot
+//! see: the **wiring**. A full turn here goes through the core
+//! (`agent-core`), the real SSE decoder and request builder
+//! (`agent-provider`), the real tool registry (`agent-tools`) and the real
+//! JSONL persistence (`agent-session`), on a temporary directory.
 //!
-//! Le provider est simulé au niveau du **transport** seulement : il rejoue un
-//! flux SSE enregistré (`tests/fixtures/*.sse`) à travers le vrai
-//! `CodexEventMapper`, et compose la requête sortante avec le vrai
-//! `build_responses_body`. Aucun octet ne part sur le réseau, aucun keyring
-//! n'est ouvert, aucun terminal n'est requis (AC3).
+//! The provider is simulated at the **transport** level only: it replays a
+//! recorded SSE stream (`tests/fixtures/*.sse`) through the real
+//! `CodexEventMapper`, and composes the outgoing request with the real
+//! `build_responses_body`. Not a byte goes on the network, no keyring
+//! is opened, no terminal is required (AC3).
 //!
-//! Le sandbox Landlock n'est PAS posé ici : `restrict_self` est irréversible et
-//! s'applique au processus entier, donc l'appliquer confinerait le harness de
-//! test lui-même. La frontière de workspace reste vérifiée par la validation de
-//! chemin d'`agent-tools`, qui est bien dans le périmètre traversé.
+//! The Landlock sandbox is NOT applied here: `restrict_self` is irreversible and
+//! applies to the whole process, so applying it would confine the test
+//! harness itself. The workspace boundary stays checked by the path validation
+//! of `agent-tools`, which is well within the traversed perimeter.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -47,10 +47,10 @@ const FINAL_TURN: &str = include_str!("fixtures/turn_final.sse");
 const BLOCKING_TURN: &str = include_str!("fixtures/turn_blocking_tool.sse");
 const MALFORMED_TURN: &str = include_str!("fixtures/turn_malformed.sse");
 
-// ───────────────────────── Répertoire temporaire ─────────────────────────
+// ───────────────────────── Temporary directory ─────────────────────────
 
-/// Répertoire de travail jetable. Écrit dans `$TMPDIR`, supprimé au `Drop` ;
-/// aucune dépendance nouvelle pour quinze lignes.
+/// Throwaway working directory. Written in `$TMPDIR`, removed on `Drop`;
+/// no new dependency for fifteen lines.
 struct TempWorkspace {
     path: PathBuf,
 }
@@ -62,9 +62,9 @@ impl TempWorkspace {
         let path =
             std::env::temp_dir().join(format!("pyxis-e2e-{tag}-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
-        // Le workspace est ancré sur le chemin canonique : `$TMPDIR` est un lien
-        // symbolique sur certaines distributions, et la validation de chemin
-        // d'`agent-tools` compare des chemins canonicalisés.
+        // The workspace is anchored on the canonical path: `$TMPDIR` is a symbolic
+        // link on some distributions, and the path validation
+        // of `agent-tools` compares canonicalized paths.
         let path = std::fs::canonicalize(&path).unwrap();
         Self { path }
     }
@@ -80,9 +80,9 @@ impl Drop for TempWorkspace {
     }
 }
 
-// ───────────────────────── Provider de rejeu SSE ─────────────────────────
+// ───────────────────────── SSE replay provider ─────────────────────────
 
-/// Extrait les payloads `data:` d'un flux SSE enregistré, dans l'ordre.
+/// Extracts the `data:` payloads of a recorded SSE stream, in order.
 fn sse_payloads(raw: &str) -> Vec<String> {
     raw.lines()
         .filter_map(|line| line.strip_prefix("data:"))
@@ -91,8 +91,8 @@ fn sse_payloads(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// Provider simulé : un flux SSE enregistré par tour, décodé par le vrai
-/// mapper. Les requêtes composées sont conservées pour être inspectées.
+/// Simulated provider: one recorded SSE stream per turn, decoded by the real
+/// mapper. The composed requests are kept for inspection.
 struct ReplayProvider {
     turns: Mutex<VecDeque<&'static str>>,
     bodies: Mutex<Vec<serde_json::Value>>,
@@ -131,9 +131,9 @@ impl Provider for ReplayProvider {
         &self,
         req: CanonicalRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
-        // Chemin de composition RÉEL : c'est lui qui porte le garde-fou des
-        // appels d'outils orphelins (US-003). Un transcript cassé échouerait ici,
-        // pas dans un simulacre.
+        // REAL composition path: it is the one carrying the guardrail against
+        // orphan tool calls (US-003). A broken transcript would fail here,
+        // not in a mock.
         let body = build_responses_body(&req, ResponsesBodyOptions::default());
         self.bodies.lock().unwrap().push(body);
 
@@ -143,8 +143,8 @@ impl Provider for ReplayProvider {
             ));
         };
 
-        // Décodage RÉEL du flux enregistré, y compris la règle « un flux sans
-        // événement terminal est une erreur de contrat » du provider ChatGPT.
+        // REAL decoding of the recorded stream, including the "a stream without
+        // a terminal event is a contract error" rule of the ChatGPT provider.
         let mut mapper = CodexEventMapper::new();
         let mut events: Vec<Result<StreamEvent, ProviderError>> = Vec::new();
         let mut saw_terminal = false;
@@ -170,27 +170,27 @@ impl Provider for ReplayProvider {
     }
 
     async fn complete(&self, _req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError> {
-        // La compaction n'est jamais atteinte par ces scénarios (contexte court).
+        // Compaction is never reached by these scenarios (short context).
         Err(ProviderError::Transport(
             "replay provider: complete() is out of scope".to_string(),
         ))
     }
 
     fn classify_error(&self, _err: &ProviderError) -> ErrorClass {
-        // Un flux enregistré ne se répare pas en réessayant : l'échec doit être
-        // terminal et déterministe, sinon un test de contrat tournerait en boucle.
+        // A recorded stream does not repair itself by retrying: the failure must be
+        // terminal and deterministic, otherwise a contract test would loop forever.
         ErrorClass::InvalidRequest
     }
 }
 
-// ─────────────────────────── Outil bloquant ───────────────────────────
+// ─────────────────────────── Blocking tool ───────────────────────────
 
-/// Outil qui signale son démarrage puis ne se termine jamais : donne au test une
-/// fenêtre déterministe pour interrompre PENDANT un dispatch, sans dépendre d'un
-/// `sleep` arbitraire.
+/// Tool that signals its start then never finishes: gives the test a
+/// deterministic window to interrupt DURING a dispatch, without depending on an
+/// arbitrary `sleep`.
 ///
-/// L'entrée reste un `Value` brut : `agent-cli` ne dépend pas de `serde` en
-/// direct, et ce test n'a aucune raison de lui en ajouter une.
+/// The input stays a raw `Value`: `agent-cli` does not depend on `serde`
+/// directly, and this test has no reason to add one.
 struct BlockingTool {
     started: tokio::sync::mpsc::UnboundedSender<()>,
 }
@@ -239,14 +239,14 @@ impl Tool for BlockingTool {
     }
 }
 
-// ─────────────────────────── Câblage du harness ───────────────────────────
+// ─────────────────────────── Harness wiring ───────────────────────────
 
 struct Harness {
     provider: Arc<ReplayProvider>,
     deps: Deps,
     session_path: PathBuf,
-    /// Specs exposées au modèle, dérivées du registre RÉEL : le test annonce
-    /// exactement les outils que le dispatch saura exécuter.
+    /// Specs exposed to the model, derived from the REAL registry: the test announces
+    /// exactly the tools that the dispatch will know how to run.
     tool_specs: Vec<agent_core::provider::ToolSpec>,
 }
 
@@ -296,21 +296,21 @@ fn context(prompt: &str, tools: Vec<agent_core::provider::ToolSpec>) -> AgentCon
     }
 }
 
-/// Relit la session persistée et retourne les messages rejoués, comme le ferait
-/// `pyxis --resume`.
+/// Reads back the persisted session and returns the replayed messages, as
+/// `pyxis --resume` would.
 fn resumed_messages(path: &std::path::Path) -> Vec<Message> {
     agent_session::resume_file(path).unwrap().messages
 }
 
-/// Appels d'outils sans résultat correspondant dans un transcript.
+/// Tool calls without a matching result in a transcript.
 fn orphan_tool_calls(messages: &[Message]) -> Vec<String> {
     agent_core::message::unanswered_tool_calls(messages)
 }
 
 // ───────────────────────────────── Tests ─────────────────────────────────
 
-/// AC1 : un tour complet — appel d'outil réel puis réponse finale — se déroule
-/// de bout en bout sur un répertoire temporaire, sans réseau.
+/// AC1: a full turn (real tool call then final reply) unfolds
+/// end to end on a temporary directory, without the network.
 #[tokio::test]
 async fn full_turn_with_tool_call_runs_without_network() {
     let workspace = TempWorkspace::new("full-turn");
@@ -334,8 +334,8 @@ async fn full_turn_with_tool_call_runs_without_network() {
         result.text
     );
 
-    // Deux requêtes composées : la seconde porte le résultat d'outil, preuve que
-    // le tour a bouclé sur le dispatch et non court-circuité.
+    // Two composed requests: the second carries the tool result, proof that
+    // the turn looped back on the dispatch and did not short-circuit.
     let bodies = h.provider.bodies();
     assert_eq!(bodies.len(), 2, "un aller-retour par tour de modèle");
     let second = serde_json::to_string(&bodies[1]).unwrap();
@@ -344,7 +344,7 @@ async fn full_turn_with_tool_call_runs_without_network() {
         "la seconde requête doit porter le résultat de l'appel d'outil : {second}"
     );
 
-    // La session persistée est rejouable et complète.
+    // The persisted session is replayable and complete.
     let messages = resumed_messages(&h.session_path);
     assert!(
         orphan_tool_calls(&messages).is_empty(),
@@ -356,9 +356,9 @@ async fn full_turn_with_tool_call_runs_without_network() {
     );
 }
 
-/// AC2 : un tour interrompu à mi-parcours laisse une session valide et
-/// reprenable — c'est le bug d'intégrité que ce PRD corrige, vérifié ici sur le
-/// câblage complet et non sur le cœur isolé.
+/// AC2: a turn interrupted halfway leaves a valid and resumable
+/// session: this is the integrity bug that this PRD fixes, checked here on the
+/// full wiring and not on the core in isolation.
 #[tokio::test]
 async fn interrupted_turn_leaves_a_resumable_session() {
     let workspace = TempWorkspace::new("interrupt");
@@ -373,8 +373,8 @@ async fn interrupted_turn_leaves_a_resumable_session() {
     );
     let cancel = h.deps.cancel.clone();
 
-    // Interrompt dès que l'outil a réellement démarré : la fenêtre est celle du
-    // dispatch, pas une approximation temporelle.
+    // Interrupts as soon as the tool has really started: the window is that of the
+    // dispatch, not a time approximation.
     tokio::spawn(async move {
         let _ = started_rx.recv().await;
         cancel.cancel();
@@ -415,8 +415,8 @@ async fn interrupted_turn_leaves_a_resumable_session() {
         "l'appel en vol doit porter un résultat marqué comme interrompu : {messages:?}"
     );
 
-    // Preuve de reprise : le transcript réparé repasse par le constructeur de
-    // requête réel sans être rejeté.
+    // Proof of resumability: the repaired transcript goes through the real request
+    // builder again without being rejected.
     let replay = ReplayProvider::new([FINAL_TURN]);
     let request = CanonicalRequest {
         model: "gpt-5".to_string(),
@@ -439,8 +439,8 @@ async fn interrupted_turn_leaves_a_resumable_session() {
     );
 }
 
-/// AC4 : un flux SSE malformé remonte comme échec de contrat provider, jamais
-/// comme panique.
+/// AC4: a malformed SSE stream surfaces as a provider contract failure, never
+/// as a panic.
 #[tokio::test]
 async fn malformed_sse_surfaces_as_a_provider_contract_error() {
     let workspace = TempWorkspace::new("malformed");
@@ -448,9 +448,9 @@ async fn malformed_sse_surfaces_as_a_provider_contract_error() {
 
     let result = run_headless(context("Réponds", Vec::new()), h.deps.clone()).await;
 
-    // Le test tourne jusqu'ici : le flux malformé n'a produit aucune panique. Reste
-    // à vérifier qu'il remonte bien comme échec de contrat provider nommé, et non
-    // comme une fin de tour silencieuse.
+    // The test runs up to here: the malformed stream produced no panic. It remains
+    // to check that it does surface as a named provider contract failure, and not
+    // as a silent end of turn.
     let outcome = match result.ended {
         HeadlessEnd::Error(err) => err.to_string(),
         other => format!("{other:?}"),
@@ -462,9 +462,9 @@ async fn malformed_sse_surfaces_as_a_provider_contract_error() {
     );
 }
 
-/// AC3 : le harness ne dépend ni d'un keyring, ni d'un terminal, ni
-/// d'identifiants réels. Vérifié structurellement : aucun `Deps` construit ici
-/// ne porte de credential, et le provider n'ouvre aucune socket.
+/// AC3: the harness depends neither on a keyring, nor on a terminal, nor
+/// on real credentials. Checked structurally: no `Deps` built here
+/// carries a credential, and the provider opens no socket.
 #[tokio::test]
 async fn harness_needs_no_credentials_terminal_or_keyring() {
     let workspace = TempWorkspace::new("no-creds");
@@ -478,7 +478,7 @@ async fn harness_needs_no_credentials_terminal_or_keyring() {
     .await;
     assert!(matches!(result.ended, HeadlessEnd::EndTurn));
 
-    // Le seul contrat sortant est le corps JSON : il ne porte aucun secret.
+    // The only outgoing contract is the JSON body: it carries no secret.
     let bodies = h.provider.bodies();
     for body in &bodies {
         let rendered = serde_json::to_string(body).unwrap();
@@ -489,15 +489,15 @@ async fn harness_needs_no_credentials_terminal_or_keyring() {
     }
 }
 
-// ─────────────────────── US-017 : flux d'événements machine ───────────────────────
+// ─────────────────────── US-017: machine event stream ───────────────────────
 
-/// US-017 AC1/AC2/AC5 sur le câblage réel : chaque événement d'un tour complet
-/// est sérialisable en UNE ligne JSON analysable, y compris quand il transporte
-/// une sortie d'outil issue du disque.
+/// US-017 AC1/AC2/AC5 on the real wiring: every event of a full turn
+/// is serializable into ONE parsable JSON line, including when it carries
+/// a tool output coming from the disk.
 #[tokio::test]
 async fn every_event_of_a_full_turn_serializes_to_one_json_line() {
     let workspace = TempWorkspace::new("jsonl");
-    // Contenu hostile pour le découpage en lignes : sauts de ligne, NUL, ANSI.
+    // Content hostile to line splitting: newlines, NUL, ANSI.
     workspace.write(
         "note.txt",
         "la phrase attendue\nseconde ligne\u{1b}[31m\u{7}\ttab\n",
@@ -536,8 +536,8 @@ async fn every_event_of_a_full_turn_serializes_to_one_json_line() {
         );
     }
 
-    // AC3 : les tours modèle sont observables et numérotés, avec des compteurs
-    // cumulés monotones — c'est ce que le récapitulatif de fin de run reprend.
+    // AC3: the model turns are observable and numbered, with monotonic cumulated
+    // counters: that is what the end-of-run summary takes back.
     let turns: Vec<serde_json::Value> = lines
         .iter()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -554,9 +554,9 @@ async fn every_event_of_a_full_turn_serializes_to_one_json_line() {
     );
 }
 
-/// US-017 AC4 : l'observateur n'altère pas le run. Le texte agrégé, le nombre
-/// d'événements et la cause de fin sont identiques avec et sans observateur —
-/// c'est ce qui garantit que `--output-format text` reste ce qu'il était.
+/// US-017 AC4: the observer does not alter the run. The aggregated text, the number
+/// of events and the end cause are identical with and without an observer:
+/// that is what guarantees that `--output-format text` stays what it was.
 #[tokio::test]
 async fn observing_events_does_not_change_the_textual_result() {
     let plain = {

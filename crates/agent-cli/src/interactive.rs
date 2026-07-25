@@ -1,11 +1,11 @@
-//! Boucle interactive : assemble le frontend (`agent-tui`), le stream d'agent
-//! (`agent-core`) et les demandes de permission en un `tokio::select`.
+//! Interactive loop: assembles the frontend (`agent-tui`), the agent stream
+//! (`agent-core`) and the permission requests into a single `tokio::select`.
 //!
-//! - Les frappes clavier arrivent d'un thread dédié (crossterm `read()` bloque).
-//! - Chaque soumission spawn `run_agent` ; ses `AgentEvent` reviennent par mpsc.
-//! - Une demande de permission suspend le pipeline d'outils jusqu'à la réponse
-//!   utilisateur (le dialog ne fige PAS la boucle : le select continue de rendre
-//!   et de lire le clavier).
+//! - Keystrokes arrive from a dedicated thread (crossterm `read()` blocks).
+//! - Each submission spawns `run_agent`; its `AgentEvent` come back through an mpsc.
+//! - A permission request suspends the tool pipeline until the user
+//!   answers (the dialog does NOT freeze the loop: the select keeps rendering
+//!   and reading the keyboard).
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -36,11 +36,11 @@ use crate::approver::{PermissionMsg, to_prompt};
 use crate::session::SharedSession;
 use crate::settings::{permission_mode_from_arg, permission_mode_id};
 
-/// Nombre maximal d'entrées d'historique de prompts agrégées par dossier.
+/// Maximum number of prompt history entries aggregated per directory.
 const PROMPT_HISTORY_CAP: usize = 200;
 
-/// Résultat d'une connexion MCP lancée en tâche de fond. Revient dans la boucle
-/// `select!` pour mettre à jour le registre et l'affichage sans figer le TUI.
+/// Result of an MCP connection started in the background. Comes back into the
+/// `select!` loop to update the registry and the display without freezing the TUI.
 enum McpEvent {
     Connected {
         name: String,
@@ -62,7 +62,7 @@ struct ActiveTurn {
     next_id: u64,
     id: Option<u64>,
     handle: Option<JoinHandle<()>>,
-    /// US-001 — signal d'annulation du tour courant, un par tour.
+    /// US-001: cancellation signal of the current turn, one per turn.
     cancel: Option<CancelToken>,
 }
 
@@ -89,8 +89,8 @@ impl ActiveTurn {
         let turn_id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         self.id = Some(turn_id);
-        // US-001 : chaque tour porte SON signal, pour qu'une annulation ne puisse
-        // pas atteindre le tour suivant.
+        // US-001: every turn carries ITS signal, so that a cancellation cannot
+        // reach the next turn.
         let cancel = CancelToken::new();
         let mut deps = deps.clone();
         deps.cancel = cancel.clone();
@@ -116,9 +116,9 @@ impl ActiveTurn {
         self.id = None;
     }
 
-    /// US-001 — demande l'arrêt COOPÉRATIF du tour. La boucle du cœur réconcilie
-    /// ses appels d'outils en vol, persiste, puis émet elle-même `Interrupted` :
-    /// c'est cet événement qui clôt le tour côté client, pas cet appel.
+    /// US-001: requests the COOPERATIVE stop of the turn. The core loop reconciles
+    /// its in-flight tool calls, persists, then emits `Interrupted` itself:
+    /// that event is what closes the turn on the client side, not this call.
     fn request_cancel(&self) {
         if let Some(cancel) = &self.cancel {
             cancel.cancel();
@@ -137,51 +137,51 @@ impl ActiveTurn {
 pub struct InteractiveConfig {
     pub model: String,
     pub reasoning_effort: Option<String>,
-    /// Guidelines comportementales des outils (US-026), injectées dans le system
-    /// prompt. Stockées brutes (pas pré-composées) car le system de base dépend du
-    /// slug courant (US-027) et est recomposé par tour.
+    /// Behavioral guidelines of the tools (US-026), injected into the system
+    /// prompt. Stored raw (not pre-composed) because the base system depends on the
+    /// current slug (US-027) and is recomposed per turn.
     pub tool_guidelines: Vec<String>,
-    /// Contexte projet éphémère (AGENTS.md + env, US-028), ré-injecté à chaque tour
-    /// dans `AgentContext::context_messages` (jamais persisté).
+    /// Ephemeral project context (AGENTS.md + env, US-028), re-injected on every turn
+    /// into `AgentContext::context_messages` (never persisted).
     pub context_messages: Vec<Message>,
     pub run_config: RunConfig,
     pub tool_specs: Vec<ToolSpec>,
     pub truecolor: bool,
-    /// Reduced-motion (`NO_COLOR` / `PYXIS_REDUCED_MOTION`) : spinner dégradé en
-    /// point pulsé plutôt qu'animé (US-044).
+    /// Reduced motion (`NO_COLOR` / `PYXIS_REDUCED_MOTION`): spinner degraded to a
+    /// pulsing dot rather than animated (US-044).
     pub reduced_motion: bool,
-    /// Credential du fournisseur présente (badge connecté + sous-menu providers).
+    /// Provider credential present (connected badge + providers submenu).
     pub connected: bool,
-    /// Skills disponibles (lus avant le sandbox), sous-menu `/skills`.
+    /// Available skills (read before the sandbox), `/skills` submenu.
     pub skills: Vec<String>,
-    /// Objectif de session persistant (`/goal`), composé dans le system à chaque
-    /// tour. Chargé du sidecar de session au démarrage.
+    /// Persistent session goal (`/goal`), composed into the system prompt on every
+    /// turn. Loaded from the session sidecar at startup.
     pub goal: Option<String>,
-    /// Durcissement appliqué aux sous-process MCP (env scrub + proxy).
+    /// Hardening applied to the MCP subprocesses (env scrub + proxy).
     pub command_hardener: agent_tools::CommandHardener,
-    /// Mode de permissions mutable, partagé avec le registre d'outils.
+    /// Mutable permission mode, shared with the tool registry.
     pub permission_mode: PermissionModeState,
-    /// Settings utilisateur globaux, utilisés pour persister les choix interactifs.
+    /// Global user settings, used to persist the interactive choices.
     pub settings_path: Option<PathBuf>,
-    /// Racine du workspace, périmètre du diff agrégé de tour (US-018).
+    /// Workspace root, scope of the aggregated turn diff (US-018).
     pub workspace: PathBuf,
 }
 
-/// Marqueur de complétion émis par le modèle quand l'objectif est pleinement
-/// atteint. Détecté par le harness pour auto-effacer le goal ; strippé de l'affichage.
+/// Completion marker emitted by the model when the goal is fully
+/// reached. Detected by the harness to auto-clear the goal; stripped from the display.
 pub const GOAL_DONE_MARKER: &str = "<<GOAL_DONE>>";
 
-/// Garde-fou : nombre max de relances automatiques par objectif (anti-runaway).
+/// Guardrail: max number of automatic re-prompts per goal (anti-runaway).
 const MAX_GOAL_ITERS: u32 = 25;
 
-/// Message injecté à chaque relance automatique tant que l'objectif n'est pas marqué atteint.
+/// Message injected on every automatic re-prompt as long as the goal is not marked reached.
 const GOAL_CONTINUE_PROMPT: &str = "Continue the session goal. If work remains, \
     keep going. If it is fully completed and verified, end your reply with \
     <<GOAL_DONE>> alone on the final line.";
 
-/// Granularité du lecteur clavier. Assez courte pour rester imperceptible à la
-/// frappe, assez longue pour ne pas monopoliser la file d'événements crossterm
-/// pendant qu'un autre appel y lit la réponse du terminal.
+/// Granularity of the keyboard reader. Short enough to stay imperceptible while
+/// typing, long enough not to monopolize the crossterm event queue
+/// while another call reads the terminal answer from it.
 const KEY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 const MCP_DISABLED_NOTICE: &str =
@@ -211,9 +211,9 @@ fn persist_reasoning_effort(
     }
 }
 
-/// Compose le system prompt effectif : base + DIRECTIVE de complétion. L'objectif
-/// vit dans `instructions` (re-envoyé chaque tour) donc survit à la compaction —
-/// `agent-core::compaction` ne touche que `messages`, jamais le system.
+/// Composes the effective system prompt: base + completion DIRECTIVE. The goal
+/// lives in `instructions` (re-sent every turn) so it survives compaction:
+/// `agent-core::compaction` only touches `messages`, never the system prompt.
 pub fn compose_system(base: &str, goal: Option<&str>) -> String {
     match goal {
         Some(g) if !g.trim().is_empty() => format!(
@@ -230,10 +230,10 @@ pub fn compose_system(base: &str, goal: Option<&str>) -> String {
     }
 }
 
-/// Injecte les guidelines comportementales des outils (US-026) dans le system
-/// prompt sous une section dédiée. Appelé UNE fois au démarrage (les outils sont
-/// fixes) pour produire la base que `compose_system` enrichit ensuite par tour.
-/// Sans guideline, renvoie la base inchangée (pas de section vide).
+/// Injects the behavioral guidelines of the tools (US-026) into the system
+/// prompt under a dedicated section. Called ONCE at startup (the tools are
+/// fixed) to produce the base that `compose_system` then enriches per turn.
+/// Without a guideline, returns the base unchanged (no empty section).
 pub fn with_tool_guidelines(base: &str, guidelines: &[String]) -> String {
     if guidelines.is_empty() {
         return base.to_string();
@@ -273,8 +273,8 @@ pub(crate) fn read_goal(path: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Construit le contexte du tour (conversation à jour + message) et lance
-/// `run_agent` dans une tâche dont les events reviennent par `tx`.
+/// Builds the turn context (up-to-date conversation + message) and launches
+/// `run_agent` in a task whose events come back through `tx`.
 fn launch_turn(
     conversation: &Arc<Mutex<Vec<Message>>>,
     cfg: &InteractiveConfig,
@@ -291,8 +291,8 @@ fn launch_turn(
     } else {
         vec![Message::user(user_msg.to_string())]
     };
-    // US-027 : system de base sélectionné par le slug COURANT (recalculé par tour →
-    // un `/models` change le template) + guidelines outils + directive d'objectif.
+    // US-027: base system prompt selected by the CURRENT slug (recomputed per turn ->
+    // a `/models` changes the template) + tool guidelines + goal directive.
     let base = with_tool_guidelines(
         crate::prompt::select_system_prompt(&cfg.model),
         &cfg.tool_guidelines,
@@ -304,22 +304,22 @@ fn launch_turn(
         messages: msgs,
         tools: cfg.tool_specs.clone(),
         config: cfg.run_config.clone(),
-        // US-028 : contexte projet ré-injecté chaque tour, jamais persisté.
+        // US-028: project context re-injected every turn, never persisted.
         context_messages: cfg.context_messages.clone(),
         ephemeral_messages,
     };
-    // Le `Deps` reçu porte déjà le signal d'annulation du tour (`ActiveTurn::start`).
+    // The received `Deps` already carries the turn cancellation signal (`ActiveTurn::start`).
     let deps = deps.clone();
     let tx = tx.clone();
     let workspace = cfg.workspace.clone();
     tokio::spawn(async move {
-        // US-018 : référence du diff prise avant le premier aller-retour.
+        // US-018: diff reference taken before the first round-trip.
         let mut diff_tracker = agent_tools::turn_diff::TurnDiffTracker::begin(&workspace).await;
         let stream = run_agent(ctx, deps);
         futures_util::pin_mut!(stream);
-        // L'événement terminal est retenu le temps de calculer le diff : la
-        // boucle d'interface clôt le tour dès qu'elle le voit, et tout ce qui
-        // arriverait après serait écarté par le filtre de `turn_id`.
+        // The terminal event is held back long enough to compute the diff: the
+        // interface loop closes the turn as soon as it sees it, and anything
+        // arriving afterwards would be discarded by the `turn_id` filter.
         let mut terminal: Option<AgentEvent> = None;
         while let Some(ev) = stream.next().await {
             if matches!(
@@ -367,8 +367,8 @@ fn launch_turn(
     })
 }
 
-/// Si la dernière réponse de l'assistant porte le marqueur de complétion, le
-/// retire de l'affichage et retourne `true` (objectif atteint).
+/// When the last assistant reply carries the completion marker, removes it
+/// from the display and returns `true` (goal reached).
 fn take_goal_done(state: &mut AppState) -> bool {
     for block in state.blocks.iter_mut().rev() {
         if let Block::Assistant { text, .. } = block {
@@ -466,7 +466,7 @@ fn count_encrypted_reasoning(messages: &[Message]) -> usize {
         .sum()
 }
 
-/// Lance la session interactive. Restaure le terminal en sortie quoi qu'il arrive.
+/// Starts the interactive session. Restores the terminal on exit whatever happens.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     deps: Deps,
@@ -527,7 +527,7 @@ async fn event_loop(
     state.mcp_servers = mcp_metas(&mcp);
     let mut goal_path = goal_path_for_session(&current_session);
     let mut goal_iters_path = goal_iters_path_for_session(&current_session);
-    // Historique des prompts de TOUT le dossier (toutes les conversations).
+    // Prompt history of the WHOLE directory (every conversation).
     state.load_history(agent_session::workspace_prompts(
         &sessions_dir,
         Some(&current_session),
@@ -558,16 +558,16 @@ async fn event_loop(
     );
     #[cfg(feature = "codex_tui_parity")]
     let mut parity_bottom_pane = BottomPane::new();
-    // Transcript vide au démarrage → l'écran d'accueil (carte + logo) s'affiche
-    // de lui-même (cf. `AppState::is_welcome`), pas de Notice à pousser.
+    // Empty transcript at startup -> the welcome screen (card + logo) shows
+    // by itself (see `AppState::is_welcome`), no Notice to push.
 
-    // Thread lecteur clavier → mpsc. `poll` puis `read` (jamais `read` seul) :
-    // un `read` bloquant retient les événements INTERNES de crossterm (dont la
-    // réponse à la requête de position curseur) dans son tampon local jusqu'à la
-    // prochaine frappe. Or ratatui interroge le curseur à chaque redimensionnement
-    // du viewport inline : la réponse n'arrivait jamais, la requête expirait, et le
-    // `draw` remontait une erreur fatale. `poll` range ces événements dans la file
-    // interne partagée, où `cursor::position()` les retrouve.
+    // Keyboard reader thread -> mpsc. `poll` then `read` (never `read` alone):
+    // a blocking `read` holds the INTERNAL crossterm events (including the
+    // answer to the cursor position request) in its local buffer until the
+    // next keystroke. Yet ratatui queries the cursor on every resize
+    // of the inline viewport: the answer never arrived, the request timed out, and the
+    // `draw` surfaced a fatal error. `poll` files those events in the shared
+    // internal queue, where `cursor::position()` finds them again.
     let (key_tx, mut key_rx) = mpsc::channel::<Event>(64);
     std::thread::spawn(move || {
         loop {
@@ -589,8 +589,8 @@ async fn event_loop(
     let (mcp_tx, mut mcp_rx) = mpsc::channel::<McpEvent>(16);
     let mut running = false;
     let mut active_turn = ActiveTurn::new();
-    // Compteur de relances automatiques de la boucle d'objectif (reset à chaque
-    // saisie utilisateur / nouvel objectif).
+    // Counter of automatic re-prompts of the goal loop (reset on every
+    // user input / new goal).
     let mut goal_iters: u32 = if cfg.goal.is_some() {
         read_goal_iters(&goal_iters_path)
     } else {
@@ -599,17 +599,17 @@ async fn event_loop(
     let mut pending_resp: Option<oneshot::Sender<bool>> = None;
     let mut queued_prompts: VecDeque<String> = VecDeque::new();
 
-    // Tick d'animation du spinner (US-044). 100 ms ≈ 10 fps : fluide et quasi gratuit
-    // (le cache de rendu sert les blocs bakés). `Skip` évite tout burst de redraw au
-    // retour d'idle. La branche `select!` est gardée par `if running` → 0 CPU en idle.
+    // Spinner animation tick (US-044). 100 ms is about 10 fps: fluid and nearly free
+    // (the render cache serves the baked blocks). `Skip` avoids any redraw burst when
+    // coming back from idle. The `select!` branch is guarded by `if running` -> 0 CPU when idle.
     let mut spinner = tokio::time::interval(Duration::from_millis(100));
     spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Début du tour courant (front montant de `running`) pour la durée écoulée.
+    // Start of the current turn (rising edge of `running`) for the elapsed time.
     let mut turn_start: Option<Instant> = None;
 
     loop {
-        // Front montant/descendant de `running` : démarre / fige le suivi de
-        // progression (spinner, durée, tokens). N'altère PAS l'orchestration.
+        // Rising/falling edge of `running`: starts / freezes the progress
+        // tracking (spinner, duration, tokens). Does NOT alter the orchestration.
         match (running, turn_start.is_some()) {
             (true, false) => {
                 turn_start = Some(Instant::now());
@@ -623,11 +623,11 @@ async fn event_loop(
         }
         #[cfg(feature = "codex_tui_parity")]
         {
-            // Terminal agrandi : le viewport inline garde sa hauteur d'origine et
-            // laisse le composer ancré au milieu de l'écran tant qu'on ne l'a pas
-            // reconstruit. Un échec (terminal qui ne répond pas à la requête de
-            // position) ne doit pas tuer la session : on abandonne le réalignement
-            // et on continue avec le viewport périmé.
+            // Terminal enlarged: the inline viewport keeps its original height and
+            // leaves the composer anchored in the middle of the screen until it is
+            // rebuilt. A failure (terminal not answering the position
+            // request) must not kill the session: we give up the realignment
+            // and go on with the stale viewport.
             if viewport_sync_enabled && let Err(err) = agent_tui::sync_inline_viewport(tui) {
                 viewport_sync_enabled = false;
                 agent_tui::debug_log::log(&format!("sync: disabled after error: {err}"));
@@ -679,9 +679,9 @@ async fn event_loop(
         tokio::select! {
             ev = key_rx.recv() => {
                 let k = match ev {
-                    None => break, // canal d'événements fermé → on sort
+                    None => break, // event channel closed -> we exit
                     Some(Event::Mouse(m)) => {
-                        // molette → scroll du transcript (capture souris activée).
+                        // wheel -> transcript scroll (mouse capture enabled).
                         match m.kind {
                             MouseEventKind::ScrollUp => state.scroll_up(3),
                             MouseEventKind::ScrollDown => state.scroll_down(3),
@@ -702,10 +702,10 @@ async fn event_loop(
                         }
                         continue;
                     }
-                    // frappe normale ; on ignore les répétitions de relâche.
+                    // normal keystroke; we ignore release repeats.
                     Some(Event::Key(k)) if k.kind != KeyEventKind::Release => k,
                     Some(other) => {
-                        // key release, resize… → simple redraw
+                        // key release, resize, ... -> plain redraw
                         if let Event::Resize(w, h) = other {
                             agent_tui::debug_log::log(&format!("event: resize {w}x{h}"));
                         }
@@ -902,7 +902,7 @@ async fn event_loop(
                                     state.blocks.push(Block::Notice("Goal cleared.".into()));
                                 }
                                 g => {
-                                    // Fixe l'objectif de cette session et lance le travail.
+                                    // Sets the goal of this session and starts the work.
                                     cfg.goal = Some(g.to_string());
                                     if let Err(e) = std::fs::write(&goal_path, g) {
                                         state.blocks.push(Block::Error(format!("goal: {e}")));
@@ -926,8 +926,8 @@ async fn event_loop(
                                     running = true;
                                 }
                             },
-                            // resume / new / clear pendant un tour : on attend (le
-                            // fichier de persistance est en cours d'écriture par le stream).
+                            // resume / new / clear during a turn: we wait (the
+                            // persistence file is being written by the stream).
                             "/resume" | "/new" | "/clear" if running => {
                                 state.blocks.push(Block::Notice(
                                     "Wait for the current turn to finish.".into(),
@@ -1020,8 +1020,8 @@ async fn event_loop(
                                     }
                                 }
                             }
-                            // /clear est un alias de /new : même mécanique (nouveau
-                            // fichier de session + contexte vidé), seul le libellé change.
+                            // /clear is an alias of /new: same mechanics (new
+                            // session file + cleared context), only the label changes.
                             "/new" | "/clear" => {
                                 let path = new_session_path(&sessions_dir);
                                 if let Err(e) = session.switch_file(&path, 0) {
@@ -1044,8 +1044,8 @@ async fn event_loop(
                                     if let Ok(mut g) = conversation.lock() {
                                         g.clear();
                                     }
-                                    // Transcript vidé → l'écran d'accueil réapparaît,
-                                    // ce qui sert de confirmation visuelle (pas de Notice).
+                                    // Transcript cleared -> the welcome screen comes back,
+                                    // which serves as visual confirmation (no Notice).
                                     state.blocks.clear();
                                     #[cfg(feature = "codex_tui_parity")]
                                     {
@@ -1140,10 +1140,10 @@ async fn event_loop(
                         if let Some(resp) = pending_resp.take() {
                             let _ = resp.send(false);
                         }
-                        // US-001 : plus d'`abort()` brutal ni d'`Interrupted` fabriqué
-                        // ici. On signale, et le tour se clôt à l'arrivée de
-                        // l'`Interrupted` émis par le cœur, transcript déjà réconcilié
-                        // (branche `stop` ci-dessous, comme pour un EndTurn).
+                        // US-001: no more brutal `abort()` nor fabricated `Interrupted`
+                        // here. We signal, and the turn closes when the
+                        // `Interrupted` emitted by the core arrives, transcript already reconciled
+                        // (`stop` branch below, as for an EndTurn).
                         active_turn.request_cancel();
                     }
                     InputAction::Interrupt => {}
@@ -1180,9 +1180,9 @@ async fn event_loop(
                     }
                     if stop {
                         active_turn.finish();
-                        // Boucle d'objectif : sur un EndTurn « propre » avec un goal
-                        // actif, on relance tant que le marqueur de complétion n'est
-                        // pas émis (le modèle ne décide pas seul de s'arrêter).
+                        // Goal loop: on a "clean" EndTurn with an active
+                        // goal, we re-prompt as long as the completion marker is
+                        // not emitted (the model does not decide alone to stop).
                         if endturn && cfg.goal.is_some() && queued_prompts.is_empty() {
                             if take_goal_done(&mut state) {
                                 cfg.goal = None;
@@ -1216,7 +1216,7 @@ async fn event_loop(
                                     GOAL_CONTINUE_PROMPT,
                                     false,
                                 );
-                                // running reste true : un nouveau tour est lancé.
+                                // running stays true: a new turn is launched.
                             } else {
                                 state.blocks.push(Block::Notice(format!(
                                     "Goal not confirmed after {MAX_GOAL_ITERS} retries. \
@@ -1306,11 +1306,11 @@ async fn event_loop(
                     state.mcp_servers = mcp_metas(&mcp);
                 }
             }
-            // Tick d'animation : réveille la boucle UNIQUEMENT pendant un tour ACTIF
-            // (`if running`) et hors attente de permission (`pending.is_none()` : on
-            // attend l'humain, pas l'agent → 0 CPU, pas de redraw à 10 fps du dialog).
-            // Le redraw a lieu en tête de boucle ; ici on ne fait qu'avancer l'état
-            // d'animation (spinner, durée). US-044.
+            // Animation tick: wakes the loop ONLY during an ACTIVE turn
+            // (`if running`) and outside a permission wait (`pending.is_none()`: we
+            // are waiting for the human, not the agent -> 0 CPU, no 10 fps redraw of the dialog).
+            // The redraw happens at the head of the loop; here we only advance the
+            // animation state (spinner, duration). US-044.
             _ = spinner.tick(), if running && state.pending.is_none() => {
                 let elapsed = turn_start.map(|t| t.elapsed()).unwrap_or_default();
                 state.tick_progress(elapsed);
@@ -1324,8 +1324,8 @@ async fn event_loop(
     Ok(())
 }
 
-/// Traite `/mcp [<serveur> <action>]`. Les connexions (spawn + handshake) sont
-/// lancées en tâche de fond — le résultat revient par `mcp_tx` dans la boucle.
+/// Handles `/mcp [<server> <action>]`. Connections (spawn + handshake) are
+/// started in the background; the result comes back through `mcp_tx` into the loop.
 fn handle_mcp(
     arg: &str,
     mcp: &Arc<Mutex<agent_mcp::McpRegistry>>,
@@ -1614,7 +1614,7 @@ fn mcp_trust_notice(server: &str, cfg: &agent_mcp::McpServerConfig, lead: &str) 
     )
 }
 
-/// Projette le registre MCP en métadonnées d'affichage pour le sous-menu `/mcp`.
+/// Projects the MCP registry into display metadata for the `/mcp` submenu.
 fn mcp_metas(mcp: &Arc<Mutex<agent_mcp::McpRegistry>>) -> Vec<McpServerMeta> {
     let Ok(reg) = mcp.lock() else {
         return Vec::new();
@@ -1635,8 +1635,8 @@ fn mcp_metas(mcp: &Arc<Mutex<agent_mcp::McpRegistry>>) -> Vec<McpServerMeta> {
         .collect()
 }
 
-/// Charge les sessions reprenables (8 plus récentes) en items de menu, en
-/// excluant la session courante. Le libellé = 1re ligne du 1er message.
+/// Loads the resumable sessions (8 most recent) as menu items,
+/// excluding the current session. The label = 1st line of the 1st message.
 fn load_sessions(dir: &Path, exclude: &Path) -> Vec<SessionMeta> {
     agent_session::list_sessions(dir, Some(exclude))
         .into_iter()
@@ -1721,7 +1721,7 @@ fn relative_time(modified: SystemTime) -> String {
     }
 }
 
-/// Chemin d'un nouveau fichier de session (horodaté, un par conversation).
+/// Path of a new session file (timestamped, one per conversation).
 pub(crate) fn new_session_path(dir: &Path) -> PathBuf {
     let millis = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

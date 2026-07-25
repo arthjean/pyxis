@@ -1,9 +1,9 @@
-//! `SharedSession` — enveloppe `JsonlSession` (persistance US-009) en exposant un
-//! **snapshot en mémoire** du transcript. Comme le cœur appelle
-//! `sync(&messages)` avec le transcript COMPLET à chaque tour
-//! (transcript-before-response), le snapshot est toujours à jour : la boucle
-//! interactive le relit pour enchaîner les tours sans réimplémenter la
-//! construction de messages du cœur.
+//! `SharedSession`: wraps `JsonlSession` (US-009 persistence) while exposing an
+//! **in-memory snapshot** of the transcript. Since the core calls
+//! `sync(&messages)` with the FULL transcript on every turn
+//! (transcript-before-response), the snapshot is always up to date: the interactive
+//! loop reads it back to chain the turns without reimplementing the core's
+//! message building.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -20,8 +20,8 @@ pub struct SharedSession {
 }
 
 impl SharedSession {
-    /// Construit la session partagée et retourne aussi la poignée snapshot que la
-    /// boucle interactive relit entre les tours.
+    /// Builds the shared session and also returns the snapshot handle that the
+    /// interactive loop reads back between turns.
     pub fn new(inner: JsonlSession) -> (Arc<Self>, Arc<Mutex<Vec<Message>>>) {
         let snapshot = Arc::new(Mutex::new(Vec::new()));
         (
@@ -49,10 +49,10 @@ impl SharedSession {
         }
     }
 
-    /// Bascule le fichier de persistance vers une session reprise (`/resume`).
-    /// `cursor` = nombre de messages déjà présents dans la session (les prochains
-    /// `sync` n'écriront que la suite). Le snapshot mémoire est mis à jour à part
-    /// par la boucle interactive (poignée `conversation`).
+    /// Switches the persistence file to a resumed session (`/resume`).
+    /// `cursor` = number of messages already present in the session (the next
+    /// `sync` will only write what follows). The in-memory snapshot is updated separately
+    /// by the interactive loop (`conversation` handle).
     pub fn switch_file(&self, path: &Path, cursor: usize) -> Result<(), SessionError> {
         self.inner.switch_to(path, cursor)
     }

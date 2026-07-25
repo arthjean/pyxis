@@ -1,31 +1,31 @@
-//! Sortie JSONL d'événements en mode headless (US-017).
+//! JSONL event output in headless mode (US-017).
 //!
-//! Un objet JSON par ligne sur la sortie standard, vidé immédiatement : un
-//! appelant automatisé (CI, orchestrateur) lit le déroulement d'un run sans
-//! analyser du texte destiné à un humain. Le schéma est documenté dans
-//! `docs/EVENT_SCHEMA.md` et chaque ligne porte son numéro de version, seule
-//! façon pour un consommateur de savoir s'il comprend ce qu'il lit.
+//! One JSON object per line on standard output, flushed immediately: an
+//! automated caller (CI, orchestrator) reads the unfolding of a run without
+//! parsing text meant for a human. The schema is documented in
+//! `docs/EVENT_SCHEMA.md` and every line carries its version number, the only
+//! way for a consumer to know whether it understands what it reads.
 //!
-//! Ce module n'existe que côté CLI : `agent-core` reste sans I/O (invariant 1).
-//! Il ne fait aucune décision de présentation non plus — la sérialisation est
-//! celle d'`AgentEvent`, donc le contrat, pas un rendu.
+//! This module only exists on the CLI side: `agent-core` stays I/O-free (invariant 1).
+//! It makes no presentation decision either: the serialization is
+//! that of `AgentEvent`, hence the contract, not a rendering.
 
 use std::io::Write;
 
 use agent_core::{AgentEvent, HeadlessEnd};
 use serde::Serialize;
 
-/// Version du schéma d'événements. À incrémenter dès qu'une ligne déjà émise
-/// change de forme ; ajouter une variante ou un champ optionnel n'en change pas
-/// la lecture et ne l'incrémente donc pas (même règle qu'`AgentEvent`).
+/// Version of the event schema. To be incremented as soon as an already emitted line
+/// changes shape; adding a variant or an optional field does not change
+/// how it is read and therefore does not increment it (same rule as `AgentEvent`).
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// Format de sortie du mode headless.
+/// Output format of the headless mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
-    /// Texte de la réponse finale, tel qu'avant US-017 (défaut).
+    /// Text of the final reply, as before US-017 (default).
     Text,
-    /// Un événement JSON par ligne.
+    /// One JSON event per line.
     Json,
 }
 
@@ -37,8 +37,8 @@ pub fn output_format_from_arg(arg: &str) -> Option<OutputFormat> {
     }
 }
 
-/// Ligne d'événement. `event` est aplati : la forme d'`AgentEvent`
-/// (`{"type": …, "data": …}`) reste visible telle quelle, augmentée du `schema`.
+/// Event line. `event` is flattened: the shape of `AgentEvent`
+/// (`{"type": ..., "data": ...}`) stays visible as is, augmented with the `schema`.
 #[derive(Serialize)]
 struct EventLine<'a> {
     schema: u32,
@@ -46,9 +46,9 @@ struct EventLine<'a> {
     event: &'a AgentEvent,
 }
 
-/// Récapitulatif de fin de run (AC3). Ce n'est PAS un `AgentEvent` : l'identifiant
-/// de session et le code de sortie sont des faits de processus, que le cœur n'a
-/// aucune raison de connaître.
+/// End-of-run summary (AC3). This is NOT an `AgentEvent`: the session identifier
+/// and the exit code are process facts, which the core has
+/// no reason to know.
 #[derive(Serialize)]
 struct SummaryLine<'a> {
     schema: u32,
@@ -59,21 +59,21 @@ struct SummaryLine<'a> {
 #[derive(Serialize)]
 struct RunSummary<'a> {
     session_id: &'a str,
-    /// Nombre d'allers-retours modèle observés (`model_turn`).
+    /// Number of model round-trips observed (`model_turn`).
     model_turns: u32,
     input_tokens: u64,
     output_tokens: u64,
-    /// Cause de fin : `end_turn`, `exhausted` ou `error`.
+    /// End cause: `end_turn`, `exhausted` or `error`.
     end: &'static str,
-    /// Détail de la cause quand il en existe un.
+    /// Detail of the cause when there is one.
     #[serde(skip_serializing_if = "Option::is_none")]
     end_detail: Option<String>,
     exit_code: i32,
 }
 
-/// Écrivain de lignes. En mode `Text`, tout est inerte : aucun octet n'est écrit,
-/// ce qui garantit AC4 (sortie textuelle par défaut inchangée) par construction
-/// plutôt que par relecture.
+/// Line writer. In `Text` mode, everything is inert: not a byte is written,
+/// which guarantees AC4 (default text output unchanged) by construction
+/// rather than by re-reading.
 pub struct EventWriter {
     format: OutputFormat,
     model_turns: u32,
@@ -95,9 +95,9 @@ impl EventWriter {
         self.format == OutputFormat::Json
     }
 
-    /// Écrit un événement et met à jour la comptabilité du récapitulatif. Appelé
-    /// pour CHAQUE événement, y compris en mode texte, afin que le comptage ne
-    /// dépende pas du format choisi.
+    /// Writes an event and updates the summary accounting. Called
+    /// for EVERY event, including in text mode, so that the counting does not
+    /// depend on the chosen format.
     pub fn event(&mut self, event: &AgentEvent) {
         if let AgentEvent::ModelTurn(view) = event {
             self.model_turns = self.model_turns.max(view.index);
@@ -111,16 +111,16 @@ impl EventWriter {
             schema: SCHEMA_VERSION,
             event,
         };
-        // Un événement non sérialisable serait un bug de contrat, pas une
-        // condition d'exécution : on le signale sur stderr sans couper le flux.
+        // A non-serializable event would be a contract bug, not a
+        // runtime condition: we report it on stderr without cutting the stream.
         match serde_json::to_string(&line) {
             Ok(json) => write_line(&json),
             Err(err) => eprintln!("[jsonl] event not serializable: {err}"),
         }
     }
 
-    /// Dernière ligne du run (AC3, AC6). `exit_code` distingue un succès d'un
-    /// échec pour un appelant qui ne lirait que le code de retour.
+    /// Last line of the run (AC3, AC6). `exit_code` distinguishes a success from a
+    /// failure for a caller that would only read the return code.
     pub fn run_summary(&mut self, session_id: &str, ended: &HeadlessEnd) {
         if self.format != OutputFormat::Json {
             return;
@@ -150,8 +150,8 @@ impl EventWriter {
     }
 }
 
-/// Une ligne, vidée immédiatement : un orchestrateur qui suit le flux ne doit pas
-/// attendre la fin du run pour voir le premier événement.
+/// One line, flushed immediately: an orchestrator following the stream must not
+/// wait for the end of the run to see the first event.
 fn write_line(json: &str) {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -184,8 +184,8 @@ mod tests {
         assert_eq!(output_format_from_arg("yaml"), None);
     }
 
-    /// AC2 : chaque ligne porte la version du schéma, et la forme d'`AgentEvent`
-    /// reste lisible telle quelle à côté.
+    /// AC2: every line carries the schema version, and the shape of `AgentEvent`
+    /// stays readable as is next to it.
     #[test]
     fn every_line_carries_the_schema_version_and_the_event_shape() {
         let value = line_of(&AgentEvent::Text("bonjour".into()));
@@ -193,14 +193,14 @@ mod tests {
         assert_eq!(value["type"], "text");
         assert_eq!(value["data"], "bonjour");
 
-        // Variante unitaire : toujours un objet, jamais une chaîne nue.
+        // Unit variant: always an object, never a bare string.
         let value = line_of(&AgentEvent::EndTurn);
         assert_eq!(value["schema"], SCHEMA_VERSION);
         assert_eq!(value["type"], "end_turn");
     }
 
-    /// AC5 : contenu non textuel et caractères de contrôle → la ligne reste un
-    /// JSON valide et analysable, sans octet brut ni saut de ligne interne.
+    /// AC5: non-textual content and control characters -> the line stays a
+    /// valid, parsable JSON, without a raw byte nor an internal newline.
     #[test]
     fn control_characters_stay_inside_one_valid_json_line() {
         let hostile = "ligne1\nligne2\u{0}\u{1b}[31mrouge\u{7}\r\t\"quote\"\\";
@@ -226,8 +226,8 @@ mod tests {
         assert_eq!(parsed["data"]["content"], hostile);
     }
 
-    /// AC3 : le récapitulatif compte les tours et reprend les jetons du dernier
-    /// `model_turn` observé, sans les additionner deux fois (ils sont cumulés).
+    /// AC3: the summary counts the turns and takes the tokens of the last
+    /// `model_turn` observed, without adding them twice (they are cumulated).
     #[test]
     fn summary_tracks_the_last_cumulative_counters() {
         let mut writer = EventWriter::new(OutputFormat::Text);
@@ -248,8 +248,8 @@ mod tests {
     fn text_format_writes_nothing() {
         let mut writer = EventWriter::new(OutputFormat::Text);
         assert!(!writer.is_json());
-        // Rien à observer sur stdout : l'absence d'écriture est structurelle
-        // (retour anticipé sur le format), pas une propriété de ce test.
+        // Nothing to observe on stdout: the absence of a write is structural
+        // (early return on the format), not a property of this test.
         writer.event(&AgentEvent::Text("x".into()));
         writer.run_summary("s.jsonl", &HeadlessEnd::EndTurn);
     }

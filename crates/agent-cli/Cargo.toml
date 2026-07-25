@@ -13,8 +13,8 @@ workspace = true
 default = ["codex_tui_parity"]
 codex_tui_parity = ["agent-tui/codex_tui_parity"]
 
-# Binaire publié `pyxis` (ADR-5/ADR-8). SEUL crate qui dépend de tout : il câble
-# le cœur, le provider, les outils, la session, le sandbox et le frontend.
+# Published `pyxis` binary (ADR-5/ADR-8). The ONLY crate that depends on everything: it wires
+# the core, the provider, the tools, the session, the sandbox and the frontend.
 [[bin]]
 name = "pyxis"
 path = "src/main.rs"

@@ -1,22 +1,22 @@
-//! Sélection du system prompt calibré selon le slug du modèle (US-027). Les
-//! templates sont embarqués via `include_str!` (pattern Codex CLI) : un prompt
-//! LONG type `gpt_5_2` pour les modèles GPT-5.x génériques (la spec comportementale
-//! n'est pas dans leurs poids), un prompt COURT pour les fine-tunés `*-codex`.
+//! Selection of the system prompt calibrated on the model slug (US-027). The
+//! templates are embedded through `include_str!` (Codex CLI pattern): a LONG
+//! `gpt_5_2`-style prompt for the generic GPT-5.x models (the behavioral spec
+//! is not in their weights), a SHORT prompt for the `*-codex` fine-tunes.
 //!
-//! Le slug peut changer en session via `/models` → `select_system_prompt` est
-//! rappelé à chaque tour (cf. `interactive::launch_turn`), pas figé au démarrage.
+//! The slug can change in session through `/models` -> `select_system_prompt` is
+//! called again on every turn (see `interactive::launch_turn`), not frozen at startup.
 
-/// Prompt long (modèles génériques GPT-5.x) : sections AGENTS.md spec, Autonomie &
-/// persistance, Réactivité/préambule, guidance d'édition (anti-relecture).
+/// Long prompt (generic GPT-5.x models): AGENTS.md spec sections, Autonomy &
+/// persistence, Responsiveness/preamble, editing guidance (anti re-reading).
 const GPT5_GENERIC: &str = include_str!("../prompts/gpt5_generic.md");
 
-/// Prompt court (modèles fine-tunés Codex `*-codex`) : la spec est dans les poids.
+/// Short prompt (Codex `*-codex` fine-tuned models): the spec is in the weights.
 const CODEX_FINETUNED: &str = include_str!("../prompts/codex_finetuned.md");
 
-/// Sélectionne le template selon le slug. Un slug fine-tuné Codex (contient
-/// `-codex`) reçoit le prompt court ; tout autre slug — générique `gpt-5.*` ou
-/// INCONNU — reçoit le prompt long (défaut sûr : mieux vaut sur-spécifier que
-/// laisser un modèle générique sans scaffold).
+/// Selects the template from the slug. A Codex fine-tuned slug (containing
+/// `-codex`) gets the short prompt; any other slug, generic `gpt-5.*` or
+/// UNKNOWN, gets the long prompt (safe default: better to over-specify than
+/// to leave a generic model without a scaffold).
 pub fn select_system_prompt(slug: &str) -> &'static str {
     if uses_codex_finetuned_prompt(slug) {
         CODEX_FINETUNED
@@ -33,7 +33,7 @@ pub fn uses_codex_finetuned_prompt(slug: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Section présente UNIQUEMENT dans le prompt long (marqueur discriminant).
+    /// Section present ONLY in the long prompt (discriminating marker).
     const LONG_ONLY: &str = "## AGENTS.md Specification";
 
     #[test]

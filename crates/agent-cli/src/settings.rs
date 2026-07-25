@@ -1,15 +1,15 @@
-//! Réglages persistants et configuration déclarative (US-016).
+//! Persistent settings and declarative configuration (US-016).
 //!
-//! Deux fichiers, un seul format : le **global** `~/.pyxis/settings.toml`
-//! (contrôlé par l'utilisateur, seul écrit par `/models`, `/effort` et le menu de
-//! permissions) et le **projet** `<workspace>/.pyxis/config.toml` (contrôlé par le
-//! dépôt, donc lu avec méfiance). La lecture passe par le parseur TOML de
-//! référence ; l'écriture reste un upsert de ligne, ce qui préserve les
-//! commentaires du fichier sans faire entrer `toml_edit` dans le graphe.
+//! Two files, one format: the **global** `~/.pyxis/settings.toml`
+//! (user-controlled, the only one written by `/models`, `/effort` and the permission
+//! menu) and the **project** `<workspace>/.pyxis/config.toml` (controlled by the
+//! repository, hence read with suspicion). Reading goes through the reference TOML
+//! parser; writing stays a line upsert, which preserves the
+//! comments of the file without pulling `toml_edit` into the graph.
 //!
-//! Précédence (AC1) : défauts < global < projet < variables d'environnement <
-//! arguments de ligne de commande. Les deux derniers niveaux sont appliqués par
-//! `main.rs`, seul détenteur d'`Args`.
+//! Precedence (AC1): defaults < global < project < environment variables <
+//! command-line arguments. The last two levels are applied by
+//! `main.rs`, the only holder of `Args`.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -29,9 +29,9 @@ const INPUT_COST_KEY: &str = "input_cost_micro_per_ktok";
 const OUTPUT_COST_KEY: &str = "output_cost_micro_per_ktok";
 const OVERLOAD_FALLBACK_KEY: &str = "overload_fallback_model";
 
-/// Clés reconnues. Une clé absente de cette liste est signalée sans faire
-/// échouer le démarrage (AC5) : un fichier écrit pour une version plus récente
-/// doit rester utilisable.
+/// Recognized keys. A key absent from this list is reported without failing
+/// the startup (AC5): a file written for a newer version
+/// must stay usable.
 const KNOWN_KEYS: &[&str] = &[
     MODEL_KEY,
     REASONING_EFFORT_KEY,
@@ -44,54 +44,54 @@ const KNOWN_KEYS: &[&str] = &[
     OVERLOAD_FALLBACK_KEY,
 ];
 
-/// Clés qui élargissent un périmètre de sécurité. Un fichier contrôlé par le
-/// workspace ne peut JAMAIS les définir (AC4, FR-07) : c'est exactement le
-/// vecteur de CVE-2026-48124, où une déclaration de hooks venue du dépôt donnait
-/// une exécution hors sandbox. `hooks` figure ici avant d'exister comme
-/// capacité (US-022) : la porte doit être fermée avant d'avoir une serrure.
+/// Keys that widen a security perimeter. A workspace-controlled file
+/// can NEVER define them (AC4, FR-07): that is exactly the
+/// vector of CVE-2026-48124, where a hooks declaration coming from the repository gave
+/// execution outside the sandbox. `hooks` appears here before existing as a
+/// capability (US-022): the door must be closed before it has a lock.
 const SECURITY_KEYS: &[&str] = &[PERMISSION_MODE_KEY, WRITABLE_ROOTS_KEY, HOOKS_KEY];
 
-/// Configuration effective après fusion des fichiers. Chaque champ optionnel
-/// signifie « non défini » : `main.rs` superpose ensuite l'environnement puis les
-/// arguments, et n'applique un défaut qu'en dernier ressort.
+/// Effective configuration after merging the files. Each optional field
+/// means "not defined": `main.rs` then layers the environment and the
+/// arguments on top, and applies a default only as a last resort.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
-    /// Global uniquement (clé de sécurité).
+    /// Global only (security key).
     pub permission_mode: Option<PermissionMode>,
-    /// Global uniquement (clé de sécurité).
+    /// Global only (security key).
     pub writable_roots: Vec<PathBuf>,
     pub token_budget: Option<u64>,
     pub cost_budget_micro_usd: Option<u64>,
     pub input_cost_micro_per_ktok: Option<u64>,
     pub output_cost_micro_per_ktok: Option<u64>,
     pub overload_fallback_model: Option<String>,
-    /// Diagnostics de chargement : syntaxe, clé inconnue, clé de sécurité
-    /// écartée. Jamais fatals (FR-12) ; l'appelant les écrit sur stderr.
+    /// Loading diagnostics: syntax, unknown key, discarded security
+    /// key. Never fatal (FR-12); the caller writes them to stderr.
     pub warnings: Vec<String>,
 }
 
-/// D'où vient un fichier de configuration. Détermine s'il a le droit de toucher
-/// aux clés de sécurité.
+/// Where a configuration file comes from. Determines whether it is allowed to touch
+/// the security keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scope {
-    /// `~/.pyxis/settings.toml` — contrôlé par l'utilisateur.
+    /// `~/.pyxis/settings.toml`: user-controlled.
     Global,
-    /// `<workspace>/.pyxis/config.toml` — contrôlé par le dépôt.
+    /// `<workspace>/.pyxis/config.toml`: repository-controlled.
     Project,
 }
 
-/// Chemin du fichier de configuration de projet. Sous `.pyxis/`, donc déjà
-/// couvert par le refus d'écriture des outils d'édition (US-013) : l'agent ne
-/// peut pas se réécrire sa propre configuration.
+/// Path of the project configuration file. Under `.pyxis/`, hence already
+/// covered by the write refusal of the editing tools (US-013): the agent
+/// cannot rewrite its own configuration.
 pub fn project_config_path(workspace: &Path) -> PathBuf {
     workspace.join(".pyxis").join(PROJECT_CONFIG_FILE)
 }
 
-/// Charge et fusionne les deux fichiers. Un fichier absent, illisible ou
-/// syntaxiquement invalide n'empêche jamais le démarrage : la valeur par défaut
-/// s'applique et l'anomalie part dans `warnings` (AC3, FR-12).
+/// Loads and merges the two files. A missing, unreadable or
+/// syntactically invalid file never prevents startup: the default value
+/// applies and the anomaly goes into `warnings` (AC3, FR-12).
 pub fn load(global: Option<&Path>, project: Option<&Path>) -> Config {
     let mut config = Config::default();
     for (path, scope) in [(global, Scope::Global), (project, Scope::Project)] {
@@ -113,9 +113,9 @@ fn apply_file(config: &mut Config, path: &Path, scope: Scope) {
     let table = match contents.parse::<toml::Table>() {
         Ok(table) => table,
         Err(err) => {
-            // AC3 : nommer le fichier, la ligne et la clé. `toml` rapporte déjà
-            // le span et un extrait annoté ; on préfixe par le chemin, et on
-            // aplatit le rendu multi-ligne pour tenir sur une ligne de stderr.
+            // AC3: name the file, the line and the key. `toml` already reports
+            // the span and an annotated excerpt; we prefix with the path, and
+            // flatten the multi-line rendering to fit on one stderr line.
             let detail = err.to_string().replace('\n', " | ");
             config
                 .warnings
@@ -172,8 +172,8 @@ fn apply_key(config: &mut Config, key: &str, value: &toml::Value) -> Result<(), 
         INPUT_COST_KEY => config.input_cost_micro_per_ktok = Some(positive_u64(value)?),
         OUTPUT_COST_KEY => config.output_cost_micro_per_ktok = Some(positive_u64(value)?),
         OVERLOAD_FALLBACK_KEY => config.overload_fallback_model = Some(non_empty_string(value)?),
-        // `KNOWN_KEYS` filtre en amont : ce bras est inatteignable et ne doit
-        // surtout pas paniquer si la liste et ce match divergent un jour.
+        // `KNOWN_KEYS` filters upstream: this arm is unreachable and must
+        // above all not panic should the list and this match ever diverge.
         other => return Err(format!("unhandled key `{other}`")),
     }
     Ok(())
@@ -250,9 +250,9 @@ pub fn save_model(path: &Path, model: &str) -> io::Result<()> {
     )
 }
 
-/// Crée le fichier (vide) et son dossier s'ils manquent. À appeler AVANT le
-/// sandbox : Landlock ne sait accorder un droit d'écriture qu'à un chemin déjà
-/// ouvrable, et le dossier parent reste, lui, en lecture seule.
+/// Creates the (empty) file and its directory when missing. To be called BEFORE the
+/// sandbox: Landlock can only grant a write right to an already
+/// openable path, and the parent directory itself stays read-only.
 pub fn ensure_file(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -264,11 +264,11 @@ pub fn ensure_file(path: &Path) -> io::Result<()> {
         .map(|_| ())
 }
 
-/// Upsert d'une clé scalaire, ligne à ligne. Volontairement pas `toml_edit` : la
-/// seule chose écrite ici est `key = "value"`, et un remplacement de ligne
-/// préserve les commentaires et l'ordre du fichier de l'utilisateur. Les lignes
-/// de continuation d'un tableau multi-ligne n'ont pas de `=` et sont donc
-/// recopiées telles quelles.
+/// Upsert of a scalar key, line by line. Deliberately not `toml_edit`: the
+/// only thing written here is `key = "value"`, and a line replacement
+/// preserves the comments and the order of the user's file. The continuation
+/// lines of a multi-line array have no `=` and are therefore
+/// copied as is.
 fn save_string_key(path: &Path, key: &str, value: Option<&str>) -> io::Result<()> {
     let new_line = value.map(|value| format!("{key} = \"{value}\""));
     let mut replaced = false;
@@ -323,8 +323,8 @@ mod tests {
         std::env::temp_dir().join(format!("pyxis-settings-{}-{tag}.toml", std::process::id()))
     }
 
-    /// Le fichier que `save_*` produit doit rester lisible par le parseur TOML :
-    /// c'est le seul point de contact entre l'upsert de ligne et la lecture.
+    /// The file that `save_*` produces must stay readable by the TOML parser:
+    /// that is the only contact point between the line upsert and the reading.
     #[test]
     fn saved_file_round_trips_through_the_toml_parser() {
         let path = temp_path("round-trip");
@@ -464,9 +464,9 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    // ─────────────────────────── US-016 : configuration ───────────────────────────
+    // ─────────────────────────── US-016: configuration ───────────────────────────
 
-    /// Deux fichiers dans un répertoire jetable, pour éprouver la fusion.
+    /// Two files in a throwaway directory, to exercise the merge.
     struct ConfigDir {
         dir: PathBuf,
     }
@@ -495,9 +495,9 @@ mod tests {
         }
     }
 
-    /// AC1 : le projet écrase le global sur les clés qu'il a le droit de porter.
-    /// Les deux niveaux suivants (env, CLI) sont appliqués par `main.rs`, prouvés
-    /// par `run_config_reads_*` là-bas.
+    /// AC1: the project overrides the global on the keys it is allowed to carry.
+    /// The next two levels (env, CLI) are applied by `main.rs`, proven
+    /// by `run_config_reads_*` over there.
     #[test]
     fn project_overrides_global_for_non_security_keys() {
         let dir = ConfigDir::new("precedence");
@@ -514,13 +514,13 @@ mod tests {
 
         assert_eq!(config.model.as_deref(), Some("project-model"));
         assert_eq!(config.token_budget, Some(222));
-        // Non redéfini par le projet → la valeur globale survit.
+        // Not redefined by the project -> the global value survives.
         assert_eq!(config.reasoning_effort.as_deref(), Some("low"));
         assert!(config.warnings.is_empty(), "{:?}", config.warnings);
     }
 
-    /// AC4 / FR-07 : un dépôt cloné ne doit pas pouvoir élargir le périmètre de
-    /// sécurité. `hooks` est refusé avant même d'exister comme capacité.
+    /// AC4 / FR-07: a cloned repository must not be able to widen the security
+    /// perimeter. `hooks` is refused before it even exists as a capability.
     #[test]
     fn project_security_keys_are_ignored_with_a_warning() {
         let dir = ConfigDir::new("security");
@@ -549,7 +549,7 @@ mod tests {
         }
     }
 
-    /// AC4 : le global, lui, a le droit de les porter.
+    /// AC4: the global file, in contrast, is allowed to carry them.
     #[test]
     fn global_may_set_security_keys() {
         let dir = ConfigDir::new("global-security");
@@ -571,7 +571,7 @@ mod tests {
         assert!(config.warnings.is_empty(), "{:?}", config.warnings);
     }
 
-    /// AC3 : syntaxe invalide → défauts + erreur localisée, jamais d'échec.
+    /// AC3: invalid syntax -> defaults + located error, never a failure.
     #[test]
     fn invalid_toml_falls_back_to_defaults_and_names_file_and_line() {
         let dir = ConfigDir::new("invalid");
@@ -579,8 +579,8 @@ mod tests {
 
         let config = load(Some(&global), None);
 
-        // Le fichier entier est écarté : un TOML invalide n'a pas de « moitié
-        // valide » sur laquelle il serait honnête de s'appuyer.
+        // The whole file is discarded: an invalid TOML has no "valid
+        // half" that it would be honest to rely on.
         assert_eq!(
             config,
             Config {
@@ -593,7 +593,7 @@ mod tests {
         assert!(warning.contains("2"), "la ligne fautive manque: {warning}");
     }
 
-    /// AC5 : clé inconnue signalée, démarrage préservé, reste du fichier appliqué.
+    /// AC5: unknown key reported, startup preserved, rest of the file applied.
     #[test]
     fn unknown_key_is_reported_without_dropping_the_rest() {
         let dir = ConfigDir::new("unknown");
@@ -610,8 +610,8 @@ mod tests {
         );
     }
 
-    /// Une valeur du bon nom mais du mauvais type est signalée par clé, et ne
-    /// contamine pas les autres.
+    /// A value with the right name but the wrong type is reported per key, and does
+    /// not contaminate the others.
     #[test]
     fn wrong_typed_value_is_reported_per_key() {
         let dir = ConfigDir::new("types");
@@ -629,7 +629,7 @@ mod tests {
         assert_eq!(config.warnings.len(), 3, "{:?}", config.warnings);
     }
 
-    /// Aucun fichier : pas de bruit, pas d'échec.
+    /// No file: no noise, no failure.
     #[test]
     fn absent_files_produce_no_warning() {
         let dir = ConfigDir::new("absent");
@@ -641,8 +641,8 @@ mod tests {
         assert_eq!(config, Config::default());
     }
 
-    /// Une permission inconnue ne dégrade pas silencieusement vers un mode plus
-    /// permissif : elle est écartée, et le défaut fail-closed s'applique.
+    /// An unknown permission does not silently degrade toward a more
+    /// permissive mode: it is discarded, and the fail-closed default applies.
     #[test]
     fn unknown_permission_mode_is_rejected() {
         let dir = ConfigDir::new("perm");

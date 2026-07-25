@@ -1,9 +1,9 @@
-//! `pyxis` — binaire CLI. SEUL crate qui câble tout (ARCHITECTURE §2) : cœur +
-//! provider abonnement ChatGPT + outils + session + sandbox + frontend TUI.
+//! `pyxis`: the CLI binary. The ONLY crate that wires everything (ARCHITECTURE 2):
+//! core + ChatGPT subscription provider + tools + session + sandbox + TUI frontend.
 //!
-//! Ordre critique : le **sandbox FS (Landlock) est appliqué sur le thread
-//! principal AVANT la construction du runtime tokio** → les workers et les
-//! sous-process Bash héritent du confinement (fork-safe, cf. `agent_sandbox::fs`).
+//! Critical order: the **FS sandbox (Landlock) is applied on the main thread
+//! BEFORE the tokio runtime is built** -> the workers and the Bash
+//! subprocesses inherit the confinement (fork-safe, see `agent_sandbox::fs`).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod approver;
@@ -39,8 +39,8 @@ struct Args {
     prompt: Option<String>,
     resume: Option<String>,
     model: String,
-    /// `--model` passé explicitement : distingue le défaut de compilation d'un
-    /// choix utilisateur, et prime donc sur le modèle persisté.
+    /// `--model` passed explicitly: distinguishes the compile-time default from a
+    /// user choice, and therefore wins over the persisted model.
     model_from_cli: bool,
     allow_hosts: Vec<String>,
     yes: bool,
@@ -50,7 +50,7 @@ struct Args {
     input_cost_micro_per_ktok: Option<String>,
     output_cost_micro_per_ktok: Option<String>,
     overload_fallback_model: Option<String>,
-    /// Format de sortie du mode headless (US-017). `Text` par défaut.
+    /// Output format of the headless mode (US-017). `Text` by default.
     output_format: jsonl::OutputFormat,
     help: bool,
 }
@@ -229,11 +229,11 @@ fn parse_positive_u64(raw: &str, name: &str) -> anyhow::Result<u64> {
     Ok(value)
 }
 
-/// Précédence d'un réglage numérique (US-016 AC1) : configuration < variable
-/// d'environnement < argument. Le premier niveau non défini est simplement
-/// traversé, ce qui rend la chaîne identique quel que soit le nombre de sources
-/// réellement renseignées. L'environnement est passé en paramètre plutôt que lu
-/// ici : la précédence devient testable sans muter l'environnement du processus.
+/// Precedence of a numeric setting (US-016 AC1): configuration < environment
+/// variable < argument. The first undefined level is simply
+/// traversed, which makes the chain identical whatever the number of sources
+/// actually filled in. The environment is passed as a parameter rather than read
+/// here: precedence becomes testable without mutating the process environment.
 fn precedence_u64(
     arg: Option<&str>,
     arg_name: &str,
@@ -352,11 +352,11 @@ fn permission_policy(headless: bool, yes: bool, _sandbox_enforced: bool) -> CliP
     }
 }
 
-/// Mode de permission effectif, et si la configuration a remplacé le défaut du
-/// mode headless (US-016 AC6). Ce remplacement peut ÉLARGIR ce qu'un `-p`
-/// s'autorise : il est donc annoncé plutôt que subi, et seule la configuration
-/// globale peut porter la clé (`settings::SECURITY_KEYS`), jamais celle du
-/// projet.
+/// Effective permission mode, and whether the configuration replaced the default of
+/// the headless mode (US-016 AC6). That replacement can WIDEN what a `-p`
+/// allows itself: it is therefore announced rather than silently applied, and only the global
+/// configuration can carry the key (`settings::SECURITY_KEYS`), never the
+/// project one.
 fn resolve_permission_mode(
     from_config: Option<PermissionMode>,
     policy: CliPermissionPolicy,
@@ -382,7 +382,7 @@ fn sandbox_enforced_from_args(
         }
         return false;
     }
-    // US-012 AC2 : une racine écartée est tracée, jamais silencieuse.
+    // US-012 AC2: a discarded root is logged, never silent.
     for ignored in &writable_roots.ignored {
         eprintln!(
             "[sandbox] writable root ignored: {} ({})",
@@ -419,30 +419,30 @@ fn main() -> anyhow::Result<()> {
     }
     let workspace = std::env::current_dir()?;
 
-    // Skills lus AVANT le sandbox : `~/.agents/skills` est hors workspace, donc
-    // inaccessible une fois Landlock appliqué.
+    // Skills read BEFORE the sandbox: `~/.agents/skills` is outside the workspace, hence
+    // inaccessible once Landlock is applied.
     let skills = read_skills();
 
-    // Config MCP lue AVANT le sandbox : `~/.claude.json` (serveurs Claude Code
-    // réutilisés) est hors workspace, donc inaccessible une fois Landlock posé. En
-    // mode -p (headless) le menu /mcp n'existe pas → on ne lit rien (latence).
+    // MCP config read BEFORE the sandbox: `~/.claude.json` (reused Claude Code
+    // servers) is outside the workspace, hence inaccessible once Landlock is in place. In
+    // -p (headless) mode the /mcp menu does not exist -> we read nothing (latency).
     let mcp_config = if args.prompt.is_none() {
         read_mcp_config(&workspace)
     } else {
         agent_mcp::McpConfigFile::default()
     };
 
-    // Contexte projet (AGENTS.md + env) lu AVANT le sandbox : la remontée
-    // d'ancêtres jusqu'au `.git` devient inaccessible une fois Landlock posé
-    // (US-028). Injecté ensuite comme messages éphémères par tour.
+    // Project context (AGENTS.md + env) read BEFORE the sandbox: walking up the
+    // ancestors to the `.git` becomes inaccessible once Landlock is in place
+    // (US-028). Injected afterwards as ephemeral messages per turn.
     let context_msgs = context::messages(&workspace, &context::today_utc());
 
     let credential = prepare_credential_before_sandbox(&args)?;
 
-    // Configuration lue AVANT le sandbox et dans LES DEUX modes (US-016 AC6) : le
-    // fichier global est hors workspace, donc inaccessible une fois Landlock posé,
-    // et le mode headless a autant besoin de ses réglages que l'interactif. Lire
-    // n'est pas persister : `-p` ne réécrit jamais le fichier (voir plus bas).
+    // Configuration read BEFORE the sandbox and in BOTH modes (US-016 AC6): the
+    // global file is outside the workspace, hence inaccessible once Landlock is in place,
+    // and the headless mode needs its settings as much as the interactive one. Reading
+    // is not persisting: `-p` never rewrites the file (see below).
     let config = settings::load(
         settings::default_settings_path().as_deref(),
         Some(&settings::project_config_path(&workspace)),
@@ -451,9 +451,9 @@ fn main() -> anyhow::Result<()> {
         eprintln!("[config] {warning}");
     }
 
-    // Réglages persistants (`~/.pyxis/settings.toml`) : le fichier doit exister
-    // AVANT Landlock pour recevoir sa règle d'écriture. En headless (-p) rien
-    // n'est persisté : la session est pilotée par la configuration et les flags.
+    // Persistent settings (`~/.pyxis/settings.toml`): the file must exist
+    // BEFORE Landlock to receive its write rule. In headless (-p) nothing
+    // is persisted: the session is driven by the configuration and the flags.
     let settings_path = if args.prompt.is_none() {
         settings::default_settings_path().filter(|path| match settings::ensure_file(path) {
             Ok(()) => true,
@@ -466,14 +466,14 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Racines writables résolues AVANT le runtime (US-012 AC3) : `restrict_self`
-    // est irréversible et précède tokio, donc la liste doit être connue ici.
+    // Writable roots resolved BEFORE the runtime (US-012 AC3): `restrict_self`
+    // is irreversible and precedes tokio, so the list must be known here.
     let writable_roots = agent_sandbox::resolve_writable_roots(
         &config.writable_roots,
         settings::home_dir().as_deref(),
     );
 
-    // Sandbox FS AVANT le runtime (thread principal → hérité par les workers).
+    // FS sandbox BEFORE the runtime (main thread -> inherited by the workers).
     let sandbox_enforced =
         sandbox_enforced_from_args(&args, &workspace, settings_path.as_deref(), &writable_roots);
 
@@ -495,9 +495,9 @@ fn main() -> anyhow::Result<()> {
     ))
 }
 
-/// Découvre les serveurs MCP avant le sandbox : `<workspace>/.mcp.json` (priorité
-/// haute) fusionné sous les `mcpServers` user-scope de `~/.claude.json`. Si la
-/// config workspace existe mais est invalide, on n'active pas le fallback user.
+/// Discovers the MCP servers before the sandbox: `<workspace>/.mcp.json` (high
+/// priority) merged over the user-scope `mcpServers` of `~/.claude.json`. When the
+/// workspace config exists but is invalid, we do not enable the user fallback.
 fn read_mcp_config(workspace: &std::path::Path) -> agent_mcp::McpConfigFile {
     let workspace_file = workspace.join(".mcp.json");
     let workspace_cfg = match agent_mcp::McpConfigFile::load(workspace) {
@@ -618,8 +618,8 @@ fn run_auth_onboarding() -> anyhow::Result<OAuthCredential> {
     })
 }
 
-/// Liste les skills disponibles dans `~/.agents/skills` (un dossier = un skill,
-/// nom = nom du dossier), triés. Symlink partagé entre CLIs ; lecture best-effort.
+/// Lists the skills available in `~/.agents/skills` (one directory = one skill,
+/// name = directory name), sorted. Symlink shared between CLIs; best-effort read.
 fn read_skills() -> Vec<String> {
     let Some(home) = home_dir() else {
         return Vec::new();
@@ -638,17 +638,17 @@ fn read_skills() -> Vec<String> {
     skills
 }
 
-/// Tout ce qui touche un chemin hors workspace, donc chargé ou créé AVANT
-/// l'enforcement Landlock : au-delà, seul le workspace (et le fichier de réglages)
-/// reste accessible en écriture.
+/// Everything that touches a path outside the workspace, hence loaded or created BEFORE
+/// the Landlock enforcement: past it, only the workspace (and the settings file)
+/// stays writable.
 struct PreSandbox {
     skills: Vec<String>,
     mcp_config: agent_mcp::McpConfigFile,
     context_msgs: Vec<Message>,
     cred: OAuthCredential,
-    /// Fichier de réglages écrivable (interactif seulement). `None` en headless.
+    /// Writable settings file (interactive only). `None` in headless mode.
     settings_path: Option<std::path::PathBuf>,
-    /// Configuration effective (global + projet), lue dans les deux modes.
+    /// Effective configuration (global + project), read in both modes.
     config: settings::Config,
 }
 
@@ -666,10 +666,10 @@ async fn run(
         settings_path,
         config,
     } = pre;
-    // `--model` explicite prime ; sinon on reprend le modèle de la configuration
-    // (dernier choix de `/models`, ou réglage de projet). Résolu AVANT tout le
-    // reste : la validation du fallback et l'effort initial se calculent sur le
-    // modèle réellement utilisé.
+    // An explicit `--model` wins; otherwise we take the model of the configuration
+    // (last `/models` choice, or project setting). Resolved BEFORE everything
+    // else: the fallback validation and the initial effort are computed on the
+    // model actually used.
     if !args.model_from_cli
         && let Some(model) = config.model.clone()
     {
@@ -682,15 +682,15 @@ async fn run(
         .as_deref()
         .and_then(|effort| agent_tui::normalize_reasoning_effort_for_model(&args.model, effort))
         .or_else(|| agent_tui::default_reasoning_effort_for_model(&args.model).map(str::to_string));
-    // 1. Credential abonnement ChatGPT chargée avant le sandbox. Si elle manque en
-    // interactif, l'onboarding OAuth a déjà tourné avant d'arriver ici.
+    // 1. ChatGPT subscription credential loaded before the sandbox. When it is missing in
+    // interactive mode, the OAuth onboarding has already run before we get here.
     let mut chatgpt = OpenAiChatGptProvider::new(
         cred,
         agent_provider::DEFAULT_MAX_CONTEXT,
         initial_reasoning_effort.clone(),
     );
-    // US-022 : idle timeout SSE configurable par session (défaut 60 s). Une valeur
-    // env invalide/0 est ignorée → garde le défaut (watchdog jamais désactivé).
+    // US-022: SSE idle timeout configurable per session (default 60 s). An invalid/0
+    // env value is ignored -> keeps the default (watchdog never disabled).
     if let Some(secs) = std::env::var("PYXIS_IDLE_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -699,14 +699,14 @@ async fn run(
         chatgpt = chatgpt.with_idle_timeout(std::time::Duration::from_secs(secs));
     }
     let chatgpt = Arc::new(chatgpt);
-    // Catalogue `/models` découvert sur le compte connecté, hors chemin critique :
-    // la session démarre sur le catalogue embarqué et bascule dès la réponse. Un
-    // échec (hors ligne, token expiré) laisse simplement le catalogue embarqué.
+    // `/models` catalog discovered on the connected account, off the critical path:
+    // the session starts on the bundled catalog and switches as soon as the answer arrives. A
+    // failure (offline, expired token) simply leaves the bundled catalog.
     if !headless {
         let catalog_source = Arc::clone(&chatgpt);
         tokio::spawn(async move {
-            // Erreur volontairement muette : le TUI occupe le terminal, et le
-            // catalogue embarqué reste un fallback correct.
+            // Error deliberately silent: the TUI owns the terminal, and the
+            // bundled catalog stays a correct fallback.
             if let Ok(models) = catalog_source.list_models().await {
                 agent_tui::set_models(
                     models
@@ -723,15 +723,15 @@ async fn run(
     }
     let provider: Arc<dyn Provider> = chatgpt;
 
-    // 2. Proxy réseau allow-list (fail-closed). Durcit les commandes Bash.
+    // 2. Network allow-list proxy (fail-closed). Hardens the Bash commands.
     let proxy = agent_sandbox::spawn_proxy(ProxyPolicy::new(args.allow_hosts.clone())).await?;
     let proxy_addr = proxy.addr.clone();
     let harden: agent_tools::CommandHardener =
         Arc::new(move |cmd: &mut tokio::process::Command| set_proxy_env(cmd, &proxy_addr));
     let mcp_harden = Arc::clone(&harden);
 
-    // 3. Session persistante : un fichier JSONL par conversation (horodaté) sous
-    // <workspace>/.pyxis/sessions/, listable/reprenable via `/resume`.
+    // 3. Persistent session: one JSONL file per conversation (timestamped) under
+    // <workspace>/.pyxis/sessions/, listable/resumable through `/resume`.
     let sessions_dir = workspace.join(".pyxis").join("sessions");
     std::fs::create_dir_all(&sessions_dir)?;
     let (current_session, initial_messages) = if let Some(resume_arg) = &args.resume {
@@ -756,14 +756,14 @@ async fn run(
         RESUME_TAINT_SCAN_MESSAGES,
     );
 
-    // Objectif persistant par session (`/goal`) : uniquement en interactif.
+    // Persistent per-session goal (`/goal`): interactive mode only.
     let goal = if headless {
         None
     } else {
         interactive::read_goal(&interactive::goal_path_for_session(&current_session))
     };
 
-    // 4. Registry d'outils + approbateur (TUI en interactif, auto en headless).
+    // 4. Tool registry + approver (TUI in interactive mode, auto in headless).
     let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
     let policy = permission_policy(headless, args.yes, sandbox_enforced);
     let (initial_permission_mode, announce_override) =
@@ -795,27 +795,27 @@ async fn run(
         .register(Bash)
         .build();
     let tool_specs = registry.tool_specs();
-    // US-026/US-027 : guidelines comportementales des outils, collectées AVANT que
-    // `registry` ne soit déplacé dans `Deps`. Le system prompt de base est désormais
-    // sélectionné PAR SLUG (US-027) au moment de composer (headless ici, par tour en
-    // interactif), pas figé : un `/models` doit pouvoir changer le template.
+    // US-026/US-027: behavioral guidelines of the tools, collected BEFORE
+    // `registry` is moved into `Deps`. The base system prompt is now
+    // selected PER SLUG (US-027) when composing (headless here, per turn in
+    // interactive mode), not frozen: a `/models` must be able to change the template.
     let tool_guidelines = registry.behavioral_guidelines();
 
-    // 5. Deps injectées dans la boucle.
+    // 5. Deps injected into the loop.
     let deps = Deps {
         provider,
         session: shared_session.clone(),
         tokenizer: Arc::new(HeuristicCounter),
         clock: Arc::new(SystemClock),
         tools: Arc::new(registry),
-        // US-001 : token de base jamais signalé. La boucle interactive substitue un
-        // token PAR TOUR (`launch_turn`) ; le mode headless garde celui-ci.
+        // US-001: base token never signalled. The interactive loop substitutes a
+        // PER-TURN token (`launch_turn`); the headless mode keeps this one.
         cancel: CancelToken::new(),
     };
 
-    // 6. Dispatch headless (-p) vs interactif.
+    // 6. Headless (-p) vs interactive dispatch.
     if let Some(prompt) = args.prompt {
-        // Headless one-shot : slug fixe (`args.model`) → template sélectionné une fois.
+        // Headless one-shot: fixed slug (`args.model`) -> template selected once.
         let base = interactive::with_tool_guidelines(
             prompt::select_system_prompt(&args.model),
             &tool_guidelines,
@@ -833,10 +833,10 @@ async fn run(
             ephemeral_messages: Vec::new(),
         };
         let mut events = jsonl::EventWriter::new(args.output_format);
-        // US-018 : référence prise AVANT le tour, sur le workspace tel qu'il est.
-        // Uniquement en sortie machine : le format texte doit rester identique au
-        // caractère près (US-017 AC4), donc il n'a aucun consommateur pour ce diff
-        // et n'a pas à payer un `git status` par run.
+        // US-018: reference taken BEFORE the turn, on the workspace as it is.
+        // Machine output only: the text format must stay identical to the
+        // character (US-017 AC4), so it has no consumer for this diff
+        // and must not pay for a `git status` per run.
         let mut diff_tracker = if events.is_json() {
             Some(agent_tools::turn_diff::TurnDiffTracker::begin(&workspace).await)
         } else {
@@ -845,8 +845,8 @@ async fn run(
         let result =
             agent_core::run_headless_observed(ctx, deps, |event| events.event(event)).await;
 
-        // Diff agrégé après la fin du tour, donc après la dernière écriture d'outil
-        // (US-018 AC6 : y compris quand le tour a été interrompu).
+        // Aggregated diff after the end of the turn, hence after the last tool write
+        // (US-018 AC6: including when the turn was interrupted).
         if let Some(tracker) = diff_tracker.as_mut() {
             match tracker.turn_diff().await {
                 Ok(diff) if !diff.is_empty() => {
@@ -867,10 +867,10 @@ async fn run(
             agent_core::HeadlessEnd::Exhausted(reason) => anyhow::bail!("stopped: {reason:?}"),
             agent_core::HeadlessEnd::EndTurn => {}
         }
-        // En mode JSON, le texte vit déjà dans les événements `text` : l'écrire à
-        // nouveau injecterait des lignes non JSON dans le flux.
+        // In JSON mode, the text already lives in the `text` events: writing it
+        // again would inject non-JSON lines into the stream.
         if !events.is_json() {
-            // En one-shot, pas de boucle d'objectif : on retire juste le marqueur.
+            // In one-shot mode, no goal loop: we simply remove the marker.
             let text = result
                 .text
                 .replace(interactive::GOAL_DONE_MARKER, "")
@@ -882,9 +882,9 @@ async fn run(
             }
         }
     } else {
-        // Registre MCP construit depuis la config découverte avant le sandbox
-        // (workspace + ~/.claude.json). Tous les serveurs démarrent déconnectés ;
-        // la connexion se fait à la demande via `/mcp`.
+        // MCP registry built from the config discovered before the sandbox
+        // (workspace + ~/.claude.json). Every server starts disconnected;
+        // the connection happens on demand through `/mcp`.
         let mcp = Arc::new(std::sync::Mutex::new(agent_mcp::McpRegistry::from_config(
             mcp_config,
         )));
@@ -897,10 +897,10 @@ async fn run(
             run_config,
             tool_specs,
             truecolor: agent_tui::supports_truecolor(),
-            // Reduced-motion : spinner dégradé en point pulsé (US-044).
+            // Reduced motion: spinner degraded to a pulsing dot (US-044).
             reduced_motion: std::env::var_os("NO_COLOR").is_some()
                 || std::env::var_os("PYXIS_REDUCED_MOTION").is_some(),
-            // credential chargée plus haut (sinon on a bail) → connecté.
+            // credential loaded above (otherwise we bail) -> connected.
             connected: true,
             skills,
             goal,
@@ -951,9 +951,9 @@ mod tests {
         }
     }
 
-    /// US-016 AC6 : la configuration globale pilote aussi le mode de permission
-    /// du headless. Le remplacement est SIGNALÉ, parce qu'il peut élargir ce
-    /// qu'un `-p` s'autorise par rapport au défaut fail-closed.
+    /// US-016 AC6: the global configuration also drives the permission mode
+    /// of the headless mode. The replacement is REPORTED, because it can widen what
+    /// a `-p` allows itself compared to the fail-closed default.
     #[test]
     fn configuration_replaces_the_headless_permission_default_and_says_so() {
         let headless_default = permission_policy(true, false, true);
@@ -967,18 +967,18 @@ mod tests {
         assert_eq!(mode, PermissionMode::BypassPermissions);
         assert!(announced, "un elargissement en headless doit etre annonce");
 
-        // Sans configuration, le défaut fail-closed est conservé, sans bruit.
+        // Without a configuration, the fail-closed default is kept, silently.
         let (mode, announced) = resolve_permission_mode(None, headless_default, true);
         assert_eq!(mode, PermissionMode::Default);
         assert!(!announced);
 
-        // Une configuration qui redit le défaut n'annonce rien non plus.
+        // A configuration that restates the default announces nothing either.
         let (_, announced) =
             resolve_permission_mode(Some(PermissionMode::Default), headless_default, true);
         assert!(!announced);
 
-        // En interactif, la substitution est le comportement normal depuis
-        // US-012 : rien à annoncer.
+        // In interactive mode, the substitution is the normal behavior since
+        // US-012: nothing to announce.
         let interactive = permission_policy(false, false, true);
         let (mode, announced) =
             resolve_permission_mode(Some(PermissionMode::AcceptEdits), interactive, false);
@@ -986,8 +986,8 @@ mod tests {
         assert!(!announced);
     }
 
-    /// US-016 AC1, les quatre niveaux que `main` superpose : défaut (aucune
-    /// source) < configuration < environnement < argument.
+    /// US-016 AC1, the four levels that `main` layers: default (no
+    /// source) < configuration < environment < argument.
     #[test]
     fn precedence_runs_config_then_env_then_argument() {
         let name = "--token-budget";
@@ -1006,16 +1006,16 @@ mod tests {
             precedence_u64(Some("30"), name, Some("20"), env, Some(10)).unwrap(),
             Some(30)
         );
-        // Une variable vide n'est pas une définition : elle laisse passer la
-        // configuration au lieu d'écraser avec un zéro.
+        // An empty variable is not a definition: it lets the configuration
+        // through instead of overwriting with a zero.
         assert_eq!(
             precedence_u64(None, name, Some("  "), env, Some(10)).unwrap(),
             Some(10)
         );
     }
 
-    /// AC1 côté `RunConfig` : sans argument ni environnement, la configuration
-    /// pilote réellement le budget passé au cœur.
+    /// AC1 on the `RunConfig` side: without an argument nor an environment variable, the
+    /// configuration really drives the budget passed to the core.
     #[test]
     fn run_config_falls_back_to_the_configuration_file() {
         let config = settings::Config {
@@ -1032,7 +1032,7 @@ mod tests {
         assert_eq!(cfg.overload_fallback_model.as_deref(), Some("gpt-5.5"));
     }
 
-    /// L'argument prime sur la configuration, dans le sens attendu.
+    /// The argument wins over the configuration, in the expected direction.
     #[test]
     fn cli_argument_overrides_the_configuration_file() {
         let config = settings::Config {
