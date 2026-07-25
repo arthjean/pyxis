@@ -20,7 +20,7 @@ use agent_core::clock::SystemClock;
 use agent_core::guardrail::CostBudget;
 use agent_core::message::{Message, recent_untrusted_content};
 use agent_core::provider::Provider;
-use agent_core::{AgentContext, Deps, RunConfig};
+use agent_core::{AgentContext, CancelToken, Deps, RunConfig};
 use agent_provider::{KEYRING_ACCOUNT, OpenAiChatGptProvider};
 use agent_sandbox::{ProxyPolicy, set_proxy_env};
 use agent_tokenizer::HeuristicCounter;
@@ -556,15 +556,16 @@ async fn run(
     // `/models`. Résolu AVANT tout le reste : la validation du fallback et l'effort
     // initial se calculent sur le modèle réellement utilisé.
     if !args.model_from_cli
-        && let Some(model) = settings_path
-            .as_deref()
-            .and_then(|path| match settings::load_model(path) {
-                Ok(model) => model,
-                Err(err) => {
-                    eprintln!("[settings] model: {err}");
-                    None
-                }
-            })
+        && let Some(model) =
+            settings_path
+                .as_deref()
+                .and_then(|path| match settings::load_model(path) {
+                    Ok(model) => model,
+                    Err(err) => {
+                        eprintln!("[settings] model: {err}");
+                        None
+                    }
+                })
     {
         args.model = model;
     }
@@ -711,6 +712,9 @@ async fn run(
         tokenizer: Arc::new(HeuristicCounter),
         clock: Arc::new(SystemClock),
         tools: Arc::new(registry),
+        // US-001 : token de base jamais signalé. La boucle interactive substitue un
+        // token PAR TOUR (`launch_turn`) ; le mode headless garde celui-ci.
+        cancel: CancelToken::new(),
     };
 
     // 6. Dispatch headless (-p) vs interactif.

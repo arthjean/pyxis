@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod budget;
+pub mod cancel;
 pub mod clock;
 pub mod compaction;
 pub mod deps;
@@ -21,12 +22,15 @@ pub mod transition;
 
 pub use agent::{AgentContext, HeadlessEnd, HeadlessResult, RunConfig, run_agent, run_headless};
 pub use budget::ContextBudget;
+pub use cancel::{CancelToken, Cancellable};
 pub use compaction::CompactKind;
 pub use deps::Deps;
 pub use error::{AgentError, ProviderFailure, ProviderFailureKind};
 pub use event::AgentEvent;
 pub use guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget};
-pub use message::{ContentBlock, Message, Role, ToolErrorKind};
+pub use message::{
+    ContentBlock, INTERRUPTED_TOOL_RESULT, Message, Role, ToolErrorKind, unanswered_tool_calls,
+};
 pub use provider::{
     AuthError, CacheCapabilities, Capabilities, CapabilityLimits, ErrorClass, Provider,
     ProviderError, ProviderKind, ReasoningCapabilities, StopReason, StreamEvent, TokenUsage,
@@ -46,14 +50,14 @@ mod loop_tests {
 
     use crate::clock::Clock;
     use crate::compaction::CompactKind;
-    use crate::message::{ContentBlock, Message};
+    use crate::message::{ContentBlock, INTERRUPTED_TOOL_RESULT, Message, unanswered_tool_calls};
     use crate::provider::{
         AuthError, CanonicalRequest, CanonicalResponse, Capabilities, ErrorClass, Provider,
         ProviderError, ProviderKind, StopReason, StreamEvent, TokenUsage,
     };
     use crate::session::{Session, SessionError};
     use crate::tools::{ToolDispatch, ToolEventSink, ToolInvocation, ToolOutcome};
-    use crate::{AgentContext, AgentEvent, Deps, RunConfig, run_agent, run_headless};
+    use crate::{AgentContext, AgentEvent, CancelToken, Deps, RunConfig, run_agent, run_headless};
 
     // ───────── doubles de test (injectés via Deps) ─────────
 
@@ -63,6 +67,9 @@ mod loop_tests {
         Err(ProviderError),
         /// Quelques events PUIS une erreur EN MILIEU de stream.
         StreamThenErr(Vec<StreamEvent>, ProviderError),
+        /// US-001 : le signal d'annulation tombe pendant la consommation du stream,
+        /// exactement après le premier événement livré.
+        StreamCancelling(Vec<StreamEvent>, crate::CancelToken),
     }
 
     struct MockProvider {
@@ -110,6 +117,18 @@ mod loop_tests {
                         evs.into_iter().map(Ok).collect();
                     items.push(Err(err));
                     Ok(Box::pin(futures_util::stream::iter(items)))
+                }
+                Some(MockTurn::StreamCancelling(evs, cancel)) => {
+                    let mut delivered = 0usize;
+                    Ok(Box::pin(
+                        futures_util::stream::iter(evs.into_iter().map(Ok)).map(move |item| {
+                            delivered += 1;
+                            if delivered == 1 {
+                                cancel.cancel();
+                            }
+                            item
+                        }),
+                    ))
                 }
                 Some(MockTurn::Err(e)) => Err(e),
                 None => Ok(Box::pin(futures_util::stream::iter(vec![Ok(
@@ -247,6 +266,80 @@ mod loop_tests {
         }
     }
 
+    /// US-001 — outils qui signalent l'annulation puis ne rendent JAMAIS la main :
+    /// la boucle doit reprendre le contrôle sans attendre le dispatch.
+    struct HangingTools(crate::CancelToken);
+    #[async_trait::async_trait]
+    impl ToolDispatch for HangingTools {
+        async fn dispatch(
+            &self,
+            _calls: Vec<ToolInvocation>,
+            _events: ToolEventSink,
+        ) -> Vec<ToolOutcome> {
+            self.0.cancel();
+            std::future::pending().await
+        }
+    }
+
+    /// Edge case #2 — l'annulation tombe dans la fenêtre entre la fin du dispatch
+    /// et la persistance : les résultats RÉELS doivent survivre.
+    struct RacingTools(crate::CancelToken);
+    #[async_trait::async_trait]
+    impl ToolDispatch for RacingTools {
+        async fn dispatch(
+            &self,
+            calls: Vec<ToolInvocation>,
+            _events: ToolEventSink,
+        ) -> Vec<ToolOutcome> {
+            self.0.cancel();
+            calls
+                .into_iter()
+                .map(|c| ToolOutcome {
+                    id: c.id,
+                    content: "real output".into(),
+                    is_error: false,
+                    untrusted: true,
+                    error_kind: None,
+                })
+                .collect()
+        }
+    }
+
+    /// Balaye la fenêtre d'annulation autour d'un dispatch : `yields` points de
+    /// cession avant le signal, puis terminaison (résultats réels) ou blocage
+    /// (appels abandonnés).
+    struct DelayedCancelTools {
+        cancel: crate::CancelToken,
+        yields: usize,
+        finish: bool,
+    }
+    #[async_trait::async_trait]
+    impl ToolDispatch for DelayedCancelTools {
+        async fn dispatch(
+            &self,
+            calls: Vec<ToolInvocation>,
+            _events: ToolEventSink,
+        ) -> Vec<ToolOutcome> {
+            for _ in 0..self.yields {
+                tokio::task::yield_now().await;
+            }
+            self.cancel.cancel();
+            if !self.finish {
+                std::future::pending::<()>().await;
+            }
+            calls
+                .into_iter()
+                .map(|c| ToolOutcome {
+                    id: c.id,
+                    content: "real output".into(),
+                    is_error: false,
+                    untrusted: true,
+                    error_kind: None,
+                })
+                .collect()
+        }
+    }
+
     // ───────── harnais ─────────
 
     struct Harness {
@@ -307,6 +400,7 @@ mod loop_tests {
             tokenizer: Arc::new(HeuristicCounter),
             clock: Arc::new(NoopClock),
             tools: Arc::new(EchoTools),
+            cancel: crate::CancelToken::new(),
         };
         Harness {
             log,
@@ -343,6 +437,21 @@ mod loop_tests {
                 stop: StopReason::ToolUse,
             },
         ])
+    }
+
+    fn tool_turn_n(ids: &[&str]) -> MockTurn {
+        let mut events = Vec::new();
+        for id in ids {
+            events.push(StreamEvent::ToolCallStart {
+                id: (*id).into(),
+                name: "bash".into(),
+            });
+            events.push(StreamEvent::ToolCallEnd { id: (*id).into() });
+        }
+        events.push(StreamEvent::Done {
+            stop: StopReason::ToolUse,
+        });
+        MockTurn::Stream(events)
     }
 
     fn text_turn(t: &str) -> MockTurn {
@@ -1193,6 +1302,237 @@ mod loop_tests {
             !h.log.lock().unwrap().contains(&"stream"),
             "provider should not be called: {:?}",
             h.log.lock().unwrap()
+        );
+    }
+
+    // ───────── US-001 / US-002 : annulation coopérative ─────────
+
+    /// Contenu des `tool_result` PERSISTÉS, dans l'ordre — `Message::text()` ne
+    /// lit que les blocs `Text` et ne dirait rien d'un résultat d'outil.
+    fn persisted_tool_results(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tool_results(events: &[AgentEvent]) -> Vec<&crate::event::ToolResultView> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ToolResult(v) => Some(v),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // US-001 AC4 : signal déjà positionné à l'entrée → arrêt à la première
+    // frontière, `Interrupted` émis par le CŒUR, aucun appel provider.
+    #[tokio::test]
+    async fn cancel_before_start_stops_at_the_first_boundary() {
+        let h = harness(vec![text_turn("jamais")], false, 100_000);
+        let mut deps = h.deps.clone();
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        deps.cancel = cancel;
+        let events = drive(AgentContext::new("mock").push(Message::user("hello")), deps).await;
+        assert!(
+            matches!(events.as_slice(), [AgentEvent::Interrupted]),
+            "single Interrupted expected: {events:?}"
+        );
+        assert!(
+            !h.log.lock().unwrap().contains(&"stream"),
+            "provider should not be called: {:?}",
+            h.log.lock().unwrap()
+        );
+    }
+
+    // US-001 AC2 : annulation pendant le streaming → aucun `Text` après la
+    // frontière ; ce qui a déjà défilé reste dans le transcript persisté.
+    #[tokio::test]
+    async fn cancel_during_stream_stops_emitting_deltas() {
+        let cancel = CancelToken::new();
+        let h = harness(
+            vec![MockTurn::StreamCancelling(
+                vec![
+                    StreamEvent::TextDelta {
+                        text: "premier".into(),
+                    },
+                    StreamEvent::TextDelta {
+                        text: "second".into(),
+                    },
+                    StreamEvent::Done {
+                        stop: StopReason::EndTurn,
+                    },
+                ],
+                cancel.clone(),
+            )],
+            false,
+            100_000,
+        );
+        let mut deps = h.deps.clone();
+        deps.cancel = cancel;
+        let events = drive(AgentContext::new("mock").push(Message::user("hi")), deps).await;
+        let texts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["premier"], "stream drained after cancel");
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Interrupted)),
+            "{events:?}"
+        );
+        let synced = h.boundaries.synced.lock().unwrap().clone();
+        assert!(
+            synced.iter().any(|m| m.text().contains("premier")),
+            "partial answer kept: {synced:?}"
+        );
+    }
+
+    // US-001 AC3 + US-002 AC1/AC3 : interruption pendant un dispatch qui ne rend
+    // jamais la main → la boucle reprend le contrôle, écrit un résultat synthétique
+    // par appel en vol, PUIS persiste.
+    #[tokio::test]
+    async fn interrupted_dispatch_writes_synthetic_results_before_persisting() {
+        let cancel = CancelToken::new();
+        let h = harness(vec![tool_turn("c1")], false, 100_000);
+        let mut deps = h.deps.clone();
+        deps.cancel = cancel.clone();
+        deps.tools = Arc::new(HangingTools(cancel));
+        let events = drive(AgentContext::new("mock").push(Message::user("ls")), deps).await;
+
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Interrupted)),
+            "{events:?}"
+        );
+        let results = tool_results(&events);
+        assert_eq!(results.len(), 1, "{events:?}");
+        assert_eq!(results[0].id, "c1");
+        assert!(results[0].is_error, "interrupted result is an error");
+        assert_eq!(results[0].content, INTERRUPTED_TOOL_RESULT);
+
+        let synced = h.boundaries.synced.lock().unwrap().clone();
+        assert!(
+            unanswered_tool_calls(&synced).is_empty(),
+            "no orphan call in the persisted transcript: {synced:?}"
+        );
+        assert_eq!(
+            persisted_tool_results(&synced),
+            vec![INTERRUPTED_TOOL_RESULT.to_string()],
+            "the synthetic result is persisted: {synced:?}"
+        );
+    }
+
+    // US-002 AC5 : plusieurs appels concurrents → exactement un résultat par appel,
+    // sans doublon ni oubli.
+    #[tokio::test]
+    async fn interrupted_concurrent_dispatch_answers_every_call_once() {
+        let cancel = CancelToken::new();
+        let h = harness(vec![tool_turn_n(&["c1", "c2"])], false, 100_000);
+        let mut deps = h.deps.clone();
+        deps.cancel = cancel.clone();
+        deps.tools = Arc::new(HangingTools(cancel));
+        let events = drive(AgentContext::new("mock").push(Message::user("ls")), deps).await;
+
+        let ids: Vec<&str> = tool_results(&events)
+            .iter()
+            .map(|v| v.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["c1", "c2"], "{events:?}");
+        let synced = h.boundaries.synced.lock().unwrap().clone();
+        assert!(unanswered_tool_calls(&synced).is_empty(), "{synced:?}");
+        assert_eq!(
+            persisted_tool_results(&synced),
+            vec![
+                INTERRUPTED_TOOL_RESULT.to_string(),
+                INTERRUPTED_TOOL_RESULT.to_string()
+            ],
+            "exactly one result per call: {synced:?}"
+        );
+    }
+
+    // Edge case #2 : le dispatch se termine dans la même fenêtre que l'annulation →
+    // le résultat RÉEL est conservé, aucun résultat synthétique ne l'écrase.
+    #[tokio::test]
+    async fn tool_finished_before_stop_keeps_its_real_result() {
+        let cancel = CancelToken::new();
+        let h = harness(vec![tool_turn("c1")], false, 100_000);
+        let mut deps = h.deps.clone();
+        deps.cancel = cancel.clone();
+        deps.tools = Arc::new(RacingTools(cancel));
+        let events = drive(AgentContext::new("mock").push(Message::user("ls")), deps).await;
+
+        let results = tool_results(&events);
+        assert_eq!(results.len(), 1, "{events:?}");
+        assert_eq!(results[0].content, "real output");
+        assert!(!results[0].is_error);
+        let synced = h.boundaries.synced.lock().unwrap().clone();
+        assert_eq!(
+            persisted_tool_results(&synced),
+            vec!["real output".to_string()],
+            "no synthetic result over a real one: {synced:?}"
+        );
+        assert!(matches!(events.last(), Some(AgentEvent::Interrupted)));
+    }
+
+    // Métrique de fiabilité du PRD : 0 session corrompue sur 50 interruptions
+    // pendant un dispatch d'outil. Version CŒUR — le point d'annulation, le nombre
+    // d'appels concurrents et la terminaison ou non des outils varient à chaque
+    // itération. La reprise du même balayage au niveau CLI relève d'US-007.
+    #[tokio::test]
+    async fn fifty_interruptions_during_dispatch_never_corrupt_the_transcript() {
+        const IDS: [&str; 3] = ["c1", "c2", "c3"];
+        for run in 0..50usize {
+            let ids = &IDS[..=(run % 3)];
+            let cancel = CancelToken::new();
+            let h = harness(vec![tool_turn_n(ids)], false, 100_000);
+            let mut deps = h.deps.clone();
+            deps.cancel = cancel.clone();
+            deps.tools = Arc::new(DelayedCancelTools {
+                cancel,
+                yields: run % 4,
+                finish: run % 2 == 0,
+            });
+            let events = drive(AgentContext::new("mock").push(Message::user("go")), deps).await;
+
+            assert!(
+                matches!(events.last(), Some(AgentEvent::Interrupted)),
+                "run {run}: the loop must stop on its own: {events:?}"
+            );
+            let synced = h.boundaries.synced.lock().unwrap().clone();
+            assert!(
+                unanswered_tool_calls(&synced).is_empty(),
+                "run {run}: orphan call persisted: {synced:?}"
+            );
+            assert_eq!(
+                persisted_tool_results(&synced).len(),
+                ids.len(),
+                "run {run}: exactly one result per call: {synced:?}"
+            );
+        }
+    }
+
+    // US-001 AC6 : signal reçu alors que la boucle est déjà terminée → ignoré, sans
+    // panique ni événement supplémentaire.
+    #[tokio::test]
+    async fn cancel_after_completion_is_ignored() {
+        let h = harness(vec![text_turn("done")], false, 100_000);
+        let mut deps = h.deps.clone();
+        let cancel = CancelToken::new();
+        deps.cancel = cancel.clone();
+        let events = drive(AgentContext::new("mock").push(Message::user("hi")), deps).await;
+        assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
+        cancel.cancel();
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Interrupted)),
+            "{events:?}"
         );
     }
 }

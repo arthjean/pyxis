@@ -15,8 +15,19 @@
 //! Les reasoning items chiffrés sont réinjectés avant leurs `function_call` quand
 //! le transcript en contient. Les blocs orphelins restent sautés pour éviter une
 //! paire reasoning/call invalide.
+//!
+//! US-003 — garde-fou d'appariement : un `function_call` sans
+//! `function_call_output` fait rejeter la requête ENTIÈRE par le backend, donc une
+//! session interrompue avant ce garde-fou reste inexploitable jusqu'à un `/new`.
+//! La construction répare en mémoire (résultat synthétique pour l'appel orphelin,
+//! résultat orphelin écarté) et ne réécrit JAMAIS le `.jsonl` sur disque. Les
+//! anomalies réparées sont tracées sous `PYXIS_DEBUG_TRANSCRIPT`.
 
-use agent_core::message::{ContentBlock, Message, Role};
+use std::collections::HashSet;
+
+use agent_core::message::{
+    ContentBlock, INTERRUPTED_TOOL_RESULT, Message, Role, unanswered_tool_calls,
+};
 use agent_core::provider::{CanonicalRequest, ToolSpec};
 use serde_json::{Value, json};
 
@@ -87,8 +98,31 @@ pub fn inject_cache_key(body: &mut Value, session_id: &str) {
     body["prompt_cache_key"] = json!(clamp_cache_key(session_id));
 }
 
+/// Trace d'anomalie de transcript (US-003). Silencieuse par défaut : la sortie
+/// standard d'erreur est partagée avec le TUI. Même convention que
+/// `PYXIS_DEBUG_USAGE` côté boucle.
+fn trace_transcript_anomaly(detail: &str) {
+    if std::env::var_os("PYXIS_DEBUG_TRANSCRIPT").is_some() {
+        eprintln!("[transcript] {detail}");
+    }
+}
+
 /// Convertit le transcript canonique en `input[]` de la Responses API.
 fn build_input(messages: &[Message]) -> Value {
+    // US-003 — appariement calculé sur le transcript ENTIER avant émission : un
+    // résultat peut arriver plusieurs messages après son appel. Sur un transcript
+    // sain, les deux ensembles rendent la construction strictement inchangée.
+    let unanswered = unanswered_tool_calls(messages);
+    let orphan_calls: HashSet<&str> = unanswered.iter().map(String::as_str).collect();
+    let known_calls: HashSet<&str> = messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+
     let mut input: Vec<Value> = Vec::new();
     for msg in messages {
         match msg.role {
@@ -104,8 +138,8 @@ fn build_input(messages: &[Message]) -> Value {
                     }));
                 }
             }
-            Role::Assistant => assistant_items(&msg.content, &mut input),
-            Role::Tool => tool_result_items(&msg.content, &mut input),
+            Role::Assistant => assistant_items(&msg.content, &orphan_calls, &mut input),
+            Role::Tool => tool_result_items(&msg.content, &known_calls, &mut input),
         }
     }
     Value::Array(input)
@@ -147,7 +181,7 @@ fn user_content(blocks: &[ContentBlock]) -> Vec<Value> {
 /// Un message assistant produit : un item `message` (texte concaténé) puis un
 /// item `function_call` par `tool_use`. Les blocs `thinking` affichables ne sont
 /// pas réinjectés ; seuls les blocs chiffrés opaques le sont.
-fn assistant_items(blocks: &[ContentBlock], input: &mut Vec<Value>) {
+fn assistant_items(blocks: &[ContentBlock], orphan_calls: &HashSet<&str>, input: &mut Vec<Value>) {
     let mut text = String::new();
     for b in blocks {
         if let ContentBlock::Text { text: t } = b {
@@ -199,10 +233,27 @@ fn assistant_items(blocks: &[ContentBlock], input: &mut Vec<Value>) {
             }));
         }
     }
+    // US-003 : réparation APRÈS les appels du message, jamais entre deux d'entre
+    // eux. Le résultat synthétique est notre propre texte → émis brut, sans
+    // enveloppe untrusted.
+    for b in blocks {
+        if let ContentBlock::ToolUse { id, .. } = b
+            && orphan_calls.contains(id.as_str())
+        {
+            trace_transcript_anomaly(&format!(
+                "tool call {id} has no result: synthetic interrupted output emitted"
+            ));
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": id,
+                "output": INTERRUPTED_TOOL_RESULT,
+            }));
+        }
+    }
 }
 
 /// Blocs `tool_result` (role Tool) → items `function_call_output`.
-fn tool_result_items(blocks: &[ContentBlock], input: &mut Vec<Value>) {
+fn tool_result_items(blocks: &[ContentBlock], known_calls: &HashSet<&str>, input: &mut Vec<Value>) {
     for b in blocks {
         if let ContentBlock::ToolResult {
             tool_use_id,
@@ -212,6 +263,14 @@ fn tool_result_items(blocks: &[ContentBlock], input: &mut Vec<Value>) {
             error_kind,
         } = b
         {
+            // US-003 : un résultat sans appel correspondant est refusé par le
+            // backend au même titre qu'un appel sans résultat. Il est écarté.
+            if !known_calls.contains(tool_use_id.as_str()) {
+                trace_transcript_anomaly(&format!(
+                    "tool result {tool_use_id} has no matching call: dropped"
+                ));
+                continue;
+            }
             let output = if *untrusted {
                 untrusted_tool_output_payload(content, *is_error, error_kind.as_ref())
             } else {
@@ -405,8 +464,11 @@ mod tests {
 
     #[test]
     fn trusted_tool_result_stays_raw_for_provider() {
+        // Le résultat est apparié à son appel : depuis US-003, un résultat orphelin
+        // est écarté de la requête (cf. `orphan_tool_result_is_dropped`).
+        let assistant = Message::assistant(vec![tool_use("call_1")]);
         let tool = Message::tool_result_with_trust("call_1", "confirmed", false, false);
-        let body = request_body(&req(vec![tool], vec![], None));
+        let body = request_body(&req(vec![assistant, tool], vec![], None));
         let out = body["input"]
             .as_array()
             .unwrap()
@@ -551,6 +613,132 @@ mod tests {
                 .all(|i| i["type"] != "reasoning"),
             "orphan reasoning skipped"
         );
+    }
+
+    fn tool_use(id: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.into(),
+            name: "bash".into(),
+            input: json!({ "cmd": "ls" }),
+        }
+    }
+
+    fn item_types(body: &Value) -> Vec<String> {
+        body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["type"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    // US-003 AC1 : un appel sans résultat reçoit un `function_call_output`
+    // synthétique plutôt que d'être émis seul (400 garanti sinon).
+    #[test]
+    fn orphan_tool_call_gets_a_synthetic_output() {
+        let assistant = Message::assistant(vec![tool_use("call_orphan")]);
+        let body = request_body(&req(vec![Message::user("go"), assistant], vec![], None));
+        assert_eq!(
+            item_types(&body),
+            vec!["message", "function_call", "function_call_output"]
+        );
+        let out = &body["input"][2];
+        assert_eq!(out["call_id"], "call_orphan");
+        assert_eq!(out["output"], INTERRUPTED_TOOL_RESULT);
+    }
+
+    // US-003 AC3 : forme exacte d'une session reprise après une interruption
+    // antérieure — l'appel orphelin est AU MILIEU du transcript, suivi du nouveau
+    // message utilisateur. Le résultat synthétique doit s'insérer entre les deux.
+    #[test]
+    fn resumed_corrupted_session_is_repaired_in_place() {
+        let body = request_body(&req(
+            vec![
+                Message::user("compile"),
+                Message::assistant(vec![tool_use("call_interrupted")]),
+                Message::user("reprends"),
+            ],
+            vec![],
+            None,
+        ));
+        assert_eq!(
+            item_types(&body),
+            vec![
+                "message",
+                "function_call",
+                "function_call_output",
+                "message"
+            ]
+        );
+        assert_eq!(body["input"][2]["call_id"], "call_interrupted");
+        assert_eq!(body["input"][3]["content"][0]["text"], "reprends");
+    }
+
+    // US-003 AC4 : sur un transcript SAIN, la sortie est celle produite avant le
+    // garde-fou — ni item ajouté, ni ordre changé.
+    #[test]
+    fn healthy_transcript_is_untouched_by_the_guardrail() {
+        let assistant = Message::assistant(vec![
+            ContentBlock::Text {
+                text: "calling".into(),
+            },
+            tool_use("call_42"),
+        ]);
+        let tool = Message::tool_result_with_trust("call_42", "files...", false, false);
+        let body = request_body(&req(
+            vec![Message::user("go"), assistant, tool],
+            vec![],
+            None,
+        ));
+        assert_eq!(
+            body["input"],
+            json!([
+                { "type": "message", "role": "user",
+                  "content": [ { "type": "input_text", "text": "go" } ] },
+                { "type": "message", "role": "assistant",
+                  "content": [ { "type": "output_text", "text": "calling", "annotations": [] } ] },
+                { "type": "function_call", "call_id": "call_42", "name": "bash",
+                  "arguments": "{\"cmd\":\"ls\"}" },
+                { "type": "function_call_output", "call_id": "call_42", "output": "files..." },
+            ])
+        );
+    }
+
+    // US-003 AC5 : un résultat sans appel correspondant est écarté (le backend le
+    // rejette symétriquement).
+    #[test]
+    fn orphan_tool_result_is_dropped() {
+        let body = request_body(&req(
+            vec![
+                Message::user("go"),
+                Message::tool_result_with_trust("ghost", "out", false, false),
+            ],
+            vec![],
+            None,
+        ));
+        assert_eq!(item_types(&body), vec!["message"]);
+    }
+
+    // Réparation partielle : seul l'appel orphelin est complété, et son résultat
+    // synthétique vient APRÈS les appels du message, jamais entre deux d'entre eux.
+    #[test]
+    fn only_the_orphan_call_of_a_mixed_message_is_repaired() {
+        let assistant = Message::assistant(vec![tool_use("answered"), tool_use("orphan")]);
+        let tool = Message::tool_result_with_trust("answered", "ok", false, false);
+        let body = request_body(&req(vec![assistant, tool], vec![], None));
+        assert_eq!(
+            item_types(&body),
+            vec![
+                "function_call",
+                "function_call",
+                "function_call_output",
+                "function_call_output"
+            ]
+        );
+        assert_eq!(body["input"][2]["call_id"], "orphan");
+        assert_eq!(body["input"][2]["output"], INTERRUPTED_TOOL_RESULT);
+        assert_eq!(body["input"][3]["call_id"], "answered");
+        assert_eq!(body["input"][3]["output"], "ok");
     }
 
     #[test]

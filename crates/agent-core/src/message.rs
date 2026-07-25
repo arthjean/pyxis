@@ -2,9 +2,50 @@
 //! PROVIDERS §1.1). `agent-core` est le crate des types canoniques : tout le
 //! système (provider, session, tools) ne connaît que ces types.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 pub type ToolCallId = String;
+
+/// US-002 — contenu du résultat écrit pour un appel d'outil resté sans réponse
+/// après une interruption. Il sert deux publics : le backend, qui rejette en 400
+/// tout `tool_use` sans `tool_result` correspondant, et le modèle, qui doit lire
+/// dans l'historique que l'utilisateur a interrompu l'exécution.
+///
+/// Le message porte la CONSÉQUENCE et pas seulement le fait : un outil interrompu
+/// peut avoir écrit la moitié de ses effets. Sans cette précision, le modèle
+/// suppose par défaut que rien n'a eu lieu et reprend sur un état faux (même
+/// raisonnement que le `<turn_aborted>` de Codex CLI).
+pub const INTERRUPTED_TOOL_RESULT: &str = "Interrupted by the user before this tool call \
+     completed. No result is available: the tool may have partially executed and any process \
+     it started may still be running.";
+
+/// Appels d'outils du transcript restés SANS résultat, dans l'ordre d'apparition.
+///
+/// C'est la définition unique de l'appariement `tool_use` ↔ `tool_result` :
+/// la boucle s'en sert pour réconcilier avant persistance (US-002) et l'adapter
+/// provider pour refuser d'émettre un appel orphelin (US-003). Un même id
+/// n'est rendu qu'une fois : la réparation ne peut pas produire de doublon.
+pub fn unanswered_tool_calls(messages: &[Message]) -> Vec<ToolCallId> {
+    let mut answered: HashSet<&str> = HashSet::new();
+    for block in messages.iter().flat_map(|m| m.content.iter()) {
+        if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+            answered.insert(tool_use_id.as_str());
+        }
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut pending = Vec::new();
+    for block in messages.iter().flat_map(|m| m.content.iter()) {
+        if let ContentBlock::ToolUse { id, .. } = block
+            && !answered.contains(id.as_str())
+            && seen.insert(id.as_str())
+        {
+            pending.push(id.clone());
+        }
+    }
+    pending
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -335,6 +376,48 @@ mod tests {
     fn tool_result_detection() {
         assert!(Message::tool_result("id1", "out", false).is_tool_result());
         assert!(!Message::user("hi").is_tool_result());
+    }
+
+    // US-002/US-003 : l'appariement rend les appels SANS résultat, dans l'ordre,
+    // une seule fois chacun — c'est ce qui garantit « ni doublon ni oubli ».
+    #[test]
+    fn unanswered_tool_calls_reports_each_pending_call_once_in_order() {
+        let messages = vec![
+            Message::assistant(vec![
+                ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({}),
+                },
+                ContentBlock::ToolUse {
+                    id: "c2".into(),
+                    name: "bash".into(),
+                    input: serde_json::json!({}),
+                },
+            ]),
+            Message::tool_result("c2", "done", false),
+            // Répétition défensive du même appel : un seul résultat doit en découler.
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "c1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            }]),
+        ];
+        assert_eq!(unanswered_tool_calls(&messages), vec!["c1".to_string()]);
+    }
+
+    #[test]
+    fn unanswered_tool_calls_is_empty_on_a_healthy_transcript() {
+        let messages = vec![
+            Message::user("go"),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "c1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            }]),
+            Message::tool_result("c1", "out", false),
+        ];
+        assert!(unanswered_tool_calls(&messages).is_empty());
     }
 
     #[test]

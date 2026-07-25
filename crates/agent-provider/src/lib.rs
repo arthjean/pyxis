@@ -21,7 +21,7 @@ pub use chatgpt::{
     DEFAULT_MAX_CONTEXT, DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, KEYRING_ACCOUNT,
     OpenAiChatGptProvider,
 };
-pub use models::CatalogModel;
 pub use chatgpt_events::CodexEventMapper;
 pub use chatgpt_request::build_responses_body;
 pub use credential::CredentialManager;
+pub use models::CatalogModel;

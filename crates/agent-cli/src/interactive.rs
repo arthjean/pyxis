@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::message::{ContentBlock, Message, recent_untrusted_content};
 use agent_core::provider::ToolSpec;
-use agent_core::{AgentContext, AgentEvent, Deps, RunConfig, Session, run_agent};
+use agent_core::{AgentContext, AgentEvent, CancelToken, Deps, RunConfig, Session, run_agent};
 use agent_provider::KEYRING_ACCOUNT;
 use agent_tools::PermissionModeState;
 use agent_tui::{
@@ -62,6 +62,8 @@ struct ActiveTurn {
     next_id: u64,
     id: Option<u64>,
     handle: Option<JoinHandle<()>>,
+    /// US-001 — signal d'annulation du tour courant, un par tour.
+    cancel: Option<CancelToken>,
 }
 
 impl ActiveTurn {
@@ -70,6 +72,7 @@ impl ActiveTurn {
             next_id: 1,
             id: None,
             handle: None,
+            cancel: None,
         }
     }
 
@@ -86,15 +89,21 @@ impl ActiveTurn {
         let turn_id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         self.id = Some(turn_id);
+        // US-001 : chaque tour porte SON signal, pour qu'une annulation ne puisse
+        // pas atteindre le tour suivant.
+        let cancel = CancelToken::new();
+        let mut deps = deps.clone();
+        deps.cancel = cancel.clone();
         self.handle = Some(launch_turn(
             conversation,
             cfg,
-            deps,
+            &deps,
             tx,
             turn_id,
             user_msg,
             persist_user_message,
         ));
+        self.cancel = Some(cancel);
     }
 
     fn is_current(&self, turn_id: u64) -> bool {
@@ -103,13 +112,24 @@ impl ActiveTurn {
 
     fn finish(&mut self) {
         self.handle.take();
+        self.cancel.take();
         self.id = None;
+    }
+
+    /// US-001 — demande l'arrêt COOPÉRATIF du tour. La boucle du cœur réconcilie
+    /// ses appels d'outils en vol, persiste, puis émet elle-même `Interrupted` :
+    /// c'est cet événement qui clôt le tour côté client, pas cet appel.
+    fn request_cancel(&self) {
+        if let Some(cancel) = &self.cancel {
+            cancel.cancel();
+        }
     }
 
     fn abort(&mut self) {
         if let Some(handle) = self.handle.take() {
             handle.abort();
         }
+        self.cancel.take();
         self.id = None;
     }
 }
@@ -169,9 +189,9 @@ fn persist_model(state: &mut AppState, settings_path: Option<&Path>, model: &str
     if let Some(path) = settings_path
         && let Err(err) = crate::settings::save_model(path, model)
     {
-        state
-            .blocks
-            .push(Block::Error(format!("settings: failed to save model: {err}")));
+        state.blocks.push(Block::Error(format!(
+            "settings: failed to save model: {err}"
+        )));
     }
 }
 
@@ -286,6 +306,7 @@ fn launch_turn(
         context_messages: cfg.context_messages.clone(),
         ephemeral_messages,
     };
+    // Le `Deps` reçu porte déjà le signal d'annulation du tour (`ActiveTurn::start`).
     let deps = deps.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -564,9 +585,7 @@ async fn event_loop(
             // reconstruit. Un échec (terminal qui ne répond pas à la requête de
             // position) ne doit pas tuer la session : on abandonne le réalignement
             // et on continue avec le viewport périmé.
-            if viewport_sync_enabled
-                && let Err(err) = agent_tui::sync_inline_viewport(tui)
-            {
+            if viewport_sync_enabled && let Err(err) = agent_tui::sync_inline_viewport(tui) {
                 viewport_sync_enabled = false;
                 agent_tui::debug_log::log(&format!("sync: disabled after error: {err}"));
                 state.blocks.push(Block::Notice(format!(
@@ -578,7 +597,12 @@ async fn event_loop(
                 let viewport = tui.get_frame().area();
                 let line = format!(
                     "frame: screen={}x{} viewport=(x{} y{} w{} h{}) sync_enabled={viewport_sync_enabled}",
-                    size.width, size.height, viewport.x, viewport.y, viewport.width, viewport.height
+                    size.width,
+                    size.height,
+                    viewport.x,
+                    viewport.y,
+                    viewport.width,
+                    viewport.height
                 );
                 if last_logged_geometry.as_deref() != Some(line.as_str()) {
                     agent_tui::debug_log::log(&line);
@@ -1073,30 +1097,11 @@ async fn event_loop(
                         if let Some(resp) = pending_resp.take() {
                             let _ = resp.send(false);
                         }
-                        active_turn.abort();
-                        let interrupted = AgentEvent::Interrupted;
-                        state.apply(&interrupted);
-                        #[cfg(feature = "codex_tui_parity")]
-                        {
-                            for update in parity_mapper.map_event(&interrupted) {
-                                parity_surface.apply_update(update);
-                            }
-                        }
-                        running = false;
-                        turn_start = None;
-                        state.end_turn();
-                        if let Some(next) = queued_prompts.pop_front() {
-                            goal_iters = 0;
-                            active_turn.start(
-                                &conversation,
-                                &cfg,
-                                &deps,
-                                &agent_tx,
-                                &next,
-                                true,
-                            );
-                            running = true;
-                        }
+                        // US-001 : plus d'`abort()` brutal ni d'`Interrupted` fabriqué
+                        // ici. On signale, et le tour se clôt à l'arrivée de
+                        // l'`Interrupted` émis par le cœur, transcript déjà réconcilié
+                        // (branche `stop` ci-dessous, comme pour un EndTurn).
+                        active_turn.request_cancel();
                     }
                     InputAction::Interrupt => {}
                     InputAction::Permission(allow) => {

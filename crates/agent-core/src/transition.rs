@@ -68,6 +68,9 @@ pub enum Transition {
     Compact(CompactKind),
     /// Erreur de contexte retenue (withholding) à récupérer avant de propager.
     Recover(PendingError),
+    /// US-001 — annulation coopérative signalée : arrêt à la frontière courante,
+    /// après réconciliation du transcript (US-002).
+    Interrupted,
     /// Plafond de tours / budget épuisé.
     Exhausted(ExhaustReason),
     /// Erreur fatale non récupérable.

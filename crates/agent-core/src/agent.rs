@@ -12,12 +12,15 @@ use std::time::Duration;
 use futures_util::{Stream, StreamExt};
 
 use crate::budget::{ContextBudget, estimate_input, estimate_static_input};
+use crate::cancel::Cancellable;
 use crate::compaction::{CompactKind, CompactionState, full_compact, microcompact};
 use crate::deps::Deps;
 use crate::error::{AgentError, ProviderFailure};
 use crate::event::{AgentEvent, ToolCallView, ToolResultView};
 use crate::guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget, batch_signature};
-use crate::message::{Message, ToolCallId};
+use crate::message::{
+    INTERRUPTED_TOOL_RESULT, Message, ToolCallId, ToolErrorKind, unanswered_tool_calls,
+};
 use crate::provider::{
     AuthError, CanonicalRequest, ErrorClass, ProviderError, StreamEvent, TokenUsage, ToolSpec,
 };
@@ -289,6 +292,35 @@ fn validate_tool_outcomes(
     Ok(())
 }
 
+/// US-002 — écrit un résultat synthétique pour chaque appel d'outil resté sans
+/// réponse au moment de l'interruption, et rend les vues à émettre aux clients.
+///
+/// Appelée AVANT toute persistance : un transcript porteur d'un `tool_use` sans
+/// `tool_result` est rejeté en 400 par le backend au tour suivant, ce qui rend la
+/// session inexploitable. Les résultats réels déjà collectés sont conservés tels
+/// quels — la réconciliation ne remplace rien, elle complète.
+fn reconcile_interrupted_calls(messages: &mut Vec<Message>) -> Vec<ToolResultView> {
+    let pending = unanswered_tool_calls(messages);
+    let mut views = Vec::with_capacity(pending.len());
+    for id in pending {
+        views.push(ToolResultView {
+            id: id.clone(),
+            content: INTERRUPTED_TOOL_RESULT.to_string(),
+            is_error: true,
+            error_kind: Some(ToolErrorKind::Semantic),
+            untrusted: false,
+        });
+        messages.push(Message::tool_result_with_metadata(
+            id,
+            INTERRUPTED_TOOL_RESULT,
+            true,
+            false,
+            Some(ToolErrorKind::Semantic),
+        ));
+    }
+    views
+}
+
 fn estimate_current_input(messages: &[Message], static_input_tokens: u32, deps: &Deps) -> u32 {
     estimate_input(messages, deps.tokenizer.as_ref()).saturating_add(static_input_tokens)
 }
@@ -396,7 +428,11 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                 return;
             }
 
-            let transition: Transition = if force_compact && pending.is_none() {
+            let transition: Transition = if deps.cancel.is_cancelled() {
+                // US-001 — frontière d'arrêt UNIQUE : tout point d'annulation profond
+                // reboucle jusqu'ici, où le transcript est dans un état connu.
+                Transition::Interrupted
+            } else if force_compact && pending.is_none() {
                 // US-030 MidTurn : compaction forcée par un long tool_result au tour
                 // précédent. Le withholding (`pending`) reste PRIORITAIRE : si une
                 // erreur de contexte est en attente, on laisse `pre_stream_transition`
@@ -459,7 +495,13 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         return;
                     }
 
-                    let mut stream = match deps.provider.stream(req).await {
+                    // US-001 : l'ouverture du stream peut bloquer plusieurs secondes
+                    // (TLS + first byte) ; l'annulation reprend la main sans l'attendre.
+                    let opened = match deps.cancel.guard(deps.provider.stream(req)).await {
+                        Cancellable::Cancelled => continue,
+                        Cancellable::Completed(opened) => opened,
+                    };
+                    let mut stream = match opened {
                         Ok(s) => s,
                         Err(e) if e.is_context_error() => {
                             pending = Some(PendingError { kind: ContextErrorKind::PromptTooLong });
@@ -500,14 +542,18 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 transient_retries += 1;
                                 // attempt indexé à partir de 0 → délais 1×,2×,4×.
                                 // US-023 : honore Retry-After (max(backoff, retry_after), borné).
-                                deps.clock
-                                    .sleep(transient_retry_delay(
+                                // US-001 : un backoff peut durer jusqu'à 60 s (Retry-After
+                                // borné) ; l'annulation écourte l'attente, la frontière
+                                // d'arrêt étant la tête de boucle.
+                                let _ = deps
+                                    .cancel
+                                    .guard(deps.clock.sleep(transient_retry_delay(
                                         &config,
                                         transient_retries - 1,
                                         class,
                                         &e,
                                         deps.clock.now_ms(),
-                                    ))
+                                    )))
                                     .await;
                                 continue;
                             }
@@ -538,7 +584,20 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     let mut acc = Accumulator::new();
                     let mut stream_err: Option<ProviderError> = None;
                     let mut last_usage: Option<TokenUsage> = None;
-                    while let Some(ev) = stream.next().await {
+                    let mut interrupted = false;
+                    loop {
+                        // US-001 : l'annulation est interrogée EN PREMIER (`biased`) →
+                        // dès qu'elle est signalée, plus aucun `Text` ni `Reasoning`
+                        // n'est émis, même si le stream a des événements prêts.
+                        let next = tokio::select! {
+                            biased;
+                            () = deps.cancel.cancelled() => {
+                                interrupted = true;
+                                break;
+                            }
+                            ev = stream.next() => ev,
+                        };
+                        let Some(ev) = next else { break };
                         match ev {
                             Ok(StreamEvent::TextDelta { text }) => {
                                 yield AgentEvent::Text(text.clone());
@@ -583,6 +642,18 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 break;
                             }
                         }
+                    }
+
+                    if interrupted {
+                        // Le partiel est COMMITÉ : `to_assistant_message` ne retient que
+                        // les appels complets (un `tool_use` à moitié streamé est
+                        // écarté), et la réconciliation leur écrira un résultat au
+                        // passage par la frontière d'arrêt. Ce que le client a vu
+                        // défiler reste donc dans le transcript.
+                        if !acc.is_empty() {
+                            messages.push(acc.to_assistant_message());
+                        }
+                        continue;
                     }
 
                     if let Some(e) = stream_err {
@@ -645,14 +716,18 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 transient_retries += 1;
                                 // attempt indexé à partir de 0 → délais 1×,2×,4×.
                                 // US-023 : honore Retry-After (max(backoff, retry_after), borné).
-                                deps.clock
-                                    .sleep(transient_retry_delay(
+                                // US-001 : un backoff peut durer jusqu'à 60 s (Retry-After
+                                // borné) ; l'annulation écourte l'attente, la frontière
+                                // d'arrêt étant la tête de boucle.
+                                let _ = deps
+                                    .cancel
+                                    .guard(deps.clock.sleep(transient_retry_delay(
                                         &config,
                                         transient_retries - 1,
                                         class,
                                         &e,
                                         deps.clock.now_ms(),
-                                    ))
+                                    )))
                                     .await;
                                 continue;
                             }
@@ -802,8 +877,16 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 deps.tools.dispatch(calls, ToolEventSink::new(tool_event_tx));
                             tokio::pin!(dispatch);
                             let mut tool_events_open = true;
+                            // US-001 : `biased` avec le dispatch EN PREMIER — un batch
+                            // qui vient de se terminer rend ses résultats réels au lieu
+                            // d'être écarté par une annulation arrivée dans la même
+                            // fenêtre (edge case #2). Sinon, la boucle reprend la main
+                            // sans attendre les outils, qui sont abandonnés avec le
+                            // future de dispatch.
                             let outcomes = loop {
                                 tokio::select! {
+                                    biased;
+                                    outcomes = &mut dispatch => break Some(outcomes),
                                     event = tool_event_rx.recv(), if tool_events_open => {
                                         match event {
                                             Some(ToolDispatchEvent::PermissionAsk(req)) => {
@@ -812,8 +895,13 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                             None => tool_events_open = false,
                                         }
                                     }
-                                    outcomes = &mut dispatch => break outcomes,
+                                    () = deps.cancel.cancelled() => break None,
                                 }
+                            };
+                            let Some(outcomes) = outcomes else {
+                                // Appels en vol abandonnés : la tête de boucle
+                                // réconcilie chacun d'eux avant persistance (US-002).
+                                continue;
                             };
                             while let Ok(event) = tool_event_rx.try_recv() {
                                 match event {
@@ -856,14 +944,21 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     }
                 }
                 Transition::Compact(kind) => {
-                    match full_compact(
+                    // US-001 : la compaction est un appel modèle complet ; l'annulation
+                    // ne l'attend pas. Le transcript n'est pas modifié tant que
+                    // `full_compact` n'a pas rendu la main.
+                    let compacted = match deps.cancel.guard(full_compact(
                         &mut messages,
                         &model,
                         deps.provider.as_ref(),
                         config.max_output_tokens,
-                    )
+                    ))
                     .await
                     {
+                        Cancellable::Cancelled => continue,
+                        Cancellable::Completed(compacted) => compacted,
+                    };
+                    match compacted {
                         Ok(usage) => {
                             usage_budget.record_usage(usage);
                             compaction.record_success();
@@ -899,14 +994,18 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                 }
                 Transition::Recover(_) => {
                     // withholding : compaction REACTIVE ; échec confirmé → propagation.
-                    match full_compact(
+                    let compacted = match deps.cancel.guard(full_compact(
                         &mut messages,
                         &model,
                         deps.provider.as_ref(),
                         config.max_output_tokens,
-                    )
+                    ))
                     .await
                     {
+                        Cancellable::Cancelled => continue,
+                        Cancellable::Completed(compacted) => compacted,
+                    };
+                    match compacted {
                         Ok(usage) => {
                             usage_budget.record_usage(usage);
                             compaction.record_success();
@@ -925,6 +1024,22 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             return;
                         }
                     }
+                }
+                Transition::Interrupted => {
+                    // US-002 — réconciliation AVANT persistance : chaque appel resté
+                    // sans réponse reçoit un résultat explicite, sinon le tour suivant
+                    // réémet un `function_call` orphelin que le backend rejette.
+                    for view in reconcile_interrupted_calls(&mut messages) {
+                        yield AgentEvent::ToolResult(view);
+                    }
+                    if let Err(e) = deps.session.sync(&messages).await {
+                        yield AgentEvent::Error(AgentError::Session(e.to_string()));
+                        return;
+                    }
+                    // US-001 — l'événement est émis par le CŒUR : le client n'a plus à
+                    // le fabriquer après un abort décidé de l'extérieur.
+                    yield AgentEvent::Interrupted;
+                    return;
                 }
                 Transition::Exhausted(reason) => {
                     yield AgentEvent::Exhausted(reason);

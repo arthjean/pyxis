@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use agent_tokenizer::TokenCounter;
 
+use crate::cancel::CancelToken;
 use crate::clock::Clock;
 use crate::provider::Provider;
 use crate::session::Session;
@@ -18,4 +19,7 @@ pub struct Deps {
     pub tokenizer: Arc<dyn TokenCounter>,
     pub clock: Arc<dyn Clock>,
     pub tools: Arc<dyn ToolDispatch>,
+    /// US-001 — signal d'annulation coopératif. Un token jamais signalé (défaut)
+    /// laisse le comportement de la boucle strictement inchangé.
+    pub cancel: CancelToken,
 }
