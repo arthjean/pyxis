@@ -1,0 +1,326 @@
+{
+  "prd": {
+    "file": "tasks/prd-harness-parity.md",
+    "title": "Pyxis : Parite harness Codex CLI",
+    "created_at": "2026-07-24",
+    "status": "IN_PROGRESS"
+  },
+  "epics": [
+    {
+      "id": "EP-001",
+      "title": "Integrite de session et annulation cooperative",
+      "status": "DONE",
+      "priority": "P0",
+      "stories_total": 3,
+      "stories_done": 3
+    },
+    {
+      "id": "EP-002",
+      "title": "Signal de verification restaure",
+      "status": "IN_REVIEW",
+      "priority": "P0",
+      "stories_total": 5,
+      "stories_done": 4
+    },
+    {
+      "id": "EP-003",
+      "title": "Composer multi-ligne",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 3,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-004",
+      "title": "Fidelite et confinement de l'execution",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 4,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-005",
+      "title": "Contrats machine",
+      "status": "TODO",
+      "priority": "P1",
+      "stories_total": 3,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-006",
+      "title": "Extensibilite utilisateur",
+      "status": "TODO",
+      "priority": "P1",
+      "stories_total": 4,
+      "stories_done": 0
+    }
+  ],
+  "stories": [
+    {
+      "id": "US-001",
+      "title": "Signal d'annulation cooperatif dans le coeur",
+      "epic": "EP-001",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [],
+      "started_at": "2026-07-25",
+      "completed_at": "2026-07-25",
+      "reviewed_at": "2026-07-25"
+    },
+    {
+      "id": "US-002",
+      "title": "Resultats d'outils synthetiques et transcript reconcilie",
+      "epic": "EP-001",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": ["US-001"],
+      "started_at": "2026-07-25",
+      "completed_at": "2026-07-25",
+      "reviewed_at": "2026-07-25"
+    },
+    {
+      "id": "US-003",
+      "title": "Garde-fou de requete et reparation des sessions corrompues",
+      "epic": "EP-001",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [],
+      "started_at": "2026-07-25",
+      "completed_at": "2026-07-25",
+      "reviewed_at": "2026-07-25"
+    },
+    {
+      "id": "US-004",
+      "title": "Integration continue GitHub Actions",
+      "epic": "EP-002",
+      "status": "IN_REVIEW",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [],
+      "started_at": "2026-07-25",
+      "completed_at": null,
+      "reviewed_at": "2026-07-25",
+      "review_note": "Workflow livré (.github/workflows/ci.yml) : fmt, clippy et test workspace sur ubuntu-latest, Linux seul (ADR-11), timeout dur de 15 min, cache Swatinem. Aucun échec préexistant : les trois commandes passent en local (600 tests, exit 0) ; les seuls écarts fmt trouvés à HEAD (main.rs, settings.rs, state.rs, term.rs) ont été corrigés, pas contournés. L'extraction des tests fautifs vers $GITHUB_STEP_SUMMARY est validée sur un log de test synthétique. Revue 2026-07-25 : ajout de `permissions: contents: read` (le job est en lecture seule et les trois actions tierces portent des tags mobiles). Restent observables uniquement lors du premier push réel : la durée effective du job (AC2) et le rendu du résumé d'échec (AC3)."
+    },
+    {
+      "id": "US-005",
+      "title": "Harness de snapshot du rendu terminal",
+      "epic": "EP-002",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": ["US-004"],
+      "started_at": "2026-07-25",
+      "completed_at": "2026-07-25",
+      "reviewed_at": "2026-07-25"
+    },
+    {
+      "id": "US-006",
+      "title": "Couverture snapshot des flux critiques",
+      "epic": "EP-002",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": ["US-005"],
+      "started_at": "2026-07-25",
+      "completed_at": "2026-07-25",
+      "reviewed_at": "2026-07-25"
+    },
+    {
+      "id": "US-007",
+      "title": "Harness d'integration bout en bout",
+      "epic": "EP-002",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": ["US-004"],
+      "started_at": "2026-07-25",
+      "completed_at": "2026-07-25",
+      "reviewed_at": "2026-07-25"
+    },
+    {
+      "id": "US-008",
+      "title": "Resorption de la divergence entre statuts et code",
+      "epic": "EP-002",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": ["US-006"],
+      "started_at": "2026-07-25",
+      "completed_at": "2026-07-25",
+      "reviewed_at": "2026-07-25",
+      "review_note": "Preuves chemin:ligne des review_note de US-017/US-018 revérifiées une par une (state.rs:560, 822-826, 1719 ; render.rs:1351 dont la zone de saisie height=1). Revue 2026-07-25 : les 16 stories déclarées confrontées à leurs critères par docs/CURRENT_STATUS.md gardaient reviewed_at=null dans tasks/prd-codex-tui-parity-status.json ; la revue était affirmée en prose mais absente du tracker. Corrigé, plus aucun reviewed_at null."
+    },
+    {
+      "id": "US-009",
+      "title": "Modele de saisie multi-ligne",
+      "epic": "EP-003",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "L",
+      "blocked_by": ["US-006"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-010",
+      "title": "Rendu wrappe, hauteur dynamique et defilement",
+      "epic": "EP-003",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": ["US-009"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-011",
+      "title": "Collage multi-ligne et collage volumineux",
+      "epic": "EP-003",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": ["US-010"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-012",
+      "title": "Racines writables configurables incluant le repertoire temporaire",
+      "epic": "EP-004",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-013",
+      "title": "Sous-chemins proteges contre l'execution differee",
+      "epic": "EP-004",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-014",
+      "title": "Coherence entre le shell annonce et le shell execute",
+      "epic": "EP-004",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "S",
+      "blocked_by": [],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-015",
+      "title": "Sortie shell streamee",
+      "epic": "EP-004",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "M",
+      "blocked_by": ["US-001"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-016",
+      "title": "Configuration declarative avec un vrai parseur TOML",
+      "epic": "EP-005",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "M",
+      "blocked_by": [],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-017",
+      "title": "Sortie JSONL d'evenements en mode headless",
+      "epic": "EP-005",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "M",
+      "blocked_by": [],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-018",
+      "title": "Tracker de diff agrege du tour",
+      "epic": "EP-005",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "M",
+      "blocked_by": ["US-017"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-019",
+      "title": "Appel d'outil MCP et adaptation au registre",
+      "epic": "EP-006",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "M",
+      "blocked_by": [],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-020",
+      "title": "Exposition des outils MCP a la boucle du modele",
+      "epic": "EP-006",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "M",
+      "blocked_by": ["US-019"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-021",
+      "title": "Skills conformes a la specification ouverte",
+      "epic": "EP-006",
+      "status": "TODO",
+      "priority": "P2",
+      "size": "M",
+      "blocked_by": [],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-022",
+      "title": "Moteur de hooks avec droit de veto",
+      "epic": "EP-006",
+      "status": "TODO",
+      "priority": "P2",
+      "size": "L",
+      "blocked_by": ["US-016"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    }
+  ]
+}

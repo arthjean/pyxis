@@ -26,3 +26,32 @@ This file is the short source of truth after ADR-11. When it conflicts with hist
 - The `originator=pyxis` rename validation still needs a live post-rename check against the ChatGPT backend.
 - Network control is proxy-based and cooperative. It helps for HTTP(S) subprocesses, but it is not a kernel-level network sandbox and does not block raw sockets by itself.
 - Linux is the only supported sandbox target today. Off-Linux filesystem confinement degrades explicitly.
+
+## Status Reconciliation (2026-07-25)
+
+US-008 of `tasks/prd-harness-parity.md` re-checked every `DONE` story against
+its acceptance criteria. Outcome:
+
+- `tasks/prd-codex-tui-parity-status.json`: US-017 and US-018 moved back to
+  `IN_REVIEW`, with the `path:line` proof recorded in each story's
+  `review_note`. The composer was never ported (input is still a flat `String`
+  submitted on Enter), and the repository held zero render snapshots while
+  US-018 required at least twenty. EP-005 and the PRD status follow. US-001 to
+  US-016 were confronted with their criteria and stay `DONE`.
+- Snapshot coverage now exists (`crates/agent-tui/tests/snapshots/`, 27
+  snapshots), delivered by US-005 and US-006 of `tasks/prd-harness-parity.md` —
+  not by US-018. The story stays `IN_REVIEW` because its own deliverable, the
+  app loop parity validation, was not what shipped.
+- Sampled `DONE` stories from the archived PRDs (`prd-pyxis`,
+  `prd-codex-orchestration`, `prd-response-rendering`) verify against the code:
+  Landlock plus proxy sandbox (`crates/agent-sandbox/src/fs.rs`,
+  `proxy.rs`), SSE connect and idle watchdog (`crates/agent-provider/src/chatgpt.rs`),
+  four-pass fuzzy edit matching (`crates/agent-tools/src/edit.rs:196`), and the
+  scroll pill (`crates/agent-tui/src/render.rs:767`). One naming divergence:
+  `prd-codex-orchestration` US-025 names a `seek_sequence` helper that ships
+  under a different name; the behavior it describes is implemented.
+- One anomaly is recorded rather than fixed: `tasks/prd-pyxis-status.json`
+  declares `prd.status = "READY"` while all of its stories are `DONE`,
+  `CANCELLED`, or `DEFERRED`. That file is listed under **Files NOT to Modify**
+  in `tasks/prd-harness-parity.md`, so it is documented here instead of being
+  edited.

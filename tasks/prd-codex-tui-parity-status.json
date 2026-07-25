@@ -3,7 +3,8 @@
     "file": "tasks/prd-codex-tui-parity.md",
     "title": "Pyxis - Parite TUI Codex CLI",
     "created_at": "2026-07-03",
-    "status": "DONE"
+    "status": "IN_REVIEW",
+    "review_note": "Revue de conformité US-008 (tasks/prd-harness-parity.md), 2026-07-25 : US-001 à US-016 confrontées à leurs critères et confirmées DONE ; US-017 et US-018 repassées en IN_REVIEW avec preuve chemin:ligne."
   },
   "epics": [
     {
@@ -41,10 +42,10 @@
     {
       "id": "EP-005",
       "title": "Bottom pane, composer, boucle app et parite snapshot",
-      "status": "DONE",
+      "status": "IN_REVIEW",
       "priority": "P0",
       "stories_total": 3,
-      "stories_done": 3
+      "stories_done": 1
     }
   ],
   "stories": [
@@ -58,7 +59,7 @@
       "blocked_by": [],
       "started_at": "2026-07-03",
       "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "reviewed_at": "2026-07-25"
     },
     {
       "id": "US-002",
@@ -70,7 +71,7 @@
       "blocked_by": ["US-001"],
       "started_at": "2026-07-03",
       "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "reviewed_at": "2026-07-25"
     },
     {
       "id": "US-003",
@@ -82,7 +83,7 @@
       "blocked_by": ["US-002"],
       "started_at": "2026-07-03",
       "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "reviewed_at": "2026-07-25"
     },
     {
       "id": "US-004",
@@ -94,7 +95,7 @@
       "blocked_by": ["US-003"],
       "started_at": "2026-07-03",
       "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "reviewed_at": "2026-07-25"
     },
     {
       "id": "US-005",
@@ -106,7 +107,7 @@
       "blocked_by": ["US-004"],
       "started_at": "2026-07-03",
       "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "reviewed_at": "2026-07-25"
     },
     {
       "id": "US-006",
@@ -118,7 +119,7 @@
       "blocked_by": ["US-004", "US-005"],
       "started_at": "2026-07-03",
       "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "reviewed_at": "2026-07-25"
     },
     {
       "id": "US-007",
@@ -130,7 +131,7 @@
       "blocked_by": ["US-006"],
       "started_at": "2026-07-03",
       "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "reviewed_at": "2026-07-25"
     },
     {
       "id": "US-008",
@@ -142,7 +143,7 @@
       "blocked_by": ["US-006"],
       "started_at": "2026-07-03",
       "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "reviewed_at": "2026-07-25"
     },
     {
       "id": "US-009",
@@ -154,7 +155,7 @@
       "blocked_by": ["US-004", "US-008"],
       "started_at": "2026-07-03",
       "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "reviewed_at": "2026-07-25"
     },
     {
       "id": "US-010",
@@ -166,7 +167,7 @@
       "blocked_by": ["US-009"],
       "started_at": "2026-07-03",
       "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "reviewed_at": "2026-07-25"
     },
     {
       "id": "US-011",
@@ -178,7 +179,7 @@
       "blocked_by": ["US-004", "US-006"],
       "started_at": "2026-07-03",
       "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "reviewed_at": "2026-07-25"
     },
     {
       "id": "US-012",
@@ -190,7 +191,7 @@
       "blocked_by": ["US-006"],
       "started_at": "2026-07-03",
       "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "reviewed_at": "2026-07-25"
     },
     {
       "id": "US-013",
@@ -202,7 +203,7 @@
       "blocked_by": ["US-006"],
       "started_at": "2026-07-03",
       "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "reviewed_at": "2026-07-25"
     },
     {
       "id": "US-014",
@@ -214,7 +215,7 @@
       "blocked_by": ["US-016"],
       "started_at": "2026-07-03",
       "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "reviewed_at": "2026-07-25"
     },
     {
       "id": "US-015",
@@ -226,7 +227,7 @@
       "blocked_by": ["US-006", "US-016"],
       "started_at": "2026-07-03",
       "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "reviewed_at": "2026-07-25"
     },
     {
       "id": "US-016",
@@ -238,31 +239,33 @@
       "blocked_by": ["US-002"],
       "started_at": "2026-07-03",
       "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "reviewed_at": "2026-07-25"
     },
     {
       "id": "US-017",
       "title": "Port du composer Codex et compat input Pyxis",
       "epic": "EP-005",
-      "status": "DONE",
+      "status": "IN_REVIEW",
       "priority": "P1",
       "size": "L",
       "blocked_by": ["US-016"],
       "started_at": "2026-07-03",
-      "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "completed_at": null,
+      "reviewed_at": "2026-07-25",
+      "review_note": "AC2 non satisfait : le collage est inseré brut dans un `String` plat (crates/agent-tui/src/state.rs:560, insert_str crates/agent-tui/src/state.rs:822-826), sans capture, ni preview, ni flush ; le composer est dessiné sur une zone de hauteur 1 (crates/agent-tui/src/render.rs:1351) et Entrée soumet toujours (crates/agent-tui/src/state.rs:1719). Le composer Codex n'a pas été porté. Revue US-008 de tasks/prd-harness-parity.md, 2026-07-25."
     },
     {
       "id": "US-018",
       "title": "Boucle app, draw pipeline et parite snapshot",
       "epic": "EP-005",
-      "status": "DONE",
+      "status": "IN_REVIEW",
       "priority": "P0",
       "size": "XL",
       "blocked_by": ["US-005", "US-006", "US-008", "US-012", "US-014", "US-017"],
       "started_at": "2026-07-03",
-      "completed_at": "2026-07-03",
-      "reviewed_at": null
+      "completed_at": null,
+      "reviewed_at": "2026-07-25",
+      "review_note": "AC3 non satisfait au moment de la revue : 0 snapshot de rendu dans le dépôt, alors que le critère en exigeait au moins 20 (tasks/prd-codex-tui-parity.md:388) ; `insta` n'était pas une dépendance du workspace. La couverture a été livrée depuis par US-005 et US-006 de tasks/prd-harness-parity.md (crates/agent-tui/tests/snapshots/, 27 snapshots), pas par cette story. Revue US-008 de tasks/prd-harness-parity.md, 2026-07-25."
     }
   ]
 }
