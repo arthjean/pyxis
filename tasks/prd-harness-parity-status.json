@@ -17,10 +17,10 @@
     {
       "id": "EP-002",
       "title": "Signal de verification restaure",
-      "status": "IN_REVIEW",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 5,
-      "stories_done": 4
+      "stories_done": 5
     },
     {
       "id": "EP-003",
@@ -96,14 +96,14 @@
       "id": "US-004",
       "title": "Integration continue GitHub Actions",
       "epic": "EP-002",
-      "status": "IN_REVIEW",
+      "status": "DONE",
       "priority": "P0",
       "size": "S",
       "blocked_by": [],
       "started_at": "2026-07-25",
-      "completed_at": null,
+      "completed_at": "2026-07-25",
       "reviewed_at": "2026-07-25",
-      "review_note": "Workflow livré (.github/workflows/ci.yml) : fmt, clippy et test workspace sur ubuntu-latest, Linux seul (ADR-11), timeout dur de 15 min, cache Swatinem. Aucun échec préexistant : les trois commandes passent en local (600 tests, exit 0) ; les seuls écarts fmt trouvés à HEAD (main.rs, settings.rs, state.rs, term.rs) ont été corrigés, pas contournés. L'extraction des tests fautifs vers $GITHUB_STEP_SUMMARY est validée sur un log de test synthétique. Revue 2026-07-25 : ajout de `permissions: contents: read` (le job est en lecture seule et les trois actions tierces portent des tags mobiles). Restent observables uniquement lors du premier push réel : la durée effective du job (AC2) et le rendu du résumé d'échec (AC3)."
+      "review_note": "Prouvé sur des runs réels, pas sur un raisonnement. AC1 : run 30152689288 vert, fmt + clippy + 600 tests sur ubuntu-latest. AC2 : 2 min 26 s à cache FROID (le run precedent avait échoué avant l'écriture du cache), soit six fois sous le plafond de 15 min. AC3 : run 30152821085 sur une branche jetable portant deux tests cassés dans deux crates différents ; l'étape Report failing tests a écrit son résumé et le script extrait exactement `ci_proof_deliberate_failure_cli` et `ci_proof_deliberate_failure_tui`, ce qui valide aussi --no-fail-fast. Branche supprimée après preuve. AC4 : deux échecs réels corrigés, pas contournés — les écarts fmt présents à HEAD, et surtout le link cassé sur le runner (`.cargo/config.toml` force -fuse-ld=mold, absent de l'image), corrigé en installant mold plutôt qu'en neutralisant la configuration. AC5 : aucune matrice multi-OS. Durcissement ajouté en revue : `permissions: contents: read`."
     },
     {
       "id": "US-005",
