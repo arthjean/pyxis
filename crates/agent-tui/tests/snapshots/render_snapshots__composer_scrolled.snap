@@ -1,12 +1,28 @@
 ---
 source: crates/agent-tui/tests/render_snapshots.rs
-expression: "harness::frame(\"resize_short_terminal\", &s, W, 8)"
+expression: "harness::frame(\"composer_scrolled\", &s, W, H)"
 ---
+› Explique la boucle d'agent et montre le code
 
 ● La boucle est un Stream d'AgentEvent.
 
 
+  Elle rend la main à chaque frontière.
+
+
+
+
+
 ────────────────────────────────────────────────────────────────────────────────
-› Le terminal est plus court que la mise en page ne le demande
+  paragraphe 11
+  paragraphe 12
+  paragraphe 13
+  paragraphe 14
+  paragraphe 15
+  paragraphe 16
+  paragraphe 17
+  paragraphe 18
+  paragraphe 19
+  paragraphe 20
 ────────────────────────────────────────────────────────────────────────────────
 gpt-5 · pyxis · Ask for approval           ctrl+j newline · ctrl+c twice to quit

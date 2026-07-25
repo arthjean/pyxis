@@ -255,6 +255,90 @@ fn pending_input() {
     insta::assert_snapshot!("pending_input", harness::frame("pending_input", &s, W, H));
 }
 
+/// Saisie de dix lignes : la hauteur du composer suit le nombre de lignes
+/// rendues, jusqu'au plafond (US-010 AC2).
+#[test]
+fn composer_multiline() {
+    let mut s = conversation();
+    s.set_input(
+        (1..=10)
+            .map(|i| format!("ligne {i} du prompt"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    insta::assert_snapshot!(
+        "composer_multiline",
+        harness::frame("composer_multiline", &s, W, H)
+    );
+}
+
+/// Ligne plus large que le terminal : repliée sur plusieurs lignes visuelles,
+/// aucun caractère perdu, aucun débordement horizontal (US-010 AC1).
+#[test]
+fn composer_wrapped_line() {
+    let mut s = conversation();
+    s.set_input(
+        "Analyse la boucle d'agent, la frontiere d'annulation cooperative et la \
+         reconciliation du transcript, puis propose un plan de test."
+            .into(),
+    );
+    insta::assert_snapshot!(
+        "composer_wrapped_line",
+        harness::frame("composer_wrapped_line", &s, NARROW, H)
+    );
+}
+
+/// Saisie au-delà du plafond : la zone défile pour garder la ligne du curseur
+/// visible, le transcript garde le reste de l'écran (US-010 AC3).
+#[test]
+fn composer_scrolled() {
+    let mut s = conversation();
+    s.set_input(
+        (1..=20)
+            .map(|i| format!("paragraphe {i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    insta::assert_snapshot!(
+        "composer_scrolled",
+        harness::frame("composer_scrolled", &s, W, H)
+    );
+}
+
+/// Terminal plus court que la hauteur demandée par le composer : transcript et
+/// composer restent visibles tous les deux (US-010 AC6).
+#[test]
+fn composer_short_terminal() {
+    let mut s = conversation();
+    s.set_input(
+        (1..=12)
+            .map(|i| format!("ligne {i}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    insta::assert_snapshot!(
+        "composer_short_terminal",
+        harness::frame("composer_short_terminal", &s, W, 8)
+    );
+}
+
+/// Collage volumineux : le composer affiche un résumé compact, pas 847 lignes
+/// (US-011 AC2).
+#[test]
+fn composer_large_paste() {
+    let mut s = conversation();
+    let big = (0..847)
+        .map(|i| format!("2026-07-25T10:00:{i:02} INFO ligne de log {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    s.insert_paste(&big);
+    s.insert_str(" corrige la cause");
+    insta::assert_snapshot!(
+        "composer_large_paste",
+        harness::frame("composer_large_paste", &s, W, H)
+    );
+}
+
 #[test]
 fn command_menu() {
     let mut s = state();

@@ -1,6 +1,6 @@
 ---
 source: crates/agent-tui/tests/render_snapshots.rs
-expression: "harness::frame(\"resize_narrow\", &s, NARROW, H)"
+expression: "harness::frame(\"composer_wrapped_line\", &s, NARROW, H)"
 ---
 › Explique la boucle d'agent et montre
   le code
@@ -19,10 +19,10 @@ expression: "harness::frame(\"resize_narrow\", &s, NARROW, H)"
 
 
 
-
-
 ────────────────────────────────────────
-› Un prompt qui dépasse largement la
-  largeur du terminal étroit
+› Analyse la boucle d'agent, la
+  frontiere d'annulation cooperative et
+  la reconciliation du transcript, puis
+  propose un plan de test.
 ────────────────────────────────────────
 gpt-5 · pyxis · As  ctrl+c twice to quit

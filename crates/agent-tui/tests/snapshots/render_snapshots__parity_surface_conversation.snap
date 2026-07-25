@@ -25,4 +25,4 @@ expression: "harness::frame_parity(\"parity_surface_conversation\", &s, &surface
 ────────────────────────────────────────────────────────────────────────────────
 ›
 ────────────────────────────────────────────────────────────────────────────────
-gpt-5 · pyxis · Ask for approval                            ctrl+c twice to quit
+gpt-5 · pyxis · Ask for approval           ctrl+j newline · ctrl+c twice to quit

@@ -15,6 +15,7 @@ pub mod app_event;
 #[cfg(feature = "codex_tui_parity")]
 pub mod bottom_pane;
 mod cache;
+mod composer;
 pub mod debug_log;
 pub mod diff;
 mod highlight;

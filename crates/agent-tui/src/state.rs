@@ -12,6 +12,8 @@ use agent_core::message::{ContentBlock, Message, Role, ToolCallId, ToolErrorKind
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::measure;
+
 /// Un élément du transcript. Le rendu choisit poids/teinte ; aucune couleur ici.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
@@ -360,7 +362,27 @@ pub fn permission_mode_label(id: &str) -> &'static str {
 
 /// Le texte est-il une vraie commande Pyxis ? (1er mot ∈ COMMANDS). Un message
 /// qui commence par un `/<skill>` n'en est PAS une → il part à l'agent.
+/// Offset byte, dans `s`, de la frontière de graphème atteignant au plus `col`
+/// colonnes terminal. Sert à conserver la colonne en navigation verticale sans
+/// jamais tomber au milieu d'un caractère (US-009 AC5).
+fn offset_at_width(s: &str, col: usize) -> usize {
+    let mut used = 0usize;
+    for (i, g) in s.grapheme_indices(true) {
+        let w = measure::width(g);
+        if used + w > col {
+            return i;
+        }
+        used += w;
+    }
+    s.len()
+}
+
 fn is_command(text: &str) -> bool {
+    // Une commande Pyxis tient sur une ligne : un message multi-ligne qui
+    // commence par `/resume …` est un prompt, pas une commande (US-009).
+    if text.contains('\n') {
+        return false;
+    }
     let first = text.split(' ').next().unwrap_or("");
     COMMANDS.iter().any(|(name, _, _)| *name == first)
 }
@@ -631,7 +653,21 @@ pub struct AppState {
     /// Début du stream live courant : index de bloc et compteur de caractères.
     /// Utilisé pour retirer les deltas abandonnés quand le core retry/recover.
     stream_start: Option<(usize, usize)>,
+    /// Collages volumineux remplacés par un résumé dans `input` (US-011). Le
+    /// contenu intégral est ré-expansé au moment de la soumission.
+    pastes: Vec<PendingPaste>,
 }
+
+/// Un collage résumé : ce qui est affiché, et ce qui sera réellement envoyé.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingPaste {
+    placeholder: String,
+    content: String,
+}
+
+/// Au-delà de ce nombre de lignes, un collage est résumé dans le composer plutôt
+/// qu'inséré tel quel (US-011 AC2).
+pub const PASTE_SUMMARY_MIN_LINES: usize = 500;
 
 /// Action déduite d'une touche, interprétée par la boucle agent-cli.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -646,6 +682,12 @@ pub enum InputAction {
     ScrollUp,
     ScrollDown,
 }
+
+/// Modificateurs qui transforment Entrée en insertion de saut de ligne. Maj y
+/// figure : les terminaux qui rapportent les modificateurs sur Entrée rendent
+/// Maj+Entrée équivalent à Alt+Entrée (US-009 AC2). Les autres n'émettent aucun
+/// modificateur, et Entrée soumet comme avant (AC3).
+const NEWLINE_MODIFIERS: KeyModifiers = KeyModifiers::ALT.union(KeyModifiers::SHIFT);
 
 fn is_ctrl_key(key: &KeyEvent, expected: char) -> bool {
     matches!(
@@ -705,6 +747,7 @@ impl AppState {
             transcript_overlay_scroll_max: Cell::new(0),
             transcript_overlay_page_height: Cell::new(10),
             stream_start: None,
+            pastes: Vec::new(),
         }
     }
 
@@ -809,6 +852,7 @@ impl AppState {
     fn clear_input(&mut self) {
         self.input.clear();
         self.cursor = 0;
+        self.pastes.clear();
     }
 
     /// Insère un char à la position du curseur.
@@ -859,11 +903,109 @@ impl AppState {
             self.cursor = next;
         }
     }
+    /// Début / fin de la ligne LOGIQUE contenant `at` (bornes en offsets byte).
+    fn line_bounds(&self, at: usize) -> (usize, usize) {
+        let start = self.input[..at].rfind('\n').map_or(0, |i| i + 1);
+        let end = self.input[at..]
+            .find('\n')
+            .map_or(self.input.len(), |i| at + i);
+        (start, end)
+    }
+
+    /// Home / Ctrl+A : début de la ligne courante (identique à l'offset 0 tant
+    /// que la saisie tient sur une ligne, donc comportement inchangé).
     fn move_home(&mut self) {
-        self.cursor = 0;
+        self.clamp_cursor();
+        self.cursor = self.line_bounds(self.cursor).0;
     }
     fn move_end(&mut self) {
-        self.cursor = self.input.len();
+        self.clamp_cursor();
+        self.cursor = self.line_bounds(self.cursor).1;
+    }
+
+    /// Monte d'une ligne logique en conservant la colonne affichée. Retourne
+    /// `false` si le curseur est déjà sur la première ligne : l'appelant rappelle
+    /// alors l'historique (US-009 AC4).
+    fn move_line_up(&mut self) -> bool {
+        self.clamp_cursor();
+        let (start, _) = self.line_bounds(self.cursor);
+        if start == 0 {
+            return false;
+        }
+        let col = measure::width(&self.input[start..self.cursor]);
+        let prev_end = start - 1;
+        let (prev_start, _) = self.line_bounds(prev_end);
+        self.cursor = prev_start + offset_at_width(&self.input[prev_start..prev_end], col);
+        true
+    }
+
+    /// Descend d'une ligne logique. `false` = déjà sur la dernière ligne.
+    fn move_line_down(&mut self) -> bool {
+        self.clamp_cursor();
+        let (start, end) = self.line_bounds(self.cursor);
+        if end >= self.input.len() {
+            return false;
+        }
+        let col = measure::width(&self.input[start..self.cursor]);
+        let next_start = end + 1;
+        let (_, next_end) = self.line_bounds(next_start);
+        self.cursor = next_start + offset_at_width(&self.input[next_start..next_end], col);
+        true
+    }
+
+    /// Insère un saut de ligne sans soumettre (Alt+Entrée, Ctrl+J, Maj+Entrée).
+    pub fn insert_newline(&mut self) {
+        self.insert_char('\n');
+    }
+
+    /// Insère un contenu collé : neutralisé des séquences de contrôle, et résumé
+    /// au-delà de `PASTE_SUMMARY_MIN_LINES` lignes (US-011).
+    pub fn insert_paste(&mut self, raw: &str) {
+        let text = crate::composer::sanitize_paste(raw);
+        let lines = text.lines().count();
+        if lines <= PASTE_SUMMARY_MIN_LINES {
+            self.insert_str(&text);
+            return;
+        }
+        let placeholder = format!("[collage : {lines} lignes]");
+        self.insert_str(&placeholder);
+        self.pastes.push(PendingPaste {
+            placeholder,
+            content: text,
+        });
+    }
+
+    /// Ré-expanse les collages résumés : c'est le contenu INTÉGRAL qui part vers
+    /// le modèle, jamais le résumé affiché (US-011 AC3).
+    ///
+    /// Appariement par texte, dans l'ordre d'apparition, chaque collage n'étant
+    /// consommé qu'une fois. Limite assumée : deux collages de même volume dont
+    /// l'un a été effacé à la main peuvent être intervertis.
+    fn expand_pastes(&self, text: &str) -> String {
+        if self.pastes.is_empty() {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        let mut used = vec![false; self.pastes.len()];
+        loop {
+            let next = self
+                .pastes
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !used[*i])
+                .filter_map(|(i, p)| rest.find(&p.placeholder).map(|at| (at, i)))
+                .min_by_key(|(at, i)| (*at, *i));
+            let Some((at, i)) = next else {
+                break;
+            };
+            out.push_str(&rest[..at]);
+            out.push_str(&self.pastes[i].content);
+            rest = &rest[at + self.pastes[i].placeholder.len()..];
+            used[i] = true;
+        }
+        out.push_str(rest);
+        out
     }
 
     fn delete_prev_word(&mut self) {
@@ -1166,6 +1308,12 @@ impl AppState {
     /// `/providers subscription …` = niveau 2, `/providers …` = niveau 1, etc.)
     fn menu_kind(&self) -> Menu {
         let i = self.input.as_str();
+        // Une saisie multi-ligne n'est jamais une commande : sans ce garde-fou,
+        // un collage commençant par `/resume ` ouvrirait un menu qui capterait
+        // Entrée au lieu de soumettre (US-009).
+        if i.contains('\n') {
+            return Menu::None;
+        }
         if let Some(rest) = i.strip_prefix("/providers ") {
             if let Some(rest2) = rest.strip_prefix("subscription ") {
                 // « <provider> » suivi d'un espace → niveau 3 (actions du provider).
@@ -1663,7 +1811,9 @@ impl AppState {
                     }
                     return InputAction::None;
                 }
-                KeyCode::Enter => {
+                // Entrée NUE seulement : Alt/Maj+Entrée insèrent un saut de ligne
+                // même quand le menu est ouvert (US-009 AC1).
+                KeyCode::Enter if !key.modifiers.intersects(NEWLINE_MODIFIERS) => {
                     self.completion_index = 0;
                     if let Some(item) = items.get(idx).cloned() {
                         return self.activate(kind, item);
@@ -1690,6 +1840,14 @@ impl AppState {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
+                // Ctrl+J (0x0A en raw mode → `Char('j')`) est le raccourci
+                // d'insertion universel : il ne dépend d'aucun protocole clavier
+                // étendu, contrairement à Maj+Entrée.
+                KeyCode::Char('j') | KeyCode::Enter => {
+                    self.insert_newline();
+                    self.completion_index = 0;
+                    InputAction::None
+                }
                 KeyCode::Char('a') => {
                     self.move_home();
                     InputAction::None
@@ -1716,8 +1874,15 @@ impl AppState {
             KeyCode::Esc if self.status == Status::Thinking && key.modifiers.is_empty() => {
                 InputAction::Interrupt
             }
+            // Alt+Entrée, et Maj+Entrée sur les terminaux qui rapportent le
+            // modificateur : saut de ligne, pas de soumission (US-009 AC1/AC2).
+            KeyCode::Enter if key.modifiers.intersects(NEWLINE_MODIFIERS) => {
+                self.insert_newline();
+                self.completion_index = 0;
+                InputAction::None
+            }
             KeyCode::Enter => {
-                let text = self.input.trim().to_string();
+                let text = self.expand_pastes(self.input.trim());
                 if text.is_empty() {
                     InputAction::None
                 } else if is_command(&text) {
@@ -1764,13 +1929,19 @@ impl AppState {
                 self.move_end();
                 InputAction::None
             }
-            // Flèches (menu fermé) : navigation de l'historique des prompts.
+            // Flèches (menu fermé) : navigation entre les lignes de la saisie,
+            // puis rappel d'historique une fois la première/dernière ligne
+            // atteinte (US-009 AC4).
             KeyCode::Up => {
-                self.history_prev();
+                if !self.move_line_up() {
+                    self.history_prev();
+                }
                 InputAction::None
             }
             KeyCode::Down => {
-                self.history_next();
+                if !self.move_line_down() {
+                    self.history_next();
+                }
                 InputAction::None
             }
             KeyCode::PageUp => {
@@ -2802,6 +2973,212 @@ mod tests {
         assert_eq!(
             s.unseen, 1,
             "stream signals content even without a new block"
+        );
+    }
+
+    // ───────────── Composer multi-ligne (EP-003, US-009 / US-011) ─────────────
+
+    fn press(s: &mut AppState, code: KeyCode, modifiers: KeyModifiers) -> InputAction {
+        s.on_key(KeyEvent::new(code, modifiers))
+    }
+
+    fn type_str(s: &mut AppState, text: &str) {
+        for c in text.chars() {
+            if c == '\n' {
+                press(s, KeyCode::Enter, KeyModifiers::ALT);
+            } else {
+                press(s, KeyCode::Char(c), KeyModifiers::NONE);
+            }
+        }
+    }
+
+    #[test]
+    fn alt_enter_ctrl_j_and_shift_enter_insert_newline_without_submitting() {
+        for (code, modifiers) in [
+            (KeyCode::Enter, KeyModifiers::ALT),
+            (KeyCode::Enter, KeyModifiers::SHIFT),
+            (KeyCode::Char('j'), KeyModifiers::CONTROL),
+            (KeyCode::Enter, KeyModifiers::CONTROL),
+        ] {
+            let mut s = AppState::new("gpt-5", false);
+            type_str(&mut s, "a");
+            assert_eq!(press(&mut s, code, modifiers), InputAction::None);
+            type_str(&mut s, "b");
+            assert_eq!(s.input, "a\nb", "{code:?} + {modifiers:?}");
+            assert_eq!(s.cursor, s.input.len());
+        }
+    }
+
+    #[test]
+    fn plain_enter_submits_the_whole_multiline_prompt() {
+        let mut s = AppState::new("gpt-5", false);
+        type_str(&mut s, "ligne un\nligne deux\nligne trois");
+        assert_eq!(
+            press(&mut s, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::Submit("ligne un\nligne deux\nligne trois".into())
+        );
+        assert!(s.input.is_empty());
+    }
+
+    #[test]
+    fn empty_and_blank_multiline_input_submits_nothing() {
+        let mut s = AppState::new("gpt-5", false);
+        assert_eq!(
+            press(&mut s, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::None
+        );
+        type_str(&mut s, "\n\n");
+        assert_eq!(
+            press(&mut s, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::None
+        );
+        assert_eq!(s.input, "\n\n", "une saisie blanche n'est pas effacée");
+    }
+
+    #[test]
+    fn arrows_walk_lines_before_recalling_history() {
+        let mut s = AppState::new("gpt-5", false);
+        s.history = vec!["ancien prompt".into()];
+        type_str(&mut s, "premiere\nseconde");
+        // Curseur en fin de « seconde » (colonne 7) : Haut monte d'une ligne en
+        // tenant la colonne, pas en sautant en fin de ligne.
+        press(&mut s, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(s.input, "premiere\nseconde");
+        assert_eq!(&s.input[..s.cursor], "premier");
+        // Déjà sur la première ligne : Haut rappelle l'historique.
+        press(&mut s, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(s.input, "ancien prompt");
+    }
+
+    #[test]
+    fn down_recalls_history_only_from_the_last_line() {
+        let mut s = AppState::new("gpt-5", false);
+        s.history = vec!["ancien".into()];
+        press(&mut s, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(s.input, "ancien");
+        s.set_input("un\ndeux".into());
+        press(&mut s, KeyCode::Home, KeyModifiers::NONE);
+        press(&mut s, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(s.cursor, 0);
+        // Sur la première ligne, Bas descend au lieu de rappeler l'historique.
+        press(&mut s, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(s.input, "un\ndeux");
+        assert_eq!(s.cursor, 3);
+    }
+
+    #[test]
+    fn home_and_end_stay_on_the_current_line() {
+        let mut s = AppState::new("gpt-5", false);
+        type_str(&mut s, "abc\ndefgh");
+        press(&mut s, KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(s.cursor, 4);
+        press(&mut s, KeyCode::End, KeyModifiers::NONE);
+        assert_eq!(s.cursor, s.input.len());
+        press(&mut s, KeyCode::Up, KeyModifiers::NONE);
+        press(&mut s, KeyCode::Home, KeyModifiers::NONE);
+        assert_eq!(s.cursor, 0);
+    }
+
+    #[test]
+    fn vertical_navigation_never_lands_inside_a_grapheme() {
+        let mut s = AppState::new("gpt-5", false);
+        // Ligne 1 étroite en cellules, ligne 2 pleine de graphèmes composés.
+        s.set_input("漢字テスト\ne\u{301}👨\u{200d}👩\u{200d}👧 fin".into());
+        for _ in 0..8 {
+            press(&mut s, KeyCode::Up, KeyModifiers::NONE);
+            press(&mut s, KeyCode::Down, KeyModifiers::NONE);
+            press(&mut s, KeyCode::Left, KeyModifiers::NONE);
+            assert!(
+                s.input.is_char_boundary(s.cursor),
+                "curseur {} au milieu d'un caractère",
+                s.cursor
+            );
+        }
+        while s.cursor > 0 {
+            press(&mut s, KeyCode::Backspace, KeyModifiers::NONE);
+            assert!(s.input.is_char_boundary(s.cursor));
+        }
+    }
+
+    #[test]
+    fn multiline_input_never_opens_the_command_menu() {
+        let mut s = AppState::new("gpt-5", false);
+        s.sessions = vec![SessionMeta {
+            id: "abc".into(),
+            label: "titre".into(),
+            hint: "hier".into(),
+        }];
+        s.set_input("/resume ".into());
+        assert!(s.menu_open());
+        s.insert_str("\nsuite du prompt");
+        assert!(!s.menu_open());
+        assert_eq!(
+            press(&mut s, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::Submit("/resume \nsuite du prompt".into())
+        );
+    }
+
+    #[test]
+    fn paste_preserves_newlines_and_does_not_submit() {
+        let mut s = AppState::new("gpt-5", false);
+        s.insert_paste("fn main() {\n    println!(\"hi\");\n}");
+        assert_eq!(s.input, "fn main() {\n    println!(\"hi\");\n}");
+        assert_eq!(s.cursor, s.input.len());
+    }
+
+    #[test]
+    fn paste_neutralizes_ansi_escape_sequences() {
+        let mut s = AppState::new("gpt-5", false);
+        s.insert_paste("\u{1b}[2J\u{1b}[31mrouge\u{1b}[0m\u{7}");
+        assert_eq!(s.input, "rouge");
+    }
+
+    #[test]
+    fn large_paste_is_summarized_then_expanded_on_submit() {
+        let mut s = AppState::new("gpt-5", false);
+        let big = (0..847)
+            .map(|i| format!("ligne {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        s.insert_paste(&big);
+        assert_eq!(s.input, "[collage : 847 lignes]");
+        type_str(&mut s, " analyse");
+        assert_eq!(
+            press(&mut s, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::Submit(format!("{big} analyse")),
+            "le contenu intégral part vers le modèle, jamais le résumé"
+        );
+        // Le collage est consommé : la soumission suivante ne le rejoue pas.
+        type_str(&mut s, "[collage : 847 lignes]");
+        assert_eq!(
+            press(&mut s, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::Submit("[collage : 847 lignes]".into())
+        );
+    }
+
+    #[test]
+    fn paste_at_the_summary_threshold_is_inserted_verbatim() {
+        let mut s = AppState::new("gpt-5", false);
+        let text = vec!["x"; PASTE_SUMMARY_MIN_LINES].join("\n");
+        s.insert_paste(&text);
+        assert_eq!(s.input, text);
+    }
+
+    #[test]
+    fn two_large_pastes_expand_in_order() {
+        let mut s = AppState::new("gpt-5", false);
+        let a = vec!["a"; 600].join("\n");
+        let b = vec!["b"; 700].join("\n");
+        s.insert_paste(&a);
+        type_str(&mut s, " puis ");
+        s.insert_paste(&b);
+        assert_eq!(
+            s.input,
+            "[collage : 600 lignes] puis [collage : 700 lignes]"
+        );
+        assert_eq!(
+            press(&mut s, KeyCode::Enter, KeyModifiers::NONE),
+            InputAction::Submit(format!("{a} puis {b}"))
         );
     }
 }

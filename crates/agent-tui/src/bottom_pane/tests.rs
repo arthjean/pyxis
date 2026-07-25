@@ -80,6 +80,23 @@ fn bottom_pane_routes_views_before_composer() {
     assert_eq!(state.input, "hello");
 }
 
+/// US-011 AC5 : un collage arrivant pendant un dialog d'approbation est ignoré
+/// et laisse le dialog intact.
+#[test]
+fn paste_during_an_approval_dialog_is_dropped() {
+    let mut state = AppState::new("gpt-5", false);
+    state.pending = Some(crate::state::PermissionPrompt::new(
+        "Écrire src/main.rs",
+        "édition hors workspace",
+        crate::diff::Diff::default(),
+    ));
+    let mut pane = BottomPane::new();
+
+    assert!(!pane.route_paste(&mut state, "contenu colle"));
+    assert!(state.input.is_empty());
+    assert!(state.pending.is_some());
+}
+
 #[test]
 fn bottom_pane_renders_active_view() {
     let mut pane = BottomPane::new();

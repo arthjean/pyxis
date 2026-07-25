@@ -654,7 +654,7 @@ async fn event_loop(
                         #[cfg(not(feature = "codex_tui_parity"))]
                         {
                             if state.pending.is_none() {
-                                state.insert_str(&p);
+                                state.insert_paste(&p);
                             }
                         }
                         continue;

@@ -25,4 +25,4 @@ expression: "harness::frame(\"error_block\", &s, W, H)"
 ────────────────────────────────────────────────────────────────────────────────
 ›
 ────────────────────────────────────────────────────────────────────────────────
-gpt-5 · pyxis · Ask for approval                            ctrl+c twice to quit
+gpt-5 · pyxis · Ask for approval           ctrl+j newline · ctrl+c twice to quit

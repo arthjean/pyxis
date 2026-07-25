@@ -16,14 +16,20 @@ use unicode_segmentation::UnicodeSegmentation;
 use agent_core::ToolErrorKind;
 
 use crate::cache::fingerprint;
+use crate::composer;
 use crate::measure;
 use crate::state::{AppState, Block, COMMANDS, MenuItem, PermissionPrompt, Status};
 use crate::theme::Theme;
 use crate::tool;
 
 const INDENT: &str = "  ";
-/// Zone de saisie : composer à séparateurs (3 lignes) + ligne de statut (1).
-const INPUT_HEIGHT: u16 = 4;
+/// Composer replié en arrêt de session : séparateur + ligne + séparateur.
+const SHUTDOWN_INPUT_HEIGHT: u16 = 3;
+/// Plafond de hauteur du composer, en lignes de texte (US-010 AC2). Au-delà, la
+/// zone défile pour garder la ligne du curseur visible.
+const COMPOSER_MAX_ROWS: u16 = 10;
+/// Gouttière du composer : `› ` sur la première ligne, alignement sur les autres.
+const COMPOSER_GUTTER: u16 = 2;
 const PROGRESS_HEIGHT: u16 = 1;
 const PROGRESS_GAP_HEIGHT: u16 = 1;
 const MENU_MAX_ITEMS: u16 = 8;
@@ -33,11 +39,14 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     let theme = Theme::new(state.truecolor);
     let area = frame.area();
 
-    // En bas : soit le dialog de permission, soit (status + input).
+    // En bas : soit le dialog de permission, soit (status + input). Clampé pour
+    // laisser au moins une ligne de transcript quand le terminal est plus court
+    // que ce que le composer demande (US-010 AC6).
     let bottom_height = match &state.pending {
         Some(p) => permission_height(p, area.width),
-        None => input_height(state),
-    };
+        None => input_height(state, area.width),
+    }
+    .min(area.height.saturating_sub(1));
     // Menu de commandes slash : popup intercalé entre transcript et input (jamais
     // pendant un dialog de permission). +1 ligne pour le rappel des raccourcis.
     let matches = state.menu_items();
@@ -88,8 +97,9 @@ pub fn render_parity(
 
     let bottom_height = match &state.pending {
         Some(p) => permission_height(p, area.width),
-        None => input_height(state),
-    };
+        None => input_height(state, area.width),
+    }
+    .min(area.height.saturating_sub(1));
     let matches = state.menu_items();
     let menu_open = state.pending.is_none() && !state.shutdown_in_progress() && !matches.is_empty();
     let max_menu_height = area.height.saturating_sub(bottom_height).saturating_sub(1);
@@ -1350,18 +1360,21 @@ fn strip_md(line: &str) -> String {
 
 fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let footer_height = u16::from(!state.shutdown_in_progress());
+    // L'aire reçue peut être PLUS PETITE que la hauteur demandée (terminal court,
+    // US-010 AC6) : le composer prend ce qui reste après progression et statut,
+    // au lieu de déborder.
     let (progress_area, composer_area, footer_area) = if progress_visible(state) {
         let rows = Layout::vertical([
             Constraint::Length(PROGRESS_HEIGHT),
             Constraint::Length(PROGRESS_GAP_HEIGHT),
-            Constraint::Length(3),
+            Constraint::Min(1),
             Constraint::Length(footer_height),
         ])
         .split(area);
         (Some(rows[0]), rows[2], rows[3])
     } else {
-        let rows = Layout::vertical([Constraint::Length(3), Constraint::Length(footer_height)])
-            .split(area);
+        let rows =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(footer_height)]).split(area);
         (None, rows[0], rows[1])
     };
 
@@ -1369,86 +1382,138 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         render_progress_line(frame, progress_area, state, theme);
     }
 
-    let rule = Line::from(Span::styled(
-        "─".repeat(composer_area.width as usize),
-        theme.composer_rule(),
-    ));
-    frame.render_widget(
-        Paragraph::new(rule.clone()),
-        Rect {
-            x: composer_area.x,
-            y: composer_area.y,
-            width: composer_area.width,
-            height: 1,
-        },
-    );
-    frame.render_widget(
-        Paragraph::new(rule),
-        Rect {
-            x: composer_area.x,
-            y: composer_area.bottom().saturating_sub(1),
-            width: composer_area.width,
-            height: 1,
-        },
-    );
-
-    let inner = Rect {
-        x: composer_area.x,
-        y: composer_area.y + composer_area.height / 2,
-        width: composer_area.width,
-        height: 1,
-    };
-
-    let mut spans = vec![Span::styled("› ", theme.fg().add_modifier(Modifier::BOLD))];
-    if state.shutdown_in_progress() {
-        spans.push(Span::styled("Shutting down...", theme.dim()));
-    } else {
-        spans.extend(input_spans(
-            &state.input,
-            &state.skills,
-            &state.files,
-            theme,
+    // Séparateurs haut/bas seulement s'il reste une ligne de texte entre eux.
+    let ruled = composer_area.height >= 3;
+    if ruled {
+        let rule = Line::from(Span::styled(
+            "─".repeat(composer_area.width as usize),
+            theme.composer_rule(),
         ));
+        frame.render_widget(
+            Paragraph::new(rule.clone()),
+            Rect {
+                height: 1,
+                ..composer_area
+            },
+        );
+        frame.render_widget(
+            Paragraph::new(rule),
+            Rect {
+                y: composer_area.bottom().saturating_sub(1),
+                height: 1,
+                ..composer_area
+            },
+        );
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 
-    if !state.shutdown_in_progress() {
-        let cursor_prefix = state.input.get(..state.cursor).unwrap_or(&state.input);
-        let col = inner
-            .x
-            .saturating_add(2)
-            .saturating_add(measure::width(cursor_prefix) as u16)
-            .min(inner.right().saturating_sub(1));
-        frame.set_cursor_position((col, inner.y));
+    let text_area = if ruled {
+        Rect {
+            y: composer_area.y + 1,
+            height: composer_area.height - 2,
+            ..composer_area
+        }
+    } else {
+        composer_area
+    };
+    if text_area.height == 0 || text_area.width == 0 {
+        return;
     }
 
-    if !state.shutdown_in_progress() {
-        render_status_line(frame, footer_area, state, theme);
+    if state.shutdown_in_progress() {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("› ", theme.fg().add_modifier(Modifier::BOLD)),
+                Span::styled("Shutting down...", theme.dim()),
+            ])),
+            Rect {
+                height: 1,
+                ..text_area
+            },
+        );
+        return;
     }
+
+    let text_width = composer_text_width(text_area.width);
+    let layout = composer::layout(&state.input, state.cursor, text_width);
+    let visible = text_area.height as usize;
+    let offset = composer::scroll_offset(layout.cursor_row, layout.rows.len(), visible);
+
+    let lines: Vec<Line<'static>> = layout
+        .rows
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible)
+        .map(|(idx, row)| {
+            let gutter = if idx == 0 {
+                Span::styled("› ", theme.fg().add_modifier(Modifier::BOLD))
+            } else {
+                Span::raw(INDENT)
+            };
+            let mut spans = vec![gutter];
+            spans.extend(input_spans(
+                &state.input[row.start..row.end],
+                &state.skills,
+                &state.files,
+                theme,
+                idx == 0,
+            ));
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), text_area);
+
+    let cursor_row = layout.cursor_row.saturating_sub(offset).min(visible - 1) as u16;
+    let col = text_area
+        .x
+        .saturating_add(COMPOSER_GUTTER)
+        .saturating_add(layout.cursor_col as u16)
+        .min(text_area.right().saturating_sub(1));
+    frame.set_cursor_position((col, text_area.y + cursor_row));
+
+    render_status_line(frame, footer_area, state, theme);
 }
 
-fn input_height(state: &AppState) -> u16 {
+/// Largeur utile pour le texte du composer, gouttière retranchée.
+fn composer_text_width(width: u16) -> usize {
+    width.saturating_sub(COMPOSER_GUTTER).max(1) as usize
+}
+
+fn input_height(state: &AppState, width: u16) -> u16 {
     if state.shutdown_in_progress() {
-        return 3;
+        return SHUTDOWN_INPUT_HEIGHT;
     }
-    if progress_visible(state) {
-        INPUT_HEIGHT + PROGRESS_HEIGHT + PROGRESS_GAP_HEIGHT
+    let progress = if progress_visible(state) {
+        PROGRESS_HEIGHT + PROGRESS_GAP_HEIGHT
     } else {
-        INPUT_HEIGHT
-    }
+        0
+    };
+    // Hauteur dérivée du nombre de lignes RÉELLEMENT rendues après repli (AC2),
+    // bornée par le plafond ; + 2 séparateurs + 1 ligne de statut.
+    let rows = composer::layout(&state.input, state.cursor, composer_text_width(width))
+        .rows
+        .len()
+        .clamp(1, COMPOSER_MAX_ROWS as usize) as u16;
+    rows + 2 + 1 + progress
 }
 
 fn progress_visible(state: &AppState) -> bool {
     matches!(state.status, Status::Thinking)
 }
 
-/// Découpe l'input en spans : chaque token `/<skill>` reconnu passe en
-/// surbrillance (pastille), le reste en `fg`. Les espaces sont préservés.
+/// Découpe un segment d'input en spans : chaque token `/<skill>` reconnu passe
+/// en surbrillance (pastille), le reste en `fg`. Les espaces sont préservés.
+///
+/// `line_start` distingue la première ligne visuelle du composer : seule elle
+/// peut porter une commande Pyxis en premier token. Sans ce drapeau, une ligne
+/// de continuation commençant par `/models` serait mise en pastille à tort.
+/// Divergence assumée : un token coupé par un repli perd sa surbrillance.
 fn input_spans(
     input: &str,
     skills: &[String],
     files: &[String],
     theme: &Theme,
+    line_start: bool,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (i, part) in input.split(' ').enumerate() {
@@ -1466,7 +1531,7 @@ fn input_spans(
         let is_file = part
             .strip_prefix('@')
             .is_some_and(|path| files.iter().any(|f| f == path));
-        let is_command = i == 0 && COMMANDS.iter().any(|(name, _, _)| *name == part);
+        let is_command = i == 0 && line_start && COMMANDS.iter().any(|(name, _, _)| *name == part);
         let style = if is_skill || is_file || is_command {
             theme.skill_chip()
         } else {
@@ -1500,7 +1565,10 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         left.push(Span::styled(format!(" {pct}% context"), theme.dim()));
     }
 
-    let right = vec![Span::styled(shortcut_hint(state), theme.faint())];
+    let right = vec![Span::styled(
+        shortcut_hints(state, area.width),
+        theme.faint(),
+    )];
     // Clampé à `area.width - 1` : sur terminal étroit, le segment droit est tronqué
     // plutôt que d'évincer la colonne gauche (workspace/modèle).
     let right_w = (right
@@ -1525,6 +1593,21 @@ fn shortcut_hint(state: &AppState) -> &'static str {
         "ctrl+c interrupt"
     } else {
         "ctrl+c twice to quit"
+    }
+}
+
+/// Rappels de raccourcis du pied de page. `ctrl+j newline` est annoncé parce
+/// que c'est le raccourci d'insertion RÉELLEMENT disponible partout : Maj+Entrée
+/// dépend du protocole clavier du terminal, Ctrl+J non (US-009 AC3). Il est
+/// abandonné en premier quand la moitié droite de la ligne ne suffit plus, pour
+/// ne pas évincer le modèle et le workspace à gauche.
+fn shortcut_hints(state: &AppState, width: u16) -> String {
+    let quit = shortcut_hint(state);
+    let full = format!("ctrl+j newline · {quit}");
+    if measure::width(&full) <= (width / 2) as usize {
+        full
+    } else {
+        quit.to_string()
     }
 }
 
