@@ -36,7 +36,7 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # `keyring` tire `dbus-secret-service` → `libdbus-sys`, qui compile contre
       # les headers dbus. L'image runner ne les garantit pas.
