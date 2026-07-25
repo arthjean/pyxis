@@ -134,7 +134,10 @@ pub fn sync_inline_viewport(tui: &mut Tui) -> io::Result<bool> {
             viewport: Viewport::Inline(screen.height.max(1)),
         },
     )?;
-    crate::debug_log::log(&format!("sync: rebuilt viewport={:?}", tui.get_frame().area()));
+    crate::debug_log::log(&format!(
+        "sync: rebuilt viewport={:?}",
+        tui.get_frame().area()
+    ));
     Ok(true)
 }
 

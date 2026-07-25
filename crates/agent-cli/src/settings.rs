@@ -65,7 +65,11 @@ pub fn load_model(path: &Path) -> io::Result<Option<String>> {
 }
 
 pub fn save_model(path: &Path, model: &str) -> io::Result<()> {
-    save_string_key(path, MODEL_KEY, Some(model.trim()).filter(|v| !v.is_empty()))
+    save_string_key(
+        path,
+        MODEL_KEY,
+        Some(model.trim()).filter(|v| !v.is_empty()),
+    )
 }
 
 /// Crée le fichier (vide) et son dossier s'ils manquent. À appeler AVANT le
@@ -267,7 +271,9 @@ mod tests {
 
     #[test]
     fn ensure_file_creates_empty_settings_without_clobbering() {
-        let path = temp_path("ensure").with_extension("d").join("settings.toml");
+        let path = temp_path("ensure")
+            .with_extension("d")
+            .join("settings.toml");
         let _ = std::fs::remove_file(&path);
 
         ensure_file(&path).unwrap();

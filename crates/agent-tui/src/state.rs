@@ -248,7 +248,9 @@ pub fn set_models(entries: Vec<ModelCatalogEntry>) -> bool {
             ),
         })
         .collect();
-    REMOTE_MODELS.set(Box::leak(metas.into_boxed_slice())).is_ok()
+    REMOTE_MODELS
+        .set(Box::leak(metas.into_boxed_slice()))
+        .is_ok()
 }
 
 pub fn reasoning_effort_label(id: &str) -> String {
