@@ -5,6 +5,16 @@
 //!
 //! Replaces a slug table frozen in the binary: the backend allow-list
 //! moves (frequent removals/additions), so the only correct source is the backend.
+//!
+//! **US-001, evidence that `context_window` is really served.** The `SAMPLE`
+//! constant of the test module below is a verbatim capture of a `/models`
+//! response from this backend (2026-07-24); the `gpt-5.4` entry carries
+//! `"context_window":272000`. Two independent confirmations: the Codex CLI,
+//! reference client of the same backend, deserializes the same field in its
+//! `ModelInfo` (`codex-rs/protocol/src/openai_models.rs`), and the entry for
+//! `gpt-5.6-sol` in the same capture carries none, which is why the field is
+//! optional here. No live request was issued during the story: the capture
+//! already recorded in the repository is the evidence used.
 
 use serde::Deserialize;
 
@@ -17,6 +27,11 @@ pub struct CatalogModel {
     pub default_reasoning_effort: Option<String>,
     /// Efforts accepted by this model (`low` to `ultra` depending on the model).
     pub supported_reasoning_efforts: Vec<String>,
+    /// Context window served by the backend (US-001). `None` when the backend
+    /// declares none: the absence is carried as such, never replaced by an
+    /// invented default. Consumers that need a number for their own geometry
+    /// (compaction thresholds) keep their own fallback.
+    pub context_window: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -41,6 +56,10 @@ struct WireModel {
     default_reasoning_level: Option<String>,
     #[serde(default)]
     supported_reasoning_levels: Vec<WireReasoningLevel>,
+    /// Context window in tokens. Absent from some entries: kept optional so a
+    /// missing value stays distinguishable from a real one.
+    #[serde(default)]
+    context_window: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +88,9 @@ pub fn parse_catalog(body: &str) -> Result<Vec<CatalogModel>, serde_json::Error>
                 .into_iter()
                 .map(|level| level.effort)
                 .collect(),
+            // A window of 0 is not a window: it is dropped like an absence
+            // rather than propagated as a usable geometry.
+            context_window: m.context_window.filter(|w| *w > 0),
         })
         .collect())
 }
@@ -102,6 +124,47 @@ mod tests {
             ["low", "max", "ultra"]
         );
         assert_eq!(catalog[1].display_name, "GPT-5.4");
+    }
+
+    /// US-001: the window served by the backend reaches the type exposed to
+    /// clients, and a model that declares none carries an absence rather than a
+    /// substituted value.
+    #[test]
+    fn keeps_context_window_and_reports_absence() {
+        let catalog = parse_catalog(SAMPLE).expect("sample catalog parses");
+        assert_eq!(catalog[1].slug, "gpt-5.4");
+        assert_eq!(catalog[1].context_window, Some(272_000));
+        assert_eq!(
+            catalog[0].context_window, None,
+            "modèle sans context_window déclaré: absence explicite"
+        );
+    }
+
+    /// A zero window would silently produce an unusable geometry downstream: it
+    /// is treated as an absence.
+    #[test]
+    fn zero_context_window_is_an_absence() {
+        let catalog = parse_catalog(
+            r#"{"models":[{"slug":"m","display_name":"M","visibility":"list","context_window":0}]}"#,
+        )
+        .expect("catalog parses");
+        assert_eq!(catalog[0].context_window, None);
+    }
+
+    /// Unknown fields must stay tolerated (the backend adds some regularly) and
+    /// the fields already read must keep being read.
+    #[test]
+    fn unknown_fields_stay_tolerated() {
+        let catalog = parse_catalog(
+            r#"{"models":[{"slug":"m","display_name":"M","visibility":"list",
+                 "context_window":100,"brand_new_field":{"nested":true},
+                 "default_reasoning_level":"high",
+                 "supported_reasoning_levels":[{"effort":"high","description":"x"}]}]}"#,
+        )
+        .expect("catalog with unknown fields parses");
+        assert_eq!(catalog[0].context_window, Some(100));
+        assert_eq!(catalog[0].default_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(catalog[0].supported_reasoning_efforts, ["high"]);
     }
 
     #[test]

@@ -104,6 +104,12 @@ mod loop_tests {
                 self.caps.max_context
             }
         }
+        /// US-001: only `windowed` has a window declared by the backend; the
+        /// other slugs stay unknown, which is the nominal case as long as the
+        /// catalog has not answered.
+        fn context_window_for_model(&self, model: &str) -> Option<u32> {
+            (model == "windowed").then_some(2_000)
+        }
         async fn stream(
             &self,
             req: CanonicalRequest,

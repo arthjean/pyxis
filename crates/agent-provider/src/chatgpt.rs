@@ -115,6 +115,11 @@ pub struct OpenAiChatGptProvider {
     session_id: RwLock<String>,
     /// US-031: reinject the encrypted reasoning items in stateless mode.
     reasoning_replay: bool,
+    /// Context windows declared by the `/models` catalog, filled by
+    /// `list_models` (US-001). Empty until the catalog answers, and in headless
+    /// mode where no discovery happens: an absent slug means "unknown window",
+    /// never "default window".
+    catalog_windows: RwLock<std::collections::HashMap<String, u32>>,
 }
 
 /// Generates a UUID v4 (RFC 4122) from 16 random bytes. Avoids the `uuid` crate
@@ -190,6 +195,7 @@ impl OpenAiChatGptProvider {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             session_id: RwLock::new(new_session_id()),
             reasoning_replay: false,
+            catalog_windows: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -260,8 +266,31 @@ impl OpenAiChatGptProvider {
                 retry_after_ms: None,
             });
         }
-        crate::models::parse_catalog(&body)
-            .map_err(|e| ProviderError::Decode(format!("models: {e}")))
+        let catalog = crate::models::parse_catalog(&body)
+            .map_err(|e| ProviderError::Decode(format!("models: {e}")))?;
+        self.record_catalog_windows(&catalog);
+        Ok(catalog)
+    }
+
+    /// US-001: memorizes the windows declared by the catalog so that the loop
+    /// and the clients stop reasoning on a heuristic. A model without a declared
+    /// window is NOT recorded: its window stays unknown.
+    fn record_catalog_windows(&self, catalog: &[crate::models::CatalogModel]) {
+        let Ok(mut windows) = self.catalog_windows.write() else {
+            return;
+        };
+        for model in catalog {
+            if let Some(window) = model.context_window {
+                windows.insert(model.slug.clone(), window);
+            }
+        }
+    }
+
+    fn catalog_window(&self, model: &str) -> Option<u32> {
+        self.catalog_windows
+            .read()
+            .ok()
+            .and_then(|windows| windows.get(model.trim()).copied())
     }
 }
 
@@ -566,7 +595,17 @@ impl Provider for OpenAiChatGptProvider {
     }
 
     fn max_context_for_model(&self, model: &str) -> u32 {
-        model_profile(model, self.capabilities.max_context).max_context
+        // The window declared by the backend wins over the family heuristic:
+        // it is the only value that is not an approximation. The heuristic stays
+        // the fallback as long as the catalog has not answered (or in headless
+        // mode, where no discovery happens), because the compaction geometry
+        // needs a number in every case.
+        self.catalog_window(model)
+            .unwrap_or_else(|| model_profile(model, self.capabilities.max_context).max_context)
+    }
+
+    fn context_window_for_model(&self, model: &str) -> Option<u32> {
+        self.catalog_window(model)
     }
 
     async fn stream(
@@ -805,6 +844,41 @@ mod tests {
         let unknown = model_profile("unknown-model", 12_345);
         assert!(!unknown.supports_reasoning);
         assert!(!unknown.parallel_tool_calls);
+    }
+
+    /// US-001: once the catalog has answered, the declared window replaces the
+    /// heuristic, and a slug the catalog does not describe stays unknown instead
+    /// of borrowing the default.
+    #[test]
+    fn catalog_window_overrides_heuristic_and_absence_stays_unknown() {
+        let p = provider();
+        assert_eq!(
+            p.context_window_for_model("gpt-5.4"),
+            None,
+            "avant le catalogue, la fenêtre est inconnue"
+        );
+        assert_eq!(p.max_context_for_model("gpt-5.4"), DEFAULT_MAX_CONTEXT);
+
+        p.record_catalog_windows(&crate::models::parse_catalog(
+            r#"{"models":[
+                {"slug":"gpt-5.4","display_name":"GPT-5.4","visibility":"list","context_window":272000},
+                {"slug":"gpt-5.6-sol","display_name":"Sol","visibility":"list"}
+            ]}"#,
+        )
+        .expect("catalog parses"));
+
+        assert_eq!(p.context_window_for_model("gpt-5.4"), Some(272_000));
+        assert_eq!(p.max_context_for_model("gpt-5.4"), 272_000);
+        assert_eq!(
+            p.context_window_for_model("gpt-5.6-sol"),
+            None,
+            "modèle listé sans fenêtre déclarée: toujours inconnu"
+        );
+        assert_eq!(
+            p.max_context_for_model("gpt-5.6-sol"),
+            DEFAULT_MAX_CONTEXT,
+            "la géométrie de compaction garde son repli"
+        );
     }
 
     #[test]

@@ -409,6 +409,16 @@ pub trait Provider: Send + Sync {
         self.capabilities().max_context
     }
 
+    /// Context window ACTUALLY declared by the backend for a slug (US-001).
+    /// Distinct from `max_context_for_model`, which must always yield a usable
+    /// geometry for the compaction thresholds and therefore falls back on a
+    /// default. `None` here means "unknown", and a client must then display
+    /// nothing rather than a percentage computed on a guessed window.
+    fn context_window_for_model(&self, model: &str) -> Option<u32> {
+        let _ = model;
+        None
+    }
+
     /// Hot path: canonical event stream.
     async fn stream(
         &self,
