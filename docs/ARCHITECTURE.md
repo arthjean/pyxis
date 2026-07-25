@@ -4,9 +4,9 @@
 >
 > État livré courant : [`docs/CURRENT_STATUS.md`](./CURRENT_STATUS.md). Documents liés : [`docs/PROVIDERS.md`](./PROVIDERS.md) (couche multi-provider, taxonomie d'erreurs, stratégie cache-hit), [`docs/ROADMAP.md`](./ROADMAP.md) (phases, spike Phase 0), [`docs/DECISIONS.md`](./DECISIONS.md) (ADR, décisions structurantes).
 
-Pyxis est une CLI agent IA en terminal, écrite en Rust natif, multi-provider first-class, conçue pour partager son cœur avec Paneflow (GPUI). La commande est `pyxis`. L'inspiration vient de l'architecture interne de Claude Code, mais transposée à un binaire Rust ultra-performant et agnostique au modèle.
+Pyxis est une CLI agent IA en terminal, écrite en Rust natif, multi-provider first-class, bâtie sur un cœur headless découplé de tout frontend. La commande est `pyxis`. L'inspiration vient de l'architecture interne de Claude Code, mais transposée à un binaire Rust ultra-performant et agnostique au modèle.
 
-Différenciateur : **qualité Claude Code, tous les providers frontier, perf Rust + intégration profonde avec Paneflow.** Pas de pari « vertical Rust verification-grounded » (TAM trop étroit), pas de pari « sandbox déclaratif » (Codex le fait déjà). Le pari est : full Rust natif ultra-perf + multi-provider de première classe (là où Claude Code est Anthropic-only) + cœur embarquable in-process dans Paneflow.
+Différenciateur : **qualité Claude Code, tous les providers frontier, perf Rust.** Pas de pari « vertical Rust verification-grounded » (TAM trop étroit), pas de pari « sandbox déclaratif » (Codex le fait déjà). Le pari est : full Rust natif ultra-perf + multi-provider de première classe (là où Claude Code est Anthropic-only).
 
 ---
 
@@ -31,7 +31,6 @@ L'invariant fondateur : **`agent-core` est totalement découplé du frontend et 
 Conséquences directes :
 
 - Le frontend Ratatui (`agent-tui`) est un **simple client** : il consomme un flux d'`AgentEvent` et décide seul de leur rendu. On peut écrire un autre client sans toucher au cœur.
-- **Paneflow embarque `agent-core` in-process** (pas d'IPC, pas de FFI : même process, types Rust partagés) et rend les mêmes événements via GPUI — diffs GPU-accélérés, arbre de plan, review par hunk. C'est un enrichissement *futur* via protocole, qui ne casse jamais le mode terminal par défaut.
 - Le mode headless `-p` (print) marche **sans Ratatui** : on consomme le stream d'événements et on les sérialise. Le cœur est testable sans I/O réelle.
 
 ```
@@ -43,13 +42,13 @@ Conséquences directes :
                          └──────────────┬───────────────┘
                                         │  événements structurés
                                         │  (jamais d'ANSI)
-                 ┌──────────────────────┼──────────────────────┐
-                 │                      │                      │
-        ┌────────▼────────┐    ┌────────▼────────┐    ┌────────▼─────────┐
-        │   agent-tui     │    │   mode -p       │    │  Paneflow (GPUI) │
-        │ Ratatui client  │    │  headless print │    │  embed in-process│
-        │ (terminal)      │    │  (JSON/texte)   │    │  rendu GPU         │
-        └─────────────────┘    └─────────────────┘    └──────────────────┘
+                          ┌─────────────┴─────────────┐
+                          │                           │
+                 ┌────────▼────────┐         ┌────────▼────────┐
+                 │   agent-tui     │         │   mode -p       │
+                 │ Ratatui client  │         │  headless print │
+                 │ (terminal)      │         │  (JSON/texte)   │
+                 └─────────────────┘         └─────────────────┘
 ```
 
 Règle d'or absolue, vérifiée à la compilation par le graphe de dépendances Cargo : **`agent-core` ne dépend NI de `agent-tui` NI de `agent-provider`.** Le cœur reste testable sans réseau, sans terminal, sans modèle réel. Les implémentations I/O sont injectées via des traits (cf. `Deps`, §3).
@@ -109,7 +108,7 @@ La boucle est une **state machine dont les transitions sont un enum exhaustif v�
 
 L'API consommateur est un **stream** via `async-stream` : `run_agent` renvoie un `Stream<Item = AgentEvent>` que le frontend (ou le mode `-p`) consomme. Le cœur ne « pousse » rien vers un terminal — il yield des événements.
 
-> **Deux types d'événements, ne pas confondre.** `StreamEvent` (défini dans `agent-provider`, cf. [`docs/PROVIDERS.md`](./PROVIDERS.md)) circule **provider → core** : ce sont les fragments bruts normalisés du stream modèle (`TextDelta`, `ToolCallDelta`, `Usage`, `Done`, …). `AgentEvent` (défini dans `agent-core`, cf. §10.1) circule **core → clients** : c'est le contrat de présentation consommé par `agent-tui`, le mode `-p` et Paneflow. `agent-core` **consomme** les `StreamEvent`, les accumule, et **traduit** le résultat décisionnel en `AgentEvent`. Ce sont deux frontières distinctes ; aucune n'expose d'ANSI.
+> **Deux types d'événements, ne pas confondre.** `StreamEvent` (défini dans `agent-provider`, cf. [`docs/PROVIDERS.md`](./PROVIDERS.md)) circule **provider → core** : ce sont les fragments bruts normalisés du stream modèle (`TextDelta`, `ToolCallDelta`, `Usage`, `Done`, …). `AgentEvent` (défini dans `agent-core`, cf. §10.1) circule **core → clients** : c'est le contrat de présentation consommé par `agent-tui` et le mode `-p`. `agent-core` **consomme** les `StreamEvent`, les accumule, et **traduit** le résultat décisionnel en `AgentEvent`. Ce sont deux frontières distinctes ; aucune n'expose d'ANSI.
 
 ### 3.2 Patterns repris de Claude Code
 
@@ -487,7 +486,7 @@ agent-core ──Stream<AgentEvent>──▶ [canal] ──▶ agent-tui (boucle
 
 ---
 
-## 10. Protocole d'événements cœur → frontend + embedding Paneflow
+## 10. Protocole d'événements cœur → frontend
 
 ### 10.1 Le contrat `AgentEvent`
 
@@ -509,21 +508,12 @@ enum AgentEvent {
 
 > **`AgentEvent` ≠ `StreamEvent`.** Ce sont deux enums distincts et c'est délibéré : `StreamEvent` (`agent-provider`, cf. [`docs/PROVIDERS.md`](./PROVIDERS.md)) est l'événement **provider → core**, bas niveau, lié au wire format ; `AgentEvent` (`agent-core`, ici) est l'événement **core → clients**, lié à la présentation. Le cœur consomme les `StreamEvent`, accumule, décide une `Transition`, et émet des `AgentEvent`. Ne jamais router un `StreamEvent` directement vers un client : il porterait des détails provider et casserait le découplage.
 
-Trois consommateurs partagent ce **même** flux d'`AgentEvent` :
+Deux consommateurs partagent ce **même** flux d'`AgentEvent` :
 
 1. `agent-tui` (Ratatui) — rendu terminal monochrome.
 2. Mode `-p` headless — sérialisation JSON / texte.
-3. Paneflow (GPUI) — rendu GPU.
 
-### 10.2 Embedding in-process par Paneflow (enrichissement futur)
-
-Paneflow est en GPUI (Rust). Il peut donc **embarquer `agent-core` in-process** : pas d'IPC, pas de FFI, même process, types Rust partagés. Paneflow instancie `run_agent`, consomme le `Stream<AgentEvent>`, et rend chaque événement nativement :
-
-- `ToolResult` d'une édition → **diff GPU-accéléré**, review par hunk.
-- séquence de `ToolCall` → **arbre de plan** interactif.
-- `PermissionAsk` → dialogue natif GPUI.
-
-C'est précisément ce que le découplage du §1 rend possible : le **même** cœur, **sans modification**, alimente le terminal *et* Paneflow. L'enrichissement Paneflow se fait **via le protocole d'events** (potentiellement étendu de variantes additionnelles), **sans jamais casser** le mode terminal par défaut. C'est le levier d'intégration profonde qui constitue, avec la perf Rust et le multi-provider, le différenciateur de Pyxis.
+Le découplage du §1 garantit qu'un client supplémentaire (GUI, serveur, intégration IDE) pourrait consommer ce même flux sans modification du cœur : le protocole s'étend par ajout de variantes, sans jamais casser le mode terminal par défaut.
 
 ---
 

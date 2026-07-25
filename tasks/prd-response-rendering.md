@@ -39,7 +39,7 @@ La solution s'organise en quatre épics livrables incrémentalement : (EP-010) l
 ## Target Users
 
 ### Arthur Jean, créateur & dogfooder principal
-- **Role:** Solo indie maker ; orchestre Codex via Pyxis au quotidien, dans Paneflow.
+- **Role:** Solo indie maker ; orchestre Codex via Pyxis au quotidien.
 - **Behaviors:** Sessions longues (refactors, audits) avec beaucoup d'éditions et de lectures de fichiers ; lit attentivement les diffs et la sortie des outils ; Fedora/Wayland, terminal truecolor.
 - **Pain points:** Le rendu actuel est plat : pas de diff après édition, code non coloré, résultats d'outils masqués, aucun feedback de progression. Difficile de suivre ce que fait l'agent d'un coup d'œil.
 - **Current workaround:** Bascule sur Codex App / Claude Code pour les tâches où le rendu compte ; Pyxis reste un prototype.
@@ -51,13 +51,6 @@ La solution s'organise en quatre épics livrables incrémentalement : (EP-010) l
 - **Pain points:** Un TUI qui rend le code en gris uni et masque les diffs paraît inachevé face au Codex CLI officiel.
 - **Current workaround:** Retourne au Codex CLI ou à Claude Code.
 - **Success looks like:** Le rendu tient la comparaison avec Codex CLI dès la première session, avec une esthétique distincte (monochrome épuré).
-
-### Utilisateur Paneflow, intégration native (futur proche)
-- **Role:** Utilisateur de Paneflow qui embarquera `agent-core` in-process et rendra les `AgentEvent` en GPU.
-- **Behaviors:** Consomme les events structurés ; le rendu TUI sert de référence de présentation.
-- **Pain points:** Si la logique de présentation fuit dans le cœur, le rendu GPU diverge.
-- **Current workaround:** N/A (intégration future).
-- **Success looks like:** Toute la présentation reste dans `agent-tui` ; `agent-core` continue de n'émettre que des events, réutilisables tels quels par un autre frontend.
 
 ## Research Findings
 

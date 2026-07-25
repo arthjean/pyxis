@@ -18,7 +18,7 @@ Deux divergences de nommage sont **actées explicitement** ici pour éviter tout
 
 **Erreurs.** Le type canonique de classification est **`ErrorClass`** (jamais `ErrClass`). Sa taxonomie de référence détaillée vit dans `docs/PROVIDERS.md` ; ce document n'en reprend que ce qui conditionne la roadmap.
 
-**Deux familles d'événements (rappel).** `StreamEvent` (provider → `agent-core`) et `AgentEvent` (`agent-core` → clients TUI/Paneflow) sont **deux enums distincts et volontairement séparés**. `agent-core` consomme les `StreamEvent` du provider et les traduit en `AgentEvent` pour les clients ; aucun client ne voit jamais un `StreamEvent` brut ni de l'ANSI. Détail dans `docs/ARCHITECTURE.md` §10.1 et `docs/PROVIDERS.md` §2.
+**Deux familles d'événements (rappel).** `StreamEvent` (provider → `agent-core`) et `AgentEvent` (`agent-core` → clients) sont **deux enums distincts et volontairement séparés**. `agent-core` consomme les `StreamEvent` du provider et les traduit en `AgentEvent` pour les clients ; aucun client ne voit jamais un `StreamEvent` brut ni de l'ANSI. Détail dans `docs/ARCHITECTURE.md` §10.1 et `docs/PROVIDERS.md` §2.
 
 ---
 
@@ -91,7 +91,7 @@ Autrement dit, « OAuth/refresh complexe » reporté = **multi-serveur** (MCP) e
 | Sandbox Landlock FS + proxy réseau | macOS Seatbelt |
 | TUI streaming + diff brut + dialogs | TUI riche (arbre de plan, review par hunk) |
 | Sessions JSONL + resume | Sous-agents / teams |
-| — | Mémoire vectorielle, protocole d'enrichissement Paneflow |
+| — | Mémoire vectorielle |
 
 **Plateforme et distribution.** Linux uniquement. macOS et cross-compile sont en Phase 3. **La distribution publique (`cargo binstall` + `curl | pipe`) n'arrive qu'en Phase 3** : au MVP, on s'installe par `cargo build`/`cargo install` local. Le README montre la commande cible `pyxis` (et `pyxis -p`) : c'est l'**interface visée**, pas l'état de distribution — aucun canal de release n'existe avant la Phase 3.
 
@@ -99,7 +99,7 @@ Autrement dit, « OAuth/refresh complexe » reporté = **multi-serveur** (MCP) e
 
 ## Phase 2 — v1
 
-**Objectif.** Couvrir l'ensemble des providers frontier et faire de Pyxis un agent complet, avec la première amorce de l'intégration profonde Paneflow.
+**Objectif.** Couvrir l'ensemble des providers frontier et faire de Pyxis un agent complet.
 
 **Livrables.**
 - **Adapters BYOK et providers publics** :
@@ -115,7 +115,6 @@ Autrement dit, « OAuth/refresh complexe » reporté = **multi-serveur** (MCP) e
 - Sous-agents / teams : `tokio::spawn(run_agent)` avec transcript séparé, comm via `mpsc` ; InProcessTeammate via `tokio::task_local`.
 - TUI riche.
 - **Mémoire vectorielle sqlite-vec.** Livrable Phase 2 ; à noter que `docs/ARCHITECTURE.md` ne couvre pas encore ce sous-système. Action de cohérence doc : ajouter au minimum une note « futur Phase 2 » dans `docs/ARCHITECTURE.md`, ou acter explicitement que la mémoire vectorielle est hors périmètre du doc d'archi actuel. Tant que ce n'est pas fait, sqlite-vec n'a pas de section architecturale de référence.
-- **Protocole d'enrichissement Paneflow.** Paneflow embarque `agent-core` **in-process** (pas d'IPC, types partagés) et rend les `AgentEvent` via GPUI : diffs GPU-accélérés, arbre de plan, review par hunk — **sans casser le mode terminal par défaut**.
 
 **Hors scope Phase 2.** Durcissement OS multi-plateforme (macOS Seatbelt), cross-compile, télémétrie, suite VCR en CI, canaux de distribution publics — tout cela est concentré en Phase 3.
 
@@ -147,4 +146,4 @@ Le risque N1 produit du projet est externe et hors de notre contrôle : depuis j
 - **Si Anthropic est exploitable (token au minimum)** → il entre dans le provider set MVP en mode conditionnel ; on garde le cache-hit, les betas gated `kind == Anthropic`, et l'OAuth single-provider + refresh associé.
 - **Si Anthropic est inexploitable** → le cadrage historique gardait un chemin non bloqué via Ollama local + OpenAI au token. Après ADR-11, ce chemin devient backlog provider ; l'assurance durable reste le trait `Provider` et l'isolation des adapters.
 
-La mitigation est structurelle, pas réactive : le différenciateur (**full Rust natif ultra-perf + multi-provider first-class + cœur partagé avec Paneflow**) tient indépendamment du sort d'Anthropic. Le spike auth ne décide pas si le projet vit — il décide seulement quels providers sont dans le MVP. Mais il se tranche **en premier**, avant tout engagement d'architecture.
+La mitigation est structurelle, pas réactive : le différenciateur (**full Rust natif ultra-perf + multi-provider first-class**) tient indépendamment du sort d'Anthropic. Le spike auth ne décide pas si le projet vit — il décide seulement quels providers sont dans le MVP. Mais il se tranche **en premier**, avant tout engagement d'architecture.

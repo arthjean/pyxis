@@ -40,7 +40,7 @@ sien.
 ## Types d'événements
 
 Les types suivants sont la sérialisation directe d'`agent_core::AgentEvent`, le
-contrat que consomment aussi la TUI et le futur client Paneflow.
+contrat que consomme aussi la TUI.
 
 | `type` | `data` | Signification |
 |---|---|---|

@@ -359,7 +359,7 @@ fn rebuild_budget_after_model_switch(
     Ok(budget)
 }
 
-/// Starts the agent. Returns a `Stream<AgentEvent>` to consume (TUI, `-p`, Paneflow).
+/// Starts the agent. Returns a `Stream<AgentEvent>` to consume (TUI, `-p`).
 pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent> + Send {
     async_stream::stream! {
         let AgentContext {

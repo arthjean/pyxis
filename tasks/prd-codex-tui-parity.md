@@ -40,7 +40,7 @@ L'ordre d'implementation est important. On commence par la compatibilite licence
 ## Target Users
 
 ### Arthur Jean, createur et dogfooder principal
-- **Role:** Solo indie maker, mainteneur Pyxis et Paneflow, utilisateur quotidien de Codex.
+- **Role:** Solo indie maker, mainteneur Pyxis, utilisateur quotidien de Codex.
 - **Behaviors:** Sessions longues d'audit, refactor, edition, permissions et outils dans un terminal.
 - **Pain points:** Une TUI moins solide que Codex force la bascule vers Codex CLI/App, meme si le coeur Pyxis est bon.
 - **Current workaround:** Utiliser Codex directement pour beneficier de son transcript, de ses approvals et de son scrollback.
@@ -53,12 +53,12 @@ L'ordre d'implementation est important. On commence par la compatibilite licence
 - **Current workaround:** Retour au Codex CLI officiel.
 - **Success looks like:** Le transcript Pyxis tient les sessions longues et les approvals sans surprise.
 
-### Futur client Paneflow
-- **Role:** UI GPU ou desktop qui consommera le meme coeur d'evenements.
-- **Behaviors:** Veut rendre les memes items que la TUI, mais dans une surface GPUI.
-- **Pain points:** Si les decisions de rendu restent implicites dans un `Block` plat, Paneflow devra recoder la logique.
+### Futur client non-terminal
+- **Role:** UI riche ou desktop qui consommera le meme coeur d'evenements.
+- **Behaviors:** Veut rendre les memes items que la TUI, mais dans une autre surface.
+- **Pain points:** Si les decisions de rendu restent implicites dans un `Block` plat, chaque client devra recoder la logique.
 - **Current workaround:** Aucun, integration future.
-- **Success looks like:** Un contrat d'items transcript clair que Paneflow peut reutiliser.
+- **Success looks like:** Un contrat d'items transcript clair qu'un autre client peut reutiliser.
 
 ## Research Findings
 
@@ -70,7 +70,7 @@ Key findings that informed this PRD:
 - **Ratatui**: la documentation de Ratatui decrit un modele immediate rendering avec `Terminal::draw`, `Frame`, `Paragraph`, `Layout` et wrapping. Cela confirme que le scrollback durable doit etre gere explicitement au-dessus de Ratatui, comme Codex le fait.
 - **Crossterm**: fournit events, paste, alternate screen et primitives terminal. Pyxis l'utilise deja, mais Codex va plus loin avec scroll regions et viewport inline.
 - **pulldown-cmark et Syntect**: les choix actuels Pyxis restent compatibles avec la parite markdown/highlight. pulldown-cmark expose les options tables, footnotes et task lists ; Syntect cible le highlight Rust avec definitions Sublime.
-- **Market gap:** une base TUI de qualite Codex dans un projet Rust GPL, headless, multi-provider et embarquable dans Paneflow.
+- **Market gap:** une base TUI de qualite Codex dans un projet Rust GPL, headless, multi-provider et embarquable.
 
 ### Best Practices Applied
 - Porter les contrats d'etat avant les styles: cellules, lifecycle, consolidation, puis rendu.
@@ -445,7 +445,6 @@ Explicit boundaries for this version:
 - Codex app-server remote protocol, WebSocket server, desktop connectors and multi-thread remote control are out of scope.
 - Codex pets, realtime audio, image generation surfaces, collab agents and subagent side conversations are out of scope unless a later Pyxis PRD reopens them.
 - Provider orchestration, auth and model behavior are out of scope. This PRD is TUI/client architecture only.
-- Paneflow GPUI implementation is out of scope. This PRD prepares event shapes but does not build Paneflow UI.
 - Public branding must not become Codex. Names, command, docs language and product identity remain Pyxis.
 - No default cutover until snapshots, manual terminal checks and rollback flag are present.
 
@@ -485,6 +484,6 @@ Explicit boundaries for this version:
 
 - Arthur should confirm before implementation whether any current Pyxis composer behavior must survive even if it diverges from Codex.
 - Engineering should verify whether Windows Terminal supports the chosen scrollback insertion path well enough for default enablement.
-- Engineering should decide whether `TranscriptItem` should be exported for Paneflow now or kept crate-private until Paneflow work starts.
+- Engineering should decide whether `TranscriptItem` should be exported now or kept crate-private until an external consumer exists.
 - Engineering should decide whether the legacy TUI remains for one release or two after cutover.
 [/PRD]

@@ -1,6 +1,6 @@
 # Registre des décisions d'architecture (ADR léger)
 
-Ce registre consigne les décisions structurantes de **Pyxis** (CLI agent IA multi-provider, écrite en Rust, liée à Paneflow). Commande : `pyxis`. Format par décision : **Contexte / Décision / Justification / Alternatives écartées / Conséquences & risques**. Statut du projet : implémentation MVP en cours, avec un provider livré (`OpenAiChatGpt`). Les ADR fixent les décisions ; l'état réellement livré est suivi par le code, les fichiers de statut JSON et [`docs/CURRENT_STATUS.md`](./CURRENT_STATUS.md).
+Ce registre consigne les décisions structurantes de **Pyxis** (CLI agent IA multi-provider, écrite en Rust). Commande : `pyxis`. Format par décision : **Contexte / Décision / Justification / Alternatives écartées / Conséquences & risques**. Statut du projet : implémentation MVP en cours, avec un provider livré (`OpenAiChatGpt`). Les ADR fixent les décisions ; l'état réellement livré est suivi par le code, les fichiers de statut JSON et [`docs/CURRENT_STATUS.md`](./CURRENT_STATUS.md).
 
 Documents détaillés (versions longues des mêmes décisions) : `docs/CURRENT_STATUS.md` (état livré courant), `docs/ARCHITECTURE.md` (boucle, cœur, crates, pipeline d'outils), `docs/PROVIDERS.md` (couche multi-provider, adapters, taxonomie d'erreurs), `docs/ROADMAP.md` (phases, spike de de-risquage). Les ADR pointent vers ces fichiers là où le détail vit.
 
@@ -22,17 +22,17 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/CURRENT_S
 
 ## ADR-1 — Langage : Rust
 
-**Contexte.** Pyxis est conçue pour être « ultra performante dans Paneflow ». Paneflow est bâti sur GPUI, donc en Rust. Le choix de langage de Pyxis conditionne sa capacité à partager du code avec Paneflow et à s'y embarquer, ainsi que la vélocité de développement solo.
+**Contexte.** Le choix de langage conditionne la perf du binaire, l'accès natif aux primitives kernel (sandbox), la distribution (binaire statique vs runtime embarqué) et la vélocité de développement solo.
 
 **Décision.** Rust, décision ferme. Workspace de crates internes (`agent-core`, `agent-provider`, `agent-tools`, `agent-mcp`, `agent-tui`, `agent-session`, `agent-sandbox`, `agent-auth`, `agent-tokenizer`, `agent-cli`). Le nommage publié/interne est tranché en **ADR-8**. Détail du workspace dans `docs/ARCHITECTURE.md`.
 
-**Justification.** La raison principale est l'intégration Paneflow : une CLI réutilisant la base existante = **crates partagées + cœur embarqué in-process** (pas d'IPC, types partagés). Bénéfices transverses : perf native, contrôle mémoire, state machine de la boucle d'agent vérifiable par le compilateur (enum `Transition` exhaustif), sandbox kernel-level (Landlock) accessible nativement.
+**Justification.** Perf native et contrôle mémoire (démarrage <100 ms, binaire statique unique), state machine de la boucle d'agent vérifiable par le compilateur (enum `Transition` exhaustif), sandbox kernel-level (Landlock) accessible nativement sans FFI.
 
 **Alternatives écartées.**
 
 | Option | Pourquoi écartée |
 |---|---|
-| TypeScript / Bun (stack de Claude Code) | Mur **FFI/IPC** avec Paneflow (GPUI = Rust) : impossible d'embarquer le cœur in-process proprement, types non partagés. Distribution Node lourde. Le seul gain (vélocité solo) ne compense pas la perte d'intégration. |
+| TypeScript / Bun (stack de Claude Code) | Distribution Node lourde, taxe de démarrage et de mémoire, pas d'accès natif à Landlock, state machine non vérifiable par le compilateur. Le seul gain (vélocité solo) ne compense pas ces pertes. |
 
 **Conséquences & risques.**
 - **Risque d'exécution N°1 assumé** : la vélocité de développement solo en Rust est plus lente qu'en TS/Bun. Mitigation : périmètre MVP serré, le dur et le risqué d'abord (cf. ADR-7 et `docs/ROADMAP.md`, Phase 0).
@@ -56,7 +56,7 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/CURRENT_S
 
 | Option | Pourquoi écartée |
 |---|---|
-| **GPUI** pour le frontend standalone | GPUI ouvre une **fenêtre GPU** (app desktop), pas une CLI terminal. Incompatible avec l'exigence « s'ouvre dans le shell ». **Nuance** : GPUI n'est pas perdu — il reste le canal de rendu *enrichi* côté Paneflow via le cœur embarqué (cf. ADR-3), où une fenêtre GPU est précisément le bon support. |
+| **GPUI** pour le frontend standalone | GPUI ouvre une **fenêtre GPU** (app desktop), pas une CLI terminal. Incompatible avec l'exigence « s'ouvre dans le shell ». |
 | Réimplémentation/portage d'Ink en Rust | Aucun gain : même plafond ANSI que Ratatui, coût de portage énorme, perte de l'écosystème Ratatui. |
 
 **Conséquences & risques.**
@@ -68,21 +68,21 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/CURRENT_S
 
 ## ADR-3 — Cœur headless + frontend client
 
-**Contexte.** Pyxis doit fonctionner en mode terminal par défaut **et** pouvoir s'enrichir dans Paneflow (diffs GPU-accélérés, arbre de plan, review par hunk) sans dupliquer la logique d'agent ni casser le mode terminal.
+**Contexte.** Pyxis doit fonctionner en mode terminal par défaut **et** rester ouverte à d'autres clients (mode headless, futurs frontends riches) sans dupliquer la logique d'agent ni casser le mode terminal.
 
 **Décision.** `agent-core` est **découplé du frontend** et **n'émet QUE des événements structurés** (jamais d'ANSI). Le frontend Ratatui est un **simple client** qui consomme ces événements. Règle d'or : `agent-core` ne dépend **ni** de `agent-tui` **ni** de `agent-provider` (testable sans I/O, mode headless `-p` sans Ratatui). Détail dans `docs/ARCHITECTURE.md`.
 
 **Justification.**
 - Le découplage event-driven rend la boucle testable sans API ni terminal (deps injectables, mode headless `-p`).
-- Conséquence clé : **Paneflow peut embarquer `agent-core` in-process** et rendre les mêmes événements via **GPUI** (diffs GPU, arbre de plan, review par hunk). L'enrichissement futur passe par un **protocole** d'événements, **sans casser** le mode terminal par défaut.
-- Un seul cœur, plusieurs rendus (terminal Ratatui aujourd'hui, GPUI Paneflow demain) : pas de fork de logique.
+- Conséquence clé : n'importe quel client peut embarquer `agent-core` in-process et rendre les mêmes événements. L'enrichissement futur passe par un **protocole** d'événements, **sans casser** le mode terminal par défaut.
+- Un seul cœur, plusieurs rendus : pas de fork de logique.
 
 **Deux types d'événements (frontière à ne pas confondre).** Le système manipule **deux** enums d'événements distincts, par design :
 
 | Enum | Sens | Défini dans | Consommé par |
 |---|---|---|---|
 | `StreamEvent` | provider → core | `docs/PROVIDERS.md` (couche multi-provider) | `agent-core` (traduit le wire format en état canonique) |
-| `AgentEvent` | core → clients | `docs/ARCHITECTURE.md` (cœur headless) | `agent-tui`, et plus tard Paneflow/GPUI |
+| `AgentEvent` | core → clients | `docs/ARCHITECTURE.md` (cœur headless) | `agent-tui` et le mode `-p` |
 
 `agent-core` consomme les `StreamEvent` d'un provider et les **traduit** en `AgentEvent` structurés vers les clients. Ce ne sont pas deux noms pour la même chose : `StreamEvent` est un détail de la couche provider (deltas de texte/reasoning/tool-call/usage), `AgentEvent` est le contrat de rendu côté frontends.
 
@@ -90,11 +90,11 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/CURRENT_S
 
 | Option | Pourquoi écartée |
 |---|---|
-| Cœur émettant directement de l'ANSI (couplé au TUI) | Rendrait l'embarquement Paneflow/GPUI impossible (GPUI ne consomme pas de l'ANSI), et le core non testable sans terminal. |
+| Cœur émettant directement de l'ANSI (couplé au TUI) | Fermerait tout client non-terminal et rendrait le core non testable sans terminal. |
 | Frontend communiquant avec le cœur via IPC/process séparé | Casse le bénéfice in-process de Rust (cf. ADR-1) : latence, sérialisation, types non partagés. L'in-process avec types partagés est précisément l'avantage qu'on protège. |
 
 **Conséquences & risques.**
-- Le **protocole d'événements** (`AgentEvent`) devient une frontière de contrat à versionner avec soin (le consommateur Paneflow et le TUI en dépendent). Le protocole d'enrichissement Paneflow est planifié en Phase 2 (`docs/ROADMAP.md`).
+- Le **protocole d'événements** (`AgentEvent`) devient une frontière de contrat à versionner avec soin (le TUI et le mode headless en dépendent).
 - API consommateur du cœur = **stream** via `async-stream` ; communication TUI via canaux.
 - Tout ajout dans le core doit rester pur (pas de dépendance TUI/HTTP) sous peine de casser l'invariant headless.
 
@@ -154,12 +154,12 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/CURRENT_S
 | Candidat | Verdict |
 |---|---|
 | Hera | Gardé pour le terminal agent-native, pas pour l'agent de code |
-| Rosetta | Déjà utilisé dans Paneflow pour le système de notifications avancé |
+| Rosetta | Déjà réservé par un autre projet maison |
 | Caelum | Bon sens de sculpture, moins percutant |
 | Chandra | Bon imaginaire d'observation, plus doux |
 | **Pyxis** | Meilleur équilibre : spatial, court, navigational, CLI-friendly |
 
-**Alternatives écartées.** Les candidats ci-dessus. La règle durable : éviter les noms déjà réservés à Paneflow, les collisions évidentes dans l'espace agent, et les noms trop génériques pour être cherchables.
+**Alternatives écartées.** Les candidats ci-dessus. La règle durable : éviter les noms déjà réservés par les projets maison, les collisions évidentes dans l'espace agent, et les noms trop génériques pour être cherchables.
 
 **Conséquences & risques.**
 - Vérifier crates.io, GitHub, domaines et risque marque avant publication publique.
@@ -171,9 +171,9 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/CURRENT_S
 
 **Contexte.** Plusieurs angles de différenciation ont été envisagés. Il fallait trancher sur le positionnement produit avant d'engager l'implémentation, pour éviter de bâtir autour d'un axe à TAM trop étroit ou déjà couvert par la concurrence.
 
-**Décision.** Différenciateur = **« Qualité Claude Code, tous les providers frontier, perf Rust + intégration profonde avec Paneflow. »** Concrètement : full Rust natif ultra-perf + multi-provider first-class (là où Claude Code est Anthropic-only) + **cœur partagé avec Paneflow** permettant une intégration profonde (in-process, cf. ADR-3).
+**Décision.** Différenciateur = **« Qualité Claude Code, tous les providers frontier, perf Rust. »** Concrètement : full Rust natif ultra-perf + multi-provider first-class (là où Claude Code est Anthropic-only), sur un cœur headless embarquable (cf. ADR-3).
 
-**Justification.** C'est l'intersection défendable : la qualité d'un agent de référence, ouverte à tous les modèles frontier, avec un moat technique (Rust + cœur partagé Paneflow) qu'un wrapper TS ne peut pas répliquer.
+**Justification.** C'est l'intersection défendable : la qualité d'un agent de référence, ouverte à tous les modèles frontier, avec un moat technique (Rust natif, cœur headless) qu'un wrapper TS ne peut pas répliquer.
 
 **Alternatives écartées.**
 
@@ -184,7 +184,6 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/CURRENT_S
 
 **Conséquences & risques.**
 - Le positionnement est **model-agnostic** : cohérent avec la mitigation du risque N°1 (cf. ADR-7 R1).
-- La promesse « intégration profonde Paneflow » crée une **dépendance de roadmap** : le protocole d'enrichissement (Phase 2, `docs/ROADMAP.md`) doit suivre, sinon le différenciateur reste théorique.
 - « Qualité Claude Code » est un standard élevé à tenir sur N providers, pas seulement un.
 
 ---
@@ -246,7 +245,7 @@ Autrement dit : **la surface publiée porte le nom `pyxis` ; les crates internes
 **Conséquences & risques.**
 - **Action à sécuriser tôt** : vérifier puis publier des stubs pour réserver `pyxis`, `pyxis-cli`, `pyxis-core` sur crates.io avant publication publique.
 - Divergence publié/interne à garder lisible : un `README` du workspace doit rappeler que `pyxis` (publié) = `agent-cli` (interne) + façade.
-- Si Phase 2/3 impose une publication granulaire (ex. `agent-core` réutilisable par Paneflow via crates.io plutôt que path dep), réévaluer : à ce moment les réservations `pyxis-core`/`pyxis-cli` peuvent devenir les noms publiés de ces crates.
+- Si Phase 2/3 impose une publication granulaire (ex. `agent-core` réutilisable par un client externe via crates.io plutôt que path dep), réévaluer : à ce moment les réservations `pyxis-core`/`pyxis-cli` peuvent devenir les noms publiés de ces crates.
 
 ---
 

@@ -129,9 +129,9 @@ Deux enums d'événements coexistent dans le système, **distincts par design** 
 | Enum | Producteur → consommateur | Rôle |
 |---|---|---|
 | `StreamEvent` | adapter `agent-provider` → `agent-core` | vocabulaire **provider-vers-cœur** : deltas de texte/reasoning, cycle de vie des tool calls, usage, stop. Normalisé en amont par l'adapter. |
-| `AgentEvent` | `agent-core` → clients (TUI, `-p` headless, Paneflow) | vocabulaire **cœur-vers-clients** : événements structurés de plus haut niveau (transition d'état, message persisté, hunk de diff, demande de permission). Jamais d'ANSI. Défini dans `ARCHITECTURE.md §10`. |
+| `AgentEvent` | `agent-core` → clients (TUI, `-p` headless) | vocabulaire **cœur-vers-clients** : événements structurés de plus haut niveau (transition d'état, message persisté, hunk de diff, demande de permission). Jamais d'ANSI. Défini dans `ARCHITECTURE.md §10`. |
 
-`agent-core` **consomme** `StreamEvent`, fait avancer sa state machine, et **émet** `AgentEvent` vers les clients. La frontière est nette : un adapter ne produit jamais d'`AgentEvent`, le cœur ne réémet jamais de `StreamEvent` brut. C'est ce qui permet à Paneflow d'embarquer `agent-core` in-process et de rendre les `AgentEvent` via GPUI sans toucher à la couche provider.
+`agent-core` **consomme** `StreamEvent`, fait avancer sa state machine, et **émet** `AgentEvent` vers les clients. La frontière est nette : un adapter ne produit jamais d'`AgentEvent`, le cœur ne réémet jamais de `StreamEvent` brut. C'est ce qui permet à n'importe quel client d'embarquer `agent-core` in-process et de consommer les `AgentEvent` sans toucher à la couche provider.
 
 ### 2.2 Taxonomie d'erreurs canonique (`ErrorClass`)
 

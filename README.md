@@ -10,7 +10,7 @@
 
 **A native, model-agnostic AI coding agent that lives in your terminal.** `pyxis` opens straight in your shell, streams a model, runs real tools (read, grep, edit, bash), and loops until the work is done, all from a single Rust binary with no Node runtime underneath.
 
-Pyxis is built around a **headless core** (`agent-core`) that emits only structured events, never ANSI. The terminal UI is just one client. That same core is meant to be embedded in-process by [Paneflow](https://paneflow.dev) (Zed's GPUI) for GPU-accelerated diffs and plan trees later, without forking any agent logic. The provider layer is multi-provider by design (a clean `Provider` trait + an Anthropic-shaped canonical format), so new model backends drop in as isolated adapters.
+Pyxis is built around a **headless core** (`agent-core`) that emits only structured events, never ANSI. The terminal UI is just one client: the same core drives the headless `-p` mode, and any future client can consume the same event stream without forking agent logic. The provider layer is multi-provider by design (a clean `Provider` trait + an Anthropic-shaped canonical format), so new model backends drop in as isolated adapters.
 
 > *Pyxis* is the compass. A small instrument for keeping direction while the agent navigates a large codebase, chooses files, edits precisely, and returns with a diff you can trust.
 
@@ -78,14 +78,13 @@ Drop `target/release/pyxis` on your `PATH` (or `cargo install --path crates/agen
 
 ## Where it fits
 
-Pyxis overlaps with every terminal coding agent, but the design center is specific: **a native, model-agnostic agent whose core is built to be embedded in a GPU terminal workspace.**
+Pyxis overlaps with every terminal coding agent, but the design center is specific: **a native, model-agnostic agent built around a headless, embeddable core.**
 
 | Tool | Strength | Pyxis's angle |
 |---|---|---|
 | Claude Code | Polished Anthropic-native agent, large ecosystem | Model-agnostic core by design; one native Rust binary, no Node runtime |
-| Codex CLI | OpenAI-native, strong sandboxing | Reuses the ChatGPT-subscription channel, but ships a headless core meant to embed in Paneflow |
-| aider / opencode | Mature multi-model OSS agents | Rust-native, kernel-level FS sandbox (Landlock), shared core with a GPU terminal workspace |
-| Paneflow | Runs CLI agents in parallel GPU panes | Pyxis is the agent; Paneflow is the surface. The plan is to embed `agent-core` in-process, no IPC |
+| Codex CLI | OpenAI-native, strong sandboxing | Reuses the ChatGPT-subscription channel, but model-agnostic with a headless, embeddable core |
+| aider / opencode | Mature multi-model OSS agents | Rust-native, kernel-level FS sandbox (Landlock), single static binary |
 
 The honest caveat: most rows describe a *direction*. Today Pyxis ships one provider and one frontend. The bet is in the architecture (headless core + provider trait), not in a checklist.
 
@@ -108,7 +107,7 @@ Shipped today:
 Architecture-ready, not yet built:
 
 - Additional provider adapters (Anthropic, OpenAI BYOK, Gemini) behind the same `Provider` trait
-- Paneflow in-process embedding with GPU diffs, plan trees, and hunk review
+- A richer TUI (plan trees, hunk-level diff review) on top of the same event stream
 - Vector memory (`sqlite-vec`), sub-agents, prompt-caching strategy, VCR provider tests
 
 ## How it works
@@ -123,13 +122,13 @@ Pyxis is a Cargo workspace. The crates are named `agent-*` internally; the publi
                          │  emits: Stream<AgentEvent>    │
                          └──────────────┬───────────────┘
                                         │  structured events (never ANSI)
-                 ┌──────────────────────┼──────────────────────┐
-                 ▼                      ▼                      ▼
-        ┌─────────────────┐    ┌─────────────────┐    ┌──────────────────┐
-        │   agent-tui     │    │   mode -p       │    │ Paneflow (GPUI)  │
-        │ Ratatui client  │    │ headless print  │    │ embed in-process │
-        │ (terminal)      │    │ (text / JSON)   │    │ GPU render (next)│
-        └─────────────────┘    └─────────────────┘    └──────────────────┘
+                          ┌─────────────┴─────────────┐
+                          ▼                           ▼
+                 ┌─────────────────┐         ┌─────────────────┐
+                 │   agent-tui     │         │   mode -p       │
+                 │ Ratatui client  │         │ headless print  │
+                 │ (terminal)      │         │ (text / JSON)   │
+                 └─────────────────┘         └─────────────────┘
 ```
 
 The founding invariant: **`agent-core` depends on neither the TUI nor the provider layer** (only on `agent-tokenizer`, which is also headless). I/O is injected through traits, so the loop is testable without network, terminal, or a real model. The provider layer normalizes heterogeneous wire formats into one Anthropic-shaped canonical format, with divergences localized per adapter.
@@ -259,7 +258,7 @@ These paths outside the workspace (skills, MCP config, keyring) are read **befor
 The MVP target was deliberately narrow: **make Pyxis excellent with one model channel (the ChatGPT subscription) and dogfood it daily**, rather than ship six empty provider columns. The multi-provider architecture is the invariant; adapters land incrementally.
 
 - **Now (shipped)**: agentic loop, tool suite + Linux FS sandbox, sessions + resume, `/goal`, MCP config/diagnostics, monochrome TUI, ChatGPT subscription provider.
-- **Next**: more provider adapters behind the existing `Provider` trait, MCP tools wired into the model loop, stable MCP connect UX, Paneflow in-process embedding (GPU diffs, plan trees, hunk review).
+- **Next**: more provider adapters behind the existing `Provider` trait, MCP tools wired into the model loop, stable MCP connect UX, richer TUI (plan trees, hunk review).
 - **Later**: vector memory (`sqlite-vec`), sub-agents, macOS Seatbelt hardening, VCR provider tests in CI.
 
 Phases and the de-risking spikes live in [`docs/ROADMAP.md`](docs/ROADMAP.md).
@@ -278,7 +277,7 @@ Phases and the de-risking spikes live in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 ## FAQ
 
 **Why Rust and not TypeScript like Claude Code?**
-The whole point is sharing a core with Paneflow, which is GPUI (Rust). A Rust core can be embedded in-process with shared types and no IPC. A TS core hits an FFI wall. The accepted cost is slower solo dev velocity; the mitigation is a tight scope and decoupled, testable crates.
+A single static binary with no Node runtime, native startup and memory footprint, kernel-level sandboxing (Landlock) reachable without FFI, and an agent loop whose state machine is compiler-checked. The accepted cost is slower solo dev velocity; the mitigation is a tight scope and decoupled, testable crates.
 
 **Why does it only work with a ChatGPT subscription today?**
 Sequencing, not abandonment. The author orchestrates agents all day and wanted *his* model working perfectly first, then to add other providers over time. The `Provider` trait keeps the door open; the canonical format and retry/auth layers already exist.
@@ -297,9 +296,6 @@ It is dogfooded daily by its author on Linux, but it is early: one provider, no 
 
 **Why GPL-3.0?**
 Pyxis is free and open source by design, and copyleft keeps it that way: improvements to the agent stay in the commons, and the shared core cannot be forked into a closed product.
-
-**How does it relate to Paneflow?**
-Paneflow runs CLI agents in parallel GPU panes; Pyxis is one such agent. The deeper plan is for Paneflow to embed `agent-core` in-process and render its events natively (GPU diffs, plan trees). That embedding is future work; the decoupling that makes it possible exists today.
 
 ## License
 

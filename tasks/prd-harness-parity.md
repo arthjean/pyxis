@@ -31,7 +31,7 @@ La solution est ordonnée en trois releases. **R1 rétablit l'intégrité et la 
 
 Trois décisions structurantes méritent d'être explicites. Le signal d'annulation passe par un `tokio::sync::watch` plutôt qu'un `CancellationToken` de `tokio-util`, pour ne pas ajouter de dépendance et parce que `Deps` n'accepte que des primitives synchrones (invariant ADR-3). Les sous-chemins protégés sont traités en userland et non par Landlock, parce que Landlock est additif : on ne peut pas soustraire un droit déjà accordé sous une racine writable, et prétendre le contraire donnerait une fausse assurance. Enfin, la configuration de projet a une surface volontairement inoffensive : elle ne peut ni définir de hooks, ni élargir les racines writables, ni changer le mode de permission, décision directement informée par CVE-2026-48124 où une configuration de hooks contrôlée par le workspace donnait une exécution non sandboxée.
 
-Le cœur reste headless. Aucune des additions ne fait entrer d'ANSI, de terminal ou de dépendance d'entrée-sortie concrète dans `agent-core` : les nouvelles capacités passent par des variantes ajoutées à `AgentEvent` et par des traits injectés dans `Deps`, ce qui bénéficie identiquement à la TUI, au mode headless et au futur embarquement Paneflow.
+Le cœur reste headless. Aucune des additions ne fait entrer d'ANSI, de terminal ou de dépendance d'entrée-sortie concrète dans `agent-core` : les nouvelles capacités passent par des variantes ajoutées à `AgentEvent` et par des traits injectés dans `Deps`, ce qui bénéficie identiquement à la TUI et au mode headless.
 
 ## Goals
 
@@ -47,7 +47,7 @@ Le cœur reste headless. Aucune des additions ne fait entrer d'ANSI, de terminal
 
 ### Arthur Jean, créateur et dogfooder principal
 
-- **Role:** Solo indie maker, mainteneur de Pyxis et de Paneflow, utilisateur quotidien de Codex CLI et de Claude Code.
+- **Role:** Solo indie maker, mainteneur de Pyxis, utilisateur quotidien de Codex CLI et de Claude Code.
 - **Behaviors:** Sessions longues d'audit et de refactor, interruptions fréquentes quand l'agent part dans une mauvaise direction, prompts longs et structurés en plusieurs paragraphes.
 - **Pain points:** Une interruption casse la session en cours, sans message compréhensible. Un prompt de plus d'une ligne est impossible à rédiger. Les fichiers de statut du projet ne permettent plus de savoir ce qui est réellement livré.
 - **Current workaround:** Rédiger les prompts longs dans un éditeur externe puis les coller en une ligne, éviter d'interrompre l'agent, relancer `/new` après chaque interruption ratée, et basculer sur Codex CLI quand la session Pyxis est cassée.
@@ -61,10 +61,10 @@ Le cœur reste headless. Aucune des additions ne fait entrer d'ANSI, de terminal
 - **Current workaround:** Lire le code source pour vérifier chaque affirmation de la documentation.
 - **Success looks like:** Une CI verte fait foi, et ce que la documentation annonce se vérifie en une commande.
 
-### Paneflow, client embarquant `agent-core`
+### Futur client embarquant `agent-core`
 
-- **Role:** Terminal GPU qui embarquera `agent-core` en process, sans IPC.
-- **Behaviors:** Consomme le flux d'`AgentEvent` pour rendre diffs, arbres de plan et review par hunk dans GPUI.
+- **Role:** Client riche qui embarquera `agent-core` en process, sans IPC.
+- **Behaviors:** Consomme le flux d'`AgentEvent` pour rendre diffs, arbres de plan et review par hunk.
 - **Pain points:** Le diff d'un tour n'existe nulle part comme donnée : chaque édition est un événement isolé et les modifications faites par une commande shell sont invisibles. L'annulation n'est pas modélisée dans le cœur, donc chaque client doit réinventer sa propre logique d'interruption.
 - **Current workaround:** Aucun, l'intégration n'a pas commencé.
 - **Success looks like:** Le flux d'événements suffit à rendre l'état complet d'un tour, y compris son diff agrégé et son annulation, sans dupliquer de logique d'agent.
@@ -106,7 +106,7 @@ Constats issus de la recherche qui ont façonné ce PRD.
 ### Hard Constraints
 
 - **ADR-3, cœur headless :** `agent-core` ne dépend ni de `agent-tui`, ni de `agent-provider`, et n'émet jamais d'ANSI. Toute nouvelle capacité passe par un trait injecté dans `Deps` ou par une variante ajoutée à `AgentEvent`.
-- **Contrats en extension seulement :** `AgentEvent` et `StreamEvent` sont consommés par la TUI, le mode headless et bientôt Paneflow. Les variantes s'ajoutent, elles ne se refondent pas.
+- **Contrats en extension seulement :** `AgentEvent` et `StreamEvent` sont consommés par la TUI et le mode headless. Les variantes s'ajoutent, elles ne se refondent pas.
 - **Landlock est additif :** aucun droit accordé sous une racine ne peut être soustrait pour un sous-chemin. Toute protection de sous-chemin est donc userland et doit être documentée comme telle.
 - **`restrict_self` est irréversible et précède le runtime tokio** (`crates/agent-sandbox/src/fs.rs:130-138`). Toute racine writable configurable doit être résolue avant le démarrage du runtime.
 - **ADR-11 :** Linux uniquement, provider unique `OpenAiChatGpt`. Aucune story de ce PRD n'introduit de support macOS, Windows ou multi-provider.
@@ -412,7 +412,7 @@ Rendre Pyxis configurable et observable par une machine, ce que l'architecture p
 - [ ] Given une erreur fatale en cours de run, when elle survient, then elle est émise comme événement structuré avant la sortie du processus, et le code de sortie la distingue d'un succès
 
 #### US-018: Tracker de diff agrégé du tour
-**Description:** As a utilisateur et as a client Paneflow, I want connaître l'ensemble des modifications d'un tour, so that je puisse répondre à la question la plus fréquente en fin de tour sans reconstituer les éditions une par une.
+**Description:** As a utilisateur et as a client du cœur, I want connaître l'ensemble des modifications d'un tour, so that je puisse répondre à la question la plus fréquente en fin de tour sans reconstituer les éditions une par une.
 
 **Priority:** P1
 **Size:** M (3 pts)
@@ -553,7 +553,7 @@ Ouvrir les trois canaux d'extension attendus en 2026, sans inventer de format pr
 ## Non-Goals
 
 - **Transport MCP distant et OAuth par serveur.** Seul stdio reste supporté. La roadmap place ce sujet en Phase 2 et l'ajouter ici doublerait le périmètre d'EP-006 pour un besoin non présent en dogfood.
-- **Protocole de type serveur d'application ou JSON-RPC pour intégration IDE.** Pyxis vise l'embarquement en process dans Paneflow, pas l'interopérabilité IDE. La sortie JSONL couvre le besoin d'observabilité machine sans introduire de protocole bidirectionnel.
+- **Protocole de type serveur d'application ou JSON-RPC pour intégration IDE.** Pyxis vise l'embarquement in-process, pas l'interopérabilité IDE. La sortie JSONL couvre le besoin d'observabilité machine sans introduire de protocole bidirectionnel.
 - **Profils de configuration.** Codex en propose, aucun besoin actuel ne les justifie. La précédence à quatre niveaux couvre les cas réels.
 - **Filtrage réseau au niveau kernel.** Le proxy coopératif reste la solution, avec sa limite déjà documentée par ADR-7. Y toucher relèverait d'un changement de stratégie de sandbox, pas d'une correction.
 - **Modes de collaboration de première classe, retour arrière sur un message précédent, steering en cours de tour.** Ces trois manques sont réels et documentés dans l'audit, mais aucun ne bloque l'usage quotidien. Ils relèvent d'un PRD ultérieur une fois le harness assaini.
@@ -562,7 +562,7 @@ Ouvrir les trois canaux d'extension attendus en 2026, sans inventer de format pr
 
 ## Files NOT to Modify
 
-- `crates/agent-core/src/event.rs` et `crates/agent-core/src/provider.rs` : contrats consommés par la TUI, le mode headless et le futur client Paneflow. Extension par ajout de variantes uniquement, jamais de refonte.
+- `crates/agent-core/src/event.rs` et `crates/agent-core/src/provider.rs` : contrats consommés par la TUI et le mode headless. Extension par ajout de variantes uniquement, jamais de refonte.
 - `crates/agent-sandbox/src/fs.rs:130-138` (`restrict_self`) : séquence irréversible exécutée avant le runtime tokio. Tout changement d'ordre casse l'héritage du confinement par les sous-processus.
 - `crates/agent-tools/src/permission.rs` : logique fail-closed et propagation de taint, couverte par neuf tests de sécurité. Les défauts ne doivent pas être affaiblis, seulement étendus.
 - `docs/ARCHITECTURE.md` invariants 1 à 9 : amendables uniquement par un ADR, pas par une story.

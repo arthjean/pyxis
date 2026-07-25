@@ -40,7 +40,7 @@ Décisions structurantes prises pendant l'audit : le transport reste **SSE state
 ## Target Users
 
 ### Arthur Jean — créateur & dogfooder principal
-- **Role:** Solo indie maker, orchestre Codex via Pyxis dans Paneflow au quotidien.
+- **Role:** Solo indie maker, orchestre Codex via Pyxis au quotidien.
 - **Behaviors:** Sessions longues d'orchestration de code (refactors, audits), abonnement ChatGPT/Codex, Fedora/Wayland, full Rust.
 - **Pain points:** Pyxis « marche » mais reste en deçà de Codex App : édition qui boucle sur des divergences d'encodage, modèle qui ne connaît pas le repo, pas de feedback de gel.
 - **Current workaround:** Bascule sur Codex App/CLI pour les tâches sérieuses ; Pyxis reste un prototype perso.
@@ -52,13 +52,6 @@ Décisions structurantes prises pendant l'audit : le transport reste **SSE state
 - **Pain points:** Un harness Codex tiers qui dégrade GPT-5.5 (edits ratés, pas de contexte) est inutilisable ; il retourne au Codex CLI officiel.
 - **Current workaround:** Codex CLI officiel.
 - **Success looks like:** Pyxis tient la comparaison avec le CLI officiel sur l'édition et le contexte, avec un cœur Rust plus rigoureux.
-
-### Utilisateur Paneflow — intégration native (futur proche)
-- **Role:** Utilisateur de Paneflow qui embarquera `agent-core` in-process.
-- **Behaviors:** Attend des `AgentEvent` propres (jamais d'ANSI), un rendu riche.
-- **Pain points:** Un cœur qui gèle ou perd l'état de session casse l'expérience embarquée.
-- **Current workaround:** N/A (intégration future).
-- **Success looks like:** `agent-core` durci, fiable sur sessions longues, réutilisable sans surprise.
 
 ## Research Findings
 

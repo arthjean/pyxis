@@ -1,4 +1,4 @@
-//! `AgentEvent`: THE core -> clients contract (TUI, `-p` headless, Paneflow).
+//! `AgentEvent`: THE core -> clients contract (TUI, `-p` headless).
 //! Structured, serializable, NO presentation decision, NEVER ANSI
 //! (ARCHITECTURE 10.1, invariant 2). Distinct from `StreamEvent` (provider -> core).
 

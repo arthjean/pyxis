@@ -16,13 +16,13 @@
 3. **Les CLI agents existants partagent des modes d'échec coûteux non maîtrisés** : boucles d'outils infinies (« le #1 fléau de l'agentique 2026 »), perte de contexte sur gros repos, coûts runaway (cas documenté : « refactor this » → facture API de 500 $ et 4000 commits), prompt injection indirecte via repos/MCP malveillants.
 4. **Les CLI Node/TS paient une taxe de démarrage et de mémoire** (500 ms–2 s de startup, 200 Mo+ idle, runtime à embarquer) là où un binaire Rust natif démarre en <100 ms pour <50 Mo.
 
-**Why now:** Le ban Anthropic du 4 avril 2026 transforme le model-agnosticism d'un confort en **moat structurel** : opencode a fait de « pas de lock-in » son argument central post-ban et a bondi de plusieurs dizaines de milliers de stars. La fenêtre narrative est ouverte maintenant. En parallèle, Pyxis partage son cœur Rust avec Paneflow (GPUI), ce qui rend ce projet uniquement faisable pour Arthur à cet instant précis.
+**Why now:** Le ban Anthropic du 4 avril 2026 transforme le model-agnosticism d'un confort en **moat structurel** : opencode a fait de « pas de lock-in » son argument central post-ban et a bondi de plusieurs dizaines de milliers de stars. La fenêtre narrative est ouverte maintenant.
 
 ## Overview
 
 Pyxis est une CLI agent IA de codage en terminal, écrite en **Rust natif**, **multi-provider first-class** (BYOK : Anthropic, OpenAI, Gemini, Ollama/local, puis cloud), inspirée de l'architecture interne de Claude Code mais agnostique au modèle. La commande est `pyxis` ; elle s'ouvre dans le shell (frontend Ratatui monochrome), **pas** dans une fenêtre.
 
-Le parti pris fondateur est un **cœur headless** (`agent-core`) qui n'émet que des événements structurés, jamais d'ANSI. Le frontend terminal n'est qu'un client. Conséquence stratégique : Paneflow (Rust/GPUI) peut embarquer `agent-core` **in-process** — pas d'IPC, types partagés — et rendre les events en GPU, sans casser le mode terminal par défaut. C'est l'intégration profonde qu'aucun concurrent ne peut offrir.
+Le parti pris fondateur est un **cœur headless** (`agent-core`) qui n'émet que des événements structurés, jamais d'ANSI. Le frontend terminal n'est qu'un client : tout autre client peut embarquer `agent-core` in-process (types partagés, pas d'IPC) et consommer les mêmes events, sans casser le mode terminal par défaut.
 
 Ce PRD couvre le **MVP** : une **Phase 0** de dé-risquage (5 spikes, dont le go/no-go d'accès provider) suivie d'une **Phase 1** livrant une boucle d'agent complète, le système d'outils avec garde-fous (loop guardrails, budgets, taint untrusted), 3 providers non-bloqués, l'auth BYOK, les sessions resumables, le frontend Ratatui et le sandbox Landlock FS. MCP, les providers cloud, le TUI riche, les sous-agents et le support multi-OS sont explicitement différés (voir Non-Goals).
 
@@ -33,17 +33,17 @@ Ce PRD couvre le **MVP** : une **Phase 0** de dé-risquage (5 spikes, dont le go
 | Providers frontier fonctionnels (BYOK) | 3 (Ollama, OpenAI, Anthropic) | 6+ (+ Gemini, OpenRouter, 1 cloud) |
 | Latence de démarrage (`pyxis` → prompt prêt) | <100 ms (P95) | <100 ms maintenu, publié avec artefact |
 | Adoption — GitHub stars (proxy de distribution) | 2 000–5 000 | 15 000–30 000 |
-| Substance — sessions dogfood/jour (Arthur, dans Paneflow) | ≥1/jour | intégration Paneflow GPUI live |
+| Substance : sessions dogfood/jour (Arthur) | ≥1/jour | usage quotidien maintenu |
 | Contributeurs externes (PR mergées) | ≥1 | ≥10 |
 
 ## Target Users
 
 ### Arthur Jean — créateur & dogfooder principal
-- **Role:** Solo indie maker, mainteneur unique, auteur de Paneflow.
-- **Behaviors:** Orchestre des agents (Claude Code, Codex) toute la journée dans Paneflow ; code en Rust ; déteste npm/Node, préfère Bun et les binaires natifs.
-- **Pain points:** Aucun agent CLI ne s'intègre nativement à Paneflow ; les agents TS sont lents à démarrer ; le ban Anthropic l'a touché directement (Max 20×).
-- **Current workaround:** Utilise plusieurs CLI tierces côte à côte comme surfaces Paneflow, sans intégration profonde.
-- **Success looks like:** `pyxis` démarre instantanément, tourne in-process dans Paneflow, parle à n'importe quel modèle, et il l'utilise tous les jours sur ses propres projets.
+- **Role:** Solo indie maker, mainteneur unique.
+- **Behaviors:** Orchestre des agents (Claude Code, Codex) toute la journée ; code en Rust ; déteste npm/Node, préfère Bun et les binaires natifs.
+- **Pain points:** Les agents TS sont lents à démarrer ; le ban Anthropic l'a touché directement (Max 20×).
+- **Current workaround:** Utilise plusieurs CLI tierces côte à côte.
+- **Success looks like:** `pyxis` démarre instantanément, parle à n'importe quel modèle, et il l'utilise tous les jours sur ses propres projets.
 
 ### Développeur Rust/systèmes — early adopter OSS
 - **Role:** Dev backend/systèmes qui vit dans le terminal.
@@ -52,20 +52,13 @@ Ce PRD couvre le **MVP** : une **Phase 0** de dé-risquage (5 spikes, dont le go
 - **Current workaround:** opencode/aider en BYOK, en tolérant la lenteur et l'absence de garde-fous de coût.
 - **Success looks like:** Un binaire unique, rapide, multi-provider, avec budgets et kill-switch fiables, sans surprise de facture.
 
-### Utilisateur Paneflow — intégration native
-- **Role:** Dev qui a adopté Paneflow comme multiplexeur.
-- **Behaviors:** Veut un agent « maison » de première classe dans son environnement.
-- **Pain points:** Les agents tiers sont des panes opaques, sans rendu enrichi.
-- **Current workaround:** Lance des CLI tierces comme n'importe quel programme terminal.
-- **Success looks like:** Pyxis rendu richement par Paneflow (à terme GPUI), pilotable, observable.
-
 ## Research Findings
 
 Key findings that informed this PRD:
 
 ### Competitive Context
-- **opencode (~172k stars, ~6.5M MAU, MIT)** : standard OSS de facto, repositionné explicitement model-agnostic post-ban. Pyxis diffère par : Rust natif (perf mesurable), intégration in-process Paneflow, garde-fous de coût/boucle de première classe.
-- **Codex CLI (~90k, Rust, Apache-2.0)** : meilleur Terminal-Bench (83,4 %), prouve la viabilité Rust. Pyxis diffère par : multi-provider BYOK ouvert (Codex est OpenAI-centré) et le couplage Paneflow.
+- **opencode (~172k stars, ~6.5M MAU, MIT)** : standard OSS de facto, repositionné explicitement model-agnostic post-ban. Pyxis diffère par : Rust natif (perf mesurable), garde-fous de coût/boucle de première classe.
+- **Codex CLI (~90k, Rust, Apache-2.0)** : meilleur Terminal-Bench (83,4 %), prouve la viabilité Rust. Pyxis diffère par : multi-provider BYOK ouvert (Codex est OpenAI-centré).
 - **Claude Code (~131k, propriétaire, TS)** : référence UX, mais Anthropic-only et lock-in subscription. Pyxis reprend ses patterns internes en les ouvrant à tous les providers.
 - **Market gap:** un agent CLI **Rust + BYOK multi-provider + garde-fous de coût/boucle de première classe + intégration terminal-natif profonde**, qu'aucun acteur ne combine en juin 2026.
 
@@ -89,7 +82,7 @@ Key findings that informed this PRD:
 ### Hard Constraints
 - **Full Rust**, workspace Cargo. Binaire publié = `pyxis` (crate interne `agent-cli`).
 - **Pas de runtime Node/Bun embarqué** ; single static binary.
-- **Cœur `agent-core` sans dépendance TUI ni HTTP** (testable headless, embarquable in-process par Paneflow).
+- **Cœur `agent-core` sans dépendance TUI ni HTTP** (testable headless, embarquable in-process).
 - **Linux-first** pour le MVP (sandbox Landlock).
 - **L'architecture est figée dans `docs/`** (ARCHITECTURE, PROVIDERS, ROADMAP, DECISIONS) — le PRD ne doit pas la contredire.
 - **Lints clippy d'Arthur obligatoires** (`panic`/`unimplemented`/`dbg_macro` = deny ; `unwrap_used`/`expect_used` = warn).
@@ -451,7 +444,6 @@ Frontières explicites — ce que le MVP ne fait PAS :
 - **Support multi-OS** — macOS (Seatbelt) / Windows : Phase 3. MVP = Linux-first.
 - **TUI riche** — sélection souris, tables markdown, virtual scroll, syntax highlight incrémental : Phase 2. MVP = streaming + diff brut + dialogs.
 - **Sous-agents / teams, mémoire vectorielle (sqlite-vec), skills/commands & hooks** — Phase 2.
-- **Rendu enrichi GPUI dans Paneflow** — Phase 2 (le cœur headless + protocole d'events garde la porte ouverte ; le MVP reste terminal).
 - **Distribution packagée (curl|sh, binstall, télémétrie OTel, tests VCR)** — Phase 3 (durcissement).
 
 ## Files NOT to Modify
@@ -480,7 +472,7 @@ Formulé comme questions pour validation à l'implémentation :
 | Providers frontier fonctionnels | N/A (nouveau) | 3 → 6+ | M1 → M6 | tests d'intégration par adapter |
 | Latence de démarrage (P95) | N/A | <100 ms | M1, maintenu M6 | benchmark reproductible publié (artefact) |
 | GitHub stars (distribution) | 0 | 2–5k → 15–30k | M1 → M6 | star-history.com |
-| Sessions dogfood/jour (Arthur) | 0 | ≥1 → usage quotidien dans Paneflow | M1 → M6 | logs de session locaux |
+| Sessions dogfood/jour (Arthur) | 0 | ≥1 → usage quotidien | M1 → M6 | logs de session locaux |
 | Contributeurs externes (PR mergées) | 0 | ≥1 → ≥10 | M1 → M6 | GitHub insights |
 | Incidents de coût runaway signalés | N/A | 0 | M6 | issues étiquetées `cost` |
 

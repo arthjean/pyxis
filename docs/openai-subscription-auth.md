@@ -273,7 +273,7 @@ fn extract_account_id(access_token: &str) -> Result<String> {
 
 ### 3.c — Stockage keyring (US-018)
 
-Pi stocke en **JSON clair 0o600**. **Pyxis DOIT faire mieux** : `US-018` impose le secret store OS (keyring), jamais en clair (`prd-pyxis.md:352`, NFR Security `:409`).
+Pi stocke en **JSON clair 0o600**. **Pyxis DOIT faire mieux** : `US-018` impose le secret store OS (keyring), jamais en clair (`prd-pyxis.md:345`, NFR Security `:404`).
 
 ```rust
 let entry = keyring::Entry::new("pyxis", &format!("oauth:{provider}"))?;

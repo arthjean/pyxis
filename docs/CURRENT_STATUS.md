@@ -21,7 +21,7 @@ This file is the short source of truth after ADR-11. When it conflicts with hist
 - Public provider adapters: OpenAI BYOK, Anthropic, Gemini, OpenRouter, Ollama, Bedrock, Vertex, and Azure are architectural backlog, not shipped adapters.
 - Public OpenAI Responses BYOK mode and server-side `previous_response_id` mode.
 - MCP tools in the agent loop, stable connect UX, and per-server OAuth.
-- Paneflow in-process embedding, GPU diff rendering, plan trees, and hunk review.
+- Rich TUI: plan trees and hunk-level diff review.
 - Vector memory, sub-agents, prompt-cache strategy, VCR provider tests, packaged releases, macOS Seatbelt, and cross-platform hardening.
 
 ## Live Risks
