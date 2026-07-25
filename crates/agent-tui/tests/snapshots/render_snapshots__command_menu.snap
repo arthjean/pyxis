@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"command_menu\", &s, W, H)"
+---
+
+                  PYXIS
+                  your terminal coding agent
+
+                  ◆ gpt-5  ·  pyxis  ·  Ask for approval
+                  ○ not connected  restart pyxis to reconnect
+
+                  /help  ·  /models  ·  /effort
+                  /permissions  ·  /goal
+                  ctrl+c twice to quit   ·   ↑ history
+
+› /help         Show available commands
+  /models       Choose the active model
+  /effort       Choose the reasoning effort
+  /permissions  Choose when Pyxis asks for confirmation
+  /skills       Insert a skill into the message
+  /goal         Set a goal and work until it is done
+  /providers    Configure the authentication provider
+  /mcp          Inspect MCP servers
+  1-8/12 · ↑↓ navigate · enter run · tab complete · esc cancel
+────────────────────────────────────────────────────────────────────────────────
+› /
+────────────────────────────────────────────────────────────────────────────────
+gpt-5 · pyxis · Ask for approval                            ctrl+c twice to quit

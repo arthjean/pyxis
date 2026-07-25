@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"welcome_narrow\", &s, NARROW, H)"
+---
+
+PYXIS
+your terminal coding agent
+
+◆ gpt-5  ·  pyxis  ·  Ask for approval
+○ not connected  restart pyxis to reconn
+
+/help  ·  /models  ·  /effort
+/permissions  ·  /goal
+ctrl+c twice to quit   ·   ↑ history
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────
+›
+────────────────────────────────────────
+gpt-5 · pyxis · As  ctrl+c twice to quit

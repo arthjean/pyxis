@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"markdown_table\", &s, W, H)"
+---
+› Compare les modes de permission
+
+● Mode    │ Édition │ Bash
+  ────────┼─────────┼────────
+  Ask     │ demande │ demande
+  DontAsk │ auto    │ demande
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────
+›
+────────────────────────────────────────────────────────────────────────────────
+gpt-5 · pyxis · Ask for approval                            ctrl+c twice to quit

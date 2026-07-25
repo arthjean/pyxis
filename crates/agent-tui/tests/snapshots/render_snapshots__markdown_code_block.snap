@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"markdown_code_block\", &s, W, H)"
+---
+› Montre-moi le token d'annulation
+
+● Voici la primitive :
+
+
+    pub fn cancel(&self) {
+        self.tx.send_replace(true);
+    }
+
+
+  Elle est idempotente.
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────
+›
+────────────────────────────────────────────────────────────────────────────────
+gpt-5 · pyxis · Ask for approval                            ctrl+c twice to quit

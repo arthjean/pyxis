@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"pending_input\", &s, W, H)"
+---
+› Explique la boucle d'agent et montre le code
+
+● La boucle est un Stream d'AgentEvent.
+
+
+  Elle rend la main à chaque frontière.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────
+› Ajoute un test qui couvre la reprise de session
+────────────────────────────────────────────────────────────────────────────────
+gpt-5 · pyxis · Ask for approval                            ctrl+c twice to quit

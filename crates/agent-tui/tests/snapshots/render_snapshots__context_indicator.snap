@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"context_indicator\", &s, W, H)"
+---
+› Explique la boucle d'agent et montre le code
+
+● La boucle est un Stream d'AgentEvent.
+
+
+  Elle rend la main à chaque frontière.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────
+›
+────────────────────────────────────────────────────────────────────────────────
+gpt-5 [high] · pyxis · Ask for approval · ▰▰▰▰▰▰▰▱ 84% con  ctrl+c twice to quit

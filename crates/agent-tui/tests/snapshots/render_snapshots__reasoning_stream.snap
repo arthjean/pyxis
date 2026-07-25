@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"reasoning_stream\", &s, W, H)"
+---
+› Pourquoi ce test échoue ?
+
+  · thinking
+    Le curseur de session n'est pas resynchronisé.
+    Donc le delta est réécrit.
+
+
+
+
+
+
+
+
+
+
+
+
+
+• Working (2s • esc to interrupt)
+
+────────────────────────────────────────────────────────────────────────────────
+›
+────────────────────────────────────────────────────────────────────────────────
+gpt-5 · pyxis · Ask for approval                                ctrl+c interrupt

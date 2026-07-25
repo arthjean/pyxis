@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"resume_menu\", &s, W, H)"
+---
+
+    ╭──────────────────────────────────────────────────────────────────────╮
+    │                                                                      │
+    │                         PYXIS                                        │
+    │                         your terminal coding agent                   │
+    │   ⢄⢵⣴⢵⢤⢄⣄   ⢀⢀⠴⠕⠷⢿⢅⠁                                                 │
+    │   ⠑⢿⠅⠁ ⠁⠁⠉⠵⠷⢍⠁  ⢀⠝⠅     ◆ gpt-5  ·  pyxis  ·  Ask for approval       │
+    │    ⠉⠵⢅ ⢠ ⢕⢵⢕⠅⠙⢵⢴⠏⠁      ○ not connected  restart pyxis to reconnect  │
+    │      ⢽⠟⠅ ⠙⠝⠟⢅⠕⠍⠁⠑⢅⠄                                                  │
+    │    ⢀⣽⠁   ⢁⠤⢟⣅    ⢙⣷⠅    /help  ·  /models  ·  /effort                │
+    │    ⠝⢷⠵⠴⠗⠉⠁  ⠁⠉⠙⠓⠗⠟⠝⠁    /permissions  ·  /goal                       │
+    │    ⠁ ⠁                  ctrl+c twice to quit   ·   ↑ history         │
+    │                                                                      │
+    │                                                                      │
+    ╰──────────────────────────────────────────────────────────────────────╯
+
+
+› Audit de parité harness  42 msgs
+  Port du composer Codex   17 msgs
+  ↑↓ navigate · enter run · tab complete · esc cancel
+────────────────────────────────────────────────────────────────────────────────
+› /resume
+────────────────────────────────────────────────────────────────────────────────
+gpt-5 · pyxis · Ask for approval                            ctrl+c twice to quit

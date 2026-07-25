@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"interrupted_turn\", &s, W, H)"
+---
+› Lance la suite complète
+
+● Run(cargo test --workspace)
+  ⎿ Error: interrupted by user
+
+  · interrupted
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────
+›
+────────────────────────────────────────────────────────────────────────────────
+gpt-5 · pyxis · Ask for approval                            ctrl+c twice to quit

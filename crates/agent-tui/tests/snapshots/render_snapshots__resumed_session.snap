@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"resumed_session\", &s, W, H)"
+---
+› Où en est la réconciliation du transcript ?
+
+● Les appels en vol reçoivent un résultat synthétique.
+
+› Et à la reprise ?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────
+›
+────────────────────────────────────────────────────────────────────────────────
+gpt-5 · pyxis · Ask for approval · ▰▰▰▱▱▱▱▱ 38% context     ctrl+c twice to quit

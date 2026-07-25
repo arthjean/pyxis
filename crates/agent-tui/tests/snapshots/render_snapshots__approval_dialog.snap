@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"approval_dialog\", &s, W, H)"
+---
+› Supprime le dossier de build
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+⟐ Bash  - destructive command outside the read-only set · ask
+       rm -rf target/debug/incremental
+  [o] allow   [n] deny

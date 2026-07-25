@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"scrolled_transcript\", &s, W, H)"
+---
+› Question numéro 0
+
+● Réponse numéro 0, assez longue pour occuper la largeur du terminal.
+
+› Question numéro 1
+
+● Réponse numéro 1, assez longue pour occuper la largeur du terminal.
+
+› Question numéro 2
+
+● Réponse numéro 2, assez longue pour occuper la largeur du terminal.
+
+› Question numéro 3
+
+● Réponse numéro 3, assez longue pour occuper la largeur du terminal.
+
+› Question numéro 4
+
+● Réponse numéro 4, assez longue pour occuper la largeur du terminal.
+                                                              ↓ 2 new items · ⇟
+────────────────────────────────────────────────────────────────────────────────
+›
+────────────────────────────────────────────────────────────────────────────────
+gpt-5 · pyxis · Ask for approval                            ctrl+c twice to quit

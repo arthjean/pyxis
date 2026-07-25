@@ -27,3 +27,8 @@ unicode-segmentation.workspace = true
 similar.workspace = true
 syntect.workspace = true
 two-face.workspace = true
+
+# US-005 : harness de snapshot du rendu terminal. `insta` reste ici, hors du
+# graphe de production (`cargo tree -e normal` ne le voit pas).
+[dev-dependencies]
+insta.workspace = true

@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"edit_diff\", &s, W, H)"
+---
+› Renomme le champ `tx` en `sender`
+
+● Update(crates/agent-core/src/cancel.rs)
+  ⎿ Added 3 lines, removed 3 lines
+   1   pub struct CancelToken {
+   2 -     tx: Arc<watch::Sender<bool>>,
+   2 +     sender: Arc<watch::Sender<bool>>,
+   3   }
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────
+›
+────────────────────────────────────────────────────────────────────────────────
+gpt-5 · pyxis · Ask for approval                            ctrl+c twice to quit

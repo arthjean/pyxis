@@ -63,3 +63,23 @@ cargo test -p agent-tui --features codex_tui_parity
 | `crates/agent-tui/src/terminal_viewport.rs` | `C:\dev\codex\codex-rs\tui\src\tui.rs` and `insert_history.rs` | `inspired` | Viewport geometry scaffold only. |
 | Future app-server runtime integration | `C:\dev\codex\codex-rs\tui\src\history_cell\hook_cell.rs`, app-server hook emitters | `skip` | Pyxis now owns hook transcript types and rendering. Direct app-server hook emission remains out of scope until Pyxis has equivalent runtime events. |
 | Future app-server or connector surfaces | `C:\dev\codex\codex-rs\app-server\**`, connector crates, realtime/audio/pets/collab surfaces | `skip` | Explicit PRD non-goals. |
+
+## Divergences de rendu assumées (US-006)
+
+Les snapshots de `crates/agent-tui/tests/snapshots/` figent le rendu réel de
+Pyxis. Les écarts ci-dessous par rapport au rendu Codex sont **intentionnels** :
+un diff de snapshot qui les fait disparaître doit être traité comme une
+régression, pas comme un rapprochement de parité.
+
+| Divergence | Snapshot témoin | Raison |
+|---|---|---|
+| Composer ancré en bas du terminal, encadré par deux filets pleine largeur, transcript rendu au-dessus | `welcome`, `pending_input` | Choix de mise en page Pyxis déjà enregistré pour `render.rs` dans l'inventaire ci-dessus. |
+| Écran d'accueil : carte bordée avec logo pixel et raccourcis, au lieu de l'accueil textuel Codex | `welcome`, `welcome_narrow`, `welcome_wide` | Signature visuelle Pyxis (monochrome + un accent). |
+| Ligne de statut unique en pied d'écran (`modèle · workspace · mode`) | tous les snapshots | Pyxis regroupe le statut en une ligne au lieu des surfaces de statut Codex. |
+| Résumé d'outil sur un connecteur `⎿` et diff inline dérivé de l'input du call | `exec_success`, `exec_error`, `edit_diff` | Pyxis dérive le diff de l'appel d'outil, sans cellule d'exécution dédiée. |
+| Dialogue d'approbation rendu en bas de frame sans overlay modal | `approval_dialog` | Le dialogue remplace la zone de saisie plutôt que de recouvrir le transcript. |
+
+Limitation connue : le composer d'une seule ligne visible dans `resize_narrow`
+(la saisie est tronquée à la largeur du terminal) n'est **pas** une divergence
+assumée, c'est le défaut traité par EP-003 de `tasks/prd-harness-parity.md`. Le
+snapshot le fige volontairement pour rendre le correctif visible en diff.

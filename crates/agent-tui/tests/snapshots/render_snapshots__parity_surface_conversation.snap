@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame_parity(\"parity_surface_conversation\", &s, &surface, W, H)"
+---
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+› Quelle est la frontière d'arrêt ?
+
+
+● La fin d'événement de stream et le retour de dispatch.
+
+────────────────────────────────────────────────────────────────────────────────
+›
+────────────────────────────────────────────────────────────────────────────────
+gpt-5 · pyxis · Ask for approval                            ctrl+c twice to quit

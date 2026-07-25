@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"user_message\", &s, W, H)"
+---
+› Relis `crates/agent-core/src/agent.rs` et dis-moi ce qui cloche
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+• Working (0s • esc to interrupt)
+
+────────────────────────────────────────────────────────────────────────────────
+›
+────────────────────────────────────────────────────────────────────────────────
+gpt-5 · pyxis · Ask for approval                                ctrl+c interrupt
