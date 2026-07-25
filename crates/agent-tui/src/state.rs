@@ -1116,6 +1116,9 @@ impl AppState {
                 });
             }
             AgentEvent::Compacted(_) => self.blocks.push(Block::Notice("context compacted".into())),
+            // Comptabilité de tour (US-017) : contrat machine, sans rendu. Le
+            // compteur de contexte a sa propre source.
+            AgentEvent::ModelTurn(_) => {}
             AgentEvent::PermissionAsk(req) => self
                 .blocks
                 .push(Block::Notice(format!("permission: {}", req.tool))),

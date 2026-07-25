@@ -780,6 +780,16 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         &deps,
                     );
 
+                    // US-017 : un aller-retour modèle vient de se terminer. Émis
+                    // ici, après la comptabilisation, pour que les compteurs
+                    // portés par l'événement incluent CE tour. C'est le seul
+                    // point du run où `model_turns` avance.
+                    yield AgentEvent::ModelTurn(crate::event::ModelTurnView {
+                        index: model_turns,
+                        input_tokens: usage_budget.spent_input(),
+                        output_tokens: usage_budget.spent_output(),
+                    });
+
                     let transition = post_stream_transition(&acc);
                     let commits_assistant =
                         matches!(transition, Transition::EndTurn | Transition::RunTools(_));
@@ -1079,6 +1089,20 @@ pub struct HeadlessResult {
 /// Consomme la boucle en mode headless : agrège le texte, AUCUN Ratatui (AC3).
 /// C'est ce que `pyxis -p` câblera (agent-cli) ; ici, testable sans terminal.
 pub async fn run_headless(ctx: AgentContext, deps: Deps) -> HeadlessResult {
+    run_headless_observed(ctx, deps, |_| {}).await
+}
+
+/// Même boucle, avec un observateur appelé sur CHAQUE événement dans l'ordre
+/// d'émission (US-017 : sortie JSONL). L'agrégation de texte reste ici, en un
+/// seul endroit : un client qui veut les deux ne réimplémente pas la règle de
+/// consolidation, dont le silence sur `Text` avant un `ToolCall` est subtil.
+/// L'observateur ne fait pas d'I/O asynchrone : il écrit une ligne et rend la
+/// main, ce qui garde le cœur libre de toute dépendance de sortie.
+pub async fn run_headless_observed(
+    ctx: AgentContext,
+    deps: Deps,
+    mut observe: impl FnMut(&AgentEvent),
+) -> HeadlessResult {
     let stream = run_agent(ctx, deps);
     futures_util::pin_mut!(stream);
 
@@ -1089,6 +1113,7 @@ pub async fn run_headless(ctx: AgentContext, deps: Deps) -> HeadlessResult {
 
     while let Some(ev) = stream.next().await {
         events += 1;
+        observe(&ev);
         match ev {
             AgentEvent::StreamReset => pending_text.clear(),
             AgentEvent::Text(t) => pending_text.push_str(&t),

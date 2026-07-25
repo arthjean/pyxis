@@ -130,6 +130,16 @@ impl UsageBudget {
         self.spent_input.saturating_add(self.spent_output)
     }
 
+    /// Détail du cumul, pour l'observabilité (US-017). Comptabilisé même sans
+    /// plafond configuré : `is_active()` ne conditionne que le kill-switch.
+    pub fn spent_input(&self) -> u64 {
+        self.spent_input
+    }
+
+    pub fn spent_output(&self) -> u64 {
+        self.spent_output
+    }
+
     /// Coût cumulé en micro-USD (0 si aucun tarif configuré).
     pub fn spent_micro_usd(&self) -> u64 {
         match self.cost {

@@ -510,6 +510,9 @@ impl TranscriptMapper {
                 }
                 updates
             }
+            // Comptabilité de tour : rien à rendre dans le transcript de parité
+            // Codex, qui n'a pas de cellule équivalente.
+            AgentEvent::ModelTurn(_) => Vec::new(),
             AgentEvent::Compacted(kind) => vec![TranscriptUpdate::new(
                 TranscriptLifecycle::Completed,
                 TranscriptItem::new(

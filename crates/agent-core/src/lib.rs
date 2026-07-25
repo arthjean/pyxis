@@ -20,13 +20,16 @@ pub mod session;
 pub mod tools;
 pub mod transition;
 
-pub use agent::{AgentContext, HeadlessEnd, HeadlessResult, RunConfig, run_agent, run_headless};
+pub use agent::{
+    AgentContext, HeadlessEnd, HeadlessResult, RunConfig, run_agent, run_headless,
+    run_headless_observed,
+};
 pub use budget::ContextBudget;
 pub use cancel::{CancelToken, Cancellable};
 pub use compaction::CompactKind;
 pub use deps::Deps;
 pub use error::{AgentError, ProviderFailure, ProviderFailureKind};
-pub use event::AgentEvent;
+pub use event::{AgentEvent, ModelTurnView};
 pub use guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget};
 pub use message::{
     ContentBlock, INTERRUPTED_TOOL_RESULT, Message, Role, ToolErrorKind, unanswered_tool_calls,

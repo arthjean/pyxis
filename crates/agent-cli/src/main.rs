@@ -9,6 +9,7 @@
 mod approver;
 mod context;
 mod interactive;
+mod jsonl;
 mod prompt;
 mod session;
 mod settings;
@@ -49,6 +50,8 @@ struct Args {
     input_cost_micro_per_ktok: Option<String>,
     output_cost_micro_per_ktok: Option<String>,
     overload_fallback_model: Option<String>,
+    /// Format de sortie du mode headless (US-017). `Text` par défaut.
+    output_format: jsonl::OutputFormat,
     help: bool,
 }
 
@@ -78,6 +81,8 @@ Options:
       --input-cost-micro-per-ktok <n>   Input price
       --output-cost-micro-per-ktok <n>  Output price
       --overload-fallback-model <slug>  Fallback model on overload
+      --output-format <text|json>       Headless output: final text (default) or
+                                        one JSON event per line (docs/EVENT_SCHEMA.md)
   -h, --help                            Show this help
 
 Configuration (TOML), lowest precedence first:
@@ -121,6 +126,7 @@ where
         input_cost_micro_per_ktok: None,
         output_cost_micro_per_ktok: None,
         overload_fallback_model: None,
+        output_format: jsonl::OutputFormat::Text,
         help: false,
     };
     let mut it = raw.into_iter().peekable();
@@ -156,6 +162,12 @@ where
             "--overload-fallback-model" => {
                 args.overload_fallback_model =
                     Some(next_value(&mut it, "--overload-fallback-model")?)
+            }
+            "--output-format" => {
+                let raw = next_value(&mut it, "--output-format")?;
+                args.output_format = jsonl::output_format_from_arg(&raw).ok_or_else(|| {
+                    anyhow::anyhow!("--output-format: expected `text` or `json`, got `{raw}`")
+                })?;
             }
             other => {
                 // A bare argument without -p is treated as the prompt.
@@ -820,21 +832,34 @@ async fn run(
             context_messages: context_msgs,
             ephemeral_messages: Vec::new(),
         };
-        let result = agent_core::run_headless(ctx, deps).await;
+        let mut events = jsonl::EventWriter::new(args.output_format);
+        let result =
+            agent_core::run_headless_observed(ctx, deps, |event| events.event(event)).await;
+
+        let session_id = current_session
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        events.run_summary(&session_id, &result.ended);
+
         match result.ended {
             agent_core::HeadlessEnd::Error(e) => anyhow::bail!("{e}"),
             agent_core::HeadlessEnd::Exhausted(reason) => anyhow::bail!("stopped: {reason:?}"),
             agent_core::HeadlessEnd::EndTurn => {}
         }
-        // En one-shot, pas de boucle d'objectif : on retire juste le marqueur.
-        let text = result
-            .text
-            .replace(interactive::GOAL_DONE_MARKER, "")
-            .trim_end()
-            .to_string();
-        print!("{text}");
-        if !text.ends_with('\n') {
-            println!();
+        // En mode JSON, le texte vit déjà dans les événements `text` : l'écrire à
+        // nouveau injecterait des lignes non JSON dans le flux.
+        if !events.is_json() {
+            // En one-shot, pas de boucle d'objectif : on retire juste le marqueur.
+            let text = result
+                .text
+                .replace(interactive::GOAL_DONE_MARKER, "")
+                .trim_end()
+                .to_string();
+            print!("{text}");
+            if !text.ends_with('\n') {
+                println!();
+            }
         }
     } else {
         // Registre MCP construit depuis la config découverte avant le sandbox
@@ -881,7 +906,7 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, parse_args_from, permission_policy, precedence_u64, resolve_permission_mode,
+        Args, jsonl, parse_args_from, permission_policy, precedence_u64, resolve_permission_mode,
         resolve_resume_path, run_config_from_args, settings,
     };
     use agent_tools::permission::PermissionMode;
@@ -900,6 +925,7 @@ mod tests {
             input_cost_micro_per_ktok: None,
             output_cost_micro_per_ktok: None,
             overload_fallback_model: None,
+            output_format: jsonl::OutputFormat::Text,
             help: false,
         }
     }

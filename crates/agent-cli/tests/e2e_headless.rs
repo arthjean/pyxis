@@ -488,3 +488,104 @@ async fn harness_needs_no_credentials_terminal_or_keyring() {
         );
     }
 }
+
+// ─────────────────────── US-017 : flux d'événements machine ───────────────────────
+
+/// US-017 AC1/AC2/AC5 sur le câblage réel : chaque événement d'un tour complet
+/// est sérialisable en UNE ligne JSON analysable, y compris quand il transporte
+/// une sortie d'outil issue du disque.
+#[tokio::test]
+async fn every_event_of_a_full_turn_serializes_to_one_json_line() {
+    let workspace = TempWorkspace::new("jsonl");
+    // Contenu hostile pour le découpage en lignes : sauts de ligne, NUL, ANSI.
+    workspace.write(
+        "note.txt",
+        "la phrase attendue\nseconde ligne\u{1b}[31m\u{7}\ttab\n",
+    );
+
+    let h = harness(&workspace, [TOOL_CALL_TURN, FINAL_TURN], None);
+    let observed = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&observed);
+
+    let result = agent_core::run_headless_observed(
+        context("Lis note.txt", h.tool_specs.clone()),
+        h.deps.clone(),
+        move |event| {
+            let line = serde_json::to_string(event).unwrap();
+            sink.lock().unwrap().push(line);
+        },
+    )
+    .await;
+
+    assert!(matches!(result.ended, HeadlessEnd::EndTurn));
+    let lines = observed.lock().unwrap().clone();
+    assert_eq!(
+        lines.len(),
+        result.events,
+        "l'observateur doit voir exactement les événements du run"
+    );
+    for line in &lines {
+        assert!(
+            !line.contains('\n'),
+            "un saut de ligne brut casserait le JSONL : {line}"
+        );
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(
+            value.get("type").and_then(|t| t.as_str()).is_some(),
+            "chaque ligne doit porter son discriminant : {line}"
+        );
+    }
+
+    // AC3 : les tours modèle sont observables et numérotés, avec des compteurs
+    // cumulés monotones — c'est ce que le récapitulatif de fin de run reprend.
+    let turns: Vec<serde_json::Value> = lines
+        .iter()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|value| value["type"] == "model_turn")
+        .collect();
+    assert_eq!(turns.len(), 2, "deux allers-retours modèle : {turns:?}");
+    assert_eq!(turns[0]["data"]["index"], 1);
+    assert_eq!(turns[1]["data"]["index"], 2);
+    let first_in = turns[0]["data"]["input_tokens"].as_u64().unwrap();
+    let second_in = turns[1]["data"]["input_tokens"].as_u64().unwrap();
+    assert!(
+        second_in >= first_in && second_in > 0,
+        "les compteurs sont cumulés : {first_in} puis {second_in}"
+    );
+}
+
+/// US-017 AC4 : l'observateur n'altère pas le run. Le texte agrégé, le nombre
+/// d'événements et la cause de fin sont identiques avec et sans observateur —
+/// c'est ce qui garantit que `--output-format text` reste ce qu'il était.
+#[tokio::test]
+async fn observing_events_does_not_change_the_textual_result() {
+    let plain = {
+        let workspace = TempWorkspace::new("observe-plain");
+        workspace.write("note.txt", "la phrase attendue\n");
+        let h = harness(&workspace, [TOOL_CALL_TURN, FINAL_TURN], None);
+        run_headless(
+            context("Lis note.txt", h.tool_specs.clone()),
+            h.deps.clone(),
+        )
+        .await
+    };
+    let observed = {
+        let workspace = TempWorkspace::new("observe-json");
+        workspace.write("note.txt", "la phrase attendue\n");
+        let h = harness(&workspace, [TOOL_CALL_TURN, FINAL_TURN], None);
+        let seen = Arc::new(Mutex::new(0usize));
+        let counter = Arc::clone(&seen);
+        let result = agent_core::run_headless_observed(
+            context("Lis note.txt", h.tool_specs.clone()),
+            h.deps.clone(),
+            move |_| *counter.lock().unwrap() += 1,
+        )
+        .await;
+        assert_eq!(*seen.lock().unwrap(), result.events);
+        result
+    };
+
+    assert_eq!(plain.text, observed.text);
+    assert_eq!(plain.events, observed.events);
+    assert!(matches!(observed.ended, HeadlessEnd::EndTurn));
+}

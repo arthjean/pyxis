@@ -28,6 +28,11 @@ pub enum AgentEvent {
     ToolResult(ToolResultView),
     /// Une compaction vient d'avoir lieu.
     Compacted(CompactKind),
+    /// Un aller-retour modèle vient de se terminer (US-017). Émis après chaque
+    /// réponse complète du provider, qu'elle close le tour ou qu'elle enchaîne
+    /// sur des outils. Purement informatif : un client qui l'ignore garde le
+    /// comportement d'avant.
+    ModelTurn(ModelTurnView),
     /// Demande d'autorisation (émis par le pipeline d'outils — US-013, non par
     /// le cœur en EP-002 ; présent pour fixer le contrat).
     PermissionAsk(PermissionReq),
@@ -61,6 +66,17 @@ pub struct ToolResultView {
     pub error_kind: Option<ToolErrorKind>,
     /// Sortie d'outil = untrusted par défaut (taint, US-013).
     pub untrusted: bool,
+}
+
+/// Fin d'un aller-retour modèle (US-017). Les compteurs sont CUMULÉS depuis le
+/// début du run : ce sont ceux qui pilotent le budget, donc réels quand le
+/// provider rapporte son `usage`, estimés localement sinon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelTurnView {
+    /// Indice 1-based du tour modèle qui vient de se terminer.
+    pub index: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
