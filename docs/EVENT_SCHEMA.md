@@ -52,12 +52,31 @@ contrat que consomment aussi la TUI et le futur client Paneflow.
 | `tool_result` | `{id, content, is_error, error_kind?, untrusted}` | Résultat d'outil. `untrusted` vaut `true` pour tout contenu externe. |
 | `compacted` | `"micro"` \| `"auto"` \| `"reactive"` | Une compaction de contexte a eu lieu. |
 | `model_turn` | `{index, input_tokens, output_tokens}` | Un aller-retour modèle vient de finir. `index` est 1-based ; les compteurs sont **cumulés depuis le début du run**, réels quand le provider rapporte son usage, estimés localement sinon. |
+| `turn_diff` | `{files:[…]}` | Diff agrégé du tour. Jamais émis quand rien n'a changé. Voir plus bas. |
 | `permission_ask` | `{call_id, tool, reason, taint_forced, input_summary, input, mode}` | Demande d'autorisation. En headless, l'approbateur refuse par défaut. |
 | `end_turn` | — | Le tour s'est terminé normalement. |
 | `interrupted` | — | Le tour a été interrompu ; le transcript est déjà réconcilié. |
 | `exhausted` | détail | Arrêt déterministe : budget, plafond de tours, boucle d'outils. |
 | `error` | détail | Erreur d'agent. Émise **avant** la sortie du processus. |
 
+### `turn_diff`
+
+```json
+{"schema":1,"type":"turn_diff","data":{"files":[
+  {"path":"src/lib.rs","change":"modified","added_lines":12,"removed_lines":3,
+   "unified":"--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ …"},
+  {"path":"assets/logo.png","change":"added","added_lines":0,"removed_lines":0}
+]}}
+```
+
+`change` vaut `added`, `modified` ou `deleted`. `unified` est **absent** pour un
+fichier binaire ou plus volumineux que le seuil de diff : le fichier reste listé,
+son contenu n'est pas comparé.
+
+Périmètre : les fichiers que git considère différents de `HEAD`, fichiers non
+suivis compris, fichiers ignorés exclus. Les modifications faites par une commande
+shell y figurent donc au même titre que celles des outils d'édition. Dans un
+répertoire qui n'est pas un dépôt git, `turn_diff` n'est jamais émis.
 
 ### `run_summary`
 
@@ -97,4 +116,10 @@ plutôt que d'interpréter le code de sortie.
 ## Ordre garanti
 
 1. Les événements du tour, dans l'ordre d'émission par la boucle d'agent.
-2. `run_summary`, toujours dernier.
+2. `turn_diff`, s'il y a quelque chose à montrer.
+3. `run_summary`, toujours dernier.
+
+En mode interactif, `turn_diff` est émis **avant** l'événement terminal du tour,
+parce que l'interface clôt le tour dès qu'elle le voit. Un consommateur du flux
+JSONL n'a pas à s'en soucier : la seule garantie dont il dépend est que
+`turn_diff` précède `run_summary`.

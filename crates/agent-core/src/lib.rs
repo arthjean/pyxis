@@ -29,7 +29,7 @@ pub use cancel::{CancelToken, Cancellable};
 pub use compaction::CompactKind;
 pub use deps::Deps;
 pub use error::{AgentError, ProviderFailure, ProviderFailureKind};
-pub use event::{AgentEvent, ModelTurnView};
+pub use event::{AgentEvent, FileChange, FileDiffView, ModelTurnView, TurnDiffView};
 pub use guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget};
 pub use message::{
     ContentBlock, INTERRUPTED_TOOL_RESULT, Message, Role, ToolErrorKind, unanswered_tool_calls,

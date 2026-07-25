@@ -33,6 +33,11 @@ pub enum AgentEvent {
     /// sur des outils. Purement informatif : un client qui l'ignore garde le
     /// comportement d'avant.
     ModelTurn(ModelTurnView),
+    /// Diff agrégé des fichiers modifiés pendant le tour (US-018). Émis par le
+    /// CLIENT à la frontière de fin de tour, pas par la boucle : calculer un diff
+    /// suppose de lire le disque, ce que le cœur ne fait pas (invariant 1). Jamais
+    /// émis quand rien n'a changé.
+    TurnDiff(TurnDiffView),
     /// Demande d'autorisation (émis par le pipeline d'outils — US-013, non par
     /// le cœur en EP-002 ; présent pour fixer le contrat).
     PermissionAsk(PermissionReq),
@@ -77,6 +82,49 @@ pub struct ModelTurnView {
     pub index: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
+}
+
+/// Diff agrégé d'un tour (US-018). Vide n'est jamais émis.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnDiffView {
+    pub files: Vec<FileDiffView>,
+}
+
+impl TurnDiffView {
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    /// Lignes ajoutées puis retirées, tous fichiers confondus.
+    pub fn totals(&self) -> (u32, u32) {
+        self.files.iter().fold((0, 0), |(added, removed), file| {
+            (
+                added.saturating_add(file.added_lines),
+                removed.saturating_add(file.removed_lines),
+            )
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDiffView {
+    /// Chemin relatif à la racine du workspace.
+    pub path: String,
+    pub change: FileChange,
+    pub added_lines: u32,
+    pub removed_lines: u32,
+    /// Diff unifié. Absent pour un fichier binaire ou plus volumineux que le
+    /// seuil de diff : le fichier reste listé, son contenu n'est pas comparé.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unified: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChange {
+    Added,
+    Modified,
+    Deleted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -163,6 +163,8 @@ pub struct InteractiveConfig {
     pub permission_mode: PermissionModeState,
     /// Settings utilisateur globaux, utilisés pour persister les choix interactifs.
     pub settings_path: Option<PathBuf>,
+    /// Racine du workspace, périmètre du diff agrégé de tour (US-018).
+    pub workspace: PathBuf,
 }
 
 /// Marqueur de complétion émis par le modèle quand l'objectif est pleinement
@@ -309,17 +311,58 @@ fn launch_turn(
     // Le `Deps` reçu porte déjà le signal d'annulation du tour (`ActiveTurn::start`).
     let deps = deps.clone();
     let tx = tx.clone();
+    let workspace = cfg.workspace.clone();
     tokio::spawn(async move {
+        // US-018 : référence du diff prise avant le premier aller-retour.
+        let mut diff_tracker = agent_tools::turn_diff::TurnDiffTracker::begin(&workspace).await;
         let stream = run_agent(ctx, deps);
         futures_util::pin_mut!(stream);
+        // L'événement terminal est retenu le temps de calculer le diff : la
+        // boucle d'interface clôt le tour dès qu'elle le voit, et tout ce qui
+        // arriverait après serait écarté par le filtre de `turn_id`.
+        let mut terminal: Option<AgentEvent> = None;
         while let Some(ev) = stream.next().await {
+            if matches!(
+                ev,
+                AgentEvent::EndTurn
+                    | AgentEvent::Interrupted
+                    | AgentEvent::Error(_)
+                    | AgentEvent::Exhausted(_)
+            ) {
+                terminal = Some(ev);
+                break;
+            }
             if tx
                 .send(AgentTurnEvent { turn_id, event: ev })
                 .await
                 .is_err()
             {
-                break;
+                return;
             }
+        }
+        if let Some(terminal) = terminal {
+            match diff_tracker.turn_diff().await {
+                Ok(diff) if !diff.is_empty() => {
+                    if tx
+                        .send(AgentTurnEvent {
+                            turn_id,
+                            event: AgentEvent::TurnDiff(diff),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => agent_tui::debug_log::log(&format!("turn diff: {err}")),
+            }
+            let _ = tx
+                .send(AgentTurnEvent {
+                    turn_id,
+                    event: terminal,
+                })
+                .await;
         }
     })
 }

@@ -7,8 +7,8 @@ use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use agent_core::AgentEvent;
 use agent_core::message::{ContentBlock, Message, Role, ToolCallId, ToolErrorKind};
+use agent_core::{AgentEvent, TurnDiffView};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -1119,6 +1119,7 @@ impl AppState {
             // Comptabilité de tour (US-017) : contrat machine, sans rendu. Le
             // compteur de contexte a sa propre source.
             AgentEvent::ModelTurn(_) => {}
+            AgentEvent::TurnDiff(view) => self.blocks.push(Block::Notice(turn_diff_summary(view))),
             AgentEvent::PermissionAsk(req) => self
                 .blocks
                 .push(Block::Notice(format!("permission: {}", req.tool))),
@@ -2083,6 +2084,24 @@ impl AppState {
         }
         InputAction::None
     }
+}
+
+/// Résumé d'une ligne du diff agrégé du tour (US-018) : la réponse à « qu'est-ce
+/// qui a changé ? » sans rejouer un diff déjà vu édition par édition. Les
+/// fichiers touchés par une commande shell, eux, n'ont jamais été affichés
+/// ailleurs — c'est là que la ligne gagne son coût.
+pub fn turn_diff_summary(view: &TurnDiffView) -> String {
+    let (added, removed) = view.totals();
+    let n = view.files.len();
+    let plural = if n == 1 { "" } else { "s" };
+    if n <= 3 {
+        let names: Vec<&str> = view.files.iter().map(|f| f.path.as_str()).collect();
+        return format!(
+            "{n} file{plural} changed (+{added} -{removed}): {}",
+            names.join(", ")
+        );
+    }
+    format!("{n} file{plural} changed (+{added} -{removed})")
 }
 
 #[cfg(test)]

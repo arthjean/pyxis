@@ -130,6 +130,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "similar",
  "thiserror",
  "tokio",
  "walkdir",

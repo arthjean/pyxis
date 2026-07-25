@@ -22,6 +22,7 @@ pub mod registry;
 pub mod shell;
 pub mod taint;
 pub mod tool;
+pub mod turn_diff;
 pub mod write;
 
 #[cfg(test)]

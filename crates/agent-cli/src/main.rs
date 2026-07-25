@@ -833,9 +833,29 @@ async fn run(
             ephemeral_messages: Vec::new(),
         };
         let mut events = jsonl::EventWriter::new(args.output_format);
+        // US-018 : référence prise AVANT le tour, sur le workspace tel qu'il est.
+        // Uniquement en sortie machine : le format texte doit rester identique au
+        // caractère près (US-017 AC4), donc il n'a aucun consommateur pour ce diff
+        // et n'a pas à payer un `git status` par run.
+        let mut diff_tracker = if events.is_json() {
+            Some(agent_tools::turn_diff::TurnDiffTracker::begin(&workspace).await)
+        } else {
+            None
+        };
         let result =
             agent_core::run_headless_observed(ctx, deps, |event| events.event(event)).await;
 
+        // Diff agrégé après la fin du tour, donc après la dernière écriture d'outil
+        // (US-018 AC6 : y compris quand le tour a été interrompu).
+        if let Some(tracker) = diff_tracker.as_mut() {
+            match tracker.turn_diff().await {
+                Ok(diff) if !diff.is_empty() => {
+                    events.event(&agent_core::AgentEvent::TurnDiff(diff))
+                }
+                Ok(_) => {}
+                Err(err) => eprintln!("[diff] {err}"),
+            }
+        }
         let session_id = current_session
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
@@ -887,6 +907,7 @@ async fn run(
             command_hardener: mcp_harden,
             permission_mode,
             settings_path,
+            workspace: workspace.clone(),
         };
         interactive::run(
             deps,

@@ -23,6 +23,9 @@ thiserror.workspace = true
 regex.workspace = true
 globset.workspace = true
 walkdir.workspace = true
+# diff agrégé du tour (US-018) : moteur de diff déjà présent dans le workspace,
+# utilisé ici pour produire le texte unifié. Aucune nouvelle dépendance.
+similar.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

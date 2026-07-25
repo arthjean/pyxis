@@ -513,6 +513,18 @@ impl TranscriptMapper {
             // Comptabilité de tour : rien à rendre dans le transcript de parité
             // Codex, qui n'a pas de cellule équivalente.
             AgentEvent::ModelTurn(_) => Vec::new(),
+            AgentEvent::TurnDiff(view) => vec![TranscriptUpdate::new(
+                TranscriptLifecycle::Completed,
+                TranscriptItem::new(
+                    Some(self.next_local("notice")),
+                    TranscriptRole::System,
+                    TranscriptItemKind::Notice,
+                    TranscriptItemStatus::Complete,
+                    TranscriptPayload::Notice {
+                        message: crate::state::turn_diff_summary(view),
+                    },
+                ),
+            )],
             AgentEvent::Compacted(kind) => vec![TranscriptUpdate::new(
                 TranscriptLifecycle::Completed,
                 TranscriptItem::new(
