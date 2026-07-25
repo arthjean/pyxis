@@ -1242,7 +1242,8 @@ async fn default_mode_asks_bypass_skips() {
     let ws = TempWs::new("perm");
     ws.write("noop", "");
 
-    // Default + refusal -> Bash not executed, error outcome.
+    // Default + refusal -> Bash not executed, error outcome. The command is
+    // outside the side-effect-free set (US-007), otherwise it would not ask.
     let (deny, deny_calls) = RecordingApprover::new(false);
     let reg = Registry::builder(ws.path())
         .mode(PermissionMode::Default)
@@ -1253,7 +1254,7 @@ async fn default_mode_asks_bypass_skips() {
         .dispatch(vec![call(
             "a",
             "bash",
-            serde_json::json!({"command": "echo hi"}),
+            serde_json::json!({"command": "touch noop"}),
         )])
         .await;
     assert_eq!(
@@ -1274,7 +1275,7 @@ async fn default_mode_asks_bypass_skips() {
         .dispatch(vec![call(
             "b",
             "bash",
-            serde_json::json!({"command": "echo hi"}),
+            serde_json::json!({"command": "touch noop"}),
         )])
         .await;
     assert_eq!(calls.lock().unwrap().len(), 0, "Bypass never asks");

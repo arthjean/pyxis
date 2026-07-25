@@ -11,6 +11,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod bash;
+pub mod command;
 pub mod edit;
 pub mod error;
 pub mod glob;
@@ -29,6 +30,7 @@ pub mod write;
 mod tests_integration;
 
 pub use bash::Bash;
+pub use command::{CommandClass, classify};
 pub use edit::Edit;
 pub use error::{ToolError, ValidationError};
 pub use glob::Glob;
