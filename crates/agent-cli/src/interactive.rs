@@ -1147,11 +1147,12 @@ async fn event_loop(
                         active_turn.request_cancel();
                     }
                     InputAction::Interrupt => {}
-                    InputAction::Permission(allow) => {
+                    InputAction::Permission { allow, remember } => {
                         if let Some(resp) = pending_resp.take() {
-                            let _ = resp.send(
-                                agent_tools::permission::ApprovalResponse::once(allow),
-                            );
+                            let _ = resp.send(agent_tools::permission::ApprovalResponse {
+                                allow,
+                                remember,
+                            });
                         }
                         #[cfg(feature = "codex_tui_parity")]
                         parity_surface.apply_update(parity_mapper.map_approval_decision(allow));

@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"approval_dialog_narrow_not_memoizable\", &s, NARROW, H)"
+---
+
+PYXIS
+your terminal coding agent
+
+◆ gpt-5  ·  pyxis  ·  Ask for approval
+○ not connected  restart pyxis to reconn
+
+/help  ·  /models  ·  /effort
+/permissions  ·  /goal
+ctrl+c twice to quit   ·   ↑ history
+
+
+
+
+
+
+
+
+
+⟐ bash  - sensitive action requires
+       rm $(cat liste)
+  not remembered: the command contains a
+  substitution or a variable
+  [o] allow   [n] deny

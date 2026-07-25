@@ -721,7 +721,13 @@ pub enum InputAction {
     Command(String),
     Interrupt,
     Quit,
-    Permission(bool),
+    /// Answer to the pending confirmation: what to do now, and whether to
+    /// remember it for the session (US-009). `remember` is only ever true when
+    /// the prompt declared itself memoizable.
+    Permission {
+        allow: bool,
+        remember: bool,
+    },
     ScrollUp,
     ScrollDown,
 }
@@ -1913,21 +1919,48 @@ impl AppState {
             return InputAction::None;
         }
 
-        if self.pending.is_some() {
+        if let Some(prompt) = &self.pending {
+            // US-009 AC1/AC2: the session options only exist when the request
+            // declares itself memoizable; otherwise their keys do nothing.
+            let memoizable = prompt.memoizable;
             return match key.code {
                 KeyCode::Char('o') | KeyCode::Char('y') | KeyCode::Enter => {
                     self.pending = None;
-                    InputAction::Permission(true)
+                    InputAction::Permission {
+                        allow: true,
+                        remember: false,
+                    }
+                }
+                KeyCode::Char('a') if memoizable => {
+                    self.pending = None;
+                    InputAction::Permission {
+                        allow: true,
+                        remember: true,
+                    }
+                }
+                KeyCode::Char('d') if memoizable => {
+                    self.pending = None;
+                    InputAction::Permission {
+                        allow: false,
+                        remember: true,
+                    }
                 }
                 KeyCode::Char('n') | KeyCode::Esc => {
                     self.pending = None;
-                    InputAction::Permission(false)
+                    InputAction::Permission {
+                        allow: false,
+                        remember: false,
+                    }
                 }
                 _ if is_ctrl_c => {
                     self.pending = None;
                     self.clear_quit_shortcut_hint();
-                    InputAction::Permission(false)
+                    InputAction::Permission {
+                        allow: false,
+                        remember: false,
+                    }
                 }
+                // US-009 AC5: any other key leaves the dialog open.
                 _ => InputAction::None,
             };
         }
@@ -2968,8 +3001,48 @@ mod tests {
         assert_eq!(s.on_key(key('x')), InputAction::None);
         assert!(s.input.is_empty());
         // 'y' accepts
-        assert_eq!(s.on_key(key('o')), InputAction::Permission(true));
+        assert_eq!(
+            s.on_key(key('o')),
+            InputAction::Permission {
+                allow: true,
+                remember: false
+            }
+        );
         assert!(s.pending.is_none());
+    }
+
+    #[test]
+    fn session_scope_keys_exist_only_when_memoizable() {
+        // US-009 AC1: a memoizable dialog answers with a session scope.
+        let mut s = AppState::new("gpt-5", false);
+        let mut prompt = PermissionPrompt::new("bash", "sensible", crate::diff::Diff::default());
+        prompt.memoizable = true;
+        s.pending = Some(prompt.clone());
+        assert_eq!(
+            s.on_key(key('a')),
+            InputAction::Permission {
+                allow: true,
+                remember: true
+            }
+        );
+        s.pending = Some(prompt);
+        assert_eq!(
+            s.on_key(key('d')),
+            InputAction::Permission {
+                allow: false,
+                remember: true
+            }
+        );
+
+        // US-009 AC2/AC5: without memoization those keys do nothing and the
+        // dialog stays open.
+        let mut prompt = PermissionPrompt::new("bash", "sensible", crate::diff::Diff::default());
+        prompt.memo_note = Some("the command contains a substitution or a variable".into());
+        s.pending = Some(prompt);
+        assert_eq!(s.on_key(key('a')), InputAction::None);
+        assert_eq!(s.on_key(key('d')), InputAction::None);
+        assert_eq!(s.on_key(key('z')), InputAction::None);
+        assert!(s.pending.is_some(), "nothing approved, dialog still open");
     }
 
     #[test]
@@ -2995,7 +3068,10 @@ mod tests {
 
         assert_eq!(
             s.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            InputAction::Permission(false)
+            InputAction::Permission {
+                allow: false,
+                remember: false
+            }
         );
     }
 
@@ -3087,7 +3163,10 @@ mod tests {
 
         assert_eq!(
             s.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            InputAction::Permission(false)
+            InputAction::Permission {
+                allow: false,
+                remember: false
+            }
         );
         assert!(!s.should_quit);
         assert!(!s.quit_shortcut_hint_visible());

@@ -277,6 +277,61 @@ fn approval_dialog() {
     );
 }
 
+/// US-009 AC1: a memoizable request offers the session scopes on top of the
+/// one-shot answers.
+#[test]
+fn approval_dialog_memoizable() {
+    let mut s = state();
+    s.push_user("Montre l'état du dépôt");
+    let preview = agent_tui::diff::note(["git status"]);
+    let mut prompt =
+        PermissionPrompt::new("bash", "sensitive action requires confirmation", preview);
+    prompt.call_id = Some("call_2".into());
+    prompt.mode = Some("ask".into());
+    prompt.memoizable = true;
+    s.pending = Some(prompt);
+    insta::assert_snapshot!(
+        "approval_dialog_memoizable",
+        harness::frame("approval_dialog_memoizable", &s, W, H)
+    );
+}
+
+/// US-009 AC2/AC4: no session option when the command is not rememberable, the
+/// reason visible, and everything readable on 40 columns.
+#[test]
+fn approval_dialog_narrow_not_memoizable() {
+    let mut s = state();
+    let preview = agent_tui::diff::note(["rm $(cat liste)"]);
+    let mut prompt =
+        PermissionPrompt::new("bash", "sensitive action requires confirmation", preview);
+    prompt.call_id = Some("call_3".into());
+    prompt.mode = Some("ask".into());
+    prompt.memo_note = Some("the command contains a substitution or a variable".into());
+    s.pending = Some(prompt);
+    insta::assert_snapshot!(
+        "approval_dialog_narrow_not_memoizable",
+        harness::frame("approval_dialog_narrow_not_memoizable", &s, NARROW, H)
+    );
+}
+
+/// US-009 AC4: the four options stack instead of being clipped when the
+/// terminal is too narrow for a single row.
+#[test]
+fn approval_dialog_narrow_memoizable() {
+    let mut s = state();
+    let preview = agent_tui::diff::note(["git status"]);
+    let mut prompt =
+        PermissionPrompt::new("bash", "sensitive action requires confirmation", preview);
+    prompt.call_id = Some("call_4".into());
+    prompt.mode = Some("ask".into());
+    prompt.memoizable = true;
+    s.pending = Some(prompt);
+    insta::assert_snapshot!(
+        "approval_dialog_narrow_memoizable",
+        harness::frame("approval_dialog_narrow_memoizable", &s, NARROW, H)
+    );
+}
+
 #[test]
 fn pending_input() {
     let mut s = conversation();

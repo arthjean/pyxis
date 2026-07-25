@@ -1700,10 +1700,11 @@ fn render_permission(frame: &mut Frame, area: Rect, prompt: &PermissionPrompt, t
     lines.push(clip(title, width));
 
     // Preview: SAME engine/rendering as the inline diff (US-039). Bounded to the
-    // remaining room (title + actions reserved) so that [y]/[n] stay ALWAYS visible.
+    // remaining room (title + actions reserved) so the answers stay ALWAYS visible.
+    let actions = permission_actions(prompt, width, theme);
     let mut preview: Vec<Line<'static>> = Vec::new();
     push_diff(&mut preview, &prompt.preview, theme, width, None);
-    let room = (area.height as usize).saturating_sub(2);
+    let room = (area.height as usize).saturating_sub(1 + actions.len());
     if preview.len() <= room {
         lines.extend(preview);
     } else {
@@ -1716,21 +1717,109 @@ fn render_permission(frame: &mut Frame, area: Rect, prompt: &PermissionPrompt, t
         )));
     }
 
-    lines.push(Line::from(vec![
-        Span::styled("  [o]", theme.accent()),
-        Span::styled(" allow   ", theme.dim()),
-        Span::styled("[n]", theme.accent()),
-        Span::styled(" deny", theme.dim()),
-    ]));
+    lines.extend(actions);
 
     // Lines already clipped to the width -> no `Wrap` (exact height).
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// Height needed by the permission dialog (title + bounded preview + actions).
-fn permission_height(prompt: &PermissionPrompt, _width: u16) -> u16 {
+/// Answer lines of the dialog. Single source for the rendering AND the height:
+/// the two must never disagree, otherwise an option would be cut off.
+///
+/// US-009: the session options only appear when the answer is memoizable; when
+/// it is not for a nameable reason, that reason takes their place. On a narrow
+/// terminal the four options split over two lines rather than being truncated
+/// (AC4).
+fn permission_actions(
+    prompt: &PermissionPrompt,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    // (key, label) pairs; all ASCII, so their byte length is their column width.
+    fn group(keys: &[(&str, &str)], theme: &Theme) -> Vec<Span<'static>> {
+        let mut spans = vec![Span::styled("  ", theme.dim())];
+        for (i, (key, label)) in keys.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled("   ", theme.dim()));
+            }
+            spans.push(Span::styled(format!("[{key}]"), theme.accent()));
+            spans.push(Span::styled(format!(" {label}"), theme.dim()));
+        }
+        spans
+    }
+    fn columns(spans: &[Span<'static>]) -> usize {
+        spans
+            .iter()
+            .map(|s| measure::width(s.content.as_ref()))
+            .sum()
+    }
+
+    // Labels kept short enough for the stacked form to fit 40 columns (AC4).
+    const ONCE: &[(&str, &str)] = &[("o", "allow"), ("n", "deny")];
+    const SESSION: &[(&str, &str)] = &[("a", "allow session"), ("d", "deny session")];
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(note) = &prompt.memo_note {
+        // The reason must stay READABLE, not merely present: on a narrow
+        // terminal it wraps instead of being clipped (AC2).
+        for row in wrap_words(&format!("not remembered: {}", sanitize(note)), width, 2) {
+            lines.push(clip(vec![Span::styled(row, theme.faint())], width));
+        }
+    }
+    if !prompt.memoizable {
+        lines.push(clip(group(ONCE, theme), width));
+        return lines;
+    }
+    let mut all = group(ONCE, theme);
+    all.push(Span::styled("   ", theme.dim()));
+    all.extend(group(SESSION, theme).into_iter().skip(1));
+    if columns(&all) <= width {
+        lines.push(clip(all, width));
+    } else {
+        // Narrow terminal (US-009 AC4): stacking keeps every option readable
+        // instead of clipping one away.
+        lines.push(clip(group(ONCE, theme), width));
+        lines.push(clip(group(SESSION, theme), width));
+    }
+    lines
+}
+
+/// Wraps `text` on word boundaries into at most `max_rows` rows of `width`
+/// columns, each indented by two spaces. The last row is left to the caller's
+/// `clip` when the text does not fit in the budget.
+fn wrap_words(text: &str, width: usize, max_rows: usize) -> Vec<String> {
+    const INDENT: &str = "  ";
+    let room = width.saturating_sub(INDENT.len()).max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{current} {word}")
+        };
+        if measure::width(&candidate) <= room || current.is_empty() {
+            current = candidate;
+            continue;
+        }
+        rows.push(format!("{INDENT}{current}"));
+        if rows.len() == max_rows {
+            return rows;
+        }
+        current = word.to_string();
+    }
+    if !current.is_empty() {
+        rows.push(format!("{INDENT}{current}"));
+    }
+    rows
+}
+
+/// Height needed by the permission dialog (title + bounded preview + answers).
+fn permission_height(prompt: &PermissionPrompt, width: u16) -> u16 {
+    // The styles play no part in the line COUNT: any theme gives the same height.
+    let actions = permission_actions(prompt, width as usize, &Theme::new(false)).len() as u16;
     let preview = prompt.preview.rows.len().min(12) as u16;
-    (2 + preview).clamp(2, 16)
+    (1 + actions + preview).clamp(1 + actions, 16)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2136,7 +2225,13 @@ mod tests {
             crate::diff::Diff::default(),
         ));
         let action = s.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-        assert_eq!(action, crate::state::InputAction::Permission(false));
+        assert_eq!(
+            action,
+            crate::state::InputAction::Permission {
+                allow: false,
+                remember: false
+            }
+        );
         assert!(s.pending.is_none());
     }
 

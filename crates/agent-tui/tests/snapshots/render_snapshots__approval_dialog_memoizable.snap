@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"approval_dialog_memoizable\", &s, W, H)"
+---
+› Montre l'état du dépôt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+⟐ bash  - sensitive action requires confirmation · ask
+       git status
+  [o] allow   [n] deny   [a] allow session   [d] deny session
