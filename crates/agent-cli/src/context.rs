@@ -129,15 +129,11 @@ fn environment_block(workspace: &Path, date: &str) -> String {
     )
 }
 
+/// Shell annoncé au modèle. Source unique partagée avec l'outil `bash` (US-014) :
+/// annoncer `$SHELL` alors que `sh` exécutait produisait des commandes bâties sur
+/// une syntaxe indisponible.
 fn default_shell() -> String {
-    #[cfg(windows)]
-    {
-        "powershell.exe".to_string()
-    }
-    #[cfg(not(windows))]
-    {
-        std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string())
-    }
+    agent_tools::shell::resolve().label
 }
 
 /// Date UTC `YYYY-MM-DD` (fournie au bloc environnement). Calculée sans dépendance
@@ -247,6 +243,18 @@ mod tests {
         assert!(block.contains("<shell>"));
         assert!(block.contains("<current_date>2026-06-17</current_date>"));
         assert!(block.contains("<timezone>"));
+    }
+
+    #[test]
+    fn env_block_announces_the_shell_that_will_execute() {
+        // US-014 AC3 : une seule source pour l'annonce et pour l'exécution.
+        let ws = tmp("shell");
+        let block = environment_block(&ws, "2026-06-17");
+        let shell = agent_tools::shell::resolve();
+        assert!(
+            block.contains(&format!("<shell>{}</shell>", shell.label)),
+            "bloc: {block}"
+        );
     }
 
     #[test]

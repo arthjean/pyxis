@@ -1078,6 +1078,42 @@ async fn bash_captures_output_untrusted() {
     assert!(o.content.contains("bonjour"));
 }
 
+#[cfg(not(windows))]
+#[tokio::test]
+async fn bash_runs_in_the_shell_it_announces() {
+    // US-014 AC1/AC3 : le shell annoncé (description de l'outil, bloc
+    // `<environment>`) est celui qui exécute réellement la commande.
+    let ws = TempWs::new("bash-shell");
+    let reg = mut_registry(&ws, PermissionMode::BypassPermissions);
+    let out = reg
+        .dispatch(vec![call(
+            "a",
+            "bash",
+            serde_json::json!({"command": "echo \"$0\""}),
+        )])
+        .await;
+    let o = by_id(&out, "a");
+    assert!(!o.is_error, "{}", o.content);
+
+    let shell = crate::shell::resolve();
+    let announced = shell
+        .program
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap()
+        .to_string();
+    assert!(
+        o.content.contains(&announced),
+        "commande exécutée par un autre shell que {announced}: {}",
+        o.content
+    );
+    assert!(
+        Bash.description().contains(&shell.label),
+        "la description doit nommer le shell exécuté: {}",
+        Bash.description()
+    );
+}
+
 #[tokio::test]
 async fn bash_nonzero_exit_is_error_but_keeps_output() {
     let ws = TempWs::new("bash-err");

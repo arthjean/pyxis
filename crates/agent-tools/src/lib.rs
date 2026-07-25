@@ -19,6 +19,7 @@ pub mod path;
 pub mod permission;
 pub mod read;
 pub mod registry;
+pub mod shell;
 pub mod taint;
 pub mod tool;
 pub mod write;
@@ -37,6 +38,7 @@ pub use permission::{
 };
 pub use read::Read;
 pub use registry::{Registry, RegistryBuilder};
+pub use shell::ShellChoice;
 pub use tool::{CommandHardener, DynTool, DynToolAdapter, Tool, ToolCtx, ToolOutput, into_dyn};
 pub use write::Write;
 

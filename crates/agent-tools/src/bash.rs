@@ -32,14 +32,23 @@ impl Tool for Bash {
     }
     fn description(&self) -> String {
         #[cfg(windows)]
-        let description = "Run a PowerShell command (powershell.exe -NoProfile -NonInteractive -Command) in the workspace and return \
-         stdout/stderr plus the exit code. The command runs under a timeout. \
-         Parameter: command.";
+        {
+            "Run a PowerShell command (powershell.exe -NoProfile -NonInteractive -Command) in the workspace and return \
+             stdout/stderr plus the exit code. The command runs under a timeout. \
+             Parameter: command."
+                .to_string()
+        }
+        // US-014 : la description nomme le shell RÉELLEMENT utilisé, le même que
+        // celui annoncé dans le bloc `<environment>`.
         #[cfg(not(windows))]
-        let description = "Run a shell command (sh -c) in the workspace and return \
-         stdout/stderr plus the exit code. The command runs under a timeout. \
-         Parameter: command.";
-        description.to_string()
+        {
+            format!(
+                "Run a shell command ({} -c) in the workspace and return \
+                 stdout/stderr plus the exit code. The command runs under a timeout. \
+                 Parameter: command.",
+                crate::shell::resolve().label
+            )
+        }
     }
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
@@ -87,45 +96,27 @@ impl Tool for Bash {
     }
 
     async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        #[cfg(windows)]
-        let mut cmd = {
-            let mut cmd = tokio::process::Command::new("powershell.exe");
-            cmd.arg("-NoProfile")
-                .arg("-NonInteractive")
-                .arg("-Command")
-                .arg(&input.command);
-            cmd
+        let shell = crate::shell::resolve();
+        let mut child = match build_command(&shell, &input.command, ctx).spawn() {
+            Ok(child) => child,
+            // AC4 : un shell de connexion introuvable ou qui refuse de démarrer ne
+            // fait pas échouer le tour. On retombe sur `sh` pour cette commande, et
+            // le drapeau process-wide aligne l'annonce faite au modèle dès le tour
+            // suivant.
+            Err(first) if !shell.is_fallback() => {
+                crate::shell::mark_login_shell_unusable();
+                let fallback = crate::shell::resolve();
+                build_command(&fallback, &input.command, ctx)
+                    .spawn()
+                    .map_err(|e| {
+                        ToolError::Io(format!(
+                            "shell launch: {} unusable ({first}), fallback {} failed: {e}",
+                            shell.label, fallback.label
+                        ))
+                    })?
+            }
+            Err(e) => return Err(ToolError::Io(format!("shell launch: {e}"))),
         };
-        #[cfg(not(windows))]
-        let mut cmd = tokio::process::Command::new("sh");
-
-        #[cfg(not(windows))]
-        {
-            cmd.arg("-c").arg(&input.command);
-            cmd.process_group(0);
-        }
-
-        cmd.current_dir(&ctx.workspace)
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-
-        #[cfg(windows)]
-        {
-            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
-        }
-
-        // Durcissement sandbox (réseau via HTTP_PROXY) injecté par l'agent-cli.
-        // Le confinement FS Landlock est process-wide → hérité par ce sous-process.
-        if let Some(harden) = &ctx.harden {
-            harden(&mut cmd);
-        }
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| ToolError::Io(format!("shell launch: {e}")))?;
         let pid = child.id();
 
         let stdout = child.stdout.take();
@@ -235,6 +226,52 @@ impl Tool for Bash {
             }
         }
     }
+}
+
+/// Construit la commande shell (mêmes options qu'avant US-014, seul le programme
+/// exécuté devient variable).
+fn build_command(
+    shell: &crate::shell::ShellChoice,
+    command: &str,
+    ctx: &ToolCtx,
+) -> tokio::process::Command {
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut cmd = tokio::process::Command::new(&shell.program);
+        cmd.arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(command);
+        cmd
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut cmd = tokio::process::Command::new(&shell.program);
+        // `-c` en mode non interactif : aucun fichier d'initialisation interactif
+        // n'est lu, le comportement reste celui d'un shell de script.
+        cmd.arg("-c").arg(command);
+        cmd.process_group(0);
+        cmd
+    };
+
+    cmd.current_dir(&ctx.workspace)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+
+    // Durcissement sandbox (réseau via HTTP_PROXY) injecté par l'agent-cli.
+    // Le confinement FS Landlock est process-wide → hérité par ce sous-process.
+    if let Some(harden) = &ctx.harden {
+        harden(&mut cmd);
+    }
+    cmd
 }
 
 #[derive(Default)]
