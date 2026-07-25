@@ -52,6 +52,7 @@ contrat que consomme aussi la TUI.
 | `tool_result` | `{id, content, is_error, error_kind?, untrusted}` | Résultat d'outil. `untrusted` vaut `true` pour tout contenu externe. |
 | `compacted` | `"micro"` \| `"auto"` \| `"reactive"` | Une compaction de contexte a eu lieu. |
 | `model_turn` | `{index, input_tokens, output_tokens, context_tokens?, context_window?, estimated_context_tokens?}` | Un aller-retour modèle vient de finir. `index` est 1-based ; `input_tokens` et `output_tokens` sont **cumulés depuis le début du run**, réels quand le provider rapporte son usage, estimés localement sinon. Voir plus bas. |
+| `quota` | `{primary?, secondary?}` | État de quota d'abonnement rapporté par le backend. Émis seulement quand le backend en sert un. Voir plus bas. |
 | `turn_diff` | `{files:[…]}` | Diff agrégé du tour. Jamais émis quand rien n'a changé. Voir plus bas. |
 | `permission_ask` | `{call_id, tool, reason, taint_forced, input_summary, input, mode}` | Demande d'autorisation. En headless, l'approbateur refuse par défaut. |
 | `end_turn` | — | Le tour s'est terminé normalement. |
@@ -75,6 +76,20 @@ est la fenêtre déclarée par le backend pour le modèle actif, **absente** tan
 qu'elle est inconnue. Le cœur ne calcule aucun pourcentage : rapporter l'un à
 l'autre est une décision de présentation. `estimated_context_tokens` n'apparaît
 que lorsque la sonde de calibration est active (`PYXIS_DEBUG_USAGE`).
+
+### `quota`
+
+```json
+{"schema":1,"type":"quota","data":{
+  "primary":{"used_percent":42.0,"window_minutes":300,"resets_at_unix":1784989920},
+  "secondary":{"used_percent":7.5,"window_minutes":10080}
+}}
+```
+
+`used_percent` va de 0 à 100. `window_minutes` est la durée de la fenêtre
+glissante et `resets_at_unix` l'instant de réinitialisation en secondes depuis
+l'époque Unix ; les deux sont absents quand le backend ne les sert pas. Une
+fenêtre entièrement vide n'est jamais émise.
 
 ### `turn_diff`
 

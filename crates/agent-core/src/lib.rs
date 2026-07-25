@@ -16,6 +16,7 @@ pub mod event;
 pub mod guardrail;
 pub mod message;
 pub mod provider;
+pub mod quota;
 pub mod session;
 pub mod tools;
 pub mod transition;
@@ -39,6 +40,7 @@ pub use provider::{
     ProviderError, ProviderKind, ReasoningCapabilities, StopReason, StreamEvent, TokenUsage,
     ToolCallingCapabilities,
 };
+pub use quota::{QuotaSnapshot, QuotaWindow, format_unix_utc};
 pub use session::{Session, SessionEntry, SessionError};
 pub use tools::{ToolDispatch, ToolDispatchEvent, ToolEventSink, ToolInvocation, ToolOutcome};
 
@@ -1201,6 +1203,48 @@ mod loop_tests {
         assert!(
             turns[0].estimated_context_tokens.is_some(),
             "sonde active: l'estimation locale accompagne la mesure"
+        );
+    }
+
+    /// US-003 AC1: a quota state served by the provider becomes a structured
+    /// event; an empty state produces nothing at all (AC5).
+    #[tokio::test]
+    async fn quota_state_is_relayed_and_emptiness_is_silent() {
+        let snapshot = crate::quota::QuotaSnapshot {
+            primary: Some(crate::quota::QuotaWindow {
+                used_percent: 42.0,
+                window_minutes: Some(300),
+                resets_at_unix: Some(1_784_989_920),
+            }),
+            secondary: None,
+        };
+        let h = harness(
+            vec![text_turn_with(vec![StreamEvent::Quota { snapshot }])],
+            false,
+            10_000,
+        );
+        let events = drive(AgentContext::new("mock").push(Message::user("go")), h.deps).await;
+        let quotas: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Quota(snapshot) => Some(*snapshot),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(quotas.len(), 1, "{events:?}");
+        assert_eq!(quotas[0].primary.map(|w| w.used_percent), Some(42.0));
+
+        let h = harness(
+            vec![text_turn_with(vec![StreamEvent::Quota {
+                snapshot: crate::quota::QuotaSnapshot::default(),
+            }])],
+            false,
+            10_000,
+        );
+        let events = drive(AgentContext::new("mock").push(Message::user("go")), h.deps).await;
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Quota(_))),
+            "état vide: aucun événement émis ({events:?})"
         );
     }
 

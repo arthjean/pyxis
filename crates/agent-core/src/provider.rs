@@ -62,6 +62,13 @@ pub enum StreamEvent {
         id: String,
         encrypted_content: String,
     },
+    /// Subscription quota state read by the adapter (US-003). Purely
+    /// informational, emitted at most once per round-trip and only when the
+    /// backend serves something usable: an adapter that knows nothing about
+    /// quotas never emits it.
+    Quota {
+        snapshot: crate::quota::QuotaSnapshot,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

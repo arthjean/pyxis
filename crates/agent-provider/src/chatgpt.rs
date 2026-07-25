@@ -352,8 +352,20 @@ async fn http_error_from_response(resp: reqwest::Response) -> ProviderError {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let retry_after_ms = parse_retry_after_ms(resp.headers(), now_ms);
+    let quota = crate::quota::parse_quota_headers(resp.headers());
     let mut text = sanitize_error_body(&resp.text().await.unwrap_or_default());
+    // Truncated BEFORE prefixing: the terminal-quota markers sit at the start of
+    // the body, and `is_terminal_rate_limit` must keep seeing them.
     text.truncate(MAX_ERR_BODY);
+    // US-003 AC3: an exhausted quota is announced by naming the limit and its
+    // reset instead of handing back the raw body. The body stays appended: it
+    // carries the markers used for the terminal/transient classification.
+    if code == 429 && is_terminal_rate_limit(&text) {
+        text = format!(
+            "{} {text}",
+            crate::quota::quota_refusal_message(quota.as_ref())
+        );
+    }
     ProviderError::Http {
         status: code,
         message: text,
@@ -691,9 +703,15 @@ impl Provider for OpenAiChatGptProvider {
         //    then the `idle_guarded` watchdog: the timeout wraps `inner.next()`, so
         //    an `es.next()` that stalls (mute backend) triggers the idle timeout, without
         //    cutting while draining already buffered events (US-022).
+        //    US-003: the quota state travels in the response headers, so it is read
+        //    here, before the body is consumed, and emitted first.
+        let quota = crate::quota::parse_quota_headers(resp.headers());
         let mut es = resp.bytes_stream().eventsource();
         let replay = self.reasoning_replay; // Copy -> captured in the 'static stream.
         let mapped = async_stream::stream! {
+            if let Some(snapshot) = quota {
+                yield Ok(StreamEvent::Quota { snapshot });
+            }
             let mut mapper = CodexEventMapper::with_replay(replay);
             let mut saw_terminal = false;
             while let Some(ev) = es.next().await {

@@ -510,9 +510,10 @@ impl TranscriptMapper {
                 }
                 updates
             }
-            // Turn accounting: nothing to render in the Codex parity transcript,
-            // which has no equivalent cell.
-            AgentEvent::ModelTurn(_) => Vec::new(),
+            // Turn accounting and quota state: nothing to render in the Codex
+            // parity transcript, which has no equivalent cell. Both are read
+            // from `AppState` by the status line and the session commands.
+            AgentEvent::ModelTurn(_) | AgentEvent::Quota(_) => Vec::new(),
             AgentEvent::TurnDiff(view) => vec![TranscriptUpdate::new(
                 TranscriptLifecycle::Completed,
                 TranscriptItem::new(

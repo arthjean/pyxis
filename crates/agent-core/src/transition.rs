@@ -216,7 +216,9 @@ impl Accumulator {
                     },
                 );
             }
-            StreamEvent::Usage { .. } => {}
+            // Telemetry, not turn content: consumed by the loop, nothing to
+            // accumulate for the assistant message.
+            StreamEvent::Usage { .. } | StreamEvent::Quota { .. } => {}
             StreamEvent::Done { stop } => self.stop = Some(stop),
         }
         Ok(())

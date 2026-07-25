@@ -602,6 +602,9 @@ pub struct AppState {
     pub workspace: String,
     /// Fraction of context consumed (0-100). `None` = unknown -> segment hidden.
     pub context_pct: Option<u8>,
+    /// Subscription quota state (US-003). `None` as long as the backend has
+    /// served nothing: nothing is then displayed.
+    pub quota: Option<agent_core::quota::QuotaSnapshot>,
     /// Reasoning effort displayed with the model in the footer.
     pub reasoning_effort: Option<String>,
     /// Permission mode displayed in the footer and the `/permissions` submenu.
@@ -739,6 +742,7 @@ impl AppState {
             model: model.into(),
             workspace: String::new(),
             context_pct: None,
+            quota: None,
             reasoning_effort: None,
             permission_mode: DEFAULT_PERMISSION_MODE_ID.to_string(),
             completion_index: 0,
@@ -1119,6 +1123,7 @@ impl AppState {
             // Turn accounting (US-017): machine contract, no rendering. The
             // context counter has its own source.
             AgentEvent::ModelTurn(_) => {}
+            AgentEvent::Quota(snapshot) => self.quota = Some(*snapshot),
             AgentEvent::TurnDiff(view) => self.blocks.push(Block::Notice(turn_diff_summary(view))),
             AgentEvent::PermissionAsk(req) => self
                 .blocks

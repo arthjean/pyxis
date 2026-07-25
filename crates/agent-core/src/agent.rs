@@ -635,6 +635,11 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 budget.observe_usage(usage);
                                 last_usage = Some(usage);
                             }
+                            Ok(StreamEvent::Quota { snapshot }) => {
+                                if !snapshot.is_empty() {
+                                    yield AgentEvent::Quota(snapshot);
+                                }
+                            }
                             Ok(other) => {
                                 if let Err(e) = acc.push(other) {
                                     yield AgentEvent::Error(e);

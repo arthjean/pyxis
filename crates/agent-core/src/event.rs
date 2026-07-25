@@ -38,6 +38,10 @@ pub enum AgentEvent {
     /// means reading the disk, which the core does not do (invariant 1). Never
     /// emitted when nothing changed.
     TurnDiff(TurnDiffView),
+    /// Subscription quota state reported by the backend (US-003). Emitted only
+    /// when the provider served something usable. Purely informational: a client
+    /// that ignores it keeps the previous behavior.
+    Quota(crate::quota::QuotaSnapshot),
     /// Permission request (emitted by the tool pipeline, US-013, not by the
     /// core in EP-002; present to pin down the contract).
     PermissionAsk(PermissionReq),
