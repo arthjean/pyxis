@@ -1,24 +1,24 @@
-//! Suivi du taint untrusted (ARCHITECTURE §4.6, OWASP LLM01). Toute sortie
-//! d'outil est untrusted par défaut (invariant 3) ; quand l'une est produite, le
-//! taint est marqué « récent » pour quelques cycles de dispatch. Une action
-//! sensible déclenchée pendant cette fenêtre force la confirmation
-//! (cf. `permission::resolve_permission`).
+//! Untrusted taint tracking (ARCHITECTURE 4.6, OWASP LLM01). Every tool
+//! output is untrusted by default (invariant 3); when one is produced, the
+//! taint is marked "recent" for a few dispatch cycles. A sensitive
+//! action triggered during that window forces confirmation
+//! (see `permission::resolve_permission`).
 //!
-//! `&self` partout (interior mutability) : le `Registry` dispatche en `&self` et
-//! exécute des outils concurrents qui peuvent marquer le taint en parallèle.
+//! `&self` everywhere (interior mutability): the `Registry` dispatches through `&self` and
+//! runs concurrent tools that can mark the taint in parallel.
 
 use std::sync::Mutex;
 
 #[derive(Debug)]
 struct State {
-    /// Cycle de dispatch courant (incrémenté à chaque batch).
+    /// Current dispatch cycle (incremented on every batch).
     cycle: u64,
-    /// Dernier cycle où du taint a été produit.
+    /// Last cycle where taint was produced.
     last_marked: Option<u64>,
 }
 
-/// Fenêtre de fraîcheur par défaut (en cycles de dispatch). Le taint produit au
-/// cycle N reste « récent » jusqu'au cycle N + WINDOW inclus.
+/// Default freshness window (in dispatch cycles). Taint produced at
+/// cycle N stays "recent" up to and including cycle N + WINDOW.
 pub const DEFAULT_WINDOW: u64 = 2;
 
 #[derive(Debug)]
@@ -44,35 +44,35 @@ impl TaintTracker {
         }
     }
 
-    /// Ouvre un nouveau cycle de dispatch (un batch d'outils). À appeler une fois
-    /// au début de `dispatch`.
+    /// Opens a new dispatch cycle (one tool batch). To be called once
+    /// at the start of `dispatch`.
     pub fn begin_cycle(&self) {
         if let Ok(mut s) = self.state.lock() {
             s.cycle = s.cycle.saturating_add(1);
         }
     }
 
-    /// Marque du taint au cycle courant (une sortie untrusted vient d'être
-    /// produite).
+    /// Marks taint at the current cycle (an untrusted output was just
+    /// produced).
     pub fn mark(&self) {
         if let Ok(mut s) = self.state.lock() {
             s.last_marked = Some(s.cycle);
         }
     }
 
-    /// Reseed depuis un transcript repris contenant du contenu non fiable récent.
+    /// Reseed from a resumed transcript containing recent untrusted content.
     pub fn seed_recent(&self) {
         self.mark();
     }
 
-    /// Le taint est-il récent (dans la fenêtre) ? Sert à forcer `Ask`.
+    /// Is the taint recent (inside the window)? Used to force `Ask`.
     pub fn is_recent(&self) -> bool {
         match self.state.lock() {
             Ok(s) => match s.last_marked {
                 Some(m) => s.cycle.saturating_sub(m) <= self.window,
                 None => false,
             },
-            // Mutex empoisonné : fail-closed → on considère le contexte taché.
+            // Poisoned mutex: fail-closed -> we consider the context tainted.
             Err(_) => true,
         }
     }
@@ -99,13 +99,13 @@ mod tests {
 
     #[test]
     fn taint_decays_after_window() {
-        let t = TaintTracker::new(1); // fenêtre 1
+        let t = TaintTracker::new(1); // window 1
         t.begin_cycle(); // cycle 1
-        t.mark(); // marqué au cycle 1
+        t.mark(); // marked at cycle 1
         assert!(t.is_recent());
-        t.begin_cycle(); // cycle 2 : 2-1=1 ≤ 1 → encore récent
+        t.begin_cycle(); // cycle 2: 2-1=1 <= 1 -> still recent
         assert!(t.is_recent());
-        t.begin_cycle(); // cycle 3 : 3-1=2 > 1 → expiré
+        t.begin_cycle(); // cycle 3: 3-1=2 > 1 -> expired
         assert!(!t.is_recent());
     }
 }

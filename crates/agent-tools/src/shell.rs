@@ -1,30 +1,30 @@
-//! Shell d'exécution des commandes (US-014). Source UNIQUE pour l'outil `bash`
-//! et pour le bloc `<environment>` annoncé au modèle : ce que Pyxis annonce doit
-//! être ce qu'il exécute, sinon le modèle produit des constructions qui échouent.
+//! Shell used to run commands (US-014). SINGLE source for the `bash` tool
+//! and for the `<environment>` block announced to the model: what Pyxis announces must
+//! be what it runs, otherwise the model produces constructs that fail.
 //!
-//! Le shell de connexion n'est retenu que s'il est exécutable ET connu comme
-//! compatible POSIX : `fish`, `nu` ou `xonsh` acceptent `-c` mais pas la
-//! syntaxe que le modèle produit (`&&`, `2>&1`, `$(...)`, `export`), donc les
-//! annoncer reviendrait au même mensonge dans l'autre sens. Repli : `sh`.
+//! The login shell is kept only when it is executable AND known to be
+//! POSIX-compatible: `fish`, `nu` or `xonsh` accept `-c` but not the
+//! syntax the model produces (`&&`, `2>&1`, `$(...)`, `export`), so
+//! announcing them would be the same lie the other way around. Fallback: `sh`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Shells dont `-c` interprète la syntaxe POSIX que le modèle génère.
+/// Shells whose `-c` interprets the POSIX syntax the model generates.
 const POSIX_SHELLS: &[&str] = &[
     "sh", "bash", "dash", "zsh", "ksh", "ksh93", "mksh", "pdksh", "ash", "busybox",
 ];
 
-/// Repli universel : présent sur tout système POSIX, sémantique de référence.
+/// Universal fallback: present on every POSIX system, reference semantics.
 pub const FALLBACK: &str = "sh";
 
-/// Un shell de connexion qui refuse de démarrer est constaté à l'exécution
-/// (AC4). Le drapeau est process-wide : le tour suivant annonce donc `sh` au
-/// modèle, au lieu de répéter une promesse déjà démentie.
+/// A login shell that refuses to start is observed at run time
+/// (AC4). The flag is process-wide: the next turn therefore announces `sh` to the
+/// model, instead of repeating a promise already broken.
 static LOGIN_SHELL_UNUSABLE: AtomicBool = AtomicBool::new(false);
 
-/// Shell retenu : `program` est exécuté, `label` est annoncé au modèle. Les deux
-/// désignent toujours la même chose.
+/// Selected shell: `program` is executed, `label` is announced to the model. Both
+/// always designate the same thing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellChoice {
     pub program: PathBuf,
@@ -39,13 +39,13 @@ impl ShellChoice {
         }
     }
 
-    /// Vrai si ce choix EST déjà le repli (aucun second essai possible).
+    /// True when this choice IS already the fallback (no second attempt possible).
     pub fn is_fallback(&self) -> bool {
         self.program == Path::new(FALLBACK)
     }
 }
 
-/// Shell effectivement utilisé pour exécuter et annoncer.
+/// Shell actually used to run and to announce.
 pub fn resolve() -> ShellChoice {
     #[cfg(windows)]
     {
@@ -63,7 +63,7 @@ pub fn resolve() -> ShellChoice {
     }
 }
 
-/// Décision pure (testable sans muter l'environnement du process).
+/// Pure decision (testable without mutating the process environment).
 #[cfg(not(windows))]
 pub fn resolve_from(login_shell: Option<&std::ffi::OsStr>) -> ShellChoice {
     let Some(raw) = login_shell
@@ -86,8 +86,8 @@ pub fn resolve_from(login_shell: Option<&std::ffi::OsStr>) -> ShellChoice {
     }
 }
 
-/// Signale que le shell de connexion a refusé de démarrer : les appels suivants,
-/// y compris l'annonce faite au modèle, retombent sur `sh`.
+/// Reports that the login shell refused to start: subsequent calls,
+/// including what is announced to the model, fall back on `sh`.
 pub fn mark_login_shell_unusable() {
     LOGIN_SHELL_UNUSABLE.store(true, Ordering::Relaxed);
 }
@@ -122,16 +122,16 @@ mod tests {
 
     #[test]
     fn non_posix_login_shell_falls_back_to_sh() {
-        // fish accepte `-c` mais pas `export VAR=1` ni `&&` de la même façon :
-        // l'annoncer au modèle produirait des commandes qui échouent.
+        // fish accepts `-c` but not `export VAR=1` nor `&&` the same way:
+        // announcing it to the model would produce commands that fail.
         assert_eq!(resolve_from(Some(OsStr::new("/usr/bin/fish"))).label, "sh");
         assert_eq!(resolve_from(Some(OsStr::new("/usr/bin/nu"))).label, "sh");
     }
 
     #[test]
     fn executable_posix_login_shell_is_kept_and_announced_verbatim() {
-        // `/bin/sh` existe partout où ce test tourne ; le label doit être le
-        // chemin exécuté, pas un alias.
+        // `/bin/sh` exists everywhere this test runs; the label must be the
+        // executed path, not an alias.
         let choice = resolve_from(Some(OsStr::new("/bin/sh")));
         assert_eq!(choice.program, PathBuf::from("/bin/sh"));
         assert_eq!(choice.label, "/bin/sh");

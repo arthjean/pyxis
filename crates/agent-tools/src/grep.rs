@@ -1,5 +1,5 @@
-//! Outil `grep` — recherche une regex dans les fichiers du workspace et retourne
-//! les correspondances `chemin:ligne: contenu`. Read-only, concurrency-safe.
+//! `grep` tool: searches a regex in the workspace files and returns
+//! the `path:line: content` matches. Read-only, concurrency-safe.
 //! US-011 AC2.
 
 use async_trait::async_trait;
@@ -14,21 +14,21 @@ use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{Tool, ToolCtx, ToolOutput};
 
 const MAX_MATCHES: usize = 500;
-/// Fichiers plus gros que ça sont ignorés (probablement des artefacts).
+/// Files larger than this are skipped (most likely artifacts).
 const MAX_FILE_BYTES: u64 = 5_000_000;
-/// Borne d'affichage d'une ligne de correspondance (évite un flood sur une ligne
-/// minifiée). Coupe sur une frontière de caractère (cf. `truncate_line`).
+/// Display bound of a match line (avoids flooding on a minified
+/// line). Cuts on a character boundary (see `truncate_line`).
 const MAX_LINE_BYTES: usize = 300;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrepInput {
-    /// Expression régulière (syntaxe `regex`).
+    /// Regular expression (`regex` syntax).
     pub pattern: String,
-    /// Sous-dossier ou fichier de base (relatif au workspace). Défaut : racine.
+    /// Base subdirectory or file (relative to the workspace). Default: root.
     #[serde(default)]
     pub path: Option<String>,
-    /// Filtre les fichiers parcourus par un motif glob (ex. "*.rs").
+    /// Filters the walked files by a glob pattern (e.g. "*.rs").
     #[serde(default)]
     pub glob: Option<String>,
 }
@@ -123,7 +123,7 @@ impl Tool for Grep {
                     Err(_) => continue,
                 };
                 if bytes.contains(&0) {
-                    continue; // binaire
+                    continue; // binary
                 }
                 let text = String::from_utf8_lossy(&bytes);
                 let rel = entry
@@ -156,8 +156,8 @@ impl Tool for Grep {
         }
         let mut body = lines.join("\n");
         if truncated {
-            // US-026 : signaler la troncation ET le moyen de paginer (grep n'a pas
-            // d'offset → on guide vers un resserrage de la recherche).
+            // US-026: report the truncation AND how to paginate (grep has no
+            // offset -> we point toward narrowing the search).
             body.push_str(&format!(
                 "\n[truncated: reached {MAX_MATCHES} matches; narrow with a more precise \
                  pattern, glob, or path to see the rest]"
@@ -167,10 +167,10 @@ impl Tool for Grep {
     }
 }
 
-/// Tronque une ligne d'affichage à `max` OCTETS sur une frontière de caractère
-/// UTF-8. Indispensable : `&line[..max]` panique si l'octet `max` tombe au milieu
-/// d'un codepoint multi-octets (ligne à accents/CJK > `max` octets) — récurrent sur
-/// du source à commentaires français. On recule jusqu'à la frontière la plus proche.
+/// Truncates a display line to `max` BYTES on a UTF-8 character
+/// boundary. Indispensable: `&line[..max]` panics when byte `max` falls in the middle
+/// of a multi-byte codepoint (accented/CJK line > `max` bytes), which happens often on
+/// source carrying accented text. We step back to the nearest boundary.
 fn truncate_line(line: &str, max: usize) -> &str {
     if line.len() <= max {
         return line;
@@ -199,8 +199,8 @@ mod tests {
 
     #[test]
     fn multibyte_boundary_does_not_panic_and_stays_valid_utf8() {
-        // "a" + 150 × 'é' = 301 octets : l'octet 300 tombe au MILIEU du 150ᵉ 'é'
-        // → `&line[..300]` paniquerait. La coupe recule sur la frontière (299).
+        // "a" + 150 x 'é' = 301 bytes: byte 300 falls in the MIDDLE of the 150th 'é'
+        // -> `&line[..300]` would panic. The cut steps back to the boundary (299).
         let line = format!("a{}", "¢".repeat(150));
         assert!(line.len() > MAX_LINE_BYTES && !line.is_char_boundary(MAX_LINE_BYTES));
         let cut = truncate_line(&line, MAX_LINE_BYTES);

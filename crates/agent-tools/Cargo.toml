@@ -9,9 +9,9 @@ publish = false
 [lints]
 workspace = true
 
-# `agent-tools` implémente le trait `ToolDispatch` du cœur (la seule frontière,
-# ARCHITECTURE §4) : Registry, pipeline strict, permissions, taint. Dépend
-# d'`agent-core` pour les types canoniques (ToolInvocation/ToolOutcome/ToolSpec).
+# `agent-tools` implements the `ToolDispatch` trait of the core (the only boundary,
+# ARCHITECTURE 4): Registry, strict pipeline, permissions, taint. Depends
+# on `agent-core` for the canonical types (ToolInvocation/ToolOutcome/ToolSpec).
 [dependencies]
 agent-core.workspace = true
 serde.workspace = true
@@ -23,8 +23,8 @@ thiserror.workspace = true
 regex.workspace = true
 globset.workspace = true
 walkdir.workspace = true
-# diff agrégé du tour (US-018) : moteur de diff déjà présent dans le workspace,
-# utilisé ici pour produire le texte unifié. Aucune nouvelle dépendance.
+# aggregated turn diff (US-018): diff engine already present in the workspace,
+# used here to produce the unified text. No new dependency.
 similar.workspace = true
 
 [dev-dependencies]

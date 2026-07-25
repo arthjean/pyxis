@@ -1,11 +1,11 @@
-//! Outil `edit` — remplacement ancré tolérant (US-025). `old_string` est localisé
-//! par 4 passes successives : exact (sous-chaîne, édition intra-ligne) → `trim_end`
-//! → `trim` → normalisation Unicode (lignes), pour absorber les divergences que
-//! GPT-5.x génère de mémoire (NBSP, tirets/guillemets typographiques). La PREMIÈRE
-//! passe à correspondance UNIQUE gagne ; ≥ 2 correspondances → ambiguë, 0 après les
-//! 4 passes → introuvable (échec explicite, AUCUNE mutation, edge case #11). Le
-//! remplacement s'applique aux lignes ORIGINALES (contenu hors-cible intact).
-//! Mutation confinée au workspace.
+//! `edit` tool: tolerant anchored replacement (US-025). `old_string` is located
+//! by 4 successive passes: exact (substring, intra-line edit) -> `trim_end`
+//! -> `trim` -> Unicode normalization (lines), to absorb the divergences that
+//! GPT-5.x generates from memory (NBSP, typographic dashes/quotes). The FIRST
+//! pass with a UNIQUE match wins; >= 2 matches -> ambiguous, 0 after the
+//! 4 passes -> not found (explicit failure, NO mutation, edge case #11). The
+//! replacement applies to the ORIGINAL lines (content outside the target intact).
+//! Mutation confined to the workspace.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -90,7 +90,7 @@ impl Tool for Edit {
                 input.new_string.len()
             )));
         }
-        // US-013 : refus des zones d'exécution différée, avant la permission.
+        // US-013: refusal of deferred-execution zones, before the permission.
         guard_protected_path(&ctx.workspace, &input.path)
     }
     fn permission(&self, _input: &Self::Input, _ctx: &PermCtx) -> PermissionDecision {
@@ -149,15 +149,15 @@ impl Tool for Edit {
     }
 }
 
-/// Invariant comportemental co-localisé avec l'outil (US-026), collecté par le
-/// Registry et injecté dans le system prompt.
+/// Behavioral invariant colocated with the tool (US-026), collected by the
+/// Registry and injected into the system prompt.
 const EDIT_GUIDELINES: &[&str] = &[
     "edit: old_string is searched in the CURRENT file contents on disk, not after \
      your other edits in the same turn. Re-anchor each edit on the current state \
      and include enough context for a unique anchor.",
 ];
 
-/// Niveau de passe de localisation atteint (observabilité, US-025 AC4).
+/// Locating pass level reached (observability, US-025 AC4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MatchLevel {
     Exact,
@@ -177,11 +177,11 @@ impl MatchLevel {
     }
 }
 
-/// Localisation réussie de l'ancre.
+/// Successful location of the anchor.
 enum Anchor {
-    /// Match exact en sous-chaîne (préserve l'édition intra-ligne, offsets exacts).
+    /// Exact substring match (preserves intra-line editing, exact offsets).
     Substring,
-    /// Fenêtre de lignes `[start, start+len)` trouvée par une passe fuzzy.
+    /// Line window `[start, start+len)` found by a fuzzy pass.
     Lines {
         start: usize,
         len: usize,
@@ -190,26 +190,26 @@ enum Anchor {
 }
 
 enum LocateError {
-    /// ≥ 2 correspondances à une passe (ou en exact) → ambiguïté irréductible
-    /// (les passes plus permissives ne feraient que fusionner davantage, jamais
-    /// distinguer). Pas de niveau : il ne renseigne que le SUCCÈS (AC4).
+    /// >= 2 matches on a pass (or on exact) -> irreducible ambiguity
+    /// (more permissive passes would only merge further, never
+    /// distinguish). No level: it only documents SUCCESS (AC4).
     Ambiguous { count: usize },
-    /// Aucune correspondance après les 4 passes.
+    /// No match after the 4 passes.
     NotFound,
 }
 
-/// Localise `old` dans `content` par 4 passes (exact → trim_end → trim → Unicode).
-/// La passe exacte reste en SOUS-CHAÎNE (édition intra-ligne préservée) ; les passes
-/// fuzzy sont LIGNE À LIGNE pour appliquer le remplacement sur les lignes ORIGINALES.
-/// Résolution déterministe : la première passe à correspondance UNIQUE gagne ;
-/// sinon ≥ 2 → ambiguë, 0 partout → introuvable.
+/// Locates `old` in `content` through 4 passes (exact -> trim_end -> trim -> Unicode).
+/// The exact pass stays a SUBSTRING one (intra-line editing preserved); the fuzzy
+/// passes are LINE BY LINE, to apply the replacement on the ORIGINAL lines.
+/// Deterministic resolution: the first pass with a UNIQUE match wins;
+/// otherwise >= 2 -> ambiguous, 0 everywhere -> not found.
 fn locate(content: &str, old: &str) -> Result<Anchor, LocateError> {
-    // Passe 1 : exact sous-chaîne.
+    // Pass 1: exact substring.
     let exact = content.matches(old).count();
     if exact == 1 {
         return Ok(Anchor::Substring);
     }
-    // Passes 2-4 : ligne à ligne, normalisation croissante.
+    // Passes 2-4: line by line, increasing normalization.
     let content_lines: Vec<&str> = content.split('\n').collect();
     let old_lines: Vec<&str> = old.split('\n').collect();
     for level in [MatchLevel::TrimEnd, MatchLevel::Trim, MatchLevel::Unicode] {
@@ -233,14 +233,14 @@ fn locate(content: &str, old: &str) -> Result<Anchor, LocateError> {
     }
 }
 
-/// Indices de départ des fenêtres de `content_lines` qui matchent `old_lines` sous
-/// la normalisation de `level`.
+/// Start indices of the `content_lines` windows matching `old_lines` under
+/// the normalization of `level`.
 fn find_windows(content_lines: &[&str], old_lines: &[&str], level: MatchLevel) -> Vec<usize> {
     if old_lines.is_empty() || old_lines.len() > content_lines.len() {
         return Vec::new();
     }
-    // Normalisation pré-calculée UNE fois par ligne (sinon chaque ligne du fichier
-    // était re-normalisée jusqu'à `old_lines.len()` fois → O(n×m) allocations).
+    // Normalization precomputed ONCE per line (otherwise each file line was
+    // renormalized up to `old_lines.len()` times -> O(n*m) allocations).
     let content_n: Vec<String> = content_lines.iter().map(|l| norm(l, level)).collect();
     let pat: Vec<String> = old_lines.iter().map(|l| norm(l, level)).collect();
     let last = content_lines.len() - old_lines.len();
@@ -253,7 +253,7 @@ fn find_windows(content_lines: &[&str], old_lines: &[&str], level: MatchLevel) -
     out
 }
 
-/// Normalise une ligne selon le niveau de passe (croissant en permissivité).
+/// Normalizes a line according to the pass level (increasing permissiveness).
 fn norm(line: &str, level: MatchLevel) -> String {
     match level {
         MatchLevel::Exact | MatchLevel::TrimEnd => line.trim_end().to_string(),
@@ -262,10 +262,10 @@ fn norm(line: &str, level: MatchLevel) -> String {
     }
 }
 
-/// Table de normalisation Unicode (US-025 AC5), reprise de Pi/Codex CLI : dashes
-/// U+2010-U+2015 & U+2212 → `-`, quotes typographiques → ASCII, NBSP & espaces
-/// spéciales → ` `. `trim` inclus (passe la plus permissive). Pas de NFKC (table de
-/// caractères explicite, sans dépendance externe).
+/// Unicode normalization table (US-025 AC5), taken from Pi/Codex CLI: dashes
+/// U+2010-U+2015 & U+2212 -> `-`, typographic quotes -> ASCII, NBSP & special
+/// spaces -> ` `. `trim` included (most permissive pass). No NFKC (explicit
+/// character table, without an external dependency).
 fn normalize_unicode_line(line: &str) -> String {
     let mapped: String = line
         .chars()
@@ -280,20 +280,20 @@ fn normalize_unicode_line(line: &str) -> String {
     mapped.trim().to_string()
 }
 
-/// Remplace la fenêtre de lignes ORIGINALES `[start, start+len)` par `new`, en
-/// rejoignant le reste byte-pour-byte (contenu hors-cible intact). Préserve le
-/// terminateur dominant : sur un fichier CRLF, les segments hors-cible gardent leur
-/// `\r` ; on aligne les lignes de `new` dessus (sinon la passe fuzzy, qui matche en
-/// strippant `\r`, réinjecterait `new` en LF → fins de ligne MIXTES dans la région
-/// éditée).
+/// Replaces the window of ORIGINAL lines `[start, start+len)` with `new`,
+/// joining the rest byte for byte (content outside the target intact). Preserves the
+/// dominant terminator: on a CRLF file, the segments outside the target keep their
+/// `\r`; we align the `new` lines on it (otherwise the fuzzy pass, which matches by
+/// stripping `\r`, would reinject `new` in LF -> MIXED line endings in the edited
+/// region).
 fn apply_line_window(content: &str, start: usize, len: usize, new: &str) -> String {
     let segs: Vec<&str> = content.split('\n').collect();
     let crlf = content.contains("\r\n");
     let mut result: Vec<String> = Vec::with_capacity(segs.len());
     result.extend(segs[..start].iter().map(|s| (*s).to_string()));
     for nl in new.split('\n') {
-        // normalise les fins de ligne de `new` sur celles du fichier (strip puis
-        // réattache `\r` si CRLF) → région éditée cohérente.
+        // normalizes the line endings of `new` onto those of the file (strip then
+        // reattach `\r` when CRLF) -> coherent edited region.
         let core = nl.strip_suffix('\r').unwrap_or(nl);
         result.push(if crlf {
             format!("{core}\r")
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn exact_substring_is_level_1_and_intramline() {
-        // « UNIQUE » intra-ligne → match exact sous-chaîne (offsets préservés).
+        // intra-line "UNIQUE" -> exact substring match (offsets preserved).
         assert!(matches!(
             locate("alpha UNIQUE beta\n", "UNIQUE"),
             Ok(Anchor::Substring)
@@ -320,8 +320,8 @@ mod tests {
 
     #[test]
     fn trim_end_pass_resolves_trailing_whitespace() {
-        // Ancre MULTI-ligne dont une ligne du fichier porte un espace final absent
-        // de l'ancre : la sous-chaîne exacte échoue, trim_end ligne-à-ligne résout.
+        // MULTI-line anchor where one file line carries a trailing space absent
+        // from the anchor: the exact substring fails, line-by-line trim_end solves it.
         let content = "foo \nbar\nbaz\n";
         assert!(matches!(
             locate(content, "foo\nbar"),
@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn trim_pass_resolves_leading_whitespace() {
-        // Différence d'espace EN TÊTE de ligne : trim_end ne suffit pas, trim oui.
+        // Whitespace difference at the START of the line: trim_end is not enough, trim is.
         let content = "  foo \nbar\nbaz\n";
         assert!(matches!(
             locate(content, "foo\nbar"),
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn multi_line_exact_substring_is_level_1() {
-        // Ancre multi-ligne PRÉSENTE telle quelle → passe exacte (sous-chaîne).
+        // Multi-line anchor PRESENT as is -> exact pass (substring).
         assert!(matches!(
             locate("x\nfoo\nbar\ny\n", "foo\nbar"),
             Ok(Anchor::Substring)
@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn unicode_pass_absorbs_nbsp_dash_and_quotes() {
-        // fichier : NBSP + em-dash + smart quotes ; ancre : ASCII.
+        // file: NBSP + em-dash + smart quotes; anchor: ASCII.
         let content = "let s = \u{201C}h\u{00A0}\u{2014}llo\u{201D};\nx\n";
         let r = locate(content, "let s = \"h -llo\";");
         assert!(
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn apply_window_keeps_surrounding_bytes_intact() {
-        // ancre multi-ligne localisée par trim_end (espace final cassant le substring).
+        // multi-line anchor located by trim_end (trailing space breaking the substring).
         let content = "a\nfoo \nbar\nz\n";
         match locate(content, "foo\nbar") {
             Ok(Anchor::Lines { start, len, .. }) => {
@@ -404,8 +404,8 @@ mod tests {
 
     #[test]
     fn apply_window_preserves_crlf_endings() {
-        // fichier CRLF : la passe fuzzy matche (trim_end strippe \r) mais le
-        // remplacement doit rester en CRLF, pas introduire de fins de ligne mixtes.
+        // CRLF file: the fuzzy pass matches (trim_end strips \r) but the
+        // replacement must stay CRLF, not introduce mixed line endings.
         let content = "a\r\nfoo \r\nbar\r\nz\r\n";
         match locate(content, "foo\nbar") {
             Ok(Anchor::Lines { start, len, .. }) => {

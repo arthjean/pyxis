@@ -1,41 +1,41 @@
-//! Confinement de chemins au workspace (défense applicative). Normalisation
-//! LEXICALE (sans toucher le FS, donc valable même pour un fichier à créer) :
-//! on résout `.`/`..` et on vérifie que le résultat reste sous la racine. Le
-//! renforcement kernel anti-symlink/anti-évasion est délégué à Landlock (US-020,
-//! ARCHITECTURE §4 / invariant sandbox) — ceci est la première ligne, pas la
-//! seule.
+//! Path confinement to the workspace (application-level defense). LEXICAL
+//! normalization (without touching the FS, hence valid even for a file to be
+//! created): we resolve `.`/`..` and check that the result stays under the root.
+//! Kernel-level anti-symlink/anti-escape enforcement is delegated to Landlock
+//! (US-020, ARCHITECTURE section 4 / sandbox invariant): this is the first line,
+//! not the only one.
 
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::{ToolError, ValidationError};
 
-/// Sous-chemins du workspace dont le contenu s'exécute PLUS TARD, hors sandbox et
-/// hors proxy, ou qui pilotent Pyxis lui-même (US-013). Un agent détourné par
-/// injection indirecte y déposerait du code que le prochain `git commit` de
-/// l'utilisateur exécuterait sur sa machine (CVE-2026-26268) ; `.git/config`
-/// suffit à rediriger `core.hooksPath` ou à définir un alias, et `.pyxis/` porte
-/// la configuration et les sessions de l'agent (motif « configuration-based
-/// sandbox escape »).
+/// Workspace subpaths whose content runs LATER, outside the sandbox and
+/// outside the proxy, or that drive Pyxis itself (US-013). An agent hijacked by
+/// indirect injection would drop code there that the user's next `git commit`
+/// would run on their machine (CVE-2026-26268); `.git/config` is enough
+/// to redirect `core.hooksPath` or define an alias, and `.pyxis/` carries
+/// the agent configuration and sessions ("configuration-based sandbox escape"
+/// pattern).
 ///
-/// `.git` est protégé en entier, et pas seulement `hooks/` et `config` : dans un
-/// worktree git, `.git` est un FICHIER `gitdir: …` dont la réécriture déplace la
-/// configuration et les hooks vers un répertoire choisi par l'attaquant. Les deux
-/// sous-chemins restent listés en tête pour que le refus nomme la zone exacte.
+/// `.git` is protected as a whole, and not only `hooks/` and `config`: in a git
+/// worktree, `.git` is a FILE `gitdir: ...` whose rewrite moves the
+/// configuration and hooks to a directory chosen by the attacker. Both
+/// subpaths stay listed first so that the refusal names the exact zone.
 ///
-/// **Portée : outils d'édition uniquement.** Landlock étant additif, ce droit ne
-/// peut pas être soustrait sous le workspace : une commande `bash` garde la
-/// possibilité d'écrire dans ces chemins. La limite est documentée dans l'aide de
-/// la CLI et dans `docs/CURRENT_STATUS.md` plutôt que passée sous silence.
+/// **Scope: editing tools only.** Since Landlock is additive, this right cannot
+/// be subtracted under the workspace: a `bash` command keeps the ability to
+/// write into these paths. The limit is documented in the CLI help and in
+/// `docs/CURRENT_STATUS.md` rather than passed over in silence.
 pub const PROTECTED_SUBPATHS: &[&str] = &[".git/hooks", ".git/config", ".git", ".pyxis"];
 
-/// Normalise lexicalement (résout `.` et `..` sans accès disque, ne suit pas les
-/// symlinks). Un `..` qui remonte au-dessus de la racine est une évasion.
+/// Normalizes lexically (resolves `.` and `..` without disk access, does not follow
+/// symlinks). A `..` that climbs above the root is an escape.
 fn lexical_join(base: &Path, rel: &Path) -> Option<PathBuf> {
     let mut out = base.to_path_buf();
     for comp in rel.components() {
         match comp {
             Component::Prefix(_) | Component::RootDir => {
-                // Chemin absolu : on repart de zéro (sera re-vérifié contre base).
+                // Absolute path: start over (it will be re-checked against base).
                 out = PathBuf::from(comp.as_os_str());
             }
             Component::CurDir => {}
@@ -50,8 +50,8 @@ fn lexical_join(base: &Path, rel: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
-/// Résout `path` (absolu ou relatif au workspace) et vérifie le confinement.
-/// Retourne le chemin normalisé absolu, ou `OutsideWorkspace`.
+/// Resolves `path` (absolute or relative to the workspace) and checks confinement.
+/// Returns the absolute normalized path, or `OutsideWorkspace`.
 pub fn confine(workspace: &Path, path: &str) -> Result<PathBuf, ToolError> {
     let requested = Path::new(path);
     let joined = if requested.is_absolute() {
@@ -68,11 +68,11 @@ pub fn confine(workspace: &Path, path: &str) -> Result<PathBuf, ToolError> {
     }
 }
 
-/// Garde-fou d'écriture appelé depuis `validate_input`, donc AVANT la décision de
-/// permission : le refus d'une zone d'exécution différée (US-013) ne dépend
-/// d'aucun mode et ne peut être levé ni par `DontAsk` ni par `BypassPermissions`.
-/// Un chemin hors workspace n'est pas traité ici : il est refusé par `confine` au
-/// moment de l'appel, avec son erreur dédiée.
+/// Write guardrail called from `validate_input`, hence BEFORE the permission
+/// decision: refusing a deferred-execution zone (US-013) depends on no
+/// mode and can be lifted neither by `DontAsk` nor by `BypassPermissions`.
+/// A path outside the workspace is not handled here: it is refused by `confine` at
+/// call time, with its dedicated error.
 pub fn guard_protected_path(workspace: &Path, path: &str) -> Result<(), ValidationError> {
     let Ok(target) = confine(workspace, path) else {
         return Ok(());
@@ -80,7 +80,7 @@ pub fn guard_protected_path(workspace: &Path, path: &str) -> Result<(), Validati
     ensure_not_protected(workspace, &target, path).map_err(|e| ValidationError::new(e.to_string()))
 }
 
-/// Refuse un chemin qui atteint une zone protégée, directement ou par symlink.
+/// Refuses a path that reaches a protected zone, directly or through a symlink.
 pub fn ensure_not_protected(
     workspace: &Path,
     target: &Path,
@@ -89,9 +89,9 @@ pub fn ensure_not_protected(
     if let Some(zone) = protected_zone(&lexical_normalize(workspace), target) {
         return Err(protected_error(display_path, zone));
     }
-    // AC2 : une cible qui n'atteint la zone qu'après résolution (symlink dans le
-    // checkout, remontée relative déjà normalisée par `confine`) est refusée de la
-    // même manière. La comparaison se fait sur les chemins RÉELS des deux côtés.
+    // AC2: a target that only reaches the zone after resolution (symlink in the
+    // checkout, relative climb already normalized by `confine`) is refused the
+    // same way. The comparison uses the REAL paths on both sides.
     let (Ok(real_root), Some(real_target)) = (
         std::fs::canonicalize(workspace),
         resolve_existing_prefix(target),
@@ -118,8 +118,8 @@ fn protected_zone(root: &Path, path: &Path) -> Option<&'static str> {
         .find(|zone| rel.starts_with(Path::new(zone)))
 }
 
-/// Résout la partie EXISTANTE de `target` (canonicalisée, donc symlinks suivis) et
-/// lui rattache les composants encore absents. `None` si rien ne résout.
+/// Resolves the EXISTING part of `target` (canonicalized, hence symlinks followed) and
+/// appends the components still missing. `None` when nothing resolves.
 fn resolve_existing_prefix(target: &Path) -> Option<PathBuf> {
     let mut missing: Vec<std::ffi::OsString> = Vec::new();
     let mut probe = target.to_path_buf();
@@ -136,9 +136,9 @@ fn resolve_existing_prefix(target: &Path) -> Option<PathBuf> {
     }
 }
 
-/// Vérifie que le plus profond ancêtre existant de `target` résout réellement
-/// sous le workspace. À appeler avant `create_dir_all` pour ne pas créer de
-/// répertoire via un symlink/junction hors workspace.
+/// Checks that the deepest existing ancestor of `target` really resolves
+/// under the workspace. To be called before `create_dir_all` so as not to create a
+/// directory through a symlink/junction outside the workspace.
 pub fn ensure_existing_ancestor_confined(
     workspace: &Path,
     target: &Path,
@@ -168,8 +168,8 @@ pub fn ensure_existing_ancestor_confined(
     }
 }
 
-/// Vérifie que `target` lui-même, s'il existe, ne résout pas hors workspace.
-/// Pour un fichier nouveau, vérifie son parent après création des dossiers.
+/// Checks that `target` itself, if it exists, does not resolve outside the workspace.
+/// For a new file, checks its parent after the directories are created.
 pub fn ensure_real_path_confined(
     workspace: &Path,
     target: &Path,
@@ -188,10 +188,10 @@ pub fn ensure_real_path_confined(
     Ok(())
 }
 
-/// Vérifie que tous les composants existants de `target` sont des chemins réels
-/// sous le workspace, sans symlink ni reparse point. Les outils natifs refusent
-/// volontairement les liens pour éviter qu'un checkout contrôle l'accès à des
-/// fichiers hors workspace.
+/// Checks that every existing component of `target` is a real path
+/// under the workspace, without a symlink nor a reparse point. Native tools refuse
+/// links on purpose, to prevent a checkout from controlling access to
+/// files outside the workspace.
 pub fn ensure_existing_path_no_links(
     workspace: &Path,
     target: &Path,
@@ -201,8 +201,8 @@ pub fn ensure_existing_path_no_links(
     ensure_real_path_confined(workspace, target, display_path)
 }
 
-/// Vérifie un chemin à créer ou remplacer. Les parents existants ne doivent pas
-/// contenir de liens ; la cible est vérifiée aussi si elle existe déjà.
+/// Checks a path to create or replace. Existing parents must not
+/// contain links; the target is checked too when it already exists.
 pub fn ensure_creatable_path_no_links(
     workspace: &Path,
     target: &Path,
@@ -212,9 +212,9 @@ pub fn ensure_creatable_path_no_links(
     ensure_real_path_confined(workspace, target, display_path)
 }
 
-/// Remplace un fichier par un contenu borné sans écrire à travers un symlink
-/// final. Le fichier temporaire est créé dans le même parent avec `create_new`,
-/// puis renommé sur la cible après une dernière vérification.
+/// Replaces a file with bounded content without writing through a final
+/// symlink. The temporary file is created in the same parent with `create_new`,
+/// then renamed onto the target after one last check.
 pub async fn replace_file_confined(
     workspace: &Path,
     target: &Path,
@@ -346,7 +346,7 @@ fn is_link_like(meta: &std::fs::Metadata) -> bool {
     }
 }
 
-/// Normalise un chemin absolu lexicalement (résout `.`/`..`).
+/// Normalizes an absolute path lexically (resolves `.`/`..`).
 fn lexical_normalize(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in p.components() {
@@ -428,10 +428,10 @@ mod tests {
             ".git/hooks",
             ".git/config",
             ".pyxis/settings.toml",
-            // remontée relative : `confine` normalise, la zone reste atteinte.
+            // relative climb: `confine` normalizes, the zone is still reached.
             "src/../.git/hooks/post-merge",
-            // worktree git : `.git` est un fichier `gitdir: …`, le réécrire déplace
-            // hooks et config vers un répertoire choisi par l'attaquant.
+            // git worktree: `.git` is a `gitdir: ...` file, rewriting it moves
+            // hooks and config to a directory chosen by the attacker.
             ".git",
             ".git/info/exclude",
         ] {
@@ -450,8 +450,8 @@ mod tests {
         for path in [
             "src/main.rs",
             ".github/workflows/ci.yml",
-            // proches mais distincts : le préfixe est comparé par composants, donc
-            // `.gitignore` n'est pas `.git`.
+            // close but distinct: the prefix is compared component-wise, so
+            // `.gitignore` is not `.git`.
             ".gitignore",
             ".gitmodules",
             ".pyxis-notes.md",
@@ -466,7 +466,7 @@ mod tests {
 
     #[test]
     fn missing_git_directory_is_not_an_error() {
-        // AC5 : un projet sans dépôt git n'est pas un cas d'erreur.
+        // AC5: a project without a git repository is not an error case.
         let ws = std::env::temp_dir().join(format!("pyxis-nogit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);
         std::fs::create_dir_all(&ws).unwrap();

@@ -1,38 +1,38 @@
-//! Modèle de permissions (5 modes, ARCHITECTURE §4.4) + défense taint (§4.6,
-//! OWASP LLM01). La décision finale combine : le mode courant, la décision
-//! *baseline* propre à l'outil, sa nature (read-only / sensible), et la présence
-//! de **taint récent**. Une action mutante ou sensible déclenchée en présence de
-//! taint récent **force `Ask`** dans tous les modes sauf
+//! Permission model (5 modes, ARCHITECTURE 4.4) + taint defense (4.6,
+//! OWASP LLM01). The final decision combines: the current mode, the tool's own
+//! *baseline* decision, its nature (read-only / sensitive), and the presence
+//! of **recent taint**. A mutating or sensitive action triggered in the presence
+//! of recent taint **forces `Ask`** in every mode except
 //! `BypassPermissions` (invariant 3).
 //!
-//! La frontière interactive est le trait `Approver` : le pipeline ne sait pas
-//! *comment* on demande (TUI, `-p`, auto) — il appelle `approve()`. Testable
-//! headless via un approbateur scripté.
+//! The interactive boundary is the `Approver` trait: the pipeline does not know
+//! *how* the question is asked (TUI, `-p`, auto), it calls `approve()`. Testable
+//! headlessly through a scripted approver.
 
 use agent_core::message::ToolCallId;
 use async_trait::async_trait;
 use std::sync::{Arc, RwLock};
 
-/// Les 5 modes de permission (ARCHITECTURE §4.4).
+/// The 5 permission modes (ARCHITECTURE 4.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PermissionMode {
-    /// Demande sur action sensible.
+    /// Asks on a sensitive action.
     #[default]
     Default,
-    /// Auto-accepte les éditions de fichiers, demande le reste.
+    /// Auto-accepts file edits, asks for the rest.
     AcceptEdits,
-    /// N'interrompt jamais (automatisations contrôlées).
+    /// Never interrupts (controlled automations).
     DontAsk,
-    /// Court-circuite tous les checks (usage avancé / sous sandbox).
+    /// Short-circuits every check (advanced use / under a sandbox).
     BypassPermissions,
-    /// Lecture seule : aucune mutation autorisée (phase de planification).
+    /// Read-only: no mutation allowed (planning phase).
     Plan,
 }
 
-/// État partagé du mode de permission courant.
+/// Shared state of the current permission mode.
 ///
-/// Le registre garde ce handle et la TUI peut le mettre à jour en session via
-/// `/permissions` sans reconstruire les outils.
+/// The registry keeps this handle and the TUI can update it in session through
+/// `/permissions` without rebuilding the tools.
 #[derive(Debug, Clone)]
 pub struct PermissionModeState {
     inner: Arc<RwLock<PermissionMode>>,
@@ -66,47 +66,47 @@ impl Default for PermissionModeState {
     }
 }
 
-/// Décision *baseline* d'un outil pour une entrée donnée, avant application des
-/// règles globales (mode + taint).
+/// A tool's *baseline* decision for a given input, before the global rules
+/// (mode + taint) are applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionDecision {
-    /// Autorisé sans confirmation.
+    /// Allowed without confirmation.
     Allow,
-    /// Confirmation humaine requise.
+    /// Human confirmation required.
     Ask,
-    /// Interdit (l'outil ne s'exécutera pas).
+    /// Forbidden (the tool will not run).
     Deny,
 }
 
-/// Contexte passé à `Tool::permission` pour décider la baseline.
+/// Context passed to `Tool::permission` to decide the baseline.
 #[derive(Debug, Clone, Copy)]
 pub struct PermCtx {
     pub mode: PermissionMode,
-    /// Du taint untrusted a-t-il été produit récemment ? (défense injection.)
+    /// Was untrusted taint produced recently? (injection defense.)
     pub taint_recent: bool,
 }
 
-/// Issue de la résolution finale (ce que le Registry applique).
+/// Outcome of the final resolution (what the Registry applies).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolved {
-    /// Exécuter directement.
+    /// Run directly.
     Allow,
-    /// Demander confirmation à l'`Approver` avant d'exécuter.
+    /// Ask the `Approver` for confirmation before running.
     Ask,
-    /// Refuser (ne pas exécuter, renvoyer une erreur à l'agent).
+    /// Refuse (do not run, return an error to the agent).
     Deny,
 }
 
-/// Résout la décision finale. PURE (sans I/O) → testable unitairement.
+/// Resolves the final decision. PURE (no I/O) -> unit-testable.
 ///
-/// Priorité :
-/// 1. `Deny` outil → toujours `Deny` (invariant terminal).
-/// 2. `BypassPermissions` → `Allow` pour les actions demandant seulement une
-///    confirmation utilisateur.
-/// 3. `Plan` → `Allow` si l'outil est read-only, sinon `Deny` (aucune mutation).
-/// 4. Sinon : on part de la baseline outil, on la met en forme selon le mode,
-///    puis le **taint** force `Ask` pour une action mutante/sensible (sauf Bypass, déjà
-///    traité) — invariant 3 / §4.6.
+/// Priority:
+/// 1. Tool `Deny` -> always `Deny` (terminal invariant).
+/// 2. `BypassPermissions` -> `Allow` for actions that only require a user
+///    confirmation.
+/// 3. `Plan` -> `Allow` when the tool is read-only, `Deny` otherwise (no mutation).
+/// 4. Otherwise: start from the tool baseline, shape it according to the mode,
+///    then **taint** forces `Ask` for a mutating/sensitive action (except Bypass, already
+///    handled): invariant 3 / section 4.6.
 pub fn resolve_permission(
     mode: PermissionMode,
     baseline: PermissionDecision,
@@ -118,11 +118,11 @@ pub fn resolve_permission(
     if baseline == PermissionDecision::Deny {
         return Resolved::Deny;
     }
-    // Bypass : court-circuit des confirmations utilisateur, pas des hard-deny.
+    // Bypass: short-circuits user confirmations, not hard denies.
     if mode == PermissionMode::BypassPermissions {
         return Resolved::Allow;
     }
-    // 2. Plan : lecture seule stricte.
+    // 2. Plan: strict read-only.
     if mode == PermissionMode::Plan {
         return if is_read_only {
             Resolved::Allow
@@ -131,15 +131,15 @@ pub fn resolve_permission(
         };
     }
 
-    // 3. Mise en forme de la baseline selon le mode.
+    // 3. Shaping the baseline according to the mode.
     let shaped = match baseline {
         PermissionDecision::Deny => Resolved::Deny,
         PermissionDecision::Allow => Resolved::Allow,
         PermissionDecision::Ask => match mode {
-            // Default : on respecte la demande.
+            // Default: we honor the request.
             PermissionMode::Default => Resolved::Ask,
-            // AcceptEdits : auto-accepte les éditions (non sensibles) ; garde la
-            // demande sur les actions sensibles (destructive/réseau).
+            // AcceptEdits: auto-accepts (non-sensitive) edits; keeps the
+            // request on sensitive actions (destructive/network).
             PermissionMode::AcceptEdits => {
                 if is_sensitive {
                     Resolved::Ask
@@ -147,48 +147,48 @@ pub fn resolve_permission(
                     Resolved::Allow
                 }
             }
-            // DontAsk : n'interrompt jamais (sous réserve du taint, ci-dessous).
+            // DontAsk: never interrupts (subject to taint, below).
             PermissionMode::DontAsk => Resolved::Allow,
-            // Plan / Bypass déjà traités.
+            // Plan / Bypass already handled.
             PermissionMode::Plan | PermissionMode::BypassPermissions => Resolved::Allow,
         },
     };
 
-    // Taint : une action mutante/sensible en contexte taché force la confirmation, quel
-    // que soit le mode (hors Bypass, déjà retourné). C'est la mitigation directe
-    // de l'injection indirecte (§4.6).
+    // Taint: a mutating/sensitive action in a tainted context forces confirmation, whatever
+    // the mode (except Bypass, already returned). This is the direct mitigation
+    // of indirect injection (section 4.6).
     if taint_recent && is_taint_sensitive && shaped == Resolved::Allow {
         return Resolved::Ask;
     }
     shaped
 }
 
-/// Demande de confirmation présentée à l'utilisateur (via l'`Approver`).
+/// Confirmation request presented to the user (through the `Approver`).
 #[derive(Debug, Clone)]
 pub struct PermissionRequest {
     pub call_id: ToolCallId,
     pub tool: String,
     pub reason: String,
-    /// Vrai si la demande est forcée par du contenu non fiable récent.
+    /// True when the request is forced by recent untrusted content.
     pub taint_forced: bool,
     pub mode: String,
-    /// Résumé court de l'entrée (ex. la commande Bash, le chemin écrit).
+    /// Short summary of the input (e.g. the Bash command, the written path).
     pub input_summary: String,
-    /// Entrée structurée brute — permet au frontend de rendre un aperçu riche
-    /// (diff pour `edit`, commande pour `bash`) dans le dialog de permission.
+    /// Raw structured input: lets the frontend render a rich preview
+    /// (diff for `edit`, command for `bash`) in the permission dialog.
     pub input: serde_json::Value,
 }
 
-/// Frontière interactive : le pipeline délègue la confirmation ici. La CLI/TUI
-/// fournit une implémentation réelle (prompt) ; les tests un double scripté.
+/// Interactive boundary: the pipeline delegates confirmation here. The CLI/TUI
+/// provides a real implementation (prompt); tests a scripted double.
 #[async_trait]
 pub trait Approver: Send + Sync {
-    /// Retourne `true` si l'action est autorisée.
+    /// Returns `true` when the action is allowed.
     async fn approve(&self, req: &PermissionRequest) -> bool;
 }
 
-/// Approbateur automatique. Par défaut, il accepte les demandes routinières mais
-/// refuse les demandes forcées par taint.
+/// Automatic approver. By default it accepts routine requests but
+/// refuses requests forced by taint.
 #[derive(Debug, Clone, Copy)]
 pub struct AutoApprove {
     approve_tainted: bool,
@@ -221,8 +221,8 @@ impl Approver for AutoApprove {
     }
 }
 
-/// Approbateur qui refuse tout (fail-closed : défaut sûr en headless sans
-/// interlocuteur, ou tests du chemin refus).
+/// Approver that refuses everything (fail-closed: safe default in headless mode
+/// without a counterpart, or for refusal-path tests).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AutoDeny;
 
@@ -237,8 +237,8 @@ impl Approver for AutoDeny {
 mod tests {
     use super::*;
 
-    // Bash-like : sensible, mutant. Edit-like : non sensible, mutant mais protégée
-    // par le taint. Read-like : read-only, non sensible.
+    // Bash-like: sensitive, mutating. Edit-like: non-sensitive, mutating but protected
+    // by taint. Read-like: read-only, non-sensitive.
     const SENSITIVE: (bool, bool, bool) = (
         /*read_only*/ false, /*sensitive*/ true, /*taint*/ true,
     );
@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn bypass_short_circuits_everything() {
-        // Même une action sensible tachée passe en Bypass.
+        // Even a tainted sensitive action passes under Bypass.
         assert_eq!(
             res(
                 PermissionMode::BypassPermissions,
@@ -287,7 +287,7 @@ mod tests {
             res(PermissionMode::Plan, PermissionDecision::Allow, READ, false),
             Resolved::Allow
         );
-        // Toute mutation est refusée en Plan, même baseline Allow.
+        // Every mutation is refused under Plan, even a baseline Allow.
         assert_eq!(
             res(PermissionMode::Plan, PermissionDecision::Allow, EDIT, false),
             Resolved::Deny
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn default_mode_asks_on_sensitive_allows_reads() {
-        // US-013 AC1 : Default → demande sur action mutante/réseau.
+        // US-013 AC1: Default -> asks on a mutating/network action.
         assert_eq!(
             res(
                 PermissionMode::Default,
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     fn accept_edits_auto_accepts_edits_keeps_ask_on_sensitive() {
-        // Édition (non sensible, baseline Ask) → auto-acceptée.
+        // Edit (non-sensitive, baseline Ask) -> auto-accepted.
         assert_eq!(
             res(
                 PermissionMode::AcceptEdits,
@@ -338,7 +338,7 @@ mod tests {
             ),
             Resolved::Allow
         );
-        // Action sensible → reste Ask.
+        // Sensitive action -> stays Ask.
         assert_eq!(
             res(
                 PermissionMode::AcceptEdits,
@@ -352,8 +352,8 @@ mod tests {
 
     #[test]
     fn taint_forces_ask_overriding_dontask() {
-        // US-013 AC3 / §4.6 : DontAsk autoriserait, mais taint récent + sensible
-        // → confirmation forcée (override du mode, hors Bypass).
+        // US-013 AC3 / section 4.6: DontAsk would allow, but recent taint + sensitive
+        // -> forced confirmation (mode override, except Bypass).
         assert_eq!(
             res(
                 PermissionMode::DontAsk,
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn taint_forces_ask_on_edits_without_breaking_accept_edits() {
-        // Une édition reste auto-acceptée sans taint.
+        // An edit stays auto-accepted without taint.
         assert_eq!(
             res(
                 PermissionMode::AcceptEdits,
@@ -388,7 +388,7 @@ mod tests {
             ),
             Resolved::Allow
         );
-        // Mais le taint protège aussi les mutations non sensibles au sens normal.
+        // But taint also protects mutations that are not sensitive in the normal sense.
         assert_eq!(
             res(PermissionMode::DontAsk, PermissionDecision::Ask, EDIT, true),
             Resolved::Ask

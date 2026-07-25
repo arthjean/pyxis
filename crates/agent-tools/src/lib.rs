@@ -1,13 +1,13 @@
-//! `agent-tools` — système d'outils & garde-fous d'exécution (EP-003). Implémente
-//! le trait `ToolDispatch` du cœur (`agent-core`) : un `Registry` qui dispatche
-//! un batch d'outils (concurrent/série) à travers un **pipeline strict** —
-//! parse → validate → permission → call (timeout) → taint — avec un modèle de
-//! permissions à 5 modes et la défense taint untrusted (OWASP LLM01).
+//! `agent-tools`: tool system & execution guardrails (EP-003). Implements
+//! the core `ToolDispatch` trait (`agent-core`): a `Registry` that dispatches
+//! a tool batch (concurrent/serial) through a **strict pipeline**:
+//! parse -> validate -> permission -> call (timeout) -> taint, with a 5-mode
+//! permission model and the untrusted taint defense (OWASP LLM01).
 //!
-//! Invariants tenus : trait `Tool` fail-closed (4), sortie untrusted par défaut
-//! (3), un `ToolOutcome` par appel (jamais de panic, corrélation par `id`).
-//! Les garde-fous de boucle/budget (US-014) vivent dans `agent-core` (le graphe
-//! interdit `core → tools` ; l'arrêt de boucle est une décision du cœur).
+//! Invariants held: fail-closed `Tool` trait (4), untrusted output by default
+//! (3), one `ToolOutcome` per call (never a panic, correlation by `id`).
+//! The loop/budget guardrails (US-014) live in `agent-core` (the graph
+//! forbids `core -> tools`; stopping the loop is a core decision).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod bash;
@@ -45,8 +45,8 @@ pub use write::Write;
 
 use std::sync::Arc;
 
-/// Construit un `Registry` câblé avec les 6 outils de base (Read, Glob, Grep,
-/// Write, Edit, Bash) — ce que l'agent-cli injectera comme `Arc<dyn ToolDispatch>`.
+/// Builds a `Registry` wired with the 6 base tools (Read, Glob, Grep,
+/// Write, Edit, Bash): what agent-cli will inject as `Arc<dyn ToolDispatch>`.
 pub fn default_registry(
     workspace: impl Into<std::path::PathBuf>,
     mode: PermissionMode,

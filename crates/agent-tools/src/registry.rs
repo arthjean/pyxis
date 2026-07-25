@@ -1,14 +1,14 @@
-//! `Registry` : implémente `ToolDispatch` (la frontière cœur↔outils). Exécute
-//! chaque batch en segments ordonnés : reads sûrs en parallèle, mutations et
-//! confirmations en série, puis fait passer chaque appel par le **pipeline strict** (§4.3) :
+//! `Registry`: implements `ToolDispatch` (the core <-> tools boundary). Runs
+//! each batch in ordered segments: safe reads in parallel, mutations and
+//! confirmations serially, then puts every call through the **strict pipeline** (4.3):
 //!
 //! ```text
-//! parse+validate → permission(mode×taint) → call() sous timeout → taint → outcome
+//! parse+validate -> permission(mode x taint) -> call() under timeout -> taint -> outcome
 //! ```
 //!
-//! Invariants : un `ToolOutcome` par `ToolInvocation` (même refus/inconnu/parse
-//! KO → outcome d'erreur, jamais de panic, corrélation par `id`), fail-closed
-//! partout.
+//! Invariants: one `ToolOutcome` per `ToolInvocation` (even a refusal/unknown/failed
+//! parse -> an error outcome, never a panic, correlation by `id`), fail-closed
+//! everywhere.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,13 +30,13 @@ use crate::permission::{
 use crate::taint::TaintTracker;
 use crate::tool::{DynTool, ToolCtx, into_dyn};
 
-/// Description d'outil cappée à l'exposition (un outil ne pollue pas le prompt).
+/// Tool description capped at exposure time (a tool does not pollute the prompt).
 const MAX_DESCRIPTION: usize = 2048;
-/// Plafond de concurrence du batch read-only (ARCHITECTURE §4.2).
+/// Concurrency cap of the read-only batch (ARCHITECTURE 4.2).
 const CONCURRENCY: usize = 10;
 
-/// Registre d'outils + politique d'exécution. Construit par la CLI/TUI, injecté
-/// dans le cœur comme `Arc<dyn ToolDispatch>`.
+/// Tool registry + execution policy. Built by the CLI/TUI, injected
+/// into the core as `Arc<dyn ToolDispatch>`.
 pub struct Registry {
     tools: HashMap<String, Box<dyn DynTool>>,
     mode: PermissionModeState,
@@ -65,7 +65,7 @@ impl Registry {
         self.mode.set(mode);
     }
 
-    /// Le taint est-il récent ? (exposé pour les tests / l'observabilité.)
+    /// Is the taint recent? (exposed for tests / observability.)
     pub fn taint_recent(&self) -> bool {
         self.taint.is_recent()
     }
@@ -76,7 +76,7 @@ impl Registry {
         }
     }
 
-    /// Specs exposées au modèle (descriptions cappées), pour `AgentContext.tools`.
+    /// Specs exposed to the model (capped descriptions), for `AgentContext.tools`.
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         let mut specs: Vec<ToolSpec> = self
             .tools
@@ -92,15 +92,15 @@ impl Registry {
                 }
             })
             .collect();
-        // Ordre stable (déterminisme du prompt / des tests).
+        // Stable order (prompt / test determinism).
         specs.sort_by(|a, b| a.name.cmp(&b.name));
         specs
     }
 
-    /// Collecte les guidelines comportementales de tous les outils (US-026), pour
-    /// injection dans le system prompt. Ordre déterministe (tri par nom d'outil,
-    /// guidelines de l'outil dans l'ordre de déclaration) → prompt stable et
-    /// cache-friendly.
+    /// Collects the behavioral guidelines of every tool (US-026), for
+    /// injection into the system prompt. Deterministic order (sorted by tool name,
+    /// tool guidelines in declaration order) -> stable and cache-friendly
+    /// prompt.
     pub fn behavioral_guidelines(&self) -> Vec<String> {
         let mut names: Vec<&String> = self.tools.keys().collect();
         names.sort();
@@ -115,13 +115,13 @@ impl Registry {
         out
     }
 
-    /// Chemin de confort pour les tests et appels directs au registre.
+    /// Convenience path for tests and direct calls into the registry.
     pub async fn dispatch(&self, calls: Vec<ToolInvocation>) -> Vec<ToolOutcome> {
         <Self as ToolDispatch>::dispatch(self, calls, ToolEventSink::default()).await
     }
 
-    /// Pipeline strict d'un seul appel. Ne panique jamais : retourne toujours un
-    /// `ToolOutcome` corrélé par `id`.
+    /// Strict pipeline of a single call. Never panics: always returns a
+    /// `ToolOutcome` correlated by `id`.
     async fn run_one(&self, call: ToolInvocation, events: ToolEventSink) -> ToolOutcome {
         let id = call.id.clone();
         let Some(tool) = self.tools.get(&call.name) else {
@@ -132,12 +132,12 @@ impl Registry {
             );
         };
 
-        // 1. parse + validate (fail-closed, US-010 AC3) — pas d'exécution si KO.
+        // 1. parse + validate (fail-closed, US-010 AC3): no execution on failure.
         if let Err(e) = tool.precheck(&call.input, &self.ctx) {
             return err_outcome(id, e.to_string(), e.kind());
         }
 
-        // 2. permission : baseline outil mise en forme par mode + taint (§4.4/4.6).
+        // 2. permission: tool baseline shaped by mode + taint (4.4/4.6).
         let mode = self.mode();
         let pctx = PermCtx {
             mode,
@@ -191,10 +191,10 @@ impl Registry {
             Resolved::Allow => {}
         }
 
-        // 3. call() sous timeout (un outil qui pend ne bloque pas la boucle).
-        // Le contexte de CET appel porte son émetteur de sortie (US-015) : les
-        // fragments partent sur le même canal que les demandes de permission, déjà
-        // corrélés par `id`.
+        // 3. call() under timeout (a tool that hangs does not block the loop).
+        // The context of THIS call carries its output emitter (US-015): the
+        // fragments travel on the same channel as permission requests, already
+        // correlated by `id`.
         let ctx = self.ctx.with_output_sink({
             let events = events.clone();
             let id = id.clone();
@@ -225,7 +225,7 @@ impl Registry {
                 err_outcome_tainted(id, e.to_string(), untrusted, e.kind())
             }
             Ok(Ok(out)) => {
-                // 4. taint : une sortie untrusted vient d'entrer dans le contexte.
+                // 4. taint: an untrusted output just entered the context.
                 if untrusted {
                     self.taint.mark();
                 }
@@ -294,7 +294,7 @@ impl ToolDispatch for Registry {
         events: ToolEventSink,
     ) -> Vec<ToolOutcome> {
         let started_tainted = self.taint.is_recent();
-        // Nouveau cycle de dispatch : fait décroître la fenêtre de taint.
+        // New dispatch cycle: shrinks the taint window.
         self.taint.begin_cycle();
 
         let mut indexed: Vec<(usize, ToolOutcome)> = Vec::new();
@@ -317,7 +317,7 @@ impl ToolDispatch for Registry {
             indexed.extend(self.run_parallel_segment(segment, events.clone()).await);
         }
 
-        // Restaure l'ordre du batch (transcripts/tests déterministes).
+        // Restores the batch order (deterministic transcripts/tests).
         indexed.sort_by_key(|(i, _)| *i);
         let outcomes: Vec<ToolOutcome> = indexed.into_iter().map(|(_, o)| o).collect();
         if started_tainted
@@ -335,7 +335,7 @@ fn err_outcome(
     msg: String,
     error_kind: ToolErrorKind,
 ) -> ToolOutcome {
-    // Erreur de pipeline (refus/inconnu/parse) : contenu maison, non taché.
+    // Pipeline error (refusal/unknown/parse): in-house content, not tainted.
     ToolOutcome {
         id,
         content: msg,
@@ -368,7 +368,7 @@ fn ask_reason(taint_forced: bool) -> String {
     }
 }
 
-/// Résumé court d'une entrée d'outil pour le prompt de confirmation.
+/// Short summary of a tool input for the confirmation prompt.
 fn summarize(input: &serde_json::Value) -> String {
     let s = input.to_string();
     if s.len() > 200 {
@@ -389,8 +389,8 @@ fn truncate_utf8_prefix(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-/// Builder de `Registry`. L'`Approver` par défaut est `AutoDeny` (fail-closed :
-/// sans interlocuteur explicite, toute confirmation échoue).
+/// `Registry` builder. The default `Approver` is `AutoDeny` (fail-closed:
+/// without an explicit counterpart, every confirmation fails).
 pub struct RegistryBuilder {
     tools: HashMap<String, Box<dyn DynTool>>,
     mode: PermissionModeState,
@@ -425,14 +425,14 @@ impl RegistryBuilder {
         self.ctx.timeout = timeout;
         self
     }
-    /// Closure de durcissement des commandes shell (sandbox réseau Bash), injecté
-    /// par l'agent-cli depuis `agent-sandbox`.
+    /// Shell command hardening closure (Bash network sandbox), injected
+    /// by agent-cli from `agent-sandbox`.
     pub fn command_hardener(mut self, harden: crate::tool::CommandHardener) -> Self {
         self.ctx.harden = Some(harden);
         self
     }
-    /// Enregistre un outil natif (boxé en `DynTool`). Un nom déjà présent garde
-    /// le premier outil enregistré.
+    /// Registers a native tool (boxed into a `DynTool`). An already present name keeps
+    /// the first registered tool.
     pub fn register<T: crate::tool::Tool + 'static>(mut self, tool: T) -> Self {
         let dyn_tool = into_dyn(tool);
         self.tools
@@ -440,7 +440,7 @@ impl RegistryBuilder {
             .or_insert(dyn_tool);
         self
     }
-    /// Enregistre un `DynTool` déjà boxé (ex. futur outil MCP).
+    /// Registers an already boxed `DynTool` (e.g. a future MCP tool).
     pub fn register_dyn(mut self, tool: Box<dyn DynTool>) -> Self {
         self.tools.entry(tool.name().to_string()).or_insert(tool);
         self

@@ -1,5 +1,5 @@
-//! Outil `glob` — liste les fichiers du workspace correspondant à un motif glob
-//! (`**/*.rs`, `src/*.toml`, …). Read-only, concurrency-safe. US-011 AC2.
+//! `glob` tool: lists the workspace files matching a glob pattern
+//! (`**/*.rs`, `src/*.toml`, ...). Read-only, concurrency-safe. US-011 AC2.
 
 use async_trait::async_trait;
 use globset::Glob as GlobPattern;
@@ -11,14 +11,14 @@ use crate::path::{confine, ensure_existing_path_no_links};
 use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{Tool, ToolCtx, ToolOutput};
 
-/// Plafond de résultats (évite un flood de prompt sur un repo géant).
+/// Result cap (avoids flooding the prompt on a huge repo).
 const MAX_MATCHES: usize = 1000;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlobInput {
     pub pattern: String,
-    /// Sous-dossier de base (relatif au workspace). Défaut : racine workspace.
+    /// Base subdirectory (relative to the workspace). Default: workspace root.
     #[serde(default)]
     pub path: Option<String>,
 }
@@ -79,7 +79,7 @@ impl Tool for Glob {
         let workspace = ctx.workspace.clone();
         let pattern = input.pattern.clone();
 
-        // Walk synchrone (FS bloquant) déporté hors du runtime async.
+        // Synchronous walk (blocking FS) moved off the async runtime.
         let matches = tokio::task::spawn_blocking(move || {
             let mut out: Vec<String> = Vec::new();
             for entry in WalkDir::new(&base).into_iter().flatten() {

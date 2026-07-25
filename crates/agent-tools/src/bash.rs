@@ -1,8 +1,8 @@
-//! Outil `bash` — exécute une commande shell dans le workspace. Action SENSIBLE
-//! (destructive/réseau possible) → cible de la défense taint (§4.6) et `Ask` par
-//! défaut. Sortie untrusted (stdout/stderr = contenu externe). Le Registry
-//! enveloppe l'appel dans un `timeout` ; `kill_on_drop` tue le process si le
-//! timeout expire (US-012 AC2 / unhappy path US-003). US-012.
+//! `bash` tool: runs a shell command in the workspace. SENSITIVE action
+//! (possibly destructive/network) -> target of the taint defense (4.6) and `Ask` by
+//! default. Untrusted output (stdout/stderr = external content). The Registry
+//! wraps the call in a `timeout`; `kill_on_drop` kills the process when the
+//! timeout expires (US-012 AC2 / US-003 unhappy path). US-012.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -12,10 +12,10 @@ use crate::error::{ToolError, ValidationError};
 use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{MAX_COMMAND_BYTES, Tool, ToolCtx, ToolOutput};
 
-/// Borne de capture (évite un flood de prompt sur une sortie géante).
+/// Capture bound (avoids flooding the prompt with a giant output).
 const MAX_OUTPUT: usize = 30_000;
-/// Streaming de sortie (US-015) : taille et délai de coalescence des fragments,
-/// et plafond d'un fragment publié.
+/// Output streaming (US-015): size and coalescing delay of the fragments,
+/// and cap of a published fragment.
 const STREAM_FLUSH_BYTES: usize = 4_096;
 const STREAM_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const STREAM_CHUNK_MAX: usize = 8_192;
@@ -43,8 +43,8 @@ impl Tool for Bash {
              Parameter: command."
                 .to_string()
         }
-        // US-014 : la description nomme le shell RÉELLEMENT utilisé, le même que
-        // celui annoncé dans le bloc `<environment>`.
+        // US-014: the description names the shell ACTUALLY used, the same as the
+        // one announced in the `<environment>` block.
         #[cfg(not(windows))]
         {
             format!(
@@ -65,8 +65,8 @@ impl Tool for Bash {
             "additionalProperties": false
         })
     }
-    // Defaults fail-closed conservés : non read-only, non concurrent, SENSIBLE,
-    // untrusted. On les rend explicites pour la lisibilité.
+    // Fail-closed defaults kept: not read-only, not concurrent, SENSITIVE,
+    // untrusted. We spell them out for readability.
     fn is_read_only(&self) -> bool {
         false
     }
@@ -104,10 +104,10 @@ impl Tool for Bash {
         let shell = crate::shell::resolve();
         let mut child = match build_command(&shell, &input.command, ctx).spawn() {
             Ok(child) => child,
-            // AC4 : un shell de connexion introuvable ou qui refuse de démarrer ne
-            // fait pas échouer le tour. On retombe sur `sh` pour cette commande, et
-            // le drapeau process-wide aligne l'annonce faite au modèle dès le tour
-            // suivant.
+            // AC4: a login shell that cannot be found or refuses to start does not
+            // fail the turn. We fall back on `sh` for this command, and the
+            // process-wide flag aligns what is announced to the model from the next
+            // turn on.
             Err(first) if !shell.is_fallback() => {
                 crate::shell::mark_login_shell_unusable();
                 let fallback = crate::shell::resolve();
@@ -126,8 +126,8 @@ impl Tool for Bash {
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        // US-015 : les deux flux sont streamés au fil de l'eau vers le client, en
-        // plus d'être capturés pour le résultat final.
+        // US-015: both streams are streamed to the client as they come, on top
+        // of being captured for the final result.
         let stdout_sink = ctx.output.clone();
         let stderr_sink = ctx.output.clone();
         let stdout_task = tokio::spawn(async move {
@@ -237,8 +237,8 @@ impl Tool for Bash {
     }
 }
 
-/// Construit la commande shell (mêmes options qu'avant US-014, seul le programme
-/// exécuté devient variable).
+/// Builds the shell command (same options as before US-014, only the executed
+/// program becomes variable).
 fn build_command(
     shell: &crate::shell::ShellChoice,
     command: &str,
@@ -256,8 +256,8 @@ fn build_command(
     #[cfg(not(windows))]
     let mut cmd = {
         let mut cmd = tokio::process::Command::new(&shell.program);
-        // `-c` en mode non interactif : aucun fichier d'initialisation interactif
-        // n'est lu, le comportement reste celui d'un shell de script.
+        // `-c` in non-interactive mode: no interactive initialization file
+        // is read, the behavior stays that of a script shell.
         cmd.arg("-c").arg(command);
         cmd.process_group(0);
         cmd
@@ -275,8 +275,8 @@ fn build_command(
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
 
-    // Durcissement sandbox (réseau via HTTP_PROXY) injecté par l'agent-cli.
-    // Le confinement FS Landlock est process-wide → hérité par ce sous-process.
+    // Sandbox hardening (network through HTTP_PROXY) injected by agent-cli.
+    // The Landlock FS confinement is process-wide -> inherited by this subprocess.
     if let Some(harden) = &ctx.harden {
         harden(&mut cmd);
     }
@@ -295,9 +295,9 @@ impl Capture {
     }
 }
 
-/// Lit un flux jusqu'à EOF : capture la QUEUE pour le résultat final (politique
-/// de troncature inchangée) et, si un consommateur écoute, publie la sortie au
-/// fil de l'eau (US-015).
+/// Reads a stream until EOF: captures the TAIL for the final result (truncation
+/// policy unchanged) and, when a consumer is listening, publishes the output as
+/// it comes (US-015).
 async fn read_tail(
     mut reader: impl tokio::io::AsyncRead + Unpin,
     sink: Option<crate::tool::OutputSink>,
@@ -315,9 +315,9 @@ async fn read_tail(
         out.bytes.extend_from_slice(&buf[..n]);
         if sink.is_some() {
             pending.extend_from_slice(&buf[..n]);
-            // Coalescence : au plus un fragment par `STREAM_FLUSH_INTERVAL`, ce qui
-            // borne le trafic d'événements sur une sortie bavarde tout en gardant la
-            // latence d'affichage très sous la seconde.
+            // Coalescing: at most one fragment per `STREAM_FLUSH_INTERVAL`, which
+            // bounds the event traffic on a chatty output while keeping the display
+            // latency well under a second.
             if pending.len() >= STREAM_FLUSH_BYTES || last_flush.elapsed() >= STREAM_FLUSH_INTERVAL
             {
                 flush_stream(&mut pending, sink.as_ref());
@@ -334,9 +334,9 @@ async fn read_tail(
     out
 }
 
-/// Publie la partie UTF-8 complète de `pending` et conserve le reliquat : un
-/// caractère multi-octets coupé par une frontière de lecture ne doit pas devenir
-/// un `U+FFFD` dans l'affichage.
+/// Publishes the complete UTF-8 part of `pending` and keeps the remainder: a
+/// multi-byte character cut by a read boundary must not become a
+/// `U+FFFD` in the display.
 fn flush_stream(pending: &mut Vec<u8>, sink: Option<&crate::tool::OutputSink>) {
     let Some(sink) = sink else {
         pending.clear();
@@ -350,8 +350,8 @@ fn flush_stream(pending: &mut Vec<u8>, sink: Option<&crate::tool::OutputSink>) {
         Err(e) => e.valid_up_to(),
     };
     if valid_up_to == 0 {
-        // Reliquat plus long qu'un caractère UTF-8 : il ne sera jamais complété,
-        // on le rend en lossy plutôt que de le laisser croître.
+        // Remainder longer than a UTF-8 character: it will never be completed,
+        // so we render it lossily rather than let it grow.
         if pending.len() > 4 {
             sink(String::from_utf8_lossy(pending).into_owned());
             pending.clear();
@@ -360,7 +360,7 @@ fn flush_stream(pending: &mut Vec<u8>, sink: Option<&crate::tool::OutputSink>) {
     }
     let rest = pending.split_off(valid_up_to);
     let mut text = String::from_utf8_lossy(pending).into_owned();
-    // Backstop : un fragment géant n'apporte rien à un affichage live borné.
+    // Backstop: a giant fragment adds nothing to a bounded live display.
     if text.len() > STREAM_CHUNK_MAX {
         text = truncate_tail(&text, STREAM_CHUNK_MAX);
     }
@@ -402,10 +402,10 @@ async fn kill_process_tree(pid: u32) {
     }
 }
 
-/// Tronque `body` en gardant la QUEUE (tail) sur `max` octets (US-026) : sur une
-/// sortie longue (compilation : warnings en tête, erreurs + exit code en queue),
-/// le tail préserve l'information critique. Le point de coupe est aligné sur une
-/// frontière de caractère UTF-8 (jamais de panic d'indexation).
+/// Truncates `body` keeping the TAIL within `max` bytes (US-026): on a long
+/// output (compilation: warnings first, errors + exit code last),
+/// the tail preserves the critical information. The cut point is aligned on a
+/// UTF-8 character boundary (never an indexing panic).
 fn truncate_tail(body: &str, max: usize) -> String {
     if body.len() <= max {
         return body.to_string();

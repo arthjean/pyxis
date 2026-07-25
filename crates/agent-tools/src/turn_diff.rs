@@ -1,25 +1,25 @@
-//! Diff agrégé d'un tour (US-018, `tasks/prd-harness-parity.md`).
+//! Aggregated diff of a turn (US-018, `tasks/prd-harness-parity.md`).
 //!
-//! Question à laquelle ce module répond : « qu'est-ce que ce tour a changé sur le
-//! disque ? » — y compris ce qu'aucun outil d'édition n'a produit, par exemple un
-//! `cargo fmt` ou un `sed -i` lancé par `bash`. C'est le seul écart de l'audit où
-//! Pyxis peut être en avance plutôt qu'en rattrapage, donc la donnée est
-//! structurée (`agent_core::TurnDiffView`) et pas seulement affichée.
+//! The question this module answers: "what did this turn change on disk?",
+//! including what no editing tool produced, for instance a `cargo fmt` or a
+//! `sed -i` launched by `bash`. It is the only gap in the audit where Pyxis can
+//! be ahead rather than catching up, so the data is structured
+//! (`agent_core::TurnDiffView`) and not merely displayed.
 //!
-//! **Périmètre : git.** Le PRD laissait la question ouverte ; la réponse retenue
-//! est de déléguer la découverte à `git status`, ce qui exclut d'office les
-//! fichiers ignorés (`target/`, `node_modules/`) sans lesquels une empreinte du
-//! workspace entier coûterait plusieurs secondes par tour, et sans ajouter de
-//! dépendance de surveillance du système de fichiers. Conséquence assumée : dans
-//! un répertoire qui n'est pas un dépôt git, le diff agrégé est toujours vide.
+//! **Scope: git.** The PRD left the question open; the chosen answer is to
+//! delegate discovery to `git status`, which rules out ignored files
+//! (`target/`, `node_modules/`) without which fingerprinting the whole
+//! workspace would cost several seconds per turn, and without adding a
+//! filesystem-watching dependency. Accepted consequence: in a directory that is
+//! not a git repository, the aggregated diff is always empty.
 //!
-//! **Comment la comparaison fonctionne.** À l'ouverture du tour, le contenu de
-//! chaque fichier que git déclare sale est mémorisé. À la fermeture, la même liste
-//! est recalculée. Un fichier apparu dans la seconde liste était propre au départ,
-//! donc son état de départ est exactement son contenu à `HEAD` ; un fichier
-//! disparu de la liste a été ramené à `HEAD`. Un fichier absent des deux listes
-//! n'a pas de modification nette, ce qui traite gratuitement le cas « créé puis
-//! supprimé dans le même tour ».
+//! **How the comparison works.** When the turn opens, the content of every file
+//! git reports as dirty is memorized. At close time, the same list is recomputed.
+//! A file that appears in the second list was clean at the start, so its
+//! starting state is exactly its content at `HEAD`; a file that disappeared
+//! from the list was brought back to `HEAD`. A file absent from both lists
+//! has no net change, which handles the "created then deleted in the same
+//! turn" case for free.
 
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
@@ -28,34 +28,34 @@ use std::time::Duration;
 
 use agent_core::{FileChange, FileDiffView, TurnDiffView};
 
-/// Au-delà de ce volume, un fichier est listé comme modifié sans être comparé
-/// ligne à ligne : un diff de plusieurs mégaoctets n'informe personne et rendrait
-/// la fin de tour coûteuse.
+/// Past this size, a file is listed as modified without being compared line by
+/// line: a multi-megabyte diff informs nobody and would make the end of the
+/// turn expensive.
 const MAX_DIFF_BYTES: usize = 512 * 1024;
 
-/// Borne d'exécution d'une commande git. Un `git status` qui ne rend pas la main
-/// (verrou, système de fichiers réseau) ne doit pas suspendre la fin du tour.
+/// Execution bound for a git command. A `git status` that never returns
+/// (lock, network filesystem) must not suspend the end of the turn.
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Lignes de contexte du diff unifié, comme `git diff`.
+/// Context lines of the unified diff, like `git diff`.
 const CONTEXT_RADIUS: usize = 3;
 
-/// État interne de Pyxis, jamais du contenu utilisateur : le fichier de session
-/// est réécrit à chaque tour, donc l'inclure ferait apparaître une modification
-/// dans absolument tous les diffs, et y recopierait le transcript. Exclu ici et
-/// pas seulement via `.gitignore`, dont on ne contrôle pas le contenu.
+/// Internal Pyxis state, never user content: the session file is rewritten on
+/// every turn, so including it would show a modification in absolutely every
+/// diff, and would copy the transcript into it. Excluded here and not only
+/// through `.gitignore`, whose content we do not control.
 const EXCLUDED_PREFIX: &str = ".pyxis/";
 
-/// État d'un fichier à un instant donné.
+/// State of a file at a given instant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FileState {
-    /// Le fichier n'existe pas.
+    /// The file does not exist.
     Absent,
-    /// Contenu UTF-8, comparable ligne à ligne.
+    /// UTF-8 content, comparable line by line.
     Text(String),
-    /// Binaire ou trop volumineux : seule son identité est suivie. Le hash n'a
-    /// aucun rôle de sécurité, uniquement de détection de changement dans le
-    /// processus courant.
+    /// Binary or too large: only its identity is tracked. The hash has no
+    /// security role, only change detection within the current
+    /// process.
     Opaque(u64),
 }
 
@@ -65,22 +65,22 @@ impl FileState {
     }
 }
 
-/// Référence prise à l'ouverture d'un tour, puis comparée à sa fermeture.
+/// Reference taken when a turn opens, then compared at its close.
 pub struct TurnDiffTracker {
-    /// Racine du dépôt : les chemins rapportés par `git status --porcelain` lui
-    /// sont relatifs, et `git show HEAD:<path>` les attend sous cette forme.
+    /// Repository root: the paths reported by `git status --porcelain` are
+    /// relative to it, and `git show HEAD:<path>` expects that form.
     repo_root: PathBuf,
-    /// Racine du workspace, pour rendre les chemins affichés relatifs à ce que
-    /// l'utilisateur voit.
+    /// Workspace root, to make displayed paths relative to what the user
+    /// sees.
     workspace: PathBuf,
-    /// `None` quand il n'y a pas de dépôt git : le tracker devient inerte. Ce
-    /// n'est pas une erreur, c'est une absence de périmètre.
+    /// `None` when there is no git repository: the tracker goes inert. This
+    /// is not an error, it is an absence of scope.
     baseline: Option<BTreeMap<String, FileState>>,
 }
 
 impl TurnDiffTracker {
-    /// Capture la référence. Ne renvoie jamais d'erreur : un tour ne doit pas
-    /// échouer parce que son observabilité a échoué.
+    /// Captures the reference. Never returns an error: a turn must not fail
+    /// because its observability failed.
     pub async fn begin(workspace: &Path) -> Self {
         let mut tracker = Self {
             repo_root: workspace.to_path_buf(),
@@ -93,14 +93,14 @@ impl TurnDiffTracker {
         tracker.repo_root = repo_root;
         match tracker.snapshot_dirty().await {
             Ok(baseline) => tracker.baseline = Some(baseline),
-            // Le dépôt existe mais git a échoué : le tour continue sans diff.
+            // The repository exists but git failed: the turn goes on without a diff.
             Err(err) => eprintln!("[diff] baseline unavailable: {err}"),
         }
         tracker
     }
 
-    /// Diff agrégé du tour. Vide quand rien n'a changé, ou quand il n'y a pas de
-    /// périmètre git à observer.
+    /// Aggregated diff of the turn. Empty when nothing changed, or when there is
+    /// no git scope to observe.
     pub async fn turn_diff(&mut self) -> Result<TurnDiffView, String> {
         let Some(baseline) = self.baseline.as_ref() else {
             return Ok(TurnDiffView::default());
@@ -113,8 +113,8 @@ impl TurnDiffTracker {
         paths.dedup();
 
         for path in paths {
-            // Un chemin absent d'une des deux listes était propre à ce
-            // moment-là, donc identique à `HEAD`.
+            // A path absent from one of the two lists was clean at that
+            // moment, so identical to `HEAD`.
             let before = match baseline.get(path) {
                 Some(state) => state.clone(),
                 None => self.head_state(path).await,
@@ -170,8 +170,8 @@ impl TurnDiffTracker {
                     unified: Some(unified),
                 }
             }
-            // Au moins un côté est binaire ou trop volumineux : listé sans diff
-            // (AC4), et sans compte de lignes qui serait faux.
+            // At least one side is binary or too large: listed without a diff
+            // (AC4), and without a line count that would be wrong.
             _ => FileDiffView {
                 path: display,
                 change,
@@ -182,8 +182,8 @@ impl TurnDiffTracker {
         }
     }
 
-    /// Chemin tel que l'utilisateur le désigne : relatif au workspace quand
-    /// celui-ci est un sous-répertoire du dépôt, relatif au dépôt sinon.
+    /// Path as the user refers to it: relative to the workspace when the
+    /// workspace is a subdirectory of the repository, relative to the repository otherwise.
     fn display_path(&self, repo_path: &str) -> String {
         let absolute = self.repo_root.join(repo_path);
         absolute
@@ -192,9 +192,9 @@ impl TurnDiffTracker {
             .unwrap_or_else(|_| repo_path.to_string())
     }
 
-    /// Contenu et état de chaque fichier que git déclare différent de `HEAD`,
-    /// fichiers non suivis compris, fichiers ignorés exclus. Le pathspec `.`
-    /// borne la liste au workspace quand il est un sous-répertoire du dépôt.
+    /// Content and state of every file git reports as different from `HEAD`,
+    /// untracked files included, ignored files excluded. The `.` pathspec
+    /// bounds the list to the workspace when it is a subdirectory of the repository.
     async fn snapshot_dirty(&self) -> Result<BTreeMap<String, FileState>, String> {
         let out = git(
             &self.workspace,
@@ -212,8 +212,8 @@ impl TurnDiffTracker {
         .await?;
 
         let mut snapshot = BTreeMap::new();
-        // Format `-z` : `XY <path>\0`, sans échappement de nom de fichier.
-        // `--no-renames` garantit qu'aucune entrée ne porte un second chemin.
+        // `-z` format: `XY <path>\0`, without filename escaping.
+        // `--no-renames` guarantees that no entry carries a second path.
         for entry in out.split('\0').filter(|entry| entry.len() > 3) {
             let path = &entry[3..];
             if self.is_excluded(path) {
@@ -225,8 +225,8 @@ impl TurnDiffTracker {
         Ok(snapshot)
     }
 
-    /// L'exclusion porte sur le chemin **vu par l'utilisateur** : `.pyxis/` du
-    /// workspace, pas d'un `.pyxis/` homonyme situé ailleurs dans le dépôt.
+    /// The exclusion applies to the path **as seen by the user**: the workspace
+    /// `.pyxis/`, not a same-named `.pyxis/` located elsewhere in the repository.
     fn is_excluded(&self, repo_path: &str) -> bool {
         self.display_path(repo_path).starts_with(EXCLUDED_PREFIX)
     }
@@ -238,8 +238,8 @@ impl TurnDiffTracker {
         }
     }
 
-    /// État du fichier à `HEAD`. Absent quand le chemin n'y est pas (fichier créé
-    /// pendant le tour, ou dépôt encore sans commit).
+    /// State of the file at `HEAD`. Absent when the path is not there (file created
+    /// during the turn, or repository still without a commit).
     async fn head_state(&self, repo_path: &str) -> FileState {
         let spec = format!("HEAD:{repo_path}");
         match git_bytes(&self.repo_root, &["--no-optional-locks", "show", &spec]).await {
@@ -284,7 +284,7 @@ fn unified_diff(path: &str, before: &str, after: &str) -> (u32, u32, String) {
     (added, removed, unified)
 }
 
-/// Racine du dépôt contenant `dir`, ou `None` si `dir` n'est pas dans un dépôt.
+/// Root of the repository containing `dir`, or `None` if `dir` is not in a repository.
 async fn repo_root(dir: &Path) -> Option<PathBuf> {
     let out = git(
         dir,
@@ -325,8 +325,8 @@ async fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
-    /// Dépôt git jetable. `-c` plutôt qu'une configuration globale : le test ne
-    /// doit rien supposer de la machine qui l'exécute.
+    /// Throwaway git repository. `-c` rather than a global configuration: the test
+    /// must assume nothing about the machine running it.
     struct Repo {
         dir: PathBuf,
     }
@@ -339,8 +339,8 @@ mod tests {
                 .join(format!("pyxis-turndiff-{}-{tag}-{n}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
-            // `$TMPDIR` est un lien symbolique sur certaines distributions, et
-            // `rev-parse --show-toplevel` rend le chemin canonique.
+            // `$TMPDIR` is a symbolic link on some distributions, and
+            // `rev-parse --show-toplevel` returns the canonical path.
             let dir = std::fs::canonicalize(&dir).unwrap();
             let repo = Self { dir };
             repo.git(&["init", "-q", "-b", "main"]).await;
@@ -405,8 +405,8 @@ mod tests {
         found.unwrap()
     }
 
-    /// AC1 + AC2 : un fichier édité et un fichier écrit par une commande shell
-    /// apparaissent tous les deux, sans que le tracker sache lequel est lequel.
+    /// AC1 + AC2: a file edited and a file written by a shell command both
+    /// show up, without the tracker knowing which is which.
     #[tokio::test]
     async fn aggregates_tool_edits_and_shell_writes() {
         let repo = Repo::new("aggregate").await;
@@ -415,9 +415,9 @@ mod tests {
 
         let mut tracker = TurnDiffTracker::begin(&repo.dir).await;
 
-        // Édition d'un fichier suivi, comme le ferait l'outil `edit`.
+        // Edit of a tracked file, as the `edit` tool would do.
         repo.write("kept.txt", "un\ndeux modifie\ntrois\n");
-        // Création par une commande shell, invisible du pipeline d'outils.
+        // Creation by a shell command, invisible to the tool pipeline.
         tokio::process::Command::new("sh")
             .current_dir(&repo.dir)
             .args(["-c", "printf 'genere\\n' > generated.txt"])
@@ -440,7 +440,7 @@ mod tests {
         assert_eq!(diff.totals(), (3, 1));
     }
 
-    /// AC3 : créé puis supprimé dans le même tour → aucune modification nette.
+    /// AC3: created then deleted in the same turn -> no net change.
     #[tokio::test]
     async fn file_created_then_deleted_is_not_a_net_change() {
         let repo = Repo::new("transient").await;
@@ -456,8 +456,8 @@ mod tests {
         assert!(diff.is_empty(), "{:?}", diff.files);
     }
 
-    /// AC3, symétrique : un fichier suivi modifié puis remis à l'identique ne
-    /// compte pas non plus.
+    /// AC3, symmetric: a tracked file modified then restored identically does
+    /// not count either.
     #[tokio::test]
     async fn tracked_file_restored_to_its_original_content_is_not_a_change() {
         let repo = Repo::new("restored").await;
@@ -473,7 +473,7 @@ mod tests {
         assert!(diff.is_empty(), "{:?}", diff.files);
     }
 
-    /// AC4 : binaire et fichier hors seuil → listés, jamais diffés.
+    /// AC4: binary and over-threshold file -> listed, never diffed.
     #[tokio::test]
     async fn binary_and_oversized_files_are_listed_without_a_diff() {
         let repo = Repo::new("binary").await;
@@ -495,14 +495,14 @@ mod tests {
         assert!(huge.unified.is_none(), "au-dela du seuil, pas de diff");
     }
 
-    /// AC5 : un tour sans modification ne produit rien, y compris quand le
-    /// workspace était déjà sale au départ.
+    /// AC5: a turn without a change produces nothing, including when the
+    /// workspace was already dirty at the start.
     #[tokio::test]
     async fn a_turn_without_modification_is_empty_even_on_a_dirty_worktree() {
         let repo = Repo::new("dirty").await;
         repo.write("kept.txt", "committe\n");
         repo.commit("initial").await;
-        // Saleté préexistante, non imputable au tour.
+        // Pre-existing dirt, not attributable to the turn.
         repo.write("kept.txt", "modifie par l'utilisateur\n");
         repo.write("untracked.txt", "brouillon utilisateur\n");
 
@@ -512,8 +512,8 @@ mod tests {
         assert!(diff.is_empty(), "{:?}", diff.files);
     }
 
-    /// La saleté préexistante ne masque pas une modification du tour sur le MÊME
-    /// fichier : c'est le contenu, pas le statut git, qui fait foi.
+    /// Pre-existing dirt does not mask a turn modification on the SAME
+    /// file: content, not git status, is what counts.
     #[tokio::test]
     async fn a_file_already_dirty_before_the_turn_is_still_diffed_from_its_turn_start_content() {
         let repo = Repo::new("already-dirty").await;
@@ -536,7 +536,7 @@ mod tests {
         );
     }
 
-    /// Suppression d'un fichier suivi.
+    /// Deletion of a tracked file.
     #[tokio::test]
     async fn deleting_a_tracked_file_is_reported_as_a_deletion() {
         let repo = Repo::new("delete").await;
@@ -553,8 +553,8 @@ mod tests {
         assert_eq!((file.added_lines, file.removed_lines), (0, 2));
     }
 
-    /// Les fichiers ignorés restent hors périmètre : c'est la raison même de
-    /// déléguer la découverte à git.
+    /// Ignored files stay out of scope: that is the very reason for
+    /// delegating discovery to git.
     #[tokio::test]
     async fn ignored_files_stay_out_of_scope() {
         let repo = Repo::new("ignored").await;
@@ -569,8 +569,8 @@ mod tests {
         assert!(diff.is_empty(), "{:?}", diff.files);
     }
 
-    /// Hors dépôt git : inerte, sans erreur (même exigence qu'US-013 sur
-    /// l'absence de `.git`).
+    /// Outside a git repository: inert, without an error (same requirement as
+    /// US-013 about a missing `.git`).
     #[tokio::test]
     async fn outside_a_git_repository_the_tracker_is_inert() {
         let dir = std::env::temp_dir().join(format!("pyxis-turndiff-nogit-{}", std::process::id()));
@@ -586,7 +586,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Un dépôt sans aucun commit : `HEAD` n'existe pas, tout est un ajout.
+    /// A repository without any commit: `HEAD` does not exist, everything is an addition.
     #[tokio::test]
     async fn a_repository_without_any_commit_reports_additions() {
         let repo = Repo::new("no-head").await;
@@ -601,13 +601,13 @@ mod tests {
         assert_eq!((file.added_lines, file.removed_lines), (1, 0));
     }
 
-    /// L'état interne de Pyxis reste hors du diff, même quand le dépôt ne
-    /// l'ignore pas : sinon chaque tour se verrait modifier sa propre session.
+    /// Pyxis internal state stays out of the diff, even when the repository does
+    /// not ignore it: otherwise every turn would see its own session modified.
     #[tokio::test]
     async fn pyxis_internal_state_is_never_reported() {
         let repo = Repo::new("pyxis-state").await;
         repo.write("kept.txt", "x\n");
-        // Volontairement PAS de .gitignore : l'exclusion ne doit pas en dépendre.
+        // Deliberately NO .gitignore: the exclusion must not depend on one.
         repo.commit("initial").await;
 
         let mut tracker = TurnDiffTracker::begin(&repo.dir).await;
@@ -620,8 +620,8 @@ mod tests {
         assert_eq!(diff.files[0].path, "kept.txt");
     }
 
-    /// Sous-répertoire du dépôt : le périmètre et les chemins affichés suivent le
-    /// workspace, pas la racine du dépôt.
+    /// Subdirectory of the repository: the scope and the displayed paths follow the
+    /// workspace, not the repository root.
     #[tokio::test]
     async fn a_workspace_subdirectory_scopes_and_relativizes_paths() {
         let repo = Repo::new("subdir").await;

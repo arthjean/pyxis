@@ -1,11 +1,11 @@
-//! Trait `Tool` (fail-closed) + `DynTool` object-safe + adapter (ARCHITECTURE
-//! §4.1). Le trait générique porte un type d'entrée associé (non object-safe) ;
-//! `DynTool` est le wrapper dyn-compatible stocké dans le `Registry` — du point
-//! de vue du dispatch, un outil natif et (à terme) un outil MCP sont
-//! indistinguables.
+//! `Tool` trait (fail-closed) + object-safe `DynTool` + adapter (ARCHITECTURE
+//! 4.1). The generic trait carries an associated input type (not object-safe);
+//! `DynTool` is the dyn-compatible wrapper stored in the `Registry`. From the
+//! dispatch point of view, a native tool and (eventually) an MCP tool are
+//! indistinguishable.
 //!
-//! Defaults FAIL-CLOSED (invariant 4) : sans override explicite, un outil est
-//! supposé non concurrent, mutant, sensible, et à sortie untrusted.
+//! FAIL-CLOSED defaults (invariant 4): without an explicit override, a tool is
+//! assumed non-concurrent, mutating, sensitive, and with untrusted output.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,41 +17,41 @@ use serde::de::DeserializeOwned;
 use crate::error::{ToolError, ValidationError};
 use crate::permission::{PermCtx, PermissionDecision};
 
-/// Plafonds globaux des outils natifs. Ces limites bornent les allocations avant
-/// qu'un payload modèle puisse devenir un problème mémoire ou disque.
+/// Global caps of the native tools. These limits bound allocations before
+/// a model payload can become a memory or disk problem.
 pub const MAX_TOOL_INPUT_BYTES: usize = 4_000_000;
 pub const MAX_WRITE_BYTES: usize = 2_000_000;
 pub const MAX_EDIT_FILE_BYTES: u64 = 5_000_000;
 pub const MAX_EDIT_ANCHOR_BYTES: usize = 200_000;
 pub const MAX_COMMAND_BYTES: usize = 16_000;
 
-/// Durcissement opaque d'une commande shell (Bash) : closure injectée par
-/// l'agent-cli, qui applique le sandbox réseau (env `HTTP_PROXY`). Opaque ici
-/// pour garder `agent-tools` découplé d'`agent-sandbox` ; le confinement FS
-/// Landlock est, lui, process-wide (hérité), donc transparent pour les outils.
+/// Opaque hardening of a shell command (Bash): closure injected by
+/// agent-cli, which applies the network sandbox (`HTTP_PROXY` env). Opaque here
+/// to keep `agent-tools` decoupled from `agent-sandbox`; the Landlock FS
+/// confinement is process-wide (inherited), hence transparent to the tools.
 pub type CommandHardener = Arc<dyn Fn(&mut tokio::process::Command) + Send + Sync>;
 
-/// Émetteur de fragments de sortie d'un outil en cours (US-015). Installé par le
-/// Registry pour la durée d'un appel, déjà corrélé à l'`id` de cet appel — un
-/// outil n'a donc rien à savoir du transport ni de son propre identifiant.
+/// Emitter of output fragments for a running tool (US-015). Installed by the
+/// Registry for the duration of a call, already correlated to that call's `id`:
+/// a tool therefore knows nothing about the transport nor about its own identifier.
 pub type OutputSink = Arc<dyn Fn(String) + Send + Sync>;
 
-/// Contexte d'exécution partagé passé à chaque outil. `&ToolCtx` (partagé) :
-/// les outils concurrents le lisent en parallèle. La mutation d'état d'agent
-/// (context-modifiers) est différée (Phase 2).
+/// Shared execution context passed to every tool. `&ToolCtx` (shared):
+/// concurrent tools read it in parallel. Agent state mutation
+/// (context-modifiers) is deferred (Phase 2).
 #[derive(Clone)]
 pub struct ToolCtx {
-    /// Racine du workspace : ancre des chemins relatifs et frontière de
-    /// confinement (renforcée au kernel par Landlock process-wide, US-020).
+    /// Workspace root: anchor of relative paths and confinement boundary
+    /// (enforced at kernel level by process-wide Landlock, US-020).
     pub workspace: PathBuf,
-    /// Timeout appliqué par le Registry autour de `call()`.
+    /// Timeout applied by the Registry around `call()`.
     pub timeout: Duration,
-    /// Marge accordée aux outils qui doivent nettoyer après leur timeout interne.
+    /// Grace given to tools that must clean up after their internal timeout.
     pub cleanup_grace: Duration,
-    /// Durcissement de commande (sandbox réseau Bash), injecté par l'agent-cli.
+    /// Command hardening (Bash network sandbox), injected by agent-cli.
     pub harden: Option<CommandHardener>,
-    /// Sortie progressive de l'appel en cours (US-015). `None` = aucun
-    /// consommateur : les outils n'émettent alors rien.
+    /// Progressive output of the current call (US-015). `None` = no
+    /// consumer: tools then emit nothing.
     pub output: Option<OutputSink>,
 }
 
@@ -85,13 +85,13 @@ impl ToolCtx {
         self.harden = Some(harden);
         self
     }
-    /// Contexte dérivé pour UN appel, doté de son émetteur de sortie (US-015).
+    /// Context derived for ONE call, equipped with its output emitter (US-015).
     pub fn with_output_sink(&self, output: OutputSink) -> Self {
         let mut ctx = self.clone();
         ctx.output = Some(output);
         ctx
     }
-    /// Publie un fragment de sortie si un consommateur écoute. No-op sinon.
+    /// Publishes an output fragment when a consumer is listening. No-op otherwise.
     pub fn emit_output(&self, chunk: impl Into<String>) {
         if let Some(sink) = &self.output {
             sink(chunk.into());
@@ -99,10 +99,10 @@ impl ToolCtx {
     }
 }
 
-/// Sortie d'un outil : le texte que le modèle verra comme `tool_result`.
-/// `is_error` distingue un échec *sémantique* (commande Bash en exit ≠ 0) d'une
-/// vraie erreur de pipeline (`ToolError`) — dans les deux cas le modèle voit le
-/// contenu et peut réagir.
+/// Output of a tool: the text the model will see as `tool_result`.
+/// `is_error` distinguishes a *semantic* failure (Bash command exiting non-zero)
+/// from a real pipeline error (`ToolError`); in both cases the model sees the
+/// content and can react.
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: String,
@@ -110,14 +110,14 @@ pub struct ToolOutput {
 }
 
 impl ToolOutput {
-    /// Sortie nominale (succès).
+    /// Nominal output (success).
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
             is_error: false,
         }
     }
-    /// Sortie marquée erreur sémantique (le contenu est conservé pour le modèle).
+    /// Output marked as a semantic error (the content is kept for the model).
     pub fn error(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
@@ -126,79 +126,79 @@ impl ToolOutput {
     }
 }
 
-/// Trait des outils natifs. Generic sur l'entrée → monomorphisé, branché dans le
-/// Registry via `DynToolAdapter`.
+/// Trait of native tools. Generic over the input -> monomorphized, plugged into the
+/// Registry through `DynToolAdapter`.
 #[async_trait]
 pub trait Tool: Send + Sync {
-    /// Type d'entrée (désérialisé depuis le JSON du `tool_use`).
+    /// Input type (deserialized from the `tool_use` JSON).
     type Input: DeserializeOwned + Send;
 
     fn name(&self) -> &str;
-    /// Description fournie au modèle (cappée par le Registry à l'exposition).
+    /// Description given to the model (capped by the Registry at exposure time).
     fn description(&self) -> String;
-    /// JSON Schema de l'entrée (exposé au modèle dans `ToolSpec`).
+    /// Input JSON Schema (exposed to the model in `ToolSpec`).
     fn input_schema(&self) -> serde_json::Value;
 
-    // ───── Defaults FAIL-CLOSED (invariant 4) — un outil élargit explicitement.
-    /// Peut tourner en parallèle d'autres outils (typiquement les reads).
+    // ───── FAIL-CLOSED defaults (invariant 4): a tool widens them explicitly.
+    /// Can run alongside other tools (typically reads).
     fn is_concurrency_safe(&self) -> bool {
         false
     }
-    /// N'effectue aucune mutation (lecture pure).
+    /// Performs no mutation (pure read).
     fn is_read_only(&self) -> bool {
         false
     }
-    /// Action destructive ou réseau → cible de la défense taint (§4.6) : si du
-    /// taint est récent, on force `Ask` même dans un mode permissif.
+    /// Destructive or network action -> target of the taint defense (4.6): when
+    /// taint is recent, we force `Ask` even in a permissive mode.
     fn is_sensitive(&self) -> bool {
         true
     }
-    /// Une sortie untrusted récente doit-elle forcer une confirmation avant cet
-    /// outil ? Par défaut, toute mutation ou action sensible est protégée.
+    /// Must a recent untrusted output force a confirmation before this
+    /// tool? By default, every mutation or sensitive action is protected.
     fn is_taint_sensitive(&self) -> bool {
         self.is_sensitive() || !self.is_read_only()
     }
-    /// Sortie untrusted (taintée) — défaut pour toute sortie d'outil (OWASP
+    /// Untrusted (tainted) output: the default for any tool output (OWASP
     /// LLM01).
     fn returns_untrusted(&self) -> bool {
         true
     }
 
-    /// Invariants comportementaux co-localisés avec l'outil (US-026) : règles que
-    /// le modèle doit connaître pour bien s'en servir (ex. « l'ancre est cherchée
-    /// dans le fichier original »). Collectés par le Registry et injectés dans le
-    /// system prompt. Défaut : aucune.
+    /// Behavioral invariants colocated with the tool (US-026): rules the model
+    /// must know to use it well (e.g. "the anchor is searched in the original
+    /// file"). Collected by the Registry and injected into the system prompt.
+    /// Default: none.
     fn behavioral_guidelines(&self) -> &[&'static str] {
         &[]
     }
 
-    /// Validation d'entrée (pré-permission, pré-exécution). Défaut : accepte. Le
-    /// `ToolCtx` est fourni pour les règles qui dépendent du workspace — la
-    /// protection des sous-chemins d'exécution différée (US-013) en est une :
-    /// refusée ici, elle précède la décision de permission et ne peut donc pas
-    /// être levée par un mode permissif.
+    /// Input validation (pre-permission, pre-execution). Default: accepts. The
+    /// `ToolCtx` is provided for rules that depend on the workspace: protecting
+    /// deferred-execution subpaths (US-013) is one of them. Refused here, it
+    /// precedes the permission decision and therefore cannot be lifted by a
+    /// permissive mode.
     fn validate_input(&self, _input: &Self::Input, _ctx: &ToolCtx) -> Result<(), ValidationError> {
         Ok(())
     }
 
-    /// Décision *baseline* propre à l'outil. Défaut fail-closed : `Ask`.
+    /// The tool's own *baseline* decision. Fail-closed default: `Ask`.
     fn permission(&self, _input: &Self::Input, _ctx: &PermCtx) -> PermissionDecision {
         PermissionDecision::Ask
     }
 
-    /// Timeout externe appliqué par le Registry. Les outils qui gèrent un timeout
-    /// interne, comme `bash`, peuvent demander une marge pour nettoyer.
+    /// External timeout applied by the Registry. Tools that manage an internal
+    /// timeout, such as `bash`, can ask for grace to clean up.
     fn timeout(&self, ctx: &ToolCtx) -> Duration {
         ctx.timeout
     }
 
-    /// Exécution. Le Registry l'enveloppe déjà dans un `timeout` : un `call` qui
-    /// pend ne bloque pas la boucle.
+    /// Execution. The Registry already wraps it in a `timeout`: a `call` that
+    /// hangs does not block the loop.
     async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError>;
 }
 
-/// Façade object-safe stockée dans le Registry. Le JSON brut traverse ici ; le
-/// parse vers `Tool::Input` est interne à l'adapter.
+/// Object-safe facade stored in the Registry. Raw JSON travels through here; the
+/// parse into `Tool::Input` is internal to the adapter.
 #[async_trait]
 pub trait DynTool: Send + Sync {
     fn name(&self) -> &str;
@@ -209,19 +209,19 @@ pub trait DynTool: Send + Sync {
     fn is_sensitive(&self) -> bool;
     fn is_taint_sensitive(&self) -> bool;
     fn returns_untrusted(&self) -> bool;
-    /// Invariants comportementaux de l'outil (US-026), forwardés depuis `Tool`.
+    /// Behavioral invariants of the tool (US-026), forwarded from `Tool`.
     fn behavioral_guidelines(&self) -> &[&'static str];
-    /// Parse + `validate_input` SANS exécuter (fail-closed, US-010 AC3). Erreur
-    /// ⇒ le Registry renvoie l'échec à l'agent sans appeler `call`.
+    /// Parse + `validate_input` WITHOUT executing (fail-closed, US-010 AC3). An error
+    /// means the Registry returns the failure to the agent without calling `call`.
     fn precheck(&self, raw: &serde_json::Value, ctx: &ToolCtx) -> Result<(), ToolError>;
-    /// Décision baseline de l'outil (raw déjà validé par `precheck`).
+    /// Baseline decision of the tool (raw already validated by `precheck`).
     fn permission(&self, raw: &serde_json::Value, ctx: &PermCtx) -> PermissionDecision;
     fn timeout(&self, ctx: &ToolCtx) -> Duration;
-    /// Parse + `call`. Enveloppé dans un timeout par le Registry.
+    /// Parse + `call`. Wrapped in a timeout by the Registry.
     async fn invoke(&self, raw: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError>;
 }
 
-/// Adapter générique `Tool` → `DynTool`.
+/// Generic `Tool` -> `DynTool` adapter.
 pub struct DynToolAdapter<T: Tool> {
     inner: T,
 }
@@ -274,8 +274,8 @@ impl<T: Tool> DynTool for DynToolAdapter<T> {
         Ok(())
     }
     fn permission(&self, raw: &serde_json::Value, ctx: &PermCtx) -> PermissionDecision {
-        // `precheck` a déjà garanti que le parse réussit ; en cas de course
-        // improbable, fail-closed → Deny.
+        // `precheck` already guaranteed that the parse succeeds; on an unlikely
+        // race, fail-closed -> Deny.
         match serde_json::from_value::<T::Input>(raw.clone()) {
             Ok(input) => self.inner.permission(&input, ctx),
             Err(_) => PermissionDecision::Deny,
@@ -291,7 +291,7 @@ impl<T: Tool> DynTool for DynToolAdapter<T> {
     }
 }
 
-/// Boîte un outil natif en `DynTool` prêt pour le Registry.
+/// Boxes a native tool into a `DynTool` ready for the Registry.
 pub fn into_dyn<T: Tool + 'static>(tool: T) -> Box<dyn DynTool> {
     Box::new(DynToolAdapter::new(tool))
 }

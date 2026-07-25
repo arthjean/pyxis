@@ -1,6 +1,6 @@
-//! Outil `write` — crée ou remplace un fichier du workspace. Mutation confinée
-//! au workspace (US-012 AC3 ; renfort kernel Landlock en US-020). Sa sortie est
-//! une simple confirmation (non untrusted). US-012.
+//! `write` tool: creates or replaces a workspace file. Mutation confined
+//! to the workspace (US-012 AC3; Landlock kernel enforcement in US-020). Its output is
+//! a simple confirmation (not untrusted). US-012.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -43,15 +43,15 @@ impl Tool for Write {
             "additionalProperties": false
         })
     }
-    // Mutation (non read-only), mais édition de fichier (non « sensible » au sens
-    // destructive/réseau) → auto-acceptée en AcceptEdits.
+    // Mutation (not read-only), but a file edit (not "sensitive" in the
+    // destructive/network sense) -> auto-accepted under AcceptEdits.
     fn is_read_only(&self) -> bool {
         false
     }
     fn is_sensitive(&self) -> bool {
         false
     }
-    /// Sortie = confirmation maison, pas du contenu externe → non untrusted.
+    /// Output = in-house confirmation, not external content -> not untrusted.
     fn returns_untrusted(&self) -> bool {
         false
     }
@@ -62,7 +62,7 @@ impl Tool for Write {
                 "content too large: {bytes} bytes > {MAX_WRITE_BYTES}"
             )));
         }
-        // US-013 : refus des zones d'exécution différée, avant la permission.
+        // US-013: refusal of deferred-execution zones, before the permission.
         guard_protected_path(&ctx.workspace, &input.path)
     }
     fn permission(&self, _input: &Self::Input, _ctx: &PermCtx) -> PermissionDecision {
@@ -71,8 +71,8 @@ impl Tool for Write {
 
     async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let path = confine(&ctx.workspace, &input.path)?;
-        // Re-vérifié juste avant l'écriture : entre la validation et ici, un lien
-        // a pu apparaître dans le workspace (US-013).
+        // Re-checked right before the write: between validation and here, a link
+        // may have appeared in the workspace (US-013).
         ensure_not_protected(&ctx.workspace, &path, &input.path)?;
         let bytes = input.content.len();
         replace_file_confined(&ctx.workspace, &path, &input.path, input.content.as_bytes()).await?;

@@ -1,11 +1,11 @@
-//! Erreurs du système d'outils. `ValidationError` est l'échec de `validate_input`
-//! (pré-exécution) ; `ToolError` est l'erreur remontée à l'agent (sérialisée en
-//! `ToolOutcome { is_error: true }`). Aucune ne panique : le pipeline est
-//! fail-closed (ARCHITECTURE §4.1, invariant 4).
+//! Errors of the tool system. `ValidationError` is the failure of `validate_input`
+//! (pre-execution); `ToolError` is the error surfaced to the agent (serialized into
+//! `ToolOutcome { is_error: true }`). Neither panics: the pipeline is
+//! fail-closed (ARCHITECTURE 4.1, invariant 4).
 
 use agent_core::ToolErrorKind;
 
-/// Échec de validation d'entrée d'un outil (pré-permission, pré-exécution).
+/// Input validation failure of a tool (pre-permission, pre-execution).
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("validation: {0}")]
 pub struct ValidationError(pub String);
@@ -16,29 +16,29 @@ impl ValidationError {
     }
 }
 
-/// Erreur d'exécution d'un outil. Convertie en `ToolOutcome { is_error: true }`
-/// puis renvoyée à l'agent comme `tool_result` (le modèle voit l'échec et peut
-/// réagir) — jamais propagée comme panic.
+/// Execution error of a tool. Converted into `ToolOutcome { is_error: true }`
+/// then returned to the agent as a `tool_result` (the model sees the failure and can
+/// react); never propagated as a panic.
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
-    /// L'entrée JSON ne se parse pas vers le schéma de l'outil (fail-closed :
-    /// on n'exécute pas — US-010 AC3).
+    /// The JSON input does not parse into the tool schema (fail-closed:
+    /// we do not execute, US-010 AC3).
     #[error("invalid argument: {0}")]
     Parse(String),
-    /// `validate_input` a refusé l'entrée.
+    /// `validate_input` refused the input.
     #[error(transparent)]
     Validation(#[from] ValidationError),
-    /// Chemin hors du workspace (confinement applicatif ; le kernel renforce via
-    /// Landlock en US-020).
+    /// Path outside the workspace (application-level confinement; the kernel enforces it
+    /// through Landlock in US-020).
     #[error("path outside workspace: {0}")]
     OutsideWorkspace(String),
-    /// Erreur d'E/S (fichier introuvable, permission OS, etc.).
+    /// I/O error (file not found, OS permission, etc.).
     #[error("io: {0}")]
     Io(String),
-    /// Entrée rejetée pour une raison métier (ancre ambiguë, fichier binaire…).
+    /// Input rejected for a domain reason (ambiguous anchor, binary file, ...).
     #[error("{0}")]
     Rejected(String),
-    /// L'outil a dépassé son timeout (signalé par le Registry, pas par l'outil).
+    /// The tool exceeded its timeout (reported by the Registry, not by the tool).
     #[error("timeout exceeded")]
     Timeout,
 }

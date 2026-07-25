@@ -1,5 +1,5 @@
-//! Outil `read` — lit un fichier du workspace avec numéros de ligne. Read-only,
-//! concurrency-safe, sortie untrusted (le contenu lu peut porter une injection,
+//! `read` tool: reads a workspace file with line numbers. Read-only,
+//! concurrency-safe, untrusted output (the content read can carry an injection,
 //! OWASP LLM01). US-011 AC1/AC3.
 
 use async_trait::async_trait;
@@ -11,18 +11,18 @@ use crate::path::{confine, ensure_existing_path_no_links};
 use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{Tool, ToolCtx, ToolOutput};
 
-/// Au-delà, on considère le contenu binaire/illisible (présence d'octets NUL
-/// vérifiée séparément ; ceci borne juste la taille lue en MVP).
+/// Past this, the content is considered binary/unreadable (presence of NUL bytes
+/// checked separately; this only bounds the size read in the MVP).
 const MAX_BYTES: usize = 2_000_000;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReadInput {
     pub path: String,
-    /// Ligne de départ (1-indexée). Défaut : 1.
+    /// Start line (1-indexed). Default: 1.
     #[serde(default)]
     pub offset: Option<usize>,
-    /// Nombre de lignes max. Défaut : tout.
+    /// Max number of lines. Default: everything.
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -94,8 +94,8 @@ impl Tool for Read {
                 input.path
             )));
         }
-        // US-026 : au-delà de MAX_BYTES, lecture PARTIELLE (tête du fichier, coupée
-        // sur une frontière de caractère) + hint de pagination, au lieu d'un rejet sec.
+        // US-026: past MAX_BYTES, PARTIAL read (head of the file, cut on a
+        // character boundary) + pagination hint, instead of a blunt rejection.
         let oversize = bytes.len() > MAX_BYTES;
         if oversize {
             bytes.truncate(MAX_BYTES);
@@ -111,11 +111,11 @@ impl Tool for Read {
     }
 }
 
-/// Rend les lignes numérotées de `text` depuis `start` (1-indexé), au plus `limit`
-/// lignes, avec des HINTS de continuation (US-026) : limite atteinte →
-/// `[lignes X-Y sur Z ; offset=Y+1 pour continuer]` ; `oversize` → hint de lecture
-/// partielle ; plage hors limites → hint plutôt qu'un message vague. Pur → testable
-/// sans I/O.
+/// Renders the numbered lines of `text` from `start` (1-indexed), at most `limit`
+/// lines, with continuation HINTS (US-026): limit reached ->
+/// `[lines X-Y of Z; offset=Y+1 to continue]`; `oversize` -> partial read
+/// hint; out-of-bounds range -> a hint rather than a vague message. Pure ->
+/// testable without I/O.
 fn render_read(text: &str, start: usize, limit: Option<usize>, oversize: bool) -> String {
     let total = text.lines().count();
     let mut out = String::new();
