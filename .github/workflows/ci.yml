@@ -1,0 +1,87 @@
+# Intégration continue (US-004, `tasks/prd-harness-parity.md`).
+#
+# Une seule plateforme : Linux. ADR-11 fixe Linux comme unique cible supportée,
+# donc aucune matrice multi-OS n'est déclarée.
+#
+# Les trois commandes sont les quality gates du PRD, dans l'ordre du moins cher
+# au plus cher. `clippy` tourne SANS `-D warnings` : le workspace déclare
+# `unwrap_used`/`expect_used` en `warn` par décision documentée (`Cargo.toml`),
+# un durcissement global rendrait la commande rouge sur du code sain.
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Le job ne fait que lire le dépôt : `checkout`, compilation, résumé d'étape.
+# Sans cette clé, le `GITHUB_TOKEN` hérite du défaut du dépôt et les trois
+# actions tierces ci-dessous (tags mobiles, réassignables par leur mainteneur)
+# s'exécutent avec ce droit. Le PRD prend explicitement position contre ce
+# vecteur (« Configuration-Based Sandbox Escape »).
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt + clippy + tests
+    runs-on: ubuntu-latest
+    # Plafond dur de l'AC2 : au-delà, le job échoue au lieu de dériver.
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # `keyring` tire `dbus-secret-service` → `libdbus-sys`, qui compile contre
+      # les headers dbus. L'image runner ne les garantit pas.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Cache registry + `target/` : sans lui la suite recompile tout le graphe
+      # à chaque push et le budget de 15 minutes ne tient pas.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      # `--no-fail-fast` : le résumé doit nommer TOUS les tests fautifs, pas
+      # seulement le premier crate qui casse.
+      - name: Tests
+        id: tests
+        run: |
+          set -o pipefail
+          cargo test --workspace --no-fail-fast 2>&1 | tee cargo-test.log
+
+      # AC3 : un échec nomme le test fautif dans le résumé du workflow, pas
+      # seulement au fond du log.
+      - name: Report failing tests
+        if: failure() && steps.tests.outcome == 'failure'
+        run: |
+          failed=""
+          if [ -f cargo-test.log ]; then
+            failed=$(sed -n 's/^test \(.*\) \.\.\. FAILED$/- `\1`/p' cargo-test.log | sort -u) || failed=""
+          fi
+          {
+            echo "## Failing tests"
+            echo
+            if [ -n "$failed" ]; then
+              echo "$failed"
+            else
+              echo "No individual test was reported as FAILED; the suite failed to build or to link."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
