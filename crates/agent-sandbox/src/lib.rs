@@ -1,13 +1,13 @@
-//! `agent-sandbox` — bac à sable d'exécution (US-020). Deux protections
-//! complémentaires :
-//! - **FS** : confinement kernel-level via Landlock (`fs`), appliqué process-wide
-//!   au démarrage → toute écriture est confinée au workspace (agent ET
-//!   sous-process Bash hérités).
-//! - **Réseau** : proxy CONNECT allow-list (`proxy`) ; les sous-process outils
-//!   reçoivent `HTTP(S)_PROXY` → filtrage best-effort par hostname.
+//! `agent-sandbox`: execution sandbox (US-020). Two complementary
+//! protections:
+//! - **FS**: kernel-level confinement through Landlock (`fs`), applied process-wide
+//!   at startup -> every write is confined to the workspace (agent AND
+//!   inherited Bash subprocesses).
+//! - **Network**: allow-list CONNECT proxy (`proxy`); the tool subprocesses
+//!   get `HTTP(S)_PROXY` -> best-effort filtering by hostname.
 //!
-//! Linux-first : hors Linux, le FS dégrade explicitement (AC3). Le proxy reste
-//! disponible (pur tokio).
+//! Linux-first: outside Linux, the FS part degrades explicitly (AC3). The proxy stays
+//! available (pure tokio).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod fs;
@@ -44,16 +44,16 @@ const SAFE_ENV_KEYS: &[&str] = &[
     "SSL_CERT_DIR",
 ];
 
-/// Vrai pour les variables conservables dans les sous-process d'outils.
-/// L'objectif est d'éviter l'héritage ambiant de secrets (`OPENAI_API_KEY`,
-/// tokens cloud, credentials CI) tout en gardant PATH, home et certificats.
+/// True for the variables that can be kept in the tool subprocesses.
+/// The goal is to avoid the ambient inheritance of secrets (`OPENAI_API_KEY`,
+/// cloud tokens, CI credentials) while keeping PATH, home and certificates.
 pub fn should_preserve_env_key(key: &str) -> bool {
     SAFE_ENV_KEYS.contains(&key)
 }
 
-/// Injecte l'environnement durci d'une commande d'outil ou MCP, sans toucher
-/// l'environnement global du process. Le provider de l'agent continue d'appeler le
-/// réseau en direct, tandis que les sous-process passent par le proxy filtrant.
+/// Injects the hardened environment of a tool or MCP command, without touching
+/// the global process environment. The agent provider keeps calling the
+/// network directly, while the subprocesses go through the filtering proxy.
 pub fn set_proxy_env(cmd: &mut tokio::process::Command, proxy_addr: &str) {
     let preserved: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
         .filter(|(k, _)| k.to_str().is_some_and(should_preserve_env_key))
@@ -69,8 +69,8 @@ pub fn set_proxy_env(cmd: &mut tokio::process::Command, proxy_addr: &str) {
         .env("https_proxy", &url)
         .env("ALL_PROXY", &url)
         .env("all_proxy", &url)
-        // Empêche les outils de bypasser le proxy pour localhost only si voulu.
-        // NO_PROXY vide signifie que tout passe par le proxy filtrant.
+        // Prevents the tools from bypassing the proxy for localhost only when wanted.
+        // An empty NO_PROXY means everything goes through the filtering proxy.
         .env("NO_PROXY", "")
         .env("no_proxy", "");
 }

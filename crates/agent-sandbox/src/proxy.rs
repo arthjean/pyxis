@@ -1,13 +1,13 @@
-//! Proxy CONNECT local avec allow-list de hostnames (US-020 AC2). Landlock ne
-//! filtre pas le réseau (ADR-7 R3) → filtrage applicatif **best-effort** : les
-//! sous-process outils reçoivent `HTTP(S)_PROXY` pointant ici ; un client qui
-//! respecte la variable pour les tunnels CONNECT est filtré. Fail-closed : tout
-//! hostname hors allow-list est bloqué (403) et journalisé. Les requêtes HTTP
-//! non-CONNECT sont refusées, pas forwardées.
+//! Local CONNECT proxy with a hostname allow-list (US-020 AC2). Landlock does not
+//! filter the network (ADR-7 R3) -> **best-effort** application-level filtering: the
+//! tool subprocesses get `HTTP(S)_PROXY` pointing here; a client that
+//! honors the variable for CONNECT tunnels is filtered. Fail-closed: any
+//! hostname outside the allow-list is blocked (403) and logged. Non-CONNECT HTTP
+//! requests are refused, not forwarded.
 //!
-//! Best-effort assumé : un binaire qui ouvre un socket brut en ignorant
-//! `HTTP_PROXY` échappe au filtre (le confinement FS Landlock reste, lui, dur).
-//! Le confinement réseau dur (Landlock AccessNet V4 / nftables) est différé.
+//! Accepted best-effort: a binary that opens a raw socket while ignoring
+//! `HTTP_PROXY` escapes the filter (the Landlock FS confinement, in contrast, stays hard).
+//! Hard network confinement (Landlock AccessNet V4 / nftables) is deferred.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -15,8 +15,8 @@ use std::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// Politique réseau : allow-list de hostnames (fail-closed). Vide = aucun réseau
-/// autorisé pour les outils (défaut sûr).
+/// Network policy: hostname allow-list (fail-closed). Empty = no network
+/// allowed for the tools (safe default).
 #[derive(Debug, Clone, Default)]
 pub struct ProxyPolicy {
     pub allow: Vec<String>,
@@ -31,16 +31,16 @@ impl ProxyPolicy {
     }
 }
 
-/// Poignée d'un proxy en cours d'exécution.
+/// Handle of a running proxy.
 #[derive(Clone)]
 pub struct ProxyHandle {
-    /// Adresse `127.0.0.1:PORT` à exporter en `HTTP(S)_PROXY`.
+    /// `127.0.0.1:PORT` address to export as `HTTP(S)_PROXY`.
     pub addr: String,
-    /// Journal des hôtes bloqués (AC2 « journalisé »), lisible par le frontend.
+    /// Log of the blocked hosts (AC2 "logged"), readable by the frontend.
     pub blocked: Arc<Mutex<Vec<String>>>,
 }
 
-/// Démarre le proxy sur un port local libre. Retourne sa poignée.
+/// Starts the proxy on a free local port. Returns its handle.
 pub async fn spawn(policy: ProxyPolicy) -> std::io::Result<ProxyHandle> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?.to_string();
@@ -66,7 +66,7 @@ async fn handle_conn(
     policy: Arc<ProxyPolicy>,
     blocked: Arc<Mutex<Vec<String>>>,
 ) -> std::io::Result<()> {
-    // Lire les en-têtes jusqu'à CRLFCRLF.
+    // Read the headers up to CRLFCRLF.
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
     loop {
@@ -106,7 +106,7 @@ async fn handle_conn(
         return Ok(());
     }
 
-    // Autorisé : résolution DNS réelle + tunnel bidirectionnel.
+    // Allowed: real DNS resolution + bidirectional tunnel.
     let mut upstream = match TcpStream::connect(format!("{host}:{port}")).await {
         Ok(s) => s,
         Err(_) => {
@@ -130,9 +130,9 @@ mod tests {
         let p = ProxyPolicy::new(vec!["api.openai.com".to_string()]);
         assert!(p.is_allowed("api.openai.com"));
         assert!(!p.is_allowed("evil.test"));
-        // pas de match partiel/suffixe (anti-contournement).
+        // no partial/suffix match (anti-bypass).
         assert!(!p.is_allowed("api.openai.com.evil.test"));
-        // défaut vide = rien autorisé.
+        // empty default = nothing allowed.
         assert!(!ProxyPolicy::default().is_allowed("anything"));
     }
 
@@ -186,12 +186,12 @@ mod tests {
         );
     }
 
-    // US-020 AC2 : hôte autorisé tunnelisé ; hôte interdit → 403 + journalisé.
+    // US-020 AC2: allowed host tunneled; forbidden host -> 403 + logged.
     #[tokio::test]
     async fn allowed_tunnels_blocked_403_and_logged() {
         let upstream = local_upstream().await;
         let port = upstream.split(':').nth(1).unwrap().to_string();
-        // on autorise 127.0.0.1 (résolu localement vers l'upstream).
+        // we allow 127.0.0.1 (resolved locally to the upstream).
         let handle = spawn(ProxyPolicy::new(vec!["127.0.0.1".to_string()]))
             .await
             .unwrap();
@@ -203,7 +203,7 @@ mod tests {
         let (blocked, _) = connect_through(&handle.addr, "evil.exfil.test:443").await;
         assert!(blocked.contains("403"), "interdit non bloqué: {blocked}");
 
-        // journalisation du blocage (AC2).
+        // logging of the block (AC2).
         let log = handle.blocked.lock().unwrap();
         assert!(
             log.iter().any(|h| h == "evil.exfil.test"),

@@ -9,13 +9,13 @@ publish = false
 [lints]
 workspace = true
 
-# Sandbox d'exécution (US-020) : confinement FS kernel-level (Landlock) + proxy
-# réseau allow-list. Linux-first ; dégradation explicite ailleurs (AC3).
+# Execution sandbox (US-020): kernel-level FS confinement (Landlock) + allow-list
+# network proxy. Linux-first; explicit degradation elsewhere (AC3).
 [dependencies]
 tokio = { workspace = true, features = ["io-util", "net", "process", "rt"] }
 thiserror.workspace = true
 
-# Landlock = Linux uniquement. Hors Linux, le sandbox FS dégrade en désactivé.
+# Landlock = Linux only. Outside Linux, the FS sandbox degrades to disabled.
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true
 

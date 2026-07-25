@@ -1,31 +1,31 @@
-//! Confinement FS kernel-level via Landlock (US-020 AC1). Politique : lecture
-//! seule sur toute la hiérarchie, lecture+écriture uniquement sous le workspace.
+//! Kernel-level FS confinement through Landlock (US-020 AC1). Policy: read
+//! only over the whole hierarchy, read+write only under the workspace.
 //!
-//! **Doit être appelé tôt, sur le thread principal, AVANT la construction du
-//! runtime tokio** : un domaine Landlock est hérité par les threads créés
-//! *après* la restriction et par les process enfants. Ainsi les workers tokio
-//! ET les sous-process Bash héritent du confinement, sans le fragile `pre_exec`
-//! post-fork (risque de deadlock malloc). `restrict_self` est irréversible.
+//! **Must be called early, on the main thread, BEFORE the tokio runtime is
+//! built**: a Landlock domain is inherited by the threads created
+//! *after* the restriction and by the child processes. That way the tokio workers
+//! AND the Bash subprocesses inherit the confinement, without the fragile post-fork
+//! `pre_exec` (malloc deadlock risk). `restrict_self` is irreversible.
 //!
-//! Landlock NE filtre PAS le réseau (cf. ADR-7 R3) ni les sockets D-Bus
-//! → le keyring (Secret Service) et le provider (HTTPS direct) restent
-//! fonctionnels ; le réseau des outils est filtré séparément par le proxy.
+//! Landlock does NOT filter the network (see ADR-7 R3) nor the D-Bus sockets
+//! -> the keyring (Secret Service) and the provider (direct HTTPS) stay
+//! functional; the network of the tools is filtered separately by the proxy.
 
-/// Résultat de l'application du sandbox FS, à présenter à l'utilisateur.
+/// Result of applying the FS sandbox, to be presented to the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxStatus {
-    /// Confinement kernel effectif (politique FS complète supportée par le kernel).
+    /// Effective kernel confinement (full FS policy supported by the kernel).
     Enforced,
-    /// Landlock actif mais kernel trop ancien pour garantir toute la politique.
+    /// Landlock active but kernel too old to guarantee the whole policy.
     PartiallyEnforced,
-    /// Kernel sans support Landlock effectif → confinement FS **non** garanti.
+    /// Kernel without effective Landlock support -> FS confinement **not** guaranteed.
     NotEnforced,
-    /// Plateforme non-Linux → sandbox FS désactivé (Linux-first, AC3).
+    /// Non-Linux platform -> FS sandbox disabled (Linux-first, AC3).
     UnsupportedPlatform,
 }
 
 impl SandboxStatus {
-    /// Message d'avertissement si le confinement n'est pas effectif (`None` si OK).
+    /// Warning message when the confinement is not effective (`None` when OK).
     pub fn warning(&self) -> Option<&'static str> {
         match self {
             SandboxStatus::Enforced => None,
@@ -42,7 +42,7 @@ impl SandboxStatus {
     }
 }
 
-/// Racine writable écartée à la résolution, avec la raison à tracer (US-012 AC2).
+/// Writable root discarded at resolution time, with the reason to log (US-012 AC2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IgnoredRoot {
     pub path: std::path::PathBuf,
@@ -51,11 +51,11 @@ pub struct IgnoredRoot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IgnoreReason {
-    /// Chemin introuvable ou non résolvable (edge case #6).
+    /// Path not found or not resolvable (edge case #6).
     Missing,
-    /// Chemin existant mais qui n'est pas un répertoire.
+    /// Existing path that is not a directory.
     NotADirectory,
-    /// Racine si large que le confinement n'aurait plus de sens (`/`, le home).
+    /// Root so broad that the confinement would lose all meaning (`/`, the home).
     TooBroad,
 }
 
@@ -71,8 +71,8 @@ impl IgnoreReason {
     }
 }
 
-/// Résultat de la résolution des racines writables : ce qui sera accordé, et ce
-/// qui a été écarté (à tracer par l'appelant).
+/// Result of resolving the writable roots: what will be granted, and what
+/// was discarded (to be logged by the caller).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WritableRoots {
     pub granted: Vec<std::path::PathBuf>,
@@ -80,7 +80,7 @@ pub struct WritableRoots {
 }
 
 impl WritableRoots {
-    /// Vue empruntée, forme attendue par [`enforce_process`].
+    /// Borrowed view, the shape expected by [`enforce_process`].
     pub fn as_paths(&self) -> Vec<&std::path::Path> {
         self.granted
             .iter()
@@ -89,16 +89,16 @@ impl WritableRoots {
     }
 }
 
-/// Résout les racines writables accordées en plus du workspace (US-012).
+/// Resolves the writable roots granted in addition to the workspace (US-012).
 ///
-/// Le répertoire temporaire (`$TMPDIR` puis `/tmp`) est toujours candidat : c'est
-/// le défaut, et sans configuration le comportement se limite à lui. Chaque
-/// chemin est canonicalisé (un `$TMPDIR` symlink est fréquent), dédupliqué, et
-/// écarté avec une raison s'il est absent, s'il n'est pas un répertoire, ou s'il
-/// est assez large pour vider le confinement de son sens.
+/// The temporary directory (`$TMPDIR` then `/tmp`) is always a candidate: it is
+/// the default, and without configuration the behavior is limited to it. Every
+/// path is canonicalized (a symlinked `$TMPDIR` is common), deduplicated, and
+/// discarded with a reason when it is absent, when it is not a directory, or when it
+/// is broad enough to empty the confinement of its meaning.
 ///
-/// `home` est passé explicitement (et non lu dans l'environnement) pour que la
-/// politique soit testable sans muter l'environnement du process.
+/// `home` is passed explicitly (and not read from the environment) so that the
+/// policy is testable without mutating the process environment.
 pub fn resolve_writable_roots(
     configured: &[std::path::PathBuf],
     home: Option<&std::path::Path>,
@@ -118,8 +118,8 @@ pub fn resolve_writable_roots(
             push_ignored(&mut out, candidate, IgnoreReason::NotADirectory);
             continue;
         }
-        // Trop large : la racine système, le home, ou n'importe quel ancêtre du
-        // home (`/home`) — accorder l'un des trois revient à ne rien confiner.
+        // Too broad: the system root, the home, or any ancestor of the
+        // home (`/home`). Granting one of the three amounts to confining nothing.
         let too_broad =
             real.parent().is_none() || home.as_ref().is_some_and(|h| h.starts_with(&real));
         if too_broad {
@@ -148,25 +148,25 @@ pub enum SandboxError {
     Io(#[from] std::io::Error),
 }
 
-/// Applique le confinement FS process-wide : RW sous `workspace`, read-only
-/// ailleurs. À appeler sur le thread principal avant le runtime async.
+/// Applies the process-wide FS confinement: RW under `workspace`, read-only
+/// elsewhere. To be called on the main thread before the async runtime.
 #[cfg(target_os = "linux")]
-/// Devices dont l'usage reste autorisé sous confinement : voir la justification à
-/// leur ajout dans `enforce_process`. Écrire dans `/dev/null` est sans effet, et
-/// `/dev/tty` est déjà le terminal de l'utilisateur, hérité via stdout.
+/// Devices whose use stays allowed under confinement: see the justification when
+/// they are added in `enforce_process`. Writing to `/dev/null` has no effect, and
+/// `/dev/tty` is already the user's terminal, inherited through stdout.
 #[cfg(target_os = "linux")]
 const STANDARD_DEVICES: &[&str] = &["/dev/tty", "/dev/null"];
 
-/// `writable_files` : fichiers EXISTANTS hors workspace auxquels le process garde
-/// un droit d'écriture (`~/.pyxis/settings.toml`). Portée volontairement réduite
-/// au fichier, jamais à son dossier : le confinement reste vrai pour tout le reste
-/// du home. Un chemin absent est ignoré (la règle Landlock exige un fd ouvrable).
+/// `writable_files`: EXISTING files outside the workspace to which the process keeps
+/// a write right (`~/.pyxis/settings.toml`). Scope deliberately reduced
+/// to the file, never to its directory: the confinement stays true for the whole rest
+/// of the home. A missing path is ignored (the Landlock rule requires an openable fd).
 ///
-/// `writable_roots` : répertoires EXISTANTS accordés en écriture complète, comme
-/// le workspace (US-012). Le répertoire temporaire en fait partie par défaut :
-/// sans lui, tout outillage passant par `mktemp` échoue et pousse l'utilisateur
-/// à désactiver le confinement entier. La liste est résolue et filtrée en amont
-/// par [`resolve_writable_roots`] ; ici, un chemin non ouvrable est ignoré.
+/// `writable_roots`: EXISTING directories granted full write access, like
+/// the workspace (US-012). The temporary directory is one of them by default:
+/// without it, any tooling going through `mktemp` fails and pushes the user
+/// to disable the whole confinement. The list is resolved and filtered upstream
+/// by [`resolve_writable_roots`]; here, a non-openable path is ignored.
 pub fn enforce_process(
     workspace: &std::path::Path,
     writable_files: &[&std::path::Path],
@@ -184,25 +184,25 @@ pub fn enforce_process(
         .map_err(|e| SandboxError::Landlock(e.to_string()))?
         .create()
         .map_err(|e| SandboxError::Landlock(e.to_string()))?
-        // Lecture + exécution globales : le provider, le keyring D-Bus et la
-        // résolution de chemins restent fonctionnels. La confidentialité FS n'est
-        // pas l'objectif de cette politique, seulement le confinement en écriture.
+        // Global read + execute: the provider, the D-Bus keyring and
+        // path resolution stay functional. FS confidentiality is
+        // not the goal of this policy, only write confinement.
         .add_rule(PathBeneath::new(
             PathFd::new("/").map_err(|e| SandboxError::Landlock(e.to_string()))?,
             AccessFs::from_read(abi),
         ))
         .map_err(|e| SandboxError::Landlock(e.to_string()))?
-        // Accès complet uniquement sous le workspace. ABI V7 couvre les droits de
-        // write modernes (`truncate`, `ioctl_dev`) quand le kernel les supporte.
+        // Full access only under the workspace. ABI V7 covers the modern
+        // write rights (`truncate`, `ioctl_dev`) when the kernel supports them.
         .add_rule(PathBeneath::new(
             PathFd::new(workspace).map_err(|e| SandboxError::Landlock(e.to_string()))?,
             AccessFs::from_all(abi),
         ))
         .map_err(|e| SandboxError::Landlock(e.to_string()))?;
 
-    // Racines writables supplémentaires (US-012) : même politique que le workspace.
-    // `from_all` accorde les droits de répertoire (création, suppression, rename),
-    // ce qu'exige `mktemp -d` et tout outillage qui écrit sous `$TMPDIR`.
+    // Additional writable roots (US-012): same policy as the workspace.
+    // `from_all` grants the directory rights (creation, deletion, rename),
+    // which `mktemp -d` and any tooling writing under `$TMPDIR` require.
     for root in writable_roots {
         let Ok(fd) = PathFd::new(root) else {
             continue;
@@ -212,13 +212,13 @@ pub fn enforce_process(
             .map_err(|e| SandboxError::Landlock(e.to_string()))?;
     }
 
-    // Devices standard : sans eux, le confinement casse des usages qu'il n'a jamais
-    // visés. `/dev/tty` porte l'ioctl `TIOCGWINSZ` que crossterm interroge pour la
-    // taille du terminal — refusé, il retombe sur `tput` et lit 80x24, ce qui fige
-    // le TUI dans un coin de l'écran. `/dev/null` est la poubelle d'écriture qu'une
-    // partie de l'outillage (git en tête) ouvre systématiquement. Le droit
-    // `IoctlDev` ne peut être accordé qu'ici : il est attaché au descripteur à son
-    // ouverture, donc un fichier ouvert après l'enforcement ne l'obtient jamais.
+    // Standard devices: without them, the confinement breaks uses it never
+    // targeted. `/dev/tty` carries the `TIOCGWINSZ` ioctl that crossterm queries for the
+    // terminal size: refused, it falls back on `tput` and reads 80x24, which pins
+    // the TUI in a corner of the screen. `/dev/null` is the write sink that part
+    // of the tooling (git first) opens systematically. The `IoctlDev`
+    // right can only be granted here: it is attached to the descriptor at
+    // opening time, so a file opened after the enforcement never gets it.
     for device in STANDARD_DEVICES {
         let Ok(fd) = PathFd::new(device) else {
             continue;
@@ -228,13 +228,13 @@ pub fn enforce_process(
             .map_err(|e| SandboxError::Landlock(e.to_string()))?;
     }
 
-    // Écriture au fichier près : `from_file` est le sous-ensemble applicable à un
-    // fichier régulier (`WriteFile`, `Truncate`…). `from_all` y ajouterait des
-    // droits de répertoire, que le kernel refuse sur un fichier — la ruleset
-    // retomberait alors en `PartiallyEnforced` et déclencherait un faux
-    // avertissement de confinement dégradé. Les droits de création vivant sur le
-    // dossier parent, un fichier supprimé après l'enforcement n'est plus
-    // recréable : la sauvegarde échoue alors explicitement.
+    // Per-file write: `from_file` is the subset applicable to a
+    // regular file (`WriteFile`, `Truncate`, ...). `from_all` would add
+    // directory rights, which the kernel refuses on a file: the ruleset
+    // would then fall back to `PartiallyEnforced` and trigger a false
+    // degraded-confinement warning. Since the creation rights live on the
+    // parent directory, a file deleted after the enforcement is no longer
+    // recreatable: saving then fails explicitly.
     for file in writable_files {
         let Ok(fd) = PathFd::new(file) else {
             continue;
@@ -255,8 +255,8 @@ pub fn enforce_process(
     })
 }
 
-/// Hors Linux : dégradation explicite (AC3). Le sandbox FS est désactivé ;
-/// l'appelant DOIT avertir l'utilisateur via `SandboxStatus::warning`.
+/// Outside Linux: explicit degradation (AC3). The FS sandbox is disabled;
+/// the caller MUST warn the user through `SandboxStatus::warning`.
 #[cfg(not(target_os = "linux"))]
 pub fn enforce_process(
     _workspace: &std::path::Path,
@@ -278,10 +278,10 @@ mod tests {
         assert!(SandboxStatus::UnsupportedPlatform.warning().is_some());
     }
 
-    // Sur Linux avec kernel Landlock, le confinement réel est prouvé par le spike
-    // s5 (process isolé : restrict_self est irréversible). Ici on vérifie juste que
-    // l'appel ne panique pas et retourne un statut cohérent, SANS restreindre le
-    // process de test (qui doit pouvoir continuer à écrire).
+    // On Linux with a Landlock kernel, the real confinement is proven by the s5
+    // spike (isolated process: restrict_self is irreversible). Here we only check that
+    // the call does not panic and returns a coherent status, WITHOUT restricting the
+    // test process (which must be able to keep writing).
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn non_linux_degrades() {
@@ -355,7 +355,7 @@ mod tests {
             &[
                 std::path::PathBuf::from("/"),
                 home.clone(),
-                // ancêtre du home : accorder `/home` revient à accorder le home.
+                // ancestor of the home: granting `/home` amounts to granting the home.
                 home.parent().unwrap().to_path_buf(),
             ],
             Some(&home),

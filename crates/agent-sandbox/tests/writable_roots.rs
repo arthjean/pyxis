@@ -1,17 +1,17 @@
-//! Preuve du confinement réel des racines writables (US-012 AC1/AC5).
+//! Proof of the real confinement of the writable roots (US-012 AC1/AC5).
 //!
-//! `restrict_self` est irréversible et s'applique au process entier : appliqué
-//! dans le harness, il confinerait `cargo test` lui-même. Le test parent relance
-//! donc le binaire de test dans un process ENFANT, qui pose le confinement puis
-//! tente trois écritures : sous le workspace, sous le répertoire temporaire, et
-//! hors des deux. L'enfant échoue par `exit(1)` avec un message explicite ; le
-//! parent en fait sa propre assertion.
+//! `restrict_self` is irreversible and applies to the whole process: applied
+//! in the harness, it would confine `cargo test` itself. The parent test therefore
+//! relaunches the test binary in a CHILD process, which applies the confinement then
+//! attempts three writes: under the workspace, under the temporary directory, and
+//! outside both. The child fails with `exit(1)` and an explicit message; the
+//! parent turns it into its own assertion.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::{Path, PathBuf};
 
-/// Marque le process enfant et lui transmet les chemins à sonder.
+/// Marks the child process and passes it the paths to probe.
 const CHILD_MARKER: &str = "PYXIS_SANDBOX_CHILD";
 const CHILD_WORKSPACE: &str = "PYXIS_SANDBOX_CHILD_WORKSPACE";
 const CHILD_OUTSIDE: &str = "PYXIS_SANDBOX_CHILD_OUTSIDE";
@@ -22,9 +22,9 @@ fn temp_dir_is_writable_under_confinement_and_the_rest_is_not() {
         return;
     }
     let workspace = scratch("ws");
-    // Témoin hors racines accordées : un répertoire writable par l'utilisateur qui
-    // n'est ni le workspace ni le répertoire temporaire. `target/` convient : il
-    // est ignoré par git et vit hors de `$TMPDIR`.
+    // Control outside the granted roots: a directory writable by the user that
+    // is neither the workspace nor the temporary directory. `target/` fits: it
+    // is ignored by git and lives outside `$TMPDIR`.
     let outside = scratch_in(&repo_target_dir(), "outside");
 
     let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -50,11 +50,11 @@ fn temp_dir_is_writable_under_confinement_and_the_rest_is_not() {
         output.status.success(),
         "l'enfant confiné a échoué.\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
-    // Un enfant vert mais muet signifierait un test creux : il doit dire s'il a
-    // prouvé le confinement ou s'il l'a sauté faute de support kernel. La ligne
-    // est reprise ici pour être lisible sous `--nocapture`.
-    // `--nocapture` colle la sortie du test à la ligne d'entête de libtest : on
-    // cherche donc le marqueur DANS la ligne, pas en tête de ligne.
+    // A green but silent child would mean a hollow test: it must say whether it
+    // proved the confinement or skipped it for lack of kernel support. The line
+    // is echoed here to be readable under `--nocapture`.
+    // `--nocapture` glues the test output to the libtest header line: so we
+    // look for the marker INSIDE the line, not at the start of the line.
     if let Some(verdict) = stdout
         .lines()
         .find(|l| l.contains("confinement proven") || l.contains("skipped:"))
@@ -67,8 +67,8 @@ fn temp_dir_is_writable_under_confinement_and_the_rest_is_not() {
     );
 }
 
-/// Corps exécuté UNIQUEMENT dans le process enfant : il pose un confinement
-/// irréversible, donc il ne doit jamais tourner dans le harness principal.
+/// Body executed ONLY in the child process: it applies an irreversible
+/// confinement, so it must never run in the main harness.
 #[test]
 #[ignore = "exécuté seulement comme process enfant confiné"]
 fn child_applies_confinement_then_probes_writes() {
@@ -92,21 +92,21 @@ fn child_applies_confinement_then_probes_writes() {
     if status == agent_sandbox::SandboxStatus::NotEnforced
         || status == agent_sandbox::SandboxStatus::UnsupportedPlatform
     {
-        // Kernel sans Landlock effectif : rien à prouver ici, le harness ne peut
-        // pas fabriquer une garantie que le noyau ne rend pas.
+        // Kernel without effective Landlock: nothing to prove here, the harness cannot
+        // manufacture a guarantee that the kernel does not provide.
         println!("skipped: {status:?}");
         return;
     }
 
-    // AC1 : le répertoire temporaire reste writable, y compris pour la création
-    // d'un sous-répertoire (`mktemp -d`).
+    // AC1: the temporary directory stays writable, including for creating
+    // a subdirectory (`mktemp -d`).
     let temp_dir = temp_root.join(format!("pyxis-sandbox-probe-{}", std::process::id()));
     assert_write_succeeds(&temp_dir, "répertoire temporaire");
 
-    // Le workspace reste writable (comportement d'avant cette story).
+    // The workspace stays writable (behavior from before this story).
     assert_write_succeeds(&workspace.join("nested"), "workspace");
 
-    // Hors racines accordées, l'écriture doit être refusée par le kernel.
+    // Outside the granted roots, the write must be refused by the kernel.
     let refused = std::fs::write(outside.join("escape.txt"), b"nope");
     assert!(
         refused.is_err(),
@@ -137,9 +137,9 @@ fn scratch_in(base: &Path, tag: &str) -> PathBuf {
     std::fs::canonicalize(&dir).unwrap()
 }
 
-/// `target/` du workspace cargo : writable, hors `$TMPDIR`, ignoré par git.
+/// `target/` of the cargo workspace: writable, outside `$TMPDIR`, ignored by git.
 fn repo_target_dir() -> PathBuf {
-    // `CARGO_TARGET_TMPDIR` pointe sous `target/`, et cargo le crée pour les tests
-    // d'intégration. C'est exactement le témoin recherché.
+    // `CARGO_TARGET_TMPDIR` points under `target/`, and cargo creates it for the
+    // integration tests. That is exactly the control we are looking for.
     PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
 }
