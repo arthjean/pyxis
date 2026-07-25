@@ -42,6 +42,104 @@ impl SandboxStatus {
     }
 }
 
+/// Racine writable écartée à la résolution, avec la raison à tracer (US-012 AC2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredRoot {
+    pub path: std::path::PathBuf,
+    pub reason: IgnoreReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IgnoreReason {
+    /// Chemin introuvable ou non résolvable (edge case #6).
+    Missing,
+    /// Chemin existant mais qui n'est pas un répertoire.
+    NotADirectory,
+    /// Racine si large que le confinement n'aurait plus de sens (`/`, le home).
+    TooBroad,
+}
+
+impl IgnoreReason {
+    pub fn message(&self) -> &'static str {
+        match self {
+            IgnoreReason::Missing => "path not found",
+            IgnoreReason::NotADirectory => "not a directory",
+            IgnoreReason::TooBroad => {
+                "root too broad (system root or entire home): confinement would be meaningless"
+            }
+        }
+    }
+}
+
+/// Résultat de la résolution des racines writables : ce qui sera accordé, et ce
+/// qui a été écarté (à tracer par l'appelant).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WritableRoots {
+    pub granted: Vec<std::path::PathBuf>,
+    pub ignored: Vec<IgnoredRoot>,
+}
+
+impl WritableRoots {
+    /// Vue empruntée, forme attendue par [`enforce_process`].
+    pub fn as_paths(&self) -> Vec<&std::path::Path> {
+        self.granted
+            .iter()
+            .map(std::path::PathBuf::as_path)
+            .collect()
+    }
+}
+
+/// Résout les racines writables accordées en plus du workspace (US-012).
+///
+/// Le répertoire temporaire (`$TMPDIR` puis `/tmp`) est toujours candidat : c'est
+/// le défaut, et sans configuration le comportement se limite à lui. Chaque
+/// chemin est canonicalisé (un `$TMPDIR` symlink est fréquent), dédupliqué, et
+/// écarté avec une raison s'il est absent, s'il n'est pas un répertoire, ou s'il
+/// est assez large pour vider le confinement de son sens.
+///
+/// `home` est passé explicitement (et non lu dans l'environnement) pour que la
+/// politique soit testable sans muter l'environnement du process.
+pub fn resolve_writable_roots(
+    configured: &[std::path::PathBuf],
+    home: Option<&std::path::Path>,
+) -> WritableRoots {
+    let mut candidates: Vec<std::path::PathBuf> = vec![std::env::temp_dir()];
+    candidates.push(std::path::PathBuf::from("/tmp"));
+    candidates.extend(configured.iter().cloned());
+
+    let home = home.and_then(|h| std::fs::canonicalize(h).ok());
+    let mut out = WritableRoots::default();
+    for candidate in candidates {
+        let Ok(real) = std::fs::canonicalize(&candidate) else {
+            push_ignored(&mut out, candidate, IgnoreReason::Missing);
+            continue;
+        };
+        if !real.is_dir() {
+            push_ignored(&mut out, candidate, IgnoreReason::NotADirectory);
+            continue;
+        }
+        // Trop large : la racine système, le home, ou n'importe quel ancêtre du
+        // home (`/home`) — accorder l'un des trois revient à ne rien confiner.
+        let too_broad =
+            real.parent().is_none() || home.as_ref().is_some_and(|h| h.starts_with(&real));
+        if too_broad {
+            push_ignored(&mut out, candidate, IgnoreReason::TooBroad);
+            continue;
+        }
+        if !out.granted.contains(&real) {
+            out.granted.push(real);
+        }
+    }
+    out
+}
+
+fn push_ignored(out: &mut WritableRoots, path: std::path::PathBuf, reason: IgnoreReason) {
+    if out.ignored.iter().any(|i| i.path == path) {
+        return;
+    }
+    out.ignored.push(IgnoredRoot { path, reason });
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
     #[error("landlock: {0}")]
@@ -63,9 +161,16 @@ const STANDARD_DEVICES: &[&str] = &["/dev/tty", "/dev/null"];
 /// un droit d'écriture (`~/.pyxis/settings.toml`). Portée volontairement réduite
 /// au fichier, jamais à son dossier : le confinement reste vrai pour tout le reste
 /// du home. Un chemin absent est ignoré (la règle Landlock exige un fd ouvrable).
+///
+/// `writable_roots` : répertoires EXISTANTS accordés en écriture complète, comme
+/// le workspace (US-012). Le répertoire temporaire en fait partie par défaut :
+/// sans lui, tout outillage passant par `mktemp` échoue et pousse l'utilisateur
+/// à désactiver le confinement entier. La liste est résolue et filtrée en amont
+/// par [`resolve_writable_roots`] ; ici, un chemin non ouvrable est ignoré.
 pub fn enforce_process(
     workspace: &std::path::Path,
     writable_files: &[&std::path::Path],
+    writable_roots: &[&std::path::Path],
 ) -> Result<SandboxStatus, SandboxError> {
     use landlock::{
         ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
@@ -94,6 +199,18 @@ pub fn enforce_process(
             AccessFs::from_all(abi),
         ))
         .map_err(|e| SandboxError::Landlock(e.to_string()))?;
+
+    // Racines writables supplémentaires (US-012) : même politique que le workspace.
+    // `from_all` accorde les droits de répertoire (création, suppression, rename),
+    // ce qu'exige `mktemp -d` et tout outillage qui écrit sous `$TMPDIR`.
+    for root in writable_roots {
+        let Ok(fd) = PathFd::new(root) else {
+            continue;
+        };
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(fd, AccessFs::from_all(abi)))
+            .map_err(|e| SandboxError::Landlock(e.to_string()))?;
+    }
 
     // Devices standard : sans eux, le confinement casse des usages qu'il n'a jamais
     // visés. `/dev/tty` porte l'ioctl `TIOCGWINSZ` que crossterm interroge pour la
@@ -144,6 +261,7 @@ pub fn enforce_process(
 pub fn enforce_process(
     _workspace: &std::path::Path,
     _writable_files: &[&std::path::Path],
+    _writable_roots: &[&std::path::Path],
 ) -> Result<SandboxStatus, SandboxError> {
     Ok(SandboxStatus::UnsupportedPlatform)
 }
@@ -167,7 +285,100 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn non_linux_degrades() {
-        let st = enforce_process(std::path::Path::new("/tmp"), &[]).unwrap();
+        let st = enforce_process(std::path::Path::new("/tmp"), &[], &[]).unwrap();
         assert_eq!(st, SandboxStatus::UnsupportedPlatform);
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pyxis-roots-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(&dir).unwrap()
+    }
+
+    #[test]
+    fn temp_dir_is_granted_by_default() {
+        let roots = resolve_writable_roots(&[], None);
+        let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert!(
+            roots.granted.contains(&tmp),
+            "le répertoire temporaire doit être accordé sans configuration: {roots:?}"
+        );
+    }
+
+    #[test]
+    fn configured_root_is_granted_and_deduplicated() {
+        let dir = scratch("granted");
+        let roots = resolve_writable_roots(&[dir.clone(), dir.clone()], None);
+        assert_eq!(
+            roots.granted.iter().filter(|p| **p == dir).count(),
+            1,
+            "une racine répétée n'est accordée qu'une fois: {roots:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_root_is_ignored_with_a_reason() {
+        let missing = std::env::temp_dir().join(format!("pyxis-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let roots = resolve_writable_roots(std::slice::from_ref(&missing), None);
+        assert!(!roots.granted.contains(&missing));
+        let ignored = roots
+            .ignored
+            .iter()
+            .find(|i| i.path == missing)
+            .expect("racine absente tracée");
+        assert_eq!(ignored.reason, IgnoreReason::Missing);
+    }
+
+    #[test]
+    fn file_root_is_ignored_as_not_a_directory() {
+        let dir = scratch("file-root");
+        let file = dir.join("not-a-dir");
+        std::fs::write(&file, "x").unwrap();
+        let roots = resolve_writable_roots(std::slice::from_ref(&file), None);
+        assert!(!roots.granted.contains(&file));
+        assert!(
+            roots
+                .ignored
+                .iter()
+                .any(|i| i.path == file && i.reason == IgnoreReason::NotADirectory)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn system_root_and_whole_home_are_refused() {
+        let home = scratch("home");
+        let roots = resolve_writable_roots(
+            &[
+                std::path::PathBuf::from("/"),
+                home.clone(),
+                // ancêtre du home : accorder `/home` revient à accorder le home.
+                home.parent().unwrap().to_path_buf(),
+            ],
+            Some(&home),
+        );
+        for refused in [
+            std::path::PathBuf::from("/"),
+            home.clone(),
+            home.parent().unwrap().to_path_buf(),
+        ] {
+            assert!(
+                !roots.granted.contains(&refused),
+                "{} ne doit jamais être accordé: {roots:?}",
+                refused.display()
+            );
+            assert!(
+                roots
+                    .ignored
+                    .iter()
+                    .any(|i| i.path == refused && i.reason == IgnoreReason::TooBroad),
+                "{} doit être refusé comme trop large: {roots:?}",
+                refused.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

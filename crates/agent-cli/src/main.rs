@@ -87,6 +87,17 @@ Configuration (TOML), lowest precedence first:
                                    a workspace-controlled file must never widen a
                                    security perimeter.
   Environment variables, then command-line arguments, override both.
+
+Sandbox:
+  Writes are confined to the workspace, plus the temporary directory and any
+  extra roots listed in `writable_roots` of ~/.pyxis/settings.toml.
+  The write and edit tools additionally refuse .git/ (hooks, config, and the
+  worktree pointer file) and .pyxis/ — which holds the project config file —
+  whose contents run or are read later outside the sandbox. That refusal does
+  NOT cover `bash`: Landlock rules are additive, so a write right granted on the
+  workspace cannot be subtracted for a subpath. A `bash` command can therefore
+  still write .pyxis/config.toml; the blast radius is bounded by the project
+  file never being allowed to set a security key.
 ";
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -347,6 +358,7 @@ fn sandbox_enforced_from_args(
     args: &Args,
     workspace: &std::path::Path,
     settings_path: Option<&std::path::Path>,
+    writable_roots: &agent_sandbox::WritableRoots,
 ) -> bool {
     if !args.sandbox {
         if args.yes {
@@ -358,8 +370,16 @@ fn sandbox_enforced_from_args(
         }
         return false;
     }
+    // US-012 AC2 : une racine écartée est tracée, jamais silencieuse.
+    for ignored in &writable_roots.ignored {
+        eprintln!(
+            "[sandbox] writable root ignored: {} ({})",
+            ignored.path.display(),
+            ignored.reason.message()
+        );
+    }
     let writable: Vec<&std::path::Path> = settings_path.into_iter().collect();
-    match agent_sandbox::enforce_process(workspace, &writable) {
+    match agent_sandbox::enforce_process(workspace, &writable, &writable_roots.as_paths()) {
         Ok(status) => {
             if let Some(w) = status.warning() {
                 eprintln!("[sandbox] {w}");
@@ -434,8 +454,16 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Racines writables résolues AVANT le runtime (US-012 AC3) : `restrict_self`
+    // est irréversible et précède tokio, donc la liste doit être connue ici.
+    let writable_roots = agent_sandbox::resolve_writable_roots(
+        &config.writable_roots,
+        settings::home_dir().as_deref(),
+    );
+
     // Sandbox FS AVANT le runtime (thread principal → hérité par les workers).
-    let sandbox_enforced = sandbox_enforced_from_args(&args, &workspace, settings_path.as_deref());
+    let sandbox_enforced =
+        sandbox_enforced_from_args(&args, &workspace, settings_path.as_deref(), &writable_roots);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
