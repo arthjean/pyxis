@@ -11,7 +11,10 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::error::{ToolError, ValidationError};
-use crate::path::{confine, ensure_existing_path_no_links, replace_file_confined};
+use crate::path::{
+    confine, ensure_existing_path_no_links, ensure_not_protected, guard_protected_path,
+    replace_file_confined,
+};
 use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{MAX_EDIT_ANCHOR_BYTES, MAX_EDIT_FILE_BYTES, Tool, ToolCtx, ToolOutput};
 
@@ -64,7 +67,7 @@ impl Tool for Edit {
     fn behavioral_guidelines(&self) -> &[&'static str] {
         EDIT_GUIDELINES
     }
-    fn validate_input(&self, input: &Self::Input) -> Result<(), ValidationError> {
+    fn validate_input(&self, input: &Self::Input, ctx: &ToolCtx) -> Result<(), ValidationError> {
         if input.old_string.is_empty() {
             return Err(ValidationError::new(
                 "old_string is empty: cannot anchor the edit",
@@ -87,7 +90,8 @@ impl Tool for Edit {
                 input.new_string.len()
             )));
         }
-        Ok(())
+        // US-013 : refus des zones d'exécution différée, avant la permission.
+        guard_protected_path(&ctx.workspace, &input.path)
     }
     fn permission(&self, _input: &Self::Input, _ctx: &PermCtx) -> PermissionDecision {
         PermissionDecision::Ask
@@ -95,6 +99,7 @@ impl Tool for Edit {
 
     async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let path = confine(&ctx.workspace, &input.path)?;
+        ensure_not_protected(&ctx.workspace, &path, &input.path)?;
         ensure_existing_path_no_links(&ctx.workspace, &path, &input.path)?;
         let meta = tokio::fs::metadata(&path)
             .await

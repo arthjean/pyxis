@@ -150,8 +150,12 @@ pub trait Tool: Send + Sync {
         &[]
     }
 
-    /// Validation d'entrée (pré-permission, pré-exécution). Défaut : accepte.
-    fn validate_input(&self, _input: &Self::Input) -> Result<(), ValidationError> {
+    /// Validation d'entrée (pré-permission, pré-exécution). Défaut : accepte. Le
+    /// `ToolCtx` est fourni pour les règles qui dépendent du workspace — la
+    /// protection des sous-chemins d'exécution différée (US-013) en est une :
+    /// refusée ici, elle précède la décision de permission et ne peut donc pas
+    /// être levée par un mode permissif.
+    fn validate_input(&self, _input: &Self::Input, _ctx: &ToolCtx) -> Result<(), ValidationError> {
         Ok(())
     }
 
@@ -187,7 +191,7 @@ pub trait DynTool: Send + Sync {
     fn behavioral_guidelines(&self) -> &[&'static str];
     /// Parse + `validate_input` SANS exécuter (fail-closed, US-010 AC3). Erreur
     /// ⇒ le Registry renvoie l'échec à l'agent sans appeler `call`.
-    fn precheck(&self, raw: &serde_json::Value) -> Result<(), ToolError>;
+    fn precheck(&self, raw: &serde_json::Value, ctx: &ToolCtx) -> Result<(), ToolError>;
     /// Décision baseline de l'outil (raw déjà validé par `precheck`).
     fn permission(&self, raw: &serde_json::Value, ctx: &PermCtx) -> PermissionDecision;
     fn timeout(&self, ctx: &ToolCtx) -> Duration;
@@ -235,7 +239,7 @@ impl<T: Tool> DynTool for DynToolAdapter<T> {
     fn behavioral_guidelines(&self) -> &[&'static str] {
         self.inner.behavioral_guidelines()
     }
-    fn precheck(&self, raw: &serde_json::Value) -> Result<(), ToolError> {
+    fn precheck(&self, raw: &serde_json::Value, ctx: &ToolCtx) -> Result<(), ToolError> {
         let estimated = estimate_json_bytes(raw);
         if estimated > MAX_TOOL_INPUT_BYTES {
             return Err(ToolError::Validation(ValidationError::new(format!(
@@ -244,7 +248,7 @@ impl<T: Tool> DynTool for DynToolAdapter<T> {
         }
         let input: T::Input =
             serde_json::from_value(raw.clone()).map_err(|e| ToolError::Parse(e.to_string()))?;
-        self.inner.validate_input(&input)?;
+        self.inner.validate_input(&input, ctx)?;
         Ok(())
     }
     fn permission(&self, raw: &serde_json::Value, ctx: &PermCtx) -> PermissionDecision {

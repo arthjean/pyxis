@@ -58,7 +58,7 @@ impl Tool for Glob {
     fn is_sensitive(&self) -> bool {
         false
     }
-    fn validate_input(&self, input: &Self::Input) -> Result<(), ValidationError> {
+    fn validate_input(&self, input: &Self::Input, _ctx: &ToolCtx) -> Result<(), ValidationError> {
         GlobPattern::new(&input.pattern)
             .map(|_| ())
             .map_err(|e| ValidationError::new(format!("invalid glob pattern: {e}")))

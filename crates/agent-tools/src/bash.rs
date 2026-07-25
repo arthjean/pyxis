@@ -65,7 +65,7 @@ impl Tool for Bash {
     fn returns_untrusted(&self) -> bool {
         true
     }
-    fn validate_input(&self, input: &Self::Input) -> Result<(), ValidationError> {
+    fn validate_input(&self, input: &Self::Input, _ctx: &ToolCtx) -> Result<(), ValidationError> {
         if input.command.trim().is_empty() {
             return Err(ValidationError::new("empty command"));
         }

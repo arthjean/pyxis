@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::error::{ToolError, ValidationError};
-use crate::path::{confine, replace_file_confined};
+use crate::path::{confine, ensure_not_protected, guard_protected_path, replace_file_confined};
 use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{MAX_WRITE_BYTES, Tool, ToolCtx, ToolOutput};
 
@@ -55,14 +55,15 @@ impl Tool for Write {
     fn returns_untrusted(&self) -> bool {
         false
     }
-    fn validate_input(&self, input: &Self::Input) -> Result<(), ValidationError> {
+    fn validate_input(&self, input: &Self::Input, ctx: &ToolCtx) -> Result<(), ValidationError> {
         let bytes = input.content.len();
         if bytes > MAX_WRITE_BYTES {
             return Err(ValidationError::new(format!(
                 "content too large: {bytes} bytes > {MAX_WRITE_BYTES}"
             )));
         }
-        Ok(())
+        // US-013 : refus des zones d'exécution différée, avant la permission.
+        guard_protected_path(&ctx.workspace, &input.path)
     }
     fn permission(&self, _input: &Self::Input, _ctx: &PermCtx) -> PermissionDecision {
         PermissionDecision::Ask
@@ -70,6 +71,9 @@ impl Tool for Write {
 
     async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let path = confine(&ctx.workspace, &input.path)?;
+        // Re-vérifié juste avant l'écriture : entre la validation et ici, un lien
+        // a pu apparaître dans le workspace (US-013).
+        ensure_not_protected(&ctx.workspace, &path, &input.path)?;
         let bytes = input.content.len();
         replace_file_confined(&ctx.workspace, &path, &input.path, input.content.as_bytes()).await?;
         Ok(ToolOutput::text(format!(

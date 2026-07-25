@@ -1029,6 +1029,38 @@ async fn edit_rejects_oversized_target_file() {
 }
 
 #[tokio::test]
+async fn protected_subpath_write_is_refused_even_in_bypass_mode() {
+    // US-013 AC3 : le refus précède la permission, donc le mode le plus permissif
+    // ne le lève pas. Preuve de bout en bout à travers le Registry.
+    let ws = TempWs::new("protected");
+    std::fs::create_dir_all(ws.path().join(".git/hooks")).unwrap();
+    let reg = mut_registry(&ws, PermissionMode::BypassPermissions);
+    let out = reg
+        .dispatch(vec![
+            call(
+                "hook",
+                "write",
+                serde_json::json!({"path": ".git/hooks/pre-commit", "content": "#!/bin/sh\nid\n"}),
+            ),
+            call(
+                "cfg",
+                "edit",
+                serde_json::json!({"path": ".git/config", "old_string": "[core]", "new_string": "[core]\n\thooksPath = evil"}),
+            ),
+        ])
+        .await;
+    for id in ["hook", "cfg"] {
+        let o = by_id(&out, id);
+        assert!(o.is_error, "{id} doit être refusé: {}", o.content);
+        assert!(o.content.contains("protected path"), "{}", o.content);
+    }
+    assert!(
+        !ws.path().join(".git/hooks/pre-commit").exists(),
+        "aucun fichier ne doit être écrit dans la zone protégée"
+    );
+}
+
+#[tokio::test]
 async fn bash_captures_output_untrusted() {
     // US-012 AC2 : tourne sous timeout, stdout/stderr capturés, untrusted.
     let ws = TempWs::new("bash");

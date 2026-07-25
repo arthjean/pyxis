@@ -7,7 +7,26 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::error::ToolError;
+use crate::error::{ToolError, ValidationError};
+
+/// Sous-chemins du workspace dont le contenu s'exécute PLUS TARD, hors sandbox et
+/// hors proxy, ou qui pilotent Pyxis lui-même (US-013). Un agent détourné par
+/// injection indirecte y déposerait du code que le prochain `git commit` de
+/// l'utilisateur exécuterait sur sa machine (CVE-2026-26268) ; `.git/config`
+/// suffit à rediriger `core.hooksPath` ou à définir un alias, et `.pyxis/` porte
+/// la configuration et les sessions de l'agent (motif « configuration-based
+/// sandbox escape »).
+///
+/// `.git` est protégé en entier, et pas seulement `hooks/` et `config` : dans un
+/// worktree git, `.git` est un FICHIER `gitdir: …` dont la réécriture déplace la
+/// configuration et les hooks vers un répertoire choisi par l'attaquant. Les deux
+/// sous-chemins restent listés en tête pour que le refus nomme la zone exacte.
+///
+/// **Portée : outils d'édition uniquement.** Landlock étant additif, ce droit ne
+/// peut pas être soustrait sous le workspace : une commande `bash` garde la
+/// possibilité d'écrire dans ces chemins. La limite est documentée dans l'aide de
+/// la CLI et dans `docs/CURRENT_STATUS.md` plutôt que passée sous silence.
+pub const PROTECTED_SUBPATHS: &[&str] = &[".git/hooks", ".git/config", ".git", ".pyxis"];
 
 /// Normalise lexicalement (résout `.` et `..` sans accès disque, ne suit pas les
 /// symlinks). Un `..` qui remonte au-dessus de la racine est une évasion.
@@ -46,6 +65,74 @@ pub fn confine(workspace: &Path, path: &str) -> Result<PathBuf, ToolError> {
         Ok(joined)
     } else {
         Err(ToolError::OutsideWorkspace(path.into()))
+    }
+}
+
+/// Garde-fou d'écriture appelé depuis `validate_input`, donc AVANT la décision de
+/// permission : le refus d'une zone d'exécution différée (US-013) ne dépend
+/// d'aucun mode et ne peut être levé ni par `DontAsk` ni par `BypassPermissions`.
+/// Un chemin hors workspace n'est pas traité ici : il est refusé par `confine` au
+/// moment de l'appel, avec son erreur dédiée.
+pub fn guard_protected_path(workspace: &Path, path: &str) -> Result<(), ValidationError> {
+    let Ok(target) = confine(workspace, path) else {
+        return Ok(());
+    };
+    ensure_not_protected(workspace, &target, path).map_err(|e| ValidationError::new(e.to_string()))
+}
+
+/// Refuse un chemin qui atteint une zone protégée, directement ou par symlink.
+pub fn ensure_not_protected(
+    workspace: &Path,
+    target: &Path,
+    display_path: &str,
+) -> Result<(), ToolError> {
+    if let Some(zone) = protected_zone(&lexical_normalize(workspace), target) {
+        return Err(protected_error(display_path, zone));
+    }
+    // AC2 : une cible qui n'atteint la zone qu'après résolution (symlink dans le
+    // checkout, remontée relative déjà normalisée par `confine`) est refusée de la
+    // même manière. La comparaison se fait sur les chemins RÉELS des deux côtés.
+    let (Ok(real_root), Some(real_target)) = (
+        std::fs::canonicalize(workspace),
+        resolve_existing_prefix(target),
+    ) else {
+        return Ok(());
+    };
+    match protected_zone(&real_root, &real_target) {
+        Some(zone) => Err(protected_error(display_path, zone)),
+        None => Ok(()),
+    }
+}
+
+fn protected_error(display_path: &str, zone: &str) -> ToolError {
+    ToolError::Rejected(format!(
+        "write refused: {display_path} is a protected path ({zone}); its contents run outside the sandbox"
+    ))
+}
+
+fn protected_zone(root: &Path, path: &Path) -> Option<&'static str> {
+    let rel = path.strip_prefix(root).ok()?;
+    PROTECTED_SUBPATHS
+        .iter()
+        .copied()
+        .find(|zone| rel.starts_with(Path::new(zone)))
+}
+
+/// Résout la partie EXISTANTE de `target` (canonicalisée, donc symlinks suivis) et
+/// lui rattache les composants encore absents. `None` si rien ne résout.
+fn resolve_existing_prefix(target: &Path) -> Option<PathBuf> {
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = target.to_path_buf();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&probe) {
+            let mut out = real;
+            out.extend(missing.iter().rev());
+            return Some(out);
+        }
+        missing.push(probe.file_name()?.to_os_string());
+        if !probe.pop() {
+            return None;
+        }
     }
 }
 
@@ -319,6 +406,89 @@ mod tests {
         let ws = Path::new("/work/repo");
         let p = confine(ws, "src/foo/../bar.rs").unwrap();
         assert_eq!(p, PathBuf::from("/work/repo/src/bar.rs"));
+    }
+
+    fn protected_ws(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("pyxis-protected-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git/hooks")).unwrap();
+        std::fs::write(dir.join(".git/config"), "[core]\n").unwrap();
+        match std::fs::canonicalize(&dir) {
+            Ok(real) => real,
+            Err(_) => dir,
+        }
+    }
+
+    #[test]
+    fn protected_subpaths_are_refused_for_writes() {
+        let ws = protected_ws("direct");
+        for path in [
+            ".git/hooks/pre-commit",
+            ".git/hooks",
+            ".git/config",
+            ".pyxis/settings.toml",
+            // remontée relative : `confine` normalise, la zone reste atteinte.
+            "src/../.git/hooks/post-merge",
+            // worktree git : `.git` est un fichier `gitdir: …`, le réécrire déplace
+            // hooks et config vers un répertoire choisi par l'attaquant.
+            ".git",
+            ".git/info/exclude",
+        ] {
+            let err = guard_protected_path(&ws, path).unwrap_err().to_string();
+            assert!(
+                err.contains("protected path"),
+                "{path} doit être refusé comme zone protégée: {err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn ordinary_workspace_paths_stay_writable() {
+        let ws = protected_ws("ordinary");
+        for path in [
+            "src/main.rs",
+            ".github/workflows/ci.yml",
+            // proches mais distincts : le préfixe est comparé par composants, donc
+            // `.gitignore` n'est pas `.git`.
+            ".gitignore",
+            ".gitmodules",
+            ".pyxis-notes.md",
+        ] {
+            assert!(
+                guard_protected_path(&ws, path).is_ok(),
+                "{path} ne doit pas être refusé"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn missing_git_directory_is_not_an_error() {
+        // AC5 : un projet sans dépôt git n'est pas un cas d'erreur.
+        let ws = std::env::temp_dir().join(format!("pyxis-nogit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        assert!(guard_protected_path(&ws, "src/main.rs").is_ok());
+        assert!(guard_protected_path(&ws, ".git/hooks/pre-commit").is_err());
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_protected_zone_is_refused_like_the_direct_path() {
+        let ws = protected_ws("symlink");
+        let link = ws.join("hooks-link");
+        if std::os::unix::fs::symlink(ws.join(".git/hooks"), &link).is_err() {
+            let _ = std::fs::remove_dir_all(&ws);
+            return;
+        }
+        let err = guard_protected_path(&ws, "hooks-link/pre-commit")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("protected path"), "{err}");
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[test]

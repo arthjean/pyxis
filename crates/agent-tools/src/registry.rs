@@ -133,7 +133,7 @@ impl Registry {
         };
 
         // 1. parse + validate (fail-closed, US-010 AC3) — pas d'exécution si KO.
-        if let Err(e) = tool.precheck(&call.input) {
+        if let Err(e) = tool.precheck(&call.input, &self.ctx) {
             return err_outcome(id, e.to_string(), e.kind());
         }
 
@@ -236,7 +236,7 @@ impl Registry {
         if !(tool.is_concurrency_safe() && tool.is_read_only() && !tool.is_taint_sensitive()) {
             return false;
         }
-        if tool.precheck(&call.input).is_err() {
+        if tool.precheck(&call.input, &self.ctx).is_err() {
             return true;
         }
         let mode = self.mode();

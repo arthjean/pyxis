@@ -228,7 +228,7 @@ impl Tool for BlockingTool {
         PermissionDecision::Allow
     }
 
-    fn validate_input(&self, _input: &Self::Input) -> Result<(), ValidationError> {
+    fn validate_input(&self, _input: &Self::Input, _ctx: &ToolCtx) -> Result<(), ValidationError> {
         Ok(())
     }
 
