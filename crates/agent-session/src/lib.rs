@@ -1,20 +1,20 @@
-//! `agent-session` — persistance JSONL append-only + resume par dossier (US-009,
-//! ARCHITECTURE §7). Implémente le trait `Session` d'`agent-core` (injecté dans
-//! la boucle). Dépend d'`agent-core` pour les types canoniques.
+//! `agent-session`: append-only JSONL persistence + per-directory resume (US-009,
+//! ARCHITECTURE 7). Implements the `Session` trait of `agent-core` (injected into
+//! the loop). Depends on `agent-core` for the canonical types.
 //!
-//! Garanties :
-//! - **durabilité par entrée** : chaque entrée est sérialisée puis `write_all` +
-//!   `flush` + `sync_data` (fdatasync). Note : `write_all` peut émettre plusieurs
-//!   syscalls `write()` ; un crash OS au milieu peut laisser une ligne PARTIELLE
-//!   en queue de fichier — c'est précisément ce que le resume détecte et ignore
-//!   (dernière ligne non parsable, AC3). On ne promet donc pas « tout ou rien »
-//!   au niveau octet, mais « toute ligne incomplète en queue est ignorée ».
-//! - **resume** : on rejoue le log ; une dernière ligne tronquée par un crash en
-//!   plein écrit est ignorée (AC3), la session reprend au dernier état valide.
-//! - un `CompactCheckpoint` récent réinitialise le transcript en une entrée
-//!   replayable unique. Les anciens logs `CompactBoundary` restent supportés :
-//!   leur `clear` est différé jusqu'au premier `Message` suivant, donc une
-//!   frontière orpheline n'efface pas le transcript antérieur.
+//! Guarantees:
+//! - **per-entry durability**: every entry is serialized then `write_all` +
+//!   `flush` + `sync_data` (fdatasync). Note: `write_all` can emit several
+//!   `write()` syscalls; an OS crash in the middle can leave a PARTIAL line
+//!   at the tail of the file, which is exactly what resume detects and ignores
+//!   (last unparsable line, AC3). So we do not promise "all or nothing"
+//!   at the byte level, but "any incomplete trailing line is ignored".
+//! - **resume**: we replay the log; a last line truncated by a crash mid-write
+//!   is ignored (AC3), the session resumes at the last valid state.
+//! - a recent `CompactCheckpoint` resets the transcript into a single
+//!   replayable entry. Older `CompactBoundary` logs stay supported:
+//!   their `clear` is deferred until the first following `Message`, so an
+//!   orphan boundary does not wipe the earlier transcript.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::collections::HashSet;
@@ -29,7 +29,7 @@ use agent_core::compaction::is_summary_message;
 use agent_core::message::{ContentBlock, Message, Role};
 use agent_core::session::{FileSnapshot, Session, SessionEntry, SessionError};
 
-/// Nom du fichier de session dans un dossier de travail.
+/// Name of the session file in a working directory.
 pub const SESSION_FILE: &str = "session.jsonl";
 pub const SESSION_SCHEMA_VERSION: u32 = 1;
 
@@ -69,8 +69,8 @@ fn redact_encrypted_reasoning(messages: &mut [Message]) {
     }
 }
 
-/// Session JSONL append-only. Tient un curseur du nombre de messages déjà écrits
-/// pour que `sync` n'écrive que le delta (transcript-before-response idempotent).
+/// Append-only JSONL session. Keeps a cursor of the number of already written messages
+/// so that `sync` only writes the delta (idempotent transcript-before-response).
 pub struct JsonlSession {
     state: Mutex<WriterState>,
 }
@@ -159,7 +159,7 @@ fn write_entry_locked(state: &mut WriterState, entry: &SessionEntry) -> Result<(
 }
 
 impl JsonlSession {
-    /// Crée (ou rouvre en append) le fichier de session dans `dir`.
+    /// Creates (or reopens in append mode) the session file in `dir`.
     pub fn create_in(dir: &Path) -> Result<Self, SessionError> {
         std::fs::create_dir_all(dir).map_err(io_err)?;
         let path = dir.join(SESSION_FILE);
@@ -175,8 +175,8 @@ impl JsonlSession {
         Ok(session)
     }
 
-    /// Crée (ou rouvre en append) une session sur un fichier nommé (un fichier
-    /// par conversation : `<dir>/<id>.jsonl`). Crée le dossier parent au besoin.
+    /// Creates (or reopens in append mode) a session on a named file (one file
+    /// per conversation: `<dir>/<id>.jsonl`). Creates the parent directory when needed.
     pub fn create_at(path: &Path) -> Result<Self, SessionError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(io_err)?;
@@ -193,9 +193,9 @@ impl JsonlSession {
         Ok(session)
     }
 
-    /// Bascule le fichier de persistance vers `path` (resume d'une session
-    /// passée) en repositionnant le curseur à `cursor` messages déjà écrits : les
-    /// prochains `sync` n'appendront que le delta dans la session reprise.
+    /// Switches the persistence file to `path` (resuming a past
+    /// session) by repositioning the cursor at `cursor` already written messages: the
+    /// next `sync` calls will only append the delta into the resumed session.
     pub fn switch_to(&self, path: &Path, cursor: usize) -> Result<(), SessionError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(io_err)?;
@@ -277,29 +277,29 @@ impl Session for JsonlSession {
     }
 }
 
-/// État reconstruit depuis un log de session.
+/// State rebuilt from a session log.
 #[derive(Debug, Default)]
 pub struct ResumedSession {
     pub messages: Vec<Message>,
     pub file_snapshots: Vec<FileSnapshot>,
     pub compactions: usize,
-    /// Vrai si une dernière ligne partielle (crash mid-write) a été ignorée.
+    /// True when a partial last line (crash mid-write) was ignored.
     pub skipped_partial: bool,
-    /// Version de schéma déclarée par la première entrée `Meta`, si présente.
+    /// Schema version declared by the first `Meta` entry, when present.
     pub schema_version: Option<u32>,
-    /// Nombre d'octets rejoués comme log valide. Sert à tronquer une queue
-    /// partielle avant de réappend dans le fichier.
+    /// Number of bytes replayed as a valid log. Used to truncate a partial
+    /// tail before appending into the file again.
     pub valid_bytes: u64,
-    /// Vrai si le fichier lu terminait par `\n`.
+    /// True when the read file ended with `\n`.
     pub ended_with_newline: bool,
 }
 
-/// Reprend la session d'un dossier (`<dir>/session.jsonl`).
+/// Resumes the session of a directory (`<dir>/session.jsonl`).
 pub fn resume_dir(dir: &Path) -> Result<ResumedSession, SessionError> {
     resume_file(&dir.join(SESSION_FILE))
 }
 
-/// Reprend une session depuis un fichier JSONL. Fichier absent ⇒ session vide.
+/// Resumes a session from a JSONL file. Missing file means an empty session.
 pub fn resume_file(path: &Path) -> Result<ResumedSession, SessionError> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -359,9 +359,9 @@ fn resume_content(content: &str) -> Result<ResumedSession, SessionError> {
         ..ResumedSession::default()
     };
 
-    // clear DIFFÉRÉ : une frontière n'efface le transcript antérieur que lorsque
-    // son premier Message de résumé arrive. Une frontière orpheline (crash entre
-    // frontière et résumé) préserve donc le transcript d'avant.
+    // DEFERRED clear: a boundary only wipes the earlier transcript when
+    // its first summary Message arrives. An orphan boundary (crash between
+    // boundary and summary) therefore preserves the transcript from before.
     let mut pending_clear = false;
     let mut start = 0usize;
 
@@ -512,20 +512,20 @@ fn scan_push_message(scan: &mut SessionScan, message: &Message) {
     }
 }
 
-/// Métadonnée d'une session listée pour le menu `/resume`.
+/// Metadata of a session listed for the `/resume` menu.
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
-    /// Nom de fichier (`<id>.jsonl`) — identifiant résolu côté CLI.
+    /// File name (`<id>.jsonl`): identifier resolved on the CLI side.
     pub id: String,
-    /// Résumé : premier message utilisateur (vide si aucun).
+    /// Summary: first user message (empty when there is none).
     pub summary: String,
     pub message_count: usize,
     pub modified: SystemTime,
 }
 
-/// Liste les sessions reprenables d'un dossier (`*.jsonl`), triées du plus
-/// récent au plus ancien. Ignore les sessions vides et celle de `exclude` (la
-/// session courante). Tolérante : un fichier illisible est simplement sauté.
+/// Lists the resumable sessions of a directory (`*.jsonl`), sorted from the most
+/// recent to the oldest. Ignores empty sessions and the one in `exclude` (the
+/// current session). Tolerant: an unreadable file is simply skipped.
 pub fn list_sessions(dir: &Path, exclude: Option<&Path>) -> Vec<SessionInfo> {
     let exclude = exclude.and_then(|p| p.canonicalize().ok());
     let mut out = Vec::new();
@@ -566,11 +566,11 @@ pub fn list_sessions(dir: &Path, exclude: Option<&Path>) -> Vec<SessionInfo> {
     out
 }
 
-/// Agrège les prompts utilisateur de TOUTES les sessions d'un dossier (ancien →
-/// récent), pour l'historique navigable **par dossier** (façon Claude Code).
-/// Exclut `exclude` (la session courante, encore vide), dédupe les doublons
-/// déjà vues et garde au plus `cap` entrées (les plus récentes). Les sessions
-/// sont ordonnées par date de modification (approx. chronologique).
+/// Aggregates the user prompts of ALL the sessions of a directory (oldest ->
+/// most recent), for the **per-directory** navigable history (Claude Code style).
+/// Excludes `exclude` (the current session, still empty), dedupes the duplicates
+/// already seen and keeps at most `cap` entries (the most recent ones). The sessions
+/// are ordered by modification date (roughly chronological).
 pub fn workspace_prompts(dir: &Path, exclude: Option<&Path>, cap: usize) -> Vec<String> {
     let exclude = exclude.and_then(|p| p.canonicalize().ok());
     let mut files: Vec<(SystemTime, PathBuf)> = Vec::new();
@@ -595,7 +595,7 @@ pub fn workspace_prompts(dir: &Path, exclude: Option<&Path>, cap: usize) -> Vec<
     }
     files.sort_by(|(a_time, a_path), (b_time, b_path)| {
         a_time.cmp(b_time).then_with(|| a_path.cmp(b_path))
-    }); // ancien → récent
+    }); // oldest -> most recent
 
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -622,7 +622,7 @@ mod tests {
     use super::*;
     use agent_core::message::Message;
 
-    /// Dossier temporaire isolé par test (pas de dépendance `rand`/`tempfile`).
+    /// Temporary directory isolated per test (no `rand`/`tempfile` dependency).
     fn tmp(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("pyxis_sess_{}_{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -645,7 +645,7 @@ mod tests {
         let s = JsonlSession::create_in(&dir).unwrap();
         let msgs = vec![Message::user("salut"), Message::assistant_text("bonjour")];
         s.sync(&msgs).await.unwrap();
-        // re-sync idempotent : n'ajoute rien
+        // idempotent re-sync: adds nothing
         s.sync(&msgs).await.unwrap();
         drop(s);
 
@@ -803,8 +803,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // #9 : une frontière ORPHELINE (crash entre frontière et résumé) ne doit PAS
-    // effacer le transcript antérieur (clear différé).
+    // #9: an ORPHAN boundary (crash between boundary and summary) must NOT
+    // wipe the earlier transcript (deferred clear).
     #[test]
     fn dangling_boundary_preserves_prior_transcript() {
         let dir = tmp("dangling");
@@ -815,7 +815,7 @@ mod tests {
             kind: CompactKind::Auto,
         })
         .unwrap();
-        // ...message, frontière, PUIS rien (crash avant l'écriture du résumé)
+        // ...message, boundary, THEN nothing (crash before the summary is written)
         std::fs::write(&path, format!("{msg}\n{boundary}\n")).unwrap();
 
         let resumed = resume_file(&path).unwrap();
@@ -825,8 +825,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // US-009 AC1 : l'entrée discriminée FileHistorySnapshot s'écrit et se rejoue
-    // proprement au resume.
+    // US-009 AC1: the discriminated FileHistorySnapshot entry is written and replayed
+    // cleanly at resume time.
     #[tokio::test]
     async fn file_snapshot_roundtrips() {
         let dir = tmp("snapshot");
@@ -854,7 +854,7 @@ mod tests {
         let dir = tmp("truncated");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(SESSION_FILE);
-        // une entrée valide + une ligne partielle (crash mid-write, pas de \n final)
+        // one valid entry + a partial line (crash mid-write, no trailing \n)
         let valid = serde_json::to_string(&SessionEntry::Message(Message::user("ok"))).unwrap();
         std::fs::write(
             &path,
@@ -971,7 +971,7 @@ mod tests {
         b.sync(&[Message::user("session B"), Message::assistant_text("ok")])
             .await
             .unwrap();
-        let empty = JsonlSession::create_at(&dir.join("empty.jsonl")).unwrap(); // vide → ignorée
+        let empty = JsonlSession::create_at(&dir.join("empty.jsonl")).unwrap(); // empty -> ignored
         drop(b);
         drop(empty);
 
@@ -1020,7 +1020,7 @@ mod tests {
             Message::user("a1"),
             Message::assistant_text("r"),
             Message::user("a2"),
-            Message::user("a2"), // doublon consécutif → dédupliqué
+            Message::user("a2"), // consecutive duplicate -> deduped
         ])
         .await
         .unwrap();
@@ -1051,7 +1051,7 @@ mod tests {
         old.sync(&[Message::user("old")]).await.unwrap();
         drop(old);
 
-        // session courante, puis bascule vers `old` au curseur 1 (1 msg présent).
+        // current session, then switches to `old` at cursor 1 (1 msg present).
         let s = JsonlSession::create_at(&dir.join("cur.jsonl")).unwrap();
         s.switch_to(&dir.join("old.jsonl"), 1).unwrap();
         s.sync(&[Message::user("old"), Message::assistant_text("next")])
@@ -1079,7 +1079,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(SESSION_FILE);
         let valid = serde_json::to_string(&SessionEntry::Message(Message::user("ok"))).unwrap();
-        // ligne corrompue AU MILIEU (suivie d'une ligne valide) → vraie corruption
+        // corrupted line IN THE MIDDLE (followed by a valid line) -> real corruption
         std::fs::write(&path, format!("{valid}\nGARBAGE\n{valid}\n")).unwrap();
         assert!(resume_file(&path).is_err());
         let _ = std::fs::remove_dir_all(&dir);
