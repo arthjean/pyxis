@@ -79,6 +79,14 @@ Options:
       --output-cost-micro-per-ktok <n>  Output price
       --overload-fallback-model <slug>  Fallback model on overload
   -h, --help                            Show this help
+
+Configuration (TOML), lowest precedence first:
+  ~/.pyxis/settings.toml           Global, user-owned. May set every key.
+  <workspace>/.pyxis/config.toml   Project. `permission_mode`, `writable_roots`
+                                   and `hooks` are ignored there with a warning:
+                                   a workspace-controlled file must never widen a
+                                   security perimeter.
+  Environment variables, then command-line arguments, override both.
 ";
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -198,32 +206,66 @@ fn parse_positive_u64(raw: &str, name: &str) -> anyhow::Result<u64> {
     Ok(value)
 }
 
-fn setting_u64(arg: &Option<String>, env: &str, name: &str) -> anyhow::Result<Option<u64>> {
-    match arg {
-        Some(raw) => parse_positive_u64(raw, name).map(Some),
-        None => match std::env::var(env) {
-            Ok(raw) if !raw.trim().is_empty() => parse_positive_u64(&raw, env).map(Some),
-            _ => Ok(None),
-        },
+/// Précédence d'un réglage numérique (US-016 AC1) : configuration < variable
+/// d'environnement < argument. Le premier niveau non défini est simplement
+/// traversé, ce qui rend la chaîne identique quel que soit le nombre de sources
+/// réellement renseignées. L'environnement est passé en paramètre plutôt que lu
+/// ici : la précédence devient testable sans muter l'environnement du processus.
+fn precedence_u64(
+    arg: Option<&str>,
+    arg_name: &str,
+    env: Option<&str>,
+    env_name: &str,
+    from_config: Option<u64>,
+) -> anyhow::Result<Option<u64>> {
+    if let Some(raw) = arg {
+        return parse_positive_u64(raw, arg_name).map(Some);
+    }
+    match env {
+        Some(raw) if !raw.trim().is_empty() => parse_positive_u64(raw, env_name).map(Some),
+        _ => Ok(from_config),
     }
 }
 
-fn run_config_from_args(args: &Args) -> anyhow::Result<RunConfig> {
-    let token_budget = setting_u64(&args.token_budget, "PYXIS_TOKEN_BUDGET", "--token-budget")?;
+fn setting_u64(
+    arg: &Option<String>,
+    env: &str,
+    name: &str,
+    from_config: Option<u64>,
+) -> anyhow::Result<Option<u64>> {
+    precedence_u64(
+        arg.as_deref(),
+        name,
+        std::env::var(env).ok().as_deref(),
+        env,
+        from_config,
+    )
+}
+
+fn run_config_from_args(args: &Args, config: &settings::Config) -> anyhow::Result<RunConfig> {
+    let token_budget = setting_u64(
+        &args.token_budget,
+        "PYXIS_TOKEN_BUDGET",
+        "--token-budget",
+        config.token_budget,
+    )?;
     let cost_limit = setting_u64(
         &args.cost_budget_micro_usd,
         "PYXIS_COST_BUDGET_MICRO_USD",
         "--cost-budget-micro-usd",
+        config.cost_budget_micro_usd,
     )?;
     let input_price = setting_u64(
         &args.input_cost_micro_per_ktok,
         "PYXIS_INPUT_COST_MICRO_PER_KTOK",
         "--input-cost-micro-per-ktok",
+        config.input_cost_micro_per_ktok,
     )?;
     let output_price = setting_u64(
         &args.output_cost_micro_per_ktok,
         "PYXIS_OUTPUT_COST_MICRO_PER_KTOK",
         "--output-cost-micro-per-ktok",
+        config.output_cost_micro_per_ktok,
     )?;
 
     let cost_budget = match (cost_limit, input_price, output_price) {
@@ -250,7 +292,8 @@ fn run_config_from_args(args: &Args) -> anyhow::Result<RunConfig> {
                 .ok()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
-        });
+        })
+        .or_else(|| config.overload_fallback_model.clone());
     if let Some(fallback) = &overload_fallback_model
         && prompt::uses_codex_finetuned_prompt(&args.model)
             != prompt::uses_codex_finetuned_prompt(fallback)
@@ -284,6 +327,20 @@ fn permission_policy(headless: bool, yes: bool, _sandbox_enforced: bool) -> CliP
     CliPermissionPolicy {
         mode: PermissionMode::AcceptEdits,
     }
+}
+
+/// Mode de permission effectif, et si la configuration a remplacé le défaut du
+/// mode headless (US-016 AC6). Ce remplacement peut ÉLARGIR ce qu'un `-p`
+/// s'autorise : il est donc annoncé plutôt que subi, et seule la configuration
+/// globale peut porter la clé (`settings::SECURITY_KEYS`), jamais celle du
+/// projet.
+fn resolve_permission_mode(
+    from_config: Option<PermissionMode>,
+    policy: CliPermissionPolicy,
+    headless: bool,
+) -> (PermissionMode, bool) {
+    let mode = from_config.unwrap_or(policy.mode);
+    (mode, headless && mode != policy.mode)
 }
 
 fn sandbox_enforced_from_args(
@@ -350,9 +407,21 @@ fn main() -> anyhow::Result<()> {
 
     let credential = prepare_credential_before_sandbox(&args)?;
 
-    // Réglages persistants (`~/.pyxis/settings.toml`) : hors workspace, donc le
-    // fichier doit exister AVANT Landlock pour recevoir sa règle d'écriture. En
-    // headless (-p) rien n'est persisté : la session est pilotée par les flags.
+    // Configuration lue AVANT le sandbox et dans LES DEUX modes (US-016 AC6) : le
+    // fichier global est hors workspace, donc inaccessible une fois Landlock posé,
+    // et le mode headless a autant besoin de ses réglages que l'interactif. Lire
+    // n'est pas persister : `-p` ne réécrit jamais le fichier (voir plus bas).
+    let config = settings::load(
+        settings::default_settings_path().as_deref(),
+        Some(&settings::project_config_path(&workspace)),
+    );
+    for warning in &config.warnings {
+        eprintln!("[config] {warning}");
+    }
+
+    // Réglages persistants (`~/.pyxis/settings.toml`) : le fichier doit exister
+    // AVANT Landlock pour recevoir sa règle d'écriture. En headless (-p) rien
+    // n'est persisté : la session est pilotée par la configuration et les flags.
     let settings_path = if args.prompt.is_none() {
         settings::default_settings_path().filter(|path| match settings::ensure_file(path) {
             Ok(()) => true,
@@ -380,6 +449,7 @@ fn main() -> anyhow::Result<()> {
             context_msgs,
             cred: credential,
             settings_path,
+            config,
         },
         sandbox_enforced,
     ))
@@ -536,7 +606,10 @@ struct PreSandbox {
     mcp_config: agent_mcp::McpConfigFile,
     context_msgs: Vec<Message>,
     cred: OAuthCredential,
+    /// Fichier de réglages écrivable (interactif seulement). `None` en headless.
     settings_path: Option<std::path::PathBuf>,
+    /// Configuration effective (global + projet), lue dans les deux modes.
+    config: settings::Config,
 }
 
 async fn run(
@@ -551,37 +624,21 @@ async fn run(
         context_msgs,
         cred,
         settings_path,
+        config,
     } = pre;
-    // `--model` explicite prime ; sinon on reprend le dernier modèle choisi via
-    // `/models`. Résolu AVANT tout le reste : la validation du fallback et l'effort
-    // initial se calculent sur le modèle réellement utilisé.
+    // `--model` explicite prime ; sinon on reprend le modèle de la configuration
+    // (dernier choix de `/models`, ou réglage de projet). Résolu AVANT tout le
+    // reste : la validation du fallback et l'effort initial se calculent sur le
+    // modèle réellement utilisé.
     if !args.model_from_cli
-        && let Some(model) =
-            settings_path
-                .as_deref()
-                .and_then(|path| match settings::load_model(path) {
-                    Ok(model) => model,
-                    Err(err) => {
-                        eprintln!("[settings] model: {err}");
-                        None
-                    }
-                })
+        && let Some(model) = config.model.clone()
     {
         args.model = model;
     }
-    let run_config = run_config_from_args(&args)?;
+    let run_config = run_config_from_args(&args, &config)?;
     let headless = args.prompt.is_some();
-    let saved_reasoning_effort =
-        settings_path
-            .as_deref()
-            .and_then(|path| match settings::load_reasoning_effort(path) {
-                Ok(effort) => effort,
-                Err(err) => {
-                    eprintln!("[settings] reasoning_effort: {err}");
-                    None
-                }
-            });
-    let initial_reasoning_effort = saved_reasoning_effort
+    let initial_reasoning_effort = config
+        .reasoning_effort
         .as_deref()
         .and_then(|effort| agent_tui::normalize_reasoning_effort_for_model(&args.model, effort))
         .or_else(|| agent_tui::default_reasoning_effort_for_model(&args.model).map(str::to_string));
@@ -669,16 +726,15 @@ async fn run(
     // 4. Registry d'outils + approbateur (TUI en interactif, auto en headless).
     let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
     let policy = permission_policy(headless, args.yes, sandbox_enforced);
-    let initial_permission_mode = settings_path
-        .as_deref()
-        .and_then(|path| match settings::load_permission_mode(path) {
-            Ok(mode) => mode,
-            Err(err) => {
-                eprintln!("[settings] permission_mode: {err}");
-                None
-            }
-        })
-        .unwrap_or(policy.mode);
+    let (initial_permission_mode, announce_override) =
+        resolve_permission_mode(config.permission_mode, policy, headless);
+    if announce_override {
+        eprintln!(
+            "[config] permission mode from configuration: {} (default for -p would be {})",
+            settings::permission_mode_id(initial_permission_mode),
+            settings::permission_mode_id(policy.mode)
+        );
+    }
     let permission_mode = PermissionModeState::new(initial_permission_mode);
     let approver: Arc<dyn agent_tools::permission::Approver> = if headless {
         Arc::new(AutoDeny)
@@ -797,8 +853,10 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, parse_args_from, permission_policy, resolve_resume_path, run_config_from_args,
+        Args, parse_args_from, permission_policy, precedence_u64, resolve_permission_mode,
+        resolve_resume_path, run_config_from_args, settings,
     };
+    use agent_tools::permission::PermissionMode;
 
     fn args() -> Args {
         Args {
@@ -818,11 +876,107 @@ mod tests {
         }
     }
 
+    /// US-016 AC6 : la configuration globale pilote aussi le mode de permission
+    /// du headless. Le remplacement est SIGNALÉ, parce qu'il peut élargir ce
+    /// qu'un `-p` s'autorise par rapport au défaut fail-closed.
+    #[test]
+    fn configuration_replaces_the_headless_permission_default_and_says_so() {
+        let headless_default = permission_policy(true, false, true);
+        assert_eq!(headless_default.mode, PermissionMode::Default);
+
+        let (mode, announced) = resolve_permission_mode(
+            Some(PermissionMode::BypassPermissions),
+            headless_default,
+            true,
+        );
+        assert_eq!(mode, PermissionMode::BypassPermissions);
+        assert!(announced, "un elargissement en headless doit etre annonce");
+
+        // Sans configuration, le défaut fail-closed est conservé, sans bruit.
+        let (mode, announced) = resolve_permission_mode(None, headless_default, true);
+        assert_eq!(mode, PermissionMode::Default);
+        assert!(!announced);
+
+        // Une configuration qui redit le défaut n'annonce rien non plus.
+        let (_, announced) =
+            resolve_permission_mode(Some(PermissionMode::Default), headless_default, true);
+        assert!(!announced);
+
+        // En interactif, la substitution est le comportement normal depuis
+        // US-012 : rien à annoncer.
+        let interactive = permission_policy(false, false, true);
+        let (mode, announced) =
+            resolve_permission_mode(Some(PermissionMode::AcceptEdits), interactive, false);
+        assert_eq!(mode, PermissionMode::AcceptEdits);
+        assert!(!announced);
+    }
+
+    /// US-016 AC1, les quatre niveaux que `main` superpose : défaut (aucune
+    /// source) < configuration < environnement < argument.
+    #[test]
+    fn precedence_runs_config_then_env_then_argument() {
+        let name = "--token-budget";
+        let env = "PYXIS_TOKEN_BUDGET";
+
+        assert_eq!(precedence_u64(None, name, None, env, None).unwrap(), None);
+        assert_eq!(
+            precedence_u64(None, name, None, env, Some(10)).unwrap(),
+            Some(10)
+        );
+        assert_eq!(
+            precedence_u64(None, name, Some("20"), env, Some(10)).unwrap(),
+            Some(20)
+        );
+        assert_eq!(
+            precedence_u64(Some("30"), name, Some("20"), env, Some(10)).unwrap(),
+            Some(30)
+        );
+        // Une variable vide n'est pas une définition : elle laisse passer la
+        // configuration au lieu d'écraser avec un zéro.
+        assert_eq!(
+            precedence_u64(None, name, Some("  "), env, Some(10)).unwrap(),
+            Some(10)
+        );
+    }
+
+    /// AC1 côté `RunConfig` : sans argument ni environnement, la configuration
+    /// pilote réellement le budget passé au cœur.
+    #[test]
+    fn run_config_falls_back_to_the_configuration_file() {
+        let config = settings::Config {
+            token_budget: Some(4242),
+            overload_fallback_model: Some("gpt-5.5".into()),
+            ..settings::Config::default()
+        };
+        let mut args = args();
+        args.model = "gpt-5.5".into();
+
+        let cfg = run_config_from_args(&args, &config).unwrap();
+
+        assert_eq!(cfg.token_budget, Some(4242));
+        assert_eq!(cfg.overload_fallback_model.as_deref(), Some("gpt-5.5"));
+    }
+
+    /// L'argument prime sur la configuration, dans le sens attendu.
+    #[test]
+    fn cli_argument_overrides_the_configuration_file() {
+        let config = settings::Config {
+            token_budget: Some(4242),
+            ..settings::Config::default()
+        };
+        let mut args = args();
+        args.token_budget = Some("7".into());
+
+        let cfg = run_config_from_args(&args, &config).unwrap();
+
+        assert_eq!(cfg.token_budget, Some(7));
+    }
+
     #[test]
     fn run_config_reads_token_budget_flag() {
         let mut args = args();
         args.token_budget = Some("1234".into());
-        let cfg = run_config_from_args(&args).unwrap();
+        let cfg = run_config_from_args(&args, &settings::Config::default()).unwrap();
         assert_eq!(cfg.token_budget, Some(1234));
     }
 
@@ -832,7 +986,7 @@ mod tests {
         args.cost_budget_micro_usd = Some("10".into());
         args.input_cost_micro_per_ktok = Some("2".into());
         args.output_cost_micro_per_ktok = Some("4".into());
-        let cfg = run_config_from_args(&args).unwrap();
+        let cfg = run_config_from_args(&args, &settings::Config::default()).unwrap();
         let cost = cfg.cost_budget.unwrap();
         assert_eq!(cost.limit_micro_usd, 10);
         assert_eq!(cost.input_micro_per_ktok, 2);
@@ -843,7 +997,9 @@ mod tests {
     fn run_config_rejects_incomplete_cost_budget() {
         let mut args = args();
         args.cost_budget_micro_usd = Some("10".into());
-        let err = run_config_from_args(&args).unwrap_err().to_string();
+        let err = run_config_from_args(&args, &settings::Config::default())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("incomplete cost budget"));
     }
 
@@ -851,7 +1007,9 @@ mod tests {
     fn run_config_rejects_zero_budget() {
         let mut args = args();
         args.token_budget = Some("0".into());
-        let err = run_config_from_args(&args).unwrap_err().to_string();
+        let err = run_config_from_args(&args, &settings::Config::default())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("must be > 0"));
     }
 
@@ -859,7 +1017,7 @@ mod tests {
     fn run_config_reads_overload_fallback_model() {
         let mut args = args();
         args.overload_fallback_model = Some(" fallback ".into());
-        let cfg = run_config_from_args(&args).unwrap();
+        let cfg = run_config_from_args(&args, &settings::Config::default()).unwrap();
         assert_eq!(cfg.overload_fallback_model.as_deref(), Some("fallback"));
     }
 
@@ -868,7 +1026,9 @@ mod tests {
         let mut args = args();
         args.model = "gpt-5-codex".into();
         args.overload_fallback_model = Some("gpt-5.5".into());
-        let err = run_config_from_args(&args).unwrap_err().to_string();
+        let err = run_config_from_args(&args, &settings::Config::default())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("fallback model is incompatible"));
     }
 

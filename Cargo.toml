@@ -70,6 +70,11 @@ syntect = { version = "5.3", default-features = false, features = ["default-fanc
 two-face = { version = "0.5", default-features = false, features = ["syntect-default-fancy"] }
 landlock = "0.4"
 anyhow = "1"
+# configuration déclarative (US-016) : parseur TOML de référence (toml-rs), en
+# remplacement du découpage textuel maison `parse_tomlish_string`. Lecture seule
+# (`toml::Table` + serde) : l'écriture des réglages reste un upsert de ligne, qui
+# préserve les commentaires sans faire entrer `toml_edit` dans le graphe.
+toml = "1"
 # snapshots de rendu terminal (US-005) : DEV-ONLY. Déclaré ici pour la version
 # unique du workspace, mais réservé aux `[dev-dependencies]` — jamais dans le
 # graphe du binaire `pyxis` distribué.
