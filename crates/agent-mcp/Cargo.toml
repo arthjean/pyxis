@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 rmcp = { workspace = true }
-# `process` (spawn du serveur stdio) en plus des features tokio du workspace.
+# `process` (spawn of the stdio server) on top of the workspace tokio features.
 tokio = { workspace = true, features = ["process"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

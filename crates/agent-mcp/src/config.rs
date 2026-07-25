@@ -1,6 +1,6 @@
-//! Parsing de `.mcp.json` (format compatible Claude Code). Seul le transport
-//! stdio est activable pour l'instant. Les entrées remote, invalides ou disabled
-//! sont conservées comme diagnostics au lieu de disparaître silencieusement.
+//! Parsing of `.mcp.json` (Claude Code compatible format). Only the stdio
+//! transport can be enabled for now. Remote, invalid or disabled entries
+//! are kept as diagnostics instead of disappearing silently.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::error::McpError;
 
-/// Origine d'une entrée MCP. Le workspace est prioritaire sur la config utilisateur.
+/// Origin of an MCP entry. The workspace takes priority over the user configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum McpConfigOrigin {
     Workspace,
@@ -28,7 +28,7 @@ impl McpConfigOrigin {
     }
 }
 
-/// Source concrète d'une entrée MCP, utilisée par l'UI de trust et les diagnostics.
+/// Concrete source of an MCP entry, used by the trust UI and the diagnostics.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct McpConfigSource {
     pub origin: McpConfigOrigin,
@@ -57,7 +57,7 @@ impl McpConfigSource {
     }
 }
 
-/// Raison pour laquelle une entrée MCP n'est pas activée telle quelle.
+/// Reason why an MCP entry is not enabled as is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpConfigIssueKind {
     Disabled,
@@ -105,7 +105,7 @@ impl McpConfigIssue {
     }
 }
 
-/// Configuration d'un serveur MCP stdio: commande, arguments et variables d'env.
+/// Configuration of a stdio MCP server: command, arguments and env variables.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct McpServerConfig {
     pub command: String,
@@ -134,7 +134,7 @@ struct RawConfigFile {
     mcp_servers: BTreeMap<String, serde_json::Value>,
 }
 
-/// Contenu résolu de `.mcp.json`: serveurs stdio exploitables et diagnostics.
+/// Resolved content of `.mcp.json`: usable stdio servers and diagnostics.
 #[derive(Debug, Clone, Default)]
 pub struct McpConfigFile {
     pub servers: BTreeMap<String, McpServerConfig>,
@@ -143,18 +143,18 @@ pub struct McpConfigFile {
 }
 
 impl McpConfigFile {
-    /// Charge `<dir>/.mcp.json` (config MCP du workspace). Fichier absent: config vide.
+    /// Loads `<dir>/.mcp.json` (workspace MCP config). Missing file: empty config.
     pub fn load(dir: &Path) -> Result<Self, McpError> {
         Self::load_file(&dir.join(".mcp.json"), McpConfigOrigin::Workspace)
     }
 
-    /// Charge les `mcpServers` user-scope d'un fichier Claude Code (`~/.claude.json`).
+    /// Loads the user-scope `mcpServers` of a Claude Code file (`~/.claude.json`).
     pub fn load_claude(path: &Path) -> Result<Self, McpError> {
         Self::load_file(path, McpConfigOrigin::ClaudeUser)
     }
 
-    /// Fusionne `lower` sous `self`. En collision, la config haute priorité gagne
-    /// et l'entrée basse priorité est enregistrée comme issue de shadowing.
+    /// Merges `lower` under `self`. On a collision, the high-priority config wins
+    /// and the low-priority entry is recorded as shadowed.
     #[must_use]
     pub fn merge_under(mut self, lower: McpConfigFile) -> Self {
         for (name, cfg) in lower.servers {

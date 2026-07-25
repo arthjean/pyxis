@@ -1,5 +1,5 @@
-//! Smoke stdio réel: spawn d'un serveur MCP minimal, handshake, tools/list,
-//! conservation des schémas et arrêt propre via `cancel`.
+//! Real stdio smoke test: spawn of a minimal MCP server, handshake, tools/list,
+//! schema preservation and clean shutdown through `cancel`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::BTreeMap;

@@ -1,6 +1,6 @@
-//! Client MCP : connexion à un serveur via transport stdio (`rmcp`), handshake
-//! `initialize` automatique, liste des outils. Le wrapping des outils en `DynTool`
-//! (intégration au registre `agent-tools`) viendra en Phase 2.
+//! MCP client: connection to a server through the stdio transport (`rmcp`), automatic
+//! `initialize` handshake, tool listing. Wrapping the tools into `DynTool`
+//! (integration into the `agent-tools` registry) will come in Phase 2.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,22 +15,22 @@ use crate::error::McpError;
 
 pub type CommandHardener = Arc<dyn Fn(&mut Command) + Send + Sync>;
 
-/// Délai max d'établissement de la connexion (spawn + handshake `initialize`).
+/// Max delay to establish the connection (spawn + `initialize` handshake).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Plafond de longueur d'une description d'outil (ARCHITECTURE §6 : un serveur ne
-/// peut pas polluer le prompt).
+/// Length cap of a tool description (ARCHITECTURE 6: a server cannot
+/// pollute the prompt).
 const DESCRIPTION_CAP: usize = 2048;
 
-/// Connexion vivante à un serveur MCP stdio. Détient le `RunningService` : sa
-/// fermeture (`cancel`) ou son drop tue le sous-process.
+/// Live connection to a stdio MCP server. Holds the `RunningService`: closing it
+/// (`cancel`) or dropping it kills the subprocess.
 pub struct McpConnection {
     service: RunningService<RoleClient, ()>,
 }
 
-/// Métadonnée d'un outil exposé. Les schémas restent attachés ici pour permettre
-/// une future exposition modèle via adapter strict, sans refaire un handshake.
+/// Metadata of an exposed tool. The schemas stay attached here to allow
+/// a future model exposure through a strict adapter, without redoing a handshake.
 #[derive(Debug, Clone)]
 pub struct McpToolInfo {
     pub name: String,
@@ -39,21 +39,21 @@ pub struct McpToolInfo {
     pub description: String,
     pub input_schema: serde_json::Value,
     pub output_schema: Option<serde_json::Value>,
-    /// Les annotations MCP sont des hints fournis par le serveur distant. Elles ne
-    /// doivent jamais devenir une décision de sécurité côté client.
+    /// The MCP annotations are hints provided by the remote server. They must
+    /// never become a security decision on the client side.
     pub annotations_untrusted: bool,
 }
 
 impl McpConnection {
-    /// Spawn le serveur stdio et établit le handshake MCP. `name` sert au libellé
-    /// d'erreur.
+    /// Spawns the stdio server and establishes the MCP handshake. `name` is used for the
+    /// error label.
     pub async fn connect(name: &str, cfg: &McpServerConfig) -> Result<Self, McpError> {
         Self::connect_hardened(name, cfg, None).await
     }
 
-    /// Variante durcie : le caller peut injecter le même scrub env + proxy que les
-    /// outils Bash. `cfg.env` reste explicite, mais les clés proxy sont ignorées
-    /// pour éviter les bypass via `NO_PROXY` ou `ALL_PROXY`.
+    /// Hardened variant: the caller can inject the same env scrub + proxy as the
+    /// Bash tools. `cfg.env` stays explicit, but the proxy keys are ignored
+    /// to avoid bypasses through `NO_PROXY` or `ALL_PROXY`.
     pub async fn connect_hardened(
         name: &str,
         cfg: &McpServerConfig,
@@ -74,9 +74,9 @@ impl McpConnection {
             server: name.to_string(),
             source: e,
         })?;
-        // Sur timeout, le futur `serve()` est droppé en place et le sous-process est
-        // tué via le `Drop` du transport (kill détaché). Suffisant pour une CLI
-        // longue-durée ; un arrêt gracieux explicite (serve_with_ct) reste possible.
+        // On timeout, the `serve()` future is dropped in place and the subprocess is
+        // killed through the `Drop` of the transport (detached kill). Enough for a
+        // long-running CLI; an explicit graceful shutdown (serve_with_ct) stays possible.
         let service: RunningService<RoleClient, ()> =
             tokio::time::timeout(CONNECT_TIMEOUT, ().serve(transport))
                 .await
@@ -91,7 +91,7 @@ impl McpConnection {
         Ok(Self { service })
     }
 
-    /// Liste les outils exposés par le serveur (descriptions cappées à 2048 chars).
+    /// Lists the tools exposed by the server (descriptions capped at 2048 chars).
     pub async fn list_tools(&self, name: &str) -> Result<Vec<McpToolInfo>, McpError> {
         let tools = tokio::time::timeout(LIST_TOOLS_TIMEOUT, self.service.list_all_tools())
             .await
@@ -122,17 +122,17 @@ impl McpConnection {
             .collect())
     }
 
-    /// Ferme proprement la connexion (stdin fermé, attente bornée, puis kill).
+    /// Closes the connection cleanly (stdin closed, bounded wait, then kill).
     ///
-    /// Le `Result` de `cancel()` (un `JoinError` si la tâche de service a paniqué)
-    /// est volontairement ignoré : le sous-process est de toute façon tué par le
-    /// `Drop` du transport. Appelé en fire-and-forget.
+    /// The `Result` of `cancel()` (a `JoinError` when the service task panicked)
+    /// is deliberately ignored: the subprocess is killed anyway by the
+    /// `Drop` of the transport. Called fire-and-forget.
     pub async fn cancel(self) {
         let _ = self.service.cancel().await;
     }
 }
 
-/// Tronque `s` à `max` chars (jamais au milieu d'un char multi-octet).
+/// Truncates `s` to `max` chars (never in the middle of a multi-byte char).
 fn cap(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()

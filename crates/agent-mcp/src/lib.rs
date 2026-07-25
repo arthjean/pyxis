@@ -1,11 +1,11 @@
-//! `agent-mcp` — intégration MCP (Model Context Protocol) via le SDK officiel
-//! `rmcp` (ARCHITECTURE §6). État d'un serveur en enum discriminé : le client
-//! n'est accessible que dans `Connected`.
+//! `agent-mcp`: MCP (Model Context Protocol) integration through the official
+//! `rmcp` SDK (ARCHITECTURE 6). State of a server as a discriminated enum: the client
+//! is only accessible in `Connected`.
 //!
-//! Périmètre actuel (en tête de Phase 2) : transport **stdio**, cycle de vie
-//! connect / disconnect / reconnect, liste des outils (descriptions cappées). Sont
-//! reportés : le wrapping des outils en `DynTool` (registre `agent-tools`), l'OAuth
-//! PKCE par serveur et les transports SSE / HTTP.
+//! Current scope (early Phase 2): **stdio** transport, connect / disconnect /
+//! reconnect life cycle, tool listing (capped descriptions). Deferred:
+//! wrapping the tools into `DynTool` (`agent-tools` registry), per-server
+//! PKCE OAuth and the SSE / HTTP transports.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod client;

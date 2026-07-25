@@ -1,5 +1,5 @@
-//! État runtime des serveurs MCP : enum discriminé (le client n'est accessible que
-//! dans `Connected`, garanti à la compilation) + registre indexé par nom.
+//! Runtime state of the MCP servers: discriminated enum (the client is only accessible
+//! in `Connected`, guaranteed at compile time) + registry indexed by name.
 
 use std::collections::BTreeMap;
 
@@ -7,8 +7,8 @@ use crate::client::{McpConnection, McpToolInfo};
 use crate::config::{McpConfigFile, McpConfigIssue, McpServerConfig};
 use crate::error::McpError;
 
-/// État d'un serveur MCP. Le `conn` n'existe que dans `Connected` : impossible
-/// d'appeler un serveur non connecté.
+/// State of an MCP server. The `conn` only exists in `Connected`: it is impossible
+/// to call a server that is not connected.
 pub enum McpServer {
     Disconnected {
         config: McpServerConfig,
@@ -37,7 +37,7 @@ impl McpServer {
         }
     }
 
-    /// Nombre d'outils exposés (0 hors `Connected`).
+    /// Number of exposed tools (0 outside `Connected`).
     pub fn tool_count(&self) -> usize {
         match self {
             McpServer::Connected { tools, .. } => tools.len(),
@@ -45,7 +45,7 @@ impl McpServer {
         }
     }
 
-    /// Outils exposés (vide hors `Connected`).
+    /// Exposed tools (empty outside `Connected`).
     pub fn tools(&self) -> &[McpToolInfo] {
         match self {
             McpServer::Connected { tools, .. } => tools,
@@ -54,9 +54,9 @@ impl McpServer {
     }
 }
 
-/// Registre des serveurs MCP connus, indexé par nom (ordre lexicographique stable).
-/// Les transitions d'état sont synchrones ; la connexion réseau elle-même se fait
-/// hors du registre (l'appelant relâche le verrou avant le `await`).
+/// Registry of the known MCP servers, indexed by name (stable lexicographic order).
+/// The state transitions are synchronous; the network connection itself happens
+/// outside the registry (the caller releases the lock before the `await`).
 #[derive(Default)]
 pub struct McpRegistry {
     servers: BTreeMap<String, McpServer>,
@@ -64,7 +64,7 @@ pub struct McpRegistry {
 }
 
 impl McpRegistry {
-    /// Construit le registre depuis la config : tous les serveurs `Disconnected`.
+    /// Builds the registry from the config: every server `Disconnected`.
     pub fn from_config(file: McpConfigFile) -> Self {
         let servers = file
             .servers
@@ -97,8 +97,8 @@ impl McpRegistry {
         self.issues.len()
     }
 
-    /// Passe un serveur en `Connecting` ; renvoie sa config (à spawner) et
-    /// l'éventuelle connexion précédente (cas reconnect : à fermer côté appelant).
+    /// Moves a server to `Connecting`; returns its config (to spawn) and
+    /// the previous connection when there is one (reconnect case: to be closed by the caller).
     pub fn begin_connect(
         &mut self,
         name: &str,
@@ -107,7 +107,7 @@ impl McpRegistry {
             .servers
             .get_mut(name)
             .ok_or_else(|| McpError::Unknown(name.to_string()))?;
-        // Déjà en cours de connexion → on refuse (évite un second spawn de process).
+        // Already connecting -> we refuse (avoids a second process spawn).
         if matches!(server, McpServer::Connecting { .. }) {
             return Err(McpError::Connect {
                 server: name.to_string(),
@@ -128,7 +128,7 @@ impl McpRegistry {
         Ok((config, old_conn))
     }
 
-    /// Repasse un serveur en `Disconnected` ; renvoie la connexion à fermer (si une).
+    /// Moves a server back to `Disconnected`; returns the connection to close (when there is one).
     pub fn begin_disconnect(&mut self, name: &str) -> Option<McpConnection> {
         let server = self.servers.get_mut(name)?;
         let config = server.config().clone();
@@ -138,9 +138,9 @@ impl McpRegistry {
         }
     }
 
-    /// Applique le succès d'une connexion. N'applique que si le serveur est
-    /// toujours `Connecting` (sinon l'utilisateur a déconnecté entre-temps : la
-    /// connexion est renvoyée à l'appelant pour fermeture).
+    /// Applies the success of a connection. Only applies when the server is
+    /// still `Connecting` (otherwise the user disconnected in the meantime: the
+    /// connection is returned to the caller for closing).
     #[must_use = "the returned connection must be closed (cancel)"]
     pub fn finish_connect(
         &mut self,
@@ -162,8 +162,8 @@ impl McpRegistry {
         }
     }
 
-    /// Marque un serveur `Failed` (spawn ou handshake échoué). Sans effet si le
-    /// serveur n'est plus `Connecting`.
+    /// Marks a server `Failed` (spawn or handshake failed). No effect when the
+    /// server is no longer `Connecting`.
     pub fn fail(&mut self, name: &str, error: String) {
         if let Some(server @ McpServer::Connecting { .. }) = self.servers.get_mut(name) {
             let config = server.config().clone();
@@ -200,10 +200,10 @@ mod tests {
     #[test]
     fn begin_connect_rejects_when_already_connecting() {
         let mut reg = registry_with("srv");
-        // 1er begin_connect : Disconnected → Connecting, aucune connexion précédente.
+        // 1st begin_connect: Disconnected -> Connecting, no previous connection.
         let (_cfg, old) = reg.begin_connect("srv").unwrap();
         assert!(old.is_none());
-        // 2e pendant Connecting → refusé (évite un double-spawn de process).
+        // 2nd one during Connecting -> refused (avoids a double process spawn).
         assert!(reg.begin_connect("srv").is_err());
     }
 
@@ -217,9 +217,9 @@ mod tests {
     fn begin_disconnect_resets_and_unblocks_connect() {
         let mut reg = registry_with("srv");
         reg.begin_connect("srv").unwrap();
-        // En Connecting (pas Connected) → pas de connexion à fermer.
+        // In Connecting (not Connected) -> no connection to close.
         assert!(reg.begin_disconnect("srv").is_none());
-        // Retour Disconnected → begin_connect remarche.
+        // Back to Disconnected -> begin_connect works again.
         assert!(reg.begin_connect("srv").is_ok());
     }
 }

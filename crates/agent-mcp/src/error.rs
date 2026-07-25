@@ -1,9 +1,9 @@
-//! Erreurs de la couche MCP : configuration, démarrage et connexion d'un serveur.
+//! Errors of the MCP layer: configuration, startup and connection of a server.
 
 use std::path::PathBuf;
 
-/// Erreur de chargement de config ou de connexion à un serveur MCP. Le message
-/// (Display) inline la cause — suffisant pour l'affichage TUI.
+/// Error while loading the config or connecting to an MCP server. The message
+/// (Display) inlines the cause, which is enough for the TUI display.
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
     #[error("lecture de {0} : {1}")]

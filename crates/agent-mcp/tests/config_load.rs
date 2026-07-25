@@ -1,13 +1,13 @@
-//! Tests d'intégration du chargement de `.mcp.json` (API publique
-//! `McpConfigFile::load`). Vérifie la tolérance aux serveurs non-stdio.
+//! Integration tests of the `.mcp.json` loading (public API
+//! `McpConfigFile::load`). Checks the tolerance to non-stdio servers.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::PathBuf;
 
 use agent_mcp::{McpConfigFile, McpConfigIssueKind, McpConfigOrigin};
 
-/// Dossier temporaire unique pour un test (sans dépendance externe). Nettoyé en
-/// début ET fin de test.
+/// Unique temporary directory for a test (without an external dependency). Cleaned at
+/// the START AND the end of the test.
 fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("pyxis-mcp-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -63,7 +63,7 @@ fn remote_server_without_command_is_skipped_not_fatal() {
     )
     .unwrap();
     let cfg = McpConfigFile::load(&dir).unwrap();
-    // Le serveur stdio est gardé, le remote (sans `command`) est ignoré sans erreur.
+    // The stdio server is kept, the remote one (without `command`) is ignored without an error.
     assert_eq!(cfg.servers.len(), 1);
     assert!(cfg.servers.contains_key("stdio-ok"));
     assert_eq!(cfg.skipped, 1);
@@ -143,8 +143,8 @@ fn malformed_json_is_an_error() {
 fn load_claude_extracts_user_scope_mcpservers_only() {
     let dir = temp_dir("claude");
     let path = dir.join("claude.json");
-    // Forme réelle de ~/.claude.json : plein de clés annexes + mcpServers user-scope
-    // + un scope projet imbriqué (qu'on ne doit PAS lire).
+    // Real shape of ~/.claude.json: plenty of unrelated keys + user-scope mcpServers
+    // + a nested project scope (that we must NOT read).
     std::fs::write(
         &path,
         r#"{
@@ -159,8 +159,8 @@ fn load_claude_extracts_user_scope_mcpservers_only() {
     )
     .unwrap();
     let cfg = McpConfigFile::load_claude(&path).unwrap();
-    // user-scope uniquement : exa gardé, remote (sans command) skippé, neon
-    // (project-scope) ignoré, clés annexes ignorées.
+    // user scope only: exa kept, remote (without command) skipped, neon
+    // (project scope) ignored, unrelated keys ignored.
     assert_eq!(cfg.servers.len(), 1);
     assert!(cfg.servers.contains_key("exa"));
     assert!(!cfg.servers.contains_key("neon"));
@@ -176,9 +176,9 @@ fn load_claude_extracts_user_scope_mcpservers_only() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Smoke local : vérifie que le vrai `~/.claude.json` de la machine parse et
-/// expose des serveurs. Ignoré par défaut (dépend de l'environnement) ; lancer
-/// avec `cargo test -p agent-mcp -- --ignored --nocapture`.
+/// Local smoke test: checks that the machine's real `~/.claude.json` parses and
+/// exposes servers. Ignored by default (environment-dependent); run it
+/// with `cargo test -p agent-mcp -- --ignored --nocapture`.
 #[test]
 #[ignore = "smoke local : dépend de ~/.claude.json réel"]
 fn smoke_real_claude_json() {
