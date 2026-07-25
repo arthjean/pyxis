@@ -8,9 +8,13 @@ This file is the short source of truth after ADR-11. When it conflicts with hist
 - Provider: one wired adapter, `OpenAiChatGpt`, using the ChatGPT subscription channel through the Codex backend.
 - Auth: OAuth PKCE flow and refresh-token rotation for the ChatGPT subscription, stored in the OS keyring.
 - Tools: `read`, `glob`, `grep`, `write`, `edit`, and `bash`, with fail-closed tool metadata, permissions, taint propagation, and concurrent read dispatch.
-- Sandbox: Linux Landlock filesystem confinement for the process tree, plus a cooperative local HTTP(S) proxy for subprocesses that honor `HTTP(S)_PROXY`.
+- Sandbox: Linux Landlock filesystem confinement for the process tree, plus a cooperative local HTTP(S) proxy for subprocesses that honor `HTTP(S)_PROXY`. Writable roots cover the workspace, the temporary directory, and any extra roots declared in `writable_roots` of `~/.pyxis/settings.toml`; a root pointing at `/` or at the whole home is refused.
 - MCP: config loading, lifecycle state, stdio client plumbing, and tool listing. MCP tools are not yet exposed as callable model tools.
 - Docs rename: `pyxis` is the public command and repo name. Internal crates still use `agent-*`.
+- Composer: multi-line input (Alt+Enter, Ctrl+J, Shift+Enter where the terminal reports it), wrapped rendering with a 10-line cap and vertical scrolling, and large pastes collapsed to a `[collage : N lignes]` summary that expands to the full content on submit. Delivered by EP-003 of `tasks/prd-harness-parity.md`; `crates/agent-tui/src/composer.rs` holds the wrap and cursor mapping.
+- Configuration: TOML parsed by the reference library, with precedence defaults < `~/.pyxis/settings.toml` < `<workspace>/.pyxis/config.toml` < environment < command line. The project file cannot set `permission_mode`, `writable_roots` or `hooks`; those keys are dropped with a warning. An invalid file names its line and key and starts on defaults instead of failing. Both modes read the configuration, so a global `permission_mode` now applies to `-p` as well, announced on stderr when it widens the headless default. Delivered by US-016 of `tasks/prd-harness-parity.md`.
+- Machine output: `pyxis -p --output-format json` writes one JSON event per line, each carrying a schema version, ending with a `run_summary` line (session id, model turns, cumulative tokens, end cause, exit code). Schema in `docs/EVENT_SCHEMA.md`; the default text output is unchanged. Delivered by US-017.
+- Turn diff: every turn exposes an aggregated diff of the files it touched, including files written by a `bash` command rather than by an edit tool, as the structured `AgentEvent::TurnDiff`. Rendered as a one-line summary in the TUI, emitted as `turn_diff` in the JSONL stream. Delivered by US-018; `crates/agent-tools/src/turn_diff.rs`.
 
 ## Deferred
 
@@ -26,6 +30,8 @@ This file is the short source of truth after ADR-11. When it conflicts with hist
 - The `originator=pyxis` rename validation still needs a live post-rename check against the ChatGPT backend.
 - Network control is proxy-based and cooperative. It helps for HTTP(S) subprocesses, but it is not a kernel-level network sandbox and does not block raw sockets by itself.
 - Linux is the only supported sandbox target today. Off-Linux filesystem confinement degrades explicitly.
+- Deferred-execution subpaths (`.git/` as a whole, which covers `hooks/`, `config`, and the worktree `gitdir:` pointer file, plus `.pyxis/`) are refused by the `write` and `edit` tools, before any permission decision, including through a symlink. That protection does **not** cover `bash`: Landlock rules are additive, so a write right granted on the workspace cannot be subtracted for a subpath, and a shell command can still write there. Closing that hole would mean changing the whole sandbox strategy, not patching a rule (US-013 of `tasks/prd-harness-parity.md`). That includes `.pyxis/config.toml`: a `bash` command can write the project configuration that the next launch reads, which is why no security key is ever honored from that file (US-016).
+- The aggregated turn diff is scoped to what git reports as different from `HEAD`, untracked files included and ignored files excluded. In a directory that is not a git repository the turn diff is always empty. That is a deliberate answer to an open question of `tasks/prd-harness-parity.md`: fingerprinting the whole workspace would cost seconds per turn on a large repo, and watching the filesystem would add a dependency.
 
 ## Status Reconciliation (2026-07-25)
 
