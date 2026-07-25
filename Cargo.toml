@@ -1,5 +1,5 @@
-# Workspace MVP (Phase 1). Les spikes Phase 0 vivent dans `spikes/` (workspace
-# séparé, jetable) et sont exclus ici. Crates internes nommées `agent-*` (ADR-8).
+# MVP workspace (Phase 1). The Phase 0 spikes live in `spikes/` (separate,
+# throwaway workspace) and are excluded here. Internal crates named `agent-*` (ADR-8).
 [workspace]
 resolver = "3"
 members = ["crates/*"]
@@ -11,8 +11,8 @@ rust-version = "1.95"
 publish = false
 license = "GPL-3.0-or-later"
 
-# Lints clippy obligatoires (mandat global). panic/unimplemented/dbg = deny ;
-# unwrap/expect = warn (jamais deny, cf. CLAUDE.md / tokio #3887).
+# Mandatory clippy lints (global mandate). panic/unimplemented/dbg = deny;
+# unwrap/expect = warn (never deny, see CLAUDE.md / tokio #3887).
 [workspace.lints.clippy]
 panic = "deny"
 unimplemented = "deny"
@@ -43,46 +43,46 @@ async-trait = "0.1"
 async-stream = "0.3"
 futures-util = "0.3"
 eventsource-stream = "0.2"
-# outils FS (Glob/Grep) — standards, légers, déjà en cache registry.
+# FS tools (Glob/Grep): standard, lightweight, already in the registry cache.
 regex = "1"
 globset = "0.4"
 walkdir = "2"
-# frontend terminal (US-019) + sandbox (US-020). `unstable-rendered-line-info` :
-# expose `Paragraph::line_count` pour borner le scroll au nombre de lignes APRÈS
-# wrap (sinon impossible de remonter tout en haut quand des lignes wrappent).
+# terminal frontend (US-019) + sandbox (US-020). `unstable-rendered-line-info`:
+# exposes `Paragraph::line_count` to bound the scroll to the number of lines AFTER
+# wrapping (otherwise it is impossible to scroll all the way up when lines wrap).
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = { version = "0.28", features = ["bracketed-paste"] }
-# rendu markdown des réponses (CommonMark + GFM) → spans ratatui.
+# markdown rendering of the replies (CommonMark + GFM) -> ratatui spans.
 pulldown-cmark = { version = "0.12", default-features = false }
 unicode-width = "0.2"
 unicode-segmentation = "1"
-# diff inline des éditions (EP-011) : lignes + emphase intra-ligne (word-diff). La
-# feature `inline` expose `iter_inline_changes` ; `unicode` aligne la segmentation
-# des mots sur les graphèmes.
+# inline diff of the edits (EP-011): lines + intra-line emphasis (word-diff). The
+# `inline` feature exposes `iter_inline_changes`; `unicode` aligns the word
+# segmentation on graphemes.
 similar = { version = "2", features = ["inline", "unicode"] }
-# coloration syntaxique des code-blocks et diffs (EP-012, US-040/042). `default-fancy`
-# = grammaires/thèmes Sublime embarqués via `fancy-regex` (PUR RUST, aucune toolchain
-# C : pas d'oniguruma) → binaire distribuable. La coloration ne tourne JAMAIS par
-# frame (cache US-041). `two-face` comble les grammaires manquantes de syntect (TS,
-# TOML…) avec le set curé de `bat` ; `syntect-default-fancy` garde le backend fancy
-# (onig hors du dependency tree, vérifié au `cargo tree`).
+# syntax coloring of code blocks and diffs (EP-012, US-040/042). `default-fancy`
+# = Sublime grammars/themes embedded through `fancy-regex` (PURE RUST, no C
+# toolchain: no oniguruma) -> distributable binary. Coloring NEVER runs per
+# frame (US-041 cache). `two-face` fills the grammars missing from syntect (TS,
+# TOML, ...) with the curated `bat` set; `syntect-default-fancy` keeps the fancy backend
+# (onig out of the dependency tree, checked with `cargo tree`).
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-default-fancy"] }
 landlock = "0.4"
 anyhow = "1"
-# configuration déclarative (US-016) : parseur TOML de référence (toml-rs), en
-# remplacement du découpage textuel maison `parse_tomlish_string`. Lecture seule
-# (`toml::Table` + serde) : l'écriture des réglages reste un upsert de ligne, qui
-# préserve les commentaires sans faire entrer `toml_edit` dans le graphe.
+# declarative configuration (US-016): reference TOML parser (toml-rs), replacing
+# the in-house text splitting of `parse_tomlish_string`. Read only
+# (`toml::Table` + serde): writing the settings stays a line upsert, which
+# preserves the comments without pulling `toml_edit` into the graph.
 toml = "1"
-# snapshots de rendu terminal (US-005) : DEV-ONLY. Déclaré ici pour la version
-# unique du workspace, mais réservé aux `[dev-dependencies]` — jamais dans le
-# graphe du binaire `pyxis` distribué.
+# terminal rendering snapshots (US-005): DEV-ONLY. Declared here for the single
+# workspace version, but reserved for `[dev-dependencies]`, never in the
+# graph of the distributed `pyxis` binary.
 insta = "1"
-# MCP (ARCHITECTURE §6) : SDK Rust officiel. Client stdio uniquement au départ
-# (transport-child-process) ; SSE/HTTP + OAuth = Phase 2.
+# MCP (ARCHITECTURE 6): official Rust SDK. stdio client only at first
+# (transport-child-process); SSE/HTTP + OAuth = Phase 2.
 rmcp = { version = "1.7.0", default-features = false, features = ["client", "transport-child-process"] }
-# crates internes
+# internal crates
 agent-tokenizer = { path = "crates/agent-tokenizer" }
 agent-mcp = { path = "crates/agent-mcp" }
 agent-core = { path = "crates/agent-core" }
