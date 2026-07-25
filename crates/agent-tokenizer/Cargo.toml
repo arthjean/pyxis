@@ -9,8 +9,8 @@ publish = false
 [lints]
 workspace = true
 
-# Headless : aucune dépendance TUI/HTTP (invariant 1). tiktoken-rs derrière un
-# feature pour garder le build léger ; l'heuristique suffit au seuil de compaction.
+# Headless: no TUI/HTTP dependency (invariant 1). tiktoken-rs behind a
+# feature to keep the build light; the heuristic is enough for the compaction threshold.
 [features]
 default = []
 tiktoken = ["dep:tiktoken-rs"]

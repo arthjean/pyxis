@@ -1,24 +1,24 @@
-//! `agent-tokenizer` — comptage de tokens local. Headless (aucune dépendance
-//! TUI/HTTP). Indispensable au fallback de `ContextBudget` quand le provider
-//! n'émet pas d'`usage` en stream (cf. ARCHITECTURE §3.3 / PROVIDERS §4.3) et de
-//! l'estimation pré-tour des budgets (US-014).
+//! `agent-tokenizer`: local token counting. Headless (no TUI/HTTP
+//! dependency). Indispensable to the `ContextBudget` fallback when the provider
+//! emits no `usage` in the stream (see ARCHITECTURE 3.3 / PROVIDERS 4.3) and to
+//! the pre-turn budget estimate (US-014).
 //!
-//! Le défaut est une **heuristique** (≈ 1 token / 4 octets) : suffisant pour un
-//! *seuil* de compaction (on n'a pas besoin du compte exact, juste d'un signal
-//! monotone). Un compteur exact tiktoken-rs est disponible derrière le feature
-//! `tiktoken`.
+//! The default is a **heuristic** (roughly 1 token / 4 bytes): enough for a
+//! compaction *threshold* (we do not need the exact count, only a monotonic
+//! signal). An exact tiktoken-rs counter is available behind the `tiktoken`
+//! feature.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-/// Compte des tokens à partir de texte brut. `Send + Sync` pour être injecté
-/// comme `dyn TokenCounter` dans les `Deps` d'`agent-core`.
+/// Counts tokens from raw text. `Send + Sync` so it can be injected
+/// as a `dyn TokenCounter` into the `Deps` of `agent-core`.
 pub trait TokenCounter: Send + Sync {
-    /// Estime le nombre de tokens d'un fragment de texte.
+    /// Estimates the number of tokens of a text fragment.
     fn count_text(&self, text: &str) -> usize;
 }
 
-/// Heuristique sans dépendance : ~1 token pour 4 octets UTF-8, plancher à 1 si
-/// non vide. Volontairement conservatrice (sur-estime un peu) pour déclencher la
-/// compaction *avant* la limite réelle plutôt qu'après.
+/// Dependency-free heuristic: ~1 token per 4 UTF-8 bytes, floored at 1 when
+/// non-empty. Deliberately conservative (slightly overestimates) to trigger
+/// compaction *before* the real limit rather than after.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct HeuristicCounter;
 
@@ -27,14 +27,14 @@ impl TokenCounter for HeuristicCounter {
         if text.is_empty() {
             return 0;
         }
-        // div_ceil : tout texte non vide vaut au moins 1 token.
+        // div_ceil: any non-empty text is worth at least 1 token.
         text.len().div_ceil(4)
     }
 }
 
-/// Compteur exact basé sur tiktoken-rs (BPE `cl100k_base`/`o200k_base`).
-/// Disponible derrière le feature `tiktoken`. Pour les modèles non-OpenAI, c'est
-/// une approximation raisonnable (meilleure que l'heuristique) du seuil.
+/// Exact counter based on tiktoken-rs (BPE `cl100k_base`/`o200k_base`).
+/// Available behind the `tiktoken` feature. For non-OpenAI models, it is
+/// a reasonable approximation (better than the heuristic) of the threshold.
 #[cfg(feature = "tiktoken")]
 pub struct TiktokenCounter {
     bpe: tiktoken_rs::CoreBPE,
@@ -42,8 +42,8 @@ pub struct TiktokenCounter {
 
 #[cfg(feature = "tiktoken")]
 impl TiktokenCounter {
-    /// Construit un compteur `o200k_base` (modèles récents). Faillible : retombe
-    /// sur l'heuristique en cas d'échec d'init côté appelant.
+    /// Builds an `o200k_base` counter (recent models). Fallible: falls back
+    /// on the heuristic when init fails on the caller side.
     pub fn o200k() -> Result<Self, anyhow::Error> {
         Ok(Self {
             bpe: tiktoken_rs::o200k_base()?,
@@ -69,7 +69,7 @@ mod tests {
         assert_eq!(c.count_text("a"), 1);
         assert_eq!(c.count_text("abcd"), 1);
         assert_eq!(c.count_text("abcde"), 2);
-        // monotone : plus de texte ⇒ ≥ de tokens
+        // monotonic: more text means at least as many tokens
         assert!(c.count_text("hello world hello world") > c.count_text("hello"));
     }
 
