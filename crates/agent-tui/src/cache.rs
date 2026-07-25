@@ -1,17 +1,17 @@
-//! Cache des lignes stylées par bloc (US-041). Le rendu (`render.rs`) reconstruit
-//! TOUT le transcript à chaque frame (modèle viewport + scroll interne, pas
-//! d'`insert_before`). Sans cache, chaque frame re-parse le markdown ET re-colore
-//! la syntaxe : coûteux et inutile (cf. opencode #811 : 25-30 % CPU idle sur un
-//! re-render par timer). Ce cache mémoïse les `Vec<Line>` déjà « baked » par bloc
-//! et ne laisse reconstruire que le bloc qui a changé (typiquement le dernier, en
-//! cours de stream).
+//! Cache of styled lines per block (US-041). Rendering (`render.rs`) rebuilds
+//! the WHOLE transcript on every frame (viewport model + internal scroll, no
+//! `insert_before`). Without a cache, each frame re-parses the markdown AND re-colors
+//! the syntax: expensive and pointless (see opencode #811: 25-30% idle CPU on a
+//! timer-driven re-render). This cache memoizes the already "baked" `Vec<Line>` per block
+//! and only lets the block that changed be rebuilt (typically the last one, being
+//! streamed).
 //!
-//! Invalidation : une empreinte `u64` par bloc (contenu + `is_last`, qui pilote
-//! l'aperçu du raisonnement en cours + l'appel apparié d'un résultat, dont dérivent
-//! le résumé `⎿` et le diff) ; un garde au niveau cache sur `(largeur, truecolor)`
-//! vide tout au resize (reflow) ou au changement de palette. `render` reste PUR :
-//! le cache est en interior mutability (même patron que `scroll_max: Cell`), sans
-//! aucune I/O et déterministe → toujours testable via `TestBackend`.
+//! Invalidation: one `u64` fingerprint per block (content + `is_last`, which drives
+//! the preview of the reasoning in progress + the paired call of a result, from which
+//! the `⎿` summary and the diff derive); a cache-level guard on `(width, truecolor)`
+//! clears everything on resize (reflow) or on a palette change. `render` stays PURE:
+//! the cache uses interior mutability (same pattern as `scroll_max: Cell`), without
+//! any I/O and deterministic -> always testable through `TestBackend`.
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -22,30 +22,30 @@ use serde_json::Value;
 
 use crate::state::Block;
 
-/// Une entrée de cache : l'empreinte du bloc tel que rendu + ses lignes stylées.
-/// `fp == None` = slot vierge (jamais construit, ou invalidé par un resize).
+/// A cache entry: the fingerprint of the block as rendered + its styled lines.
+/// `fp == None` = blank slot (never built, or invalidated by a resize).
 #[derive(Clone, Default)]
 struct Slot {
     fp: Option<u64>,
     lines: Vec<Line<'static>>,
 }
 
-/// Cache de rendu du transcript, aligné par index de bloc.
+/// Transcript rendering cache, aligned by block index.
 #[derive(Clone, Default)]
 pub(crate) struct RenderCache {
     width: usize,
     truecolor: bool,
     ready: bool,
     slots: Vec<Slot>,
-    /// Reconstructions de la dernière passe (instrumentation / tests) : 0 = tout
-    /// servi depuis le cache.
+    /// Rebuilds of the last pass (instrumentation / tests): 0 = everything
+    /// served from the cache.
     rebuilds: usize,
 }
 
 impl RenderCache {
-    /// Prépare le cache pour une frame de `n` blocs à `(width, truecolor)` donnés :
-    /// invalide tout si une dimension a changé (reflow / palette), aligne le nombre
-    /// de slots sur `n`, et remet le compteur de reconstructions à 0.
+    /// Prepares the cache for a frame of `n` blocks at the given `(width, truecolor)`:
+    /// invalidates everything when a dimension changed (reflow / palette), aligns the number
+    /// of slots on `n`, and resets the rebuild counter to 0.
     pub(crate) fn begin(&mut self, width: usize, truecolor: bool, n: usize) {
         if !self.ready || self.width != width || self.truecolor != truecolor {
             self.slots.clear();
@@ -57,9 +57,9 @@ impl RenderCache {
         self.rebuilds = 0;
     }
 
-    /// Lignes du bloc `i` : depuis le cache si l'empreinte `fp` correspond, sinon
-    /// (re)construites par `build` puis mémoïsées. `begin` doit avoir dimensionné le
-    /// cache à au moins `i + 1` slots.
+    /// Lines of block `i`: from the cache when the `fp` fingerprint matches, otherwise
+    /// (re)built by `build` then memoized. `begin` must have sized the
+    /// cache to at least `i + 1` slots.
     pub(crate) fn block_lines(
         &mut self,
         i: usize,
@@ -79,16 +79,16 @@ impl RenderCache {
         &self.slots[i].lines
     }
 
-    /// Nombre de blocs reconstruits lors de la dernière passe (0 = 100 % cache hit).
+    /// Number of blocks rebuilt during the last pass (0 = 100% cache hit).
     pub(crate) fn rebuilds(&self) -> usize {
         self.rebuilds
     }
 }
 
-/// Empreinte d'un bloc tel qu'il sera rendu. Couvre tout ce que `push_block` lit :
-/// le contenu du bloc, `is_last` (aperçu du raisonnement en cours), et — pour un
-/// résultat d'outil — l'appel apparié (le résumé `⎿` et le diff inline en dérivent).
-/// Un changement d'un seul de ces facteurs change l'empreinte → reconstruction.
+/// Fingerprint of a block as it will be rendered. Covers everything `push_block` reads:
+/// the block content, `is_last` (preview of the reasoning in progress), and, for a
+/// tool result, the paired call (the `⎿` summary and the inline diff derive from it).
+/// A change in any single one of these factors changes the fingerprint -> rebuild.
 pub(crate) fn fingerprint(
     block: &Block,
     is_last: bool,
@@ -108,7 +108,7 @@ pub(crate) fn fingerprint(
         Block::Reasoning(t) => {
             2u8.hash(&mut h);
             t.hash(&mut h);
-            // L'aperçu des dernières lignes n'apparaît que sur le dernier bloc.
+            // The preview of the last lines only appears on the last block.
             is_last.hash(&mut h);
         }
         Block::ToolCall {
@@ -129,11 +129,11 @@ pub(crate) fn fingerprint(
             content.hash(&mut h);
             is_error.hash(&mut h);
             error_kind.hash(&mut h);
-            // Pas (encore) lu par `push_block`, mais inclus pour que l'invariant
-            // « l'empreinte couvre tout l'état du bloc » survive à un futur badge.
+            // Not read by `push_block` (yet), but included so that the invariant
+            // "the fingerprint covers the whole block state" survives a future badge.
             untrusted.hash(&mut h);
-            // Le résumé `⎿` et le diff dérivent de l'appel apparié : un id orphelin
-            // (résultat sans call) dégrade en empreinte sur l'id seul.
+            // The `⎿` summary and the diff derive from the paired call: an orphan id
+            // (result without a call) degrades to a fingerprint on the id alone.
             match calls.get(call_id.as_str()) {
                 Some((name, _, input_hash)) => {
                     name.hash(&mut h);
@@ -160,9 +160,9 @@ pub(crate) fn value_hash(v: &Value) -> u64 {
     h.finish()
 }
 
-/// Hash récursif d'un `serde_json::Value` SANS le sérialiser (évite une allocation
-/// par frame). L'ordre des clés d'objet est déterministe (map interne ordonnée de
-/// serde_json), donc l'empreinte est stable d'une frame à l'autre.
+/// Recursive hash of a `serde_json::Value` WITHOUT serializing it (avoids one allocation
+/// per frame). The order of object keys is deterministic (ordered internal map of
+/// serde_json), so the fingerprint is stable from one frame to the next.
 fn hash_value(v: &Value, h: &mut impl Hasher) {
     match v {
         Value::Null => 0u8.hash(h),
@@ -219,7 +219,7 @@ mod tests {
             fingerprint(&b, false, &calls())
         );
 
-        // Le texte change → empreinte différente.
+        // The text changes -> different fingerprint.
         let c = Block::Assistant {
             text: "hello!".into(),
             streaming: false,
@@ -229,7 +229,7 @@ mod tests {
             fingerprint(&c, false, &calls())
         );
 
-        // Le flag streaming compte (finalize_streaming doit invalider).
+        // The streaming flag counts (finalize_streaming must invalidate).
         let d = Block::Assistant {
             text: "hello".into(),
             streaming: true,
@@ -262,7 +262,7 @@ mod tests {
             is_error: false,
             error_kind: None,
         };
-        // Avec vs sans l'appel apparié → empreintes différentes (le diff en dépend).
+        // With vs without the paired call -> different fingerprints (the diff depends on it).
         assert_ne!(
             fingerprint(&res, false, &with_call),
             fingerprint(&res, false, &calls())
@@ -281,7 +281,7 @@ mod tests {
         ];
         let build = |_i: usize| vec![Line::from("x")];
 
-        // 1re passe : tout est reconstruit.
+        // 1st pass: everything is rebuilt.
         cache.begin(80, true, blocks.len());
         for (i, b) in blocks.iter().enumerate() {
             let fp = fingerprint(b, i == blocks.len() - 1, &calls());
@@ -289,7 +289,7 @@ mod tests {
         }
         assert_eq!(cache.rebuilds(), 2);
 
-        // 2e passe identique : 0 reconstruction (100 % cache hit).
+        // Identical 2nd pass: 0 rebuild (100% cache hit).
         cache.begin(80, true, blocks.len());
         for (i, b) in blocks.iter().enumerate() {
             let fp = fingerprint(b, i == blocks.len() - 1, &calls());
@@ -297,7 +297,7 @@ mod tests {
         }
         assert_eq!(cache.rebuilds(), 0);
 
-        // Le dernier bloc change (token de stream) : une seule reconstruction.
+        // The last block changes (stream token): a single rebuild.
         let blocks2 = [
             Block::User("hi".into()),
             Block::Assistant {
@@ -322,12 +322,12 @@ mod tests {
         let _ = cache.block_lines(0, fp, || vec![Line::from("x")]);
         assert_eq!(cache.rebuilds(), 1);
 
-        // Largeur différente → reflow → tout invalidé même à contenu identique.
+        // Different width -> reflow -> everything invalidated even with identical content.
         cache.begin(40, true, 1);
         let _ = cache.block_lines(0, fp, || vec![Line::from("x")]);
         assert_eq!(cache.rebuilds(), 1);
 
-        // Perte du truecolor → palette différente → invalidation également.
+        // Loss of truecolor -> different palette -> invalidation as well.
         cache.begin(40, false, 1);
         let _ = cache.block_lines(0, fp, || vec![Line::from("x")]);
         assert_eq!(cache.rebuilds(), 1);

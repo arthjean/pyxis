@@ -1,27 +1,27 @@
-//! Banc d'essai de logos cosmiques pour Pyxis : rend plusieurs concepts en ANSI
-//! truecolor pour choisir sur pièce. `cargo run -p agent-tui --example logo_lab`.
-//! Aucun n'est encore câblé dans la TUI — c'est exploratoire. Le gagnant sera
-//! porté dans `render.rs` (générateur géométrique → demi-blocs bi-color).
+//! Test bench of cosmic logos for Pyxis: renders several concepts in truecolor
+//! ANSI to pick one for real. `cargo run -p agent-tui --example logo_lab`.
+//! None is wired into the TUI yet: this is exploratory. The winner will be
+//! ported into `render.rs` (geometric generator -> bi-color half-blocks).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
-/// Côté de la grille en pixels (→ N/2 cellules de haut une fois empilé).
+/// Side of the grid in pixels (-> N/2 cells tall once stacked).
 const N: usize = 24;
 
-/// Grille d'intensités 0.0 (vide) .. 1.0 (cœur le plus brillant).
+/// Grid of intensities 0.0 (empty) .. 1.0 (brightest core).
 type Grid = Vec<Vec<f32>>;
 
 fn blank() -> Grid {
     vec![vec![0.0; N]; N]
 }
 
-/// Galaxie spirale : noyau gaussien brillant + deux bras logarithmiques qui
-/// s'estompent vers la lisière.
+/// Spiral galaxy: bright gaussian nucleus + two logarithmic arms fading
+/// toward the rim.
 fn galaxy() -> Grid {
     let mut g = blank();
     let c = (N as f32 - 1.0) / 2.0;
-    let k = 2.3; // serrage des bras
+    let k = 2.3; // arm tightness
     for (y, row) in g.iter_mut().enumerate() {
         for (x, cell) in row.iter_mut().enumerate() {
             let dx = x as f32 - c;
@@ -38,7 +38,7 @@ fn galaxy() -> Grid {
                     if dphase > PI {
                         dphase -= TAU;
                     }
-                    let width = 0.42 + 0.40 * rn; // les bras s'élargissent en sortant
+                    let width = 0.42 + 0.40 * rn; // the arms widen going outward
                     let along = (-(dphase / width).powi(2)).exp();
                     let radial = (-(rn / 0.62).powi(2)).exp() * (rn * 3.2).min(1.0);
                     arm = arm.max(along * radial);
@@ -50,12 +50,12 @@ fn galaxy() -> Grid {
     g
 }
 
-/// Pulsar : étoile à neutrons (point très brillant) émettant deux faisceaux
-/// opposés inclinés (le phare de l'univers).
+/// Pulsar: neutron star (very bright point) emitting two opposite tilted
+/// beams (the lighthouse of the universe).
 fn pulsar() -> Grid {
     let mut g = blank();
     let c = (N as f32 - 1.0) / 2.0;
-    let axis = FRAC_PI_2 + 0.5; // axe magnétique incliné
+    let axis = FRAC_PI_2 + 0.5; // tilted magnetic axis
     for (y, row) in g.iter_mut().enumerate() {
         for (x, cell) in row.iter_mut().enumerate() {
             let dx = x as f32 - c;
@@ -81,7 +81,7 @@ fn pulsar() -> Grid {
     g
 }
 
-/// Supernova : cœur incandescent + rayons en étoile + coquille de choc.
+/// Supernova: incandescent core + star-shaped rays + shock shell.
 fn supernova() -> Grid {
     let mut g = blank();
     let c = (N as f32 - 1.0) / 2.0;
@@ -108,8 +108,8 @@ fn supernova() -> Grid {
     g
 }
 
-/// Onde gravitationnelle : anneaux concentriques nets s'estompant en lisière
-/// (une présence qui se propage). Le plus abstrait.
+/// Gravitational wave: crisp concentric rings fading at the rim
+/// (a presence that propagates). The most abstract one.
 fn ripple() -> Grid {
     let mut g = blank();
     let c = (N as f32 - 1.0) / 2.0;
@@ -119,7 +119,7 @@ fn ripple() -> Grid {
             let dy = y as f32 - c;
             let rr = (dx * dx + dy * dy).sqrt();
             let rn = rr / c;
-            let phase = rn * 7.0 * PI; // ~3.5 anneaux sur le rayon
+            let phase = rn * 7.0 * PI; // ~3.5 rings over the radius
             let crest = (((phase).cos() + 1.0) / 2.0).powf(3.0);
             let fade = (-(rn / 0.82).powi(2)).exp();
             let core = (-(rn / 0.09).powi(2)).exp();
@@ -129,8 +129,8 @@ fn ripple() -> Grid {
     g
 }
 
-/// Saturne : disque planétaire + anneau elliptique incliné (la partie arrière de
-/// l'anneau est occultée par la planète).
+/// Saturn: planetary disk + tilted elliptical ring (the back part of
+/// the ring is occluded by the planet).
 fn saturn() -> Grid {
     let mut g = blank();
     let c = (N as f32 - 1.0) / 2.0;
@@ -142,12 +142,12 @@ fn saturn() -> Grid {
             let dy = y as f32 - c;
             let rn = (dx * dx + dy * dy).sqrt() / c;
             let planet = (-(rn / 0.34).powi(2)).exp();
-            // Coordonnées tournées puis aplaties → ellipse.
+            // Rotated then flattened coordinates -> ellipse.
             let u = dx * ct + dy * st;
             let v = -dx * st + dy * ct;
             let e = ((u / (0.98 * c)).powi(2) + (v / (0.30 * c)).powi(2)).sqrt();
             let ring = (-(((e - 0.82) / 0.14).powi(2))).exp();
-            // L'arrière de l'anneau (v < 0) est masqué dans la silhouette planétaire.
+            // The back of the ring (v < 0) is hidden in the planetary silhouette.
             let ring = if v < 0.0 && rn < 0.36 { 0.0 } else { ring };
             *cell = planet.max(ring * 0.9);
         }
@@ -155,13 +155,13 @@ fn saturn() -> Grid {
     g
 }
 
-/// Comète : tête brillante en haut à droite, traînée qui s'élargit et s'estompe
-/// vers le coin opposé.
+/// Comet: bright head at the top right, trail widening and fading
+/// toward the opposite corner.
 fn comet() -> Grid {
     let mut g = blank();
     let c = (N as f32 - 1.0) / 2.0;
-    let (hx, hy) = (c * 0.42, -c * 0.42); // position de la tête
-    let (mut ux, mut uy) = (-1.0_f32, 1.0_f32); // sens de la traînée
+    let (hx, hy) = (c * 0.42, -c * 0.42); // head position
+    let (mut ux, mut uy) = (-1.0_f32, 1.0_f32); // trail direction
     let dl = (ux * ux + uy * uy).sqrt();
     ux /= dl;
     uy /= dl;
@@ -169,7 +169,7 @@ fn comet() -> Grid {
         for (x, cell) in row.iter_mut().enumerate() {
             let rx = (x as f32 - c) - hx;
             let ry = (y as f32 - c) - hy;
-            let along = rx * ux + ry * uy; // > 0 derrière la tête (traînée)
+            let along = rx * ux + ry * uy; // > 0 behind the head (trail)
             let perp = (-rx * uy + ry * ux).abs();
             let head = (-((rx * rx + ry * ry).sqrt() / (0.16 * c)).powi(2)).exp();
             let tail = if along > 0.0 {
@@ -184,13 +184,13 @@ fn comet() -> Grid {
     g
 }
 
-/// Spirale d'or (nautilus) : une seule spirale logarithmique, noyau brillant,
-/// estompée vers la lisière. Plus épurée que la galaxie à deux bras.
+/// Golden spiral (nautilus): a single logarithmic spiral, bright nucleus,
+/// fading toward the rim. Sparer than the two-armed galaxy.
 fn nautilus() -> Grid {
     let mut g = blank();
     let c = (N as f32 - 1.0) / 2.0;
-    let a = 0.7; // rayon de départ
-    let k = 0.45; // croissance (plus grand = plus lâche)
+    let a = 0.7; // starting radius
+    let k = 0.45; // growth (larger = looser)
     for (y, row) in g.iter_mut().enumerate() {
         for (x, cell) in row.iter_mut().enumerate() {
             let dx = x as f32 - c;
@@ -217,7 +217,7 @@ fn nautilus() -> Grid {
     g
 }
 
-/// Distance d'un point au segment [a,b] (pixels).
+/// Distance from a point to the segment [a,b] (pixels).
 fn dist_point_seg(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     let (vx, vy) = (bx - ax, by - ay);
     let (wx, wy) = (px - ax, py - ay);
@@ -231,8 +231,8 @@ fn dist_point_seg(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     ((px - cx).powi(2) + (py - cy).powi(2)).sqrt()
 }
 
-/// Constellation : étoiles (gaussiennes brillantes) reliées par des filets ténus.
-/// Tracé abstrait, signable comme une marque.
+/// Constellation: stars (bright gaussians) linked by thin threads.
+/// Abstract drawing, signable as a mark.
 fn constellation() -> Grid {
     let mut g = blank();
     let c = (N as f32 - 1.0) / 2.0;
@@ -270,8 +270,8 @@ fn sharp(x: f32, p: i32) -> f32 {
     (((x + 1.0) / 2.0).clamp(0.0, 1.0)).powi(p)
 }
 
-/// Globe filaire : sphère en latitudes/longitudes, plus dense vers le limbe,
-/// halo de bord. Un monde.
+/// Wireframe globe: sphere in latitudes/longitudes, denser toward the limb,
+/// edge halo. A world.
 fn globe() -> Grid {
     let mut g = blank();
     let c = (N as f32 - 1.0) / 2.0;
@@ -289,7 +289,7 @@ fn globe() -> Grid {
             let lon = dx.atan2(z);
             let lat_lines = sharp((lat * 9.0).cos(), 14);
             let lon_lines = sharp((lon * 5.0).cos(), 14);
-            let depth = 0.35 + 0.65 * (z / radius); // estompe vers le limbe
+            let depth = 0.35 + 0.65 * (z / radius); // fades toward the limb
             let mesh = lat_lines.max(lon_lines) * depth;
             let rim = (-(((rr / radius - 0.97) / 0.05).powi(2))).exp() * 0.6;
             *cell = mesh.max(rim);
@@ -298,9 +298,9 @@ fn globe() -> Grid {
     g
 }
 
-/// Sphère de Dyson : étoile centrale enserrée dans une résille de panneaux
-/// (essaim incomplet, l'étoile flamboie par les panneaux manquants) + lueur de
-/// surface et liseré de silhouette. Mégastructure de type II (Kardashev).
+/// Dyson sphere: central star wrapped in a mesh of panels
+/// (incomplete swarm, the star blazing through the missing panels) + surface
+/// glow and silhouette rim. Type II megastructure (Kardashev).
 fn dyson() -> Grid {
     let mut g = blank();
     let c = (N as f32 - 1.0) / 2.0;
@@ -312,24 +312,24 @@ fn dyson() -> Grid {
             let rr = (dx * dx + dy * dy).sqrt();
             let rn = rr / c;
             if rr > radius {
-                // Au-delà de la coque : faible couronne stellaire.
+                // Beyond the shell: faint stellar corona.
                 *cell = (-(((rr - radius) / (0.12 * c)).powi(2))).exp() * 0.22;
                 continue;
             }
             let z = (radius * radius - dx * dx - dy * dy).max(0.0).sqrt();
-            let depth = z / radius; // 1 au centre, 0 au limbe
+            let depth = z / radius; // 1 at the center, 0 at the limb
             let lat = (dy / radius).clamp(-1.0, 1.0).asin();
             let lon = dx.atan2(z);
-            // Panneaux : un essaim incomplet, ~25 % manquants (motif déterministe).
+            // Panels: an incomplete swarm, ~25% missing (deterministic pattern).
             let pi = (lat * 8.0 / PI).floor() as i32;
             let pj = (lon * 8.0 / PI).floor() as i32;
             let missing = ((pi * 73 + pj * 131) & 7) < 2;
-            // Lumière de l'étoile transmise : pleine par les trous, atténuée par les panneaux.
+            // Transmitted starlight: full through the holes, attenuated by the panels.
             let star_broad = (-(rn / 0.55).powi(2)).exp();
             let star_core = (-(rn / 0.14).powi(2)).exp();
             let transmit = if missing { 0.95 } else { 0.30 };
             let glow = (star_broad * transmit).max(star_core * 0.6);
-            // Résille structurelle (poutres) + lueur de surface + liseré.
+            // Structural mesh (beams) + surface glow + rim.
             let seam = sharp((lat * 9.0).cos(), 12).max(sharp((lon * 7.0).cos(), 12))
                 * (0.45 + 0.55 * depth);
             let ambient = 0.09 * depth;
@@ -340,13 +340,13 @@ fn dyson() -> Grid {
     g
 }
 
-/// Sphère de Dyson, version minimaliste : un cœur net + deux anneaux fins de
-/// collecteurs inclinés, chacun avec une brèche (essaim en assemblage). Lignes
-/// fines, beaucoup de vide, aucun panneau.
+/// Dyson sphere, minimalist version: a crisp core + two thin tilted rings of
+/// collectors, each with a gap (swarm still assembling). Thin lines,
+/// lots of emptiness, no panel.
 fn dyson_min() -> Grid {
     let mut g = blank();
     let c = (N as f32 - 1.0) / 2.0;
-    // (inclinaison, ratio petit axe, début de brèche, fin de brèche) en radians.
+    // (tilt, minor axis ratio, gap start, gap end) in radians.
     let rings = [
         (0.50_f32, 0.30_f32, 1.1_f32, 2.3_f32),
         (-0.62, 0.26, 4.0, 5.0),
@@ -375,9 +375,9 @@ fn dyson_min() -> Grid {
     g
 }
 
-/// Champ continu (résolution-indépendant) du Dyson minimaliste, en coordonnées
-/// normalisées nx,ny ∈ [-1,1] (rayon 1 = bord). `line_w` = épaisseur des anneaux
-/// (plus grand = traits plus épais). Sert au rendu braille (stippling).
+/// Continuous (resolution-independent) field of the minimalist Dyson, in
+/// normalized coordinates nx,ny in [-1,1] (radius 1 = edge). `line_w` = ring thickness
+/// (larger = thicker strokes). Used by the braille rendering (stippling).
 fn dyson_min_at(nx: f32, ny: f32, line_w: f32, core_w: f32) -> f32 {
     let rn = (nx * nx + ny * ny).sqrt();
     let core = (-(rn / core_w).powi(2)).exp();
@@ -400,8 +400,8 @@ fn dyson_min_at(nx: f32, ny: f32, line_w: f32, core_w: f32) -> f32 {
     core.max(ring * 0.9)
 }
 
-/// Matrice de Bayer 4×4 (tramage ordonné) : convertit l'intensité en densité de
-/// points (le motif « plus ou moins resserré » façon Grok).
+/// 4x4 Bayer matrix (ordered dithering): converts intensity into dot
+/// density (the Grok-like "more or less packed" pattern).
 const BAYER4: [[f32; 4]; 4] = [
     [0.0, 8.0, 2.0, 10.0],
     [12.0, 4.0, 14.0, 6.0],
@@ -409,7 +409,7 @@ const BAYER4: [[f32; 4]; 4] = [
     [15.0, 7.0, 13.0, 5.0],
 ];
 
-/// Disposition des 8 points d'une cellule braille → bit (base U+2800).
+/// Layout of the 8 dots of a braille cell -> bit (base U+2800).
 const DOTS: [(usize, usize, u8); 8] = [
     (0, 0, 0x01),
     (0, 1, 0x02),
@@ -421,10 +421,10 @@ const DOTS: [(usize, usize, u8); 8] = [
     (1, 3, 0x80),
 ];
 
-/// Rend un champ en points braille tramés : `cols × rows` cellules, chacune
-/// échantillonnée sur 2×4 sous-points. La densité des points suit l'intensité,
-/// boostée par `gamma` (< 1 = bords plus fournis, plus dense ; le fond vrai reste
-/// vide car 0^gamma = 0). Monochrome : gris fonction du pic de la cellule.
+/// Renders a field as dithered braille dots: `cols x rows` cells, each
+/// sampled over 2x4 subdots. Dot density follows the intensity,
+/// boosted by `gamma` (< 1 = richer edges, denser; the true background stays
+/// empty since 0^gamma = 0). Monochrome: grey depending on the cell peak.
 fn render_braille(
     name: &str,
     cols: usize,
@@ -433,7 +433,7 @@ fn render_braille(
     gamma: f32,
     f: impl Fn(f32, f32) -> f32,
 ) {
-    let (sw, sh) = (cols * 2, rows * 4); // sous-grille (carrée si cols = 2·rows)
+    let (sw, sh) = (cols * 2, rows * 4); // subgrid (square when cols = 2*rows)
     println!("\n  ◆ {name}");
     let mut cur = 0u8;
     for cy in 0..rows {
@@ -461,7 +461,7 @@ fn render_braille(
                 line.push(' ');
                 continue;
             }
-            // Gris dans une bande médiane (ni trop sombre, ni blanc pur).
+            // Grey in a middle band (neither too dark, nor pure white).
             let v = lerp(0x6a, 0xde, peak.clamp(0.0, 1.0));
             if !have || cur != v {
                 line.push_str(&format!("\x1b[38;2;{v};{v};{v}m"));
@@ -479,8 +479,8 @@ fn lerp(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t).round() as u8
 }
 
-/// Rampe monochrome continue : gris sombre → gris moyen → presque blanc
-/// (calée sur les gris du thème : faint/dim/fg).
+/// Continuous monochrome ramp: dark grey -> mid grey -> almost white
+/// (aligned on the theme greys: faint/dim/fg).
 fn shade(t: f32) -> (u8, u8, u8) {
     let t = t.clamp(0.0, 1.0);
     let (a, b, tt) = if t < 0.5 {
@@ -492,10 +492,10 @@ fn shade(t: f32) -> (u8, u8, u8) {
     (v, v, v)
 }
 
-/// Empile la grille en demi-blocs bi-color (fg = pixel haut, bg = pixel bas) et
-/// imprime en ANSI truecolor, codes émis seulement sur changement.
+/// Stacks the grid into bi-color half-blocks (fg = top pixel, bg = bottom pixel) and
+/// prints in truecolor ANSI, codes emitted only on change.
 fn render_grid(name: &str, g: &Grid) {
-    const EPS: f32 = 0.07; // sous ce seuil : vide (transparent)
+    const EPS: f32 = 0.07; // below this threshold: empty (transparent)
     let indent = "      ";
     println!("\n  ◆ {name}");
     let mut r = 0;

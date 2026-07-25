@@ -1,13 +1,13 @@
-//! Indicateurs de progression vivante (US-044/045) : shimmer animé et durée écoulée.
-//! Signale que la session travaille (pas gelée).
+//! Live progress indicators (US-044/045): animated shimmer and elapsed time.
+//! Signals that the session is working (not frozen).
 //!
-//! Pur et SANS horloge : l'horloge vit dans la boucle d'`agent-cli`, qui avance
-//! `AppState::spinner_tick` (~10 fps) et fournit la durée. Ce module ne fait que
-//! choisir le style du shimmer pour un tick donné et formater la durée, donc
-//! `render` reste testable via `TestBackend`.
+//! Pure and CLOCK-FREE: the clock lives in the `agent-cli` loop, which advances
+//! `AppState::spinner_tick` (~10 fps) and provides the duration. This module only
+//! picks the shimmer style for a given tick and formats the duration, so that
+//! `render` stays testable through `TestBackend`.
 //!
-//! Dégradation reduced-motion (`NO_COLOR` / `PYXIS_REDUCED_MOTION`) : le shimmer
-//! animé devient un texte statique.
+//! Reduced-motion degradation (`NO_COLOR` / `PYXIS_REDUCED_MOTION`): the animated
+//! shimmer becomes static text.
 
 use std::time::Duration;
 
@@ -20,7 +20,7 @@ const SHIMMER_PADDING: usize = 10;
 const SHIMMER_SWEEP_TICKS: usize = 20;
 const SHIMMER_BAND_HALF_WIDTH: f32 = 5.0;
 
-/// Durée compacte : `Ns` sous la minute, puis `Nm Ns`.
+/// Compact duration: `Ns` below a minute, then `Nm Ns`.
 pub(crate) fn fmt_duration(d: Duration) -> String {
     let s = d.as_secs();
     if s < 60 {

@@ -1,13 +1,13 @@
-//! Rendu markdown → lignes ratatui stylées (réponses de l'assistant). Parse via
-//! pulldown-cmark (CommonMark + strikethrough/tables) et mappe les events vers des
-//! `Span` en réutilisant la palette du `Theme` : headers et code inline = accent
-//! (bleu ciel), gras/italique via modifiers, listes en puces. Les code-blocks sont
-//! colorés syntaxiquement (US-042, via `highlight`), les tables alignées et les
-//! blockquotes préfixées d'une barre `▎` atténuée (US-043).
+//! Markdown rendering -> styled ratatui lines (assistant replies). Parses through
+//! pulldown-cmark (CommonMark + strikethrough/tables) and maps the events into
+//! `Span`s reusing the `Theme` palette: headers and inline code = accent
+//! (sky blue), bold/italic through modifiers, lists as bullets. Code blocks are
+//! syntax-colored (US-042, through `highlight`), tables aligned and
+//! blockquotes prefixed with a muted `▎` bar (US-043).
 //!
-//! Pensé pour le streaming : sur un markdown incomplet (tag non fermé en cours de
-//! stream), pulldown ferme implicitement → le rendu se stabilise à la complétion.
-//! BEST-EFFORT et sans panic sur les structures malformées (table coupée au milieu).
+//! Designed for streaming: on incomplete markdown (tag not closed mid-stream),
+//! pulldown closes implicitly -> the rendering stabilizes at completion.
+//! BEST-EFFORT and panic-free on malformed structures (table cut in the middle).
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
@@ -16,9 +16,9 @@ use ratatui::text::{Line, Span};
 use crate::measure;
 use crate::theme::Theme;
 
-/// Convertit un bloc markdown en lignes prêtes à rendre (SANS gouttière : le
-/// transcript ajoute son préfixe). `width` = largeur de CONTENU disponible (après la
-/// gouttière), utilisée pour dimensionner les tables. Le texte est supposé nettoyé.
+/// Converts a markdown block into lines ready to render (WITHOUT a gutter: the
+/// transcript adds its prefix). `width` = available CONTENT width (after the
+/// gutter), used to size the tables. The text is assumed already cleaned.
 pub fn render_markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     render_markdown_with_highlight(text, theme, width, true)
 }
@@ -37,8 +37,8 @@ pub(crate) fn render_markdown_with_highlight(
     r.finish()
 }
 
-/// Table en cours d'accumulation (les events arrivent cellule par cellule : on
-/// bufferise tout avant de calculer les largeurs de colonnes à la fermeture).
+/// Table being accumulated (events arrive cell by cell: everything is
+/// buffered before computing the column widths at closing time).
 #[derive(Default)]
 struct TableState {
     aligns: Vec<Alignment>,
@@ -58,14 +58,14 @@ struct Renderer<'t> {
     italic: u32,
     strike: u32,
     heading: bool,
-    /// Profondeur de blockquote (préfixe `▎` par niveau).
+    /// Blockquote depth (a `▎` prefix per level).
     blockquote: u32,
-    /// Code-block en cours : on bufferise le contenu pour une coloration stateful.
+    /// Code block in progress: we buffer the content for stateful coloring.
     in_code: bool,
     code_lang: String,
     code_buf: String,
     highlight_code: bool,
-    /// Pile de listes : `None` = puces, `Some(n)` = prochain numéro ordonné.
+    /// List stack: `None` = bullets, `Some(n)` = next ordered number.
     list_stack: Vec<Option<u64>>,
     table: Option<TableState>,
 }
@@ -237,8 +237,8 @@ impl<'t> Renderer<'t> {
         }
     }
 
-    /// Texte feuille : bufferisé si code-block ; routé en cellule si table ; sinon un
-    /// span au style courant (les `\n` coupent la ligne).
+    /// Leaf text: buffered when in a code block; routed to a cell when in a table; otherwise a
+    /// span with the current style (the `\n` break the line).
     fn text(&mut self, t: &str) {
         if self.in_code {
             self.code_buf.push_str(t);
@@ -258,8 +258,8 @@ impl<'t> Renderer<'t> {
         }
     }
 
-    /// Route un span vers la cellule de table active, sinon vers la ligne courante.
-    /// Dans une table mais hors cellule (malformé), le span est ignoré (best-effort).
+    /// Routes a span to the active table cell, otherwise to the current line.
+    /// Inside a table but outside a cell (malformed), the span is ignored (best-effort).
     fn emit(&mut self, span: Span<'static>) {
         if let Some(t) = self.table.as_mut() {
             if t.in_cell && t.cur_row.len() < MAX_COLS && cell_width(&t.cur_cell) < MAX_CELL_WIDTH {
@@ -292,8 +292,8 @@ impl<'t> Renderer<'t> {
         st
     }
 
-    /// Émet le code-block accumulé : coloré syntaxiquement si possible (US-042),
-    /// sinon en dim indenté (repli neutre). Chaque ligne est indentée de 2 colonnes.
+    /// Emits the accumulated code block: syntax-colored when possible (US-042),
+    /// otherwise dim and indented (neutral fallback). Every line is indented by 2 columns.
     fn end_code_block(&mut self) {
         self.in_code = false;
         let code = std::mem::take(&mut self.code_buf);
@@ -329,7 +329,7 @@ impl<'t> Renderer<'t> {
         self.blank();
     }
 
-    /// Émet la table accumulée (grille alignée, ou repli clé/valeur si trop large).
+    /// Emits the accumulated table (aligned grid, or key/value fallback when too wide).
     fn end_table(&mut self) {
         if let Some(t) = self.table.take() {
             self.lines.extend(render_table(&t, self.theme, self.width));
@@ -350,7 +350,7 @@ impl<'t> Renderer<'t> {
         self.lines.push(Line::from(spans));
     }
 
-    /// Ligne vide, dédupliquée (pas deux vides consécutives).
+    /// Empty line, deduplicated (never two consecutive empty ones).
     fn blank(&mut self) {
         if self.lines.last().map(|l| l.spans.is_empty()) != Some(true) {
             self.lines.push(Line::default());
@@ -369,39 +369,39 @@ impl<'t> Renderer<'t> {
     }
 }
 
-/// Largeur d'affichage d'une cellule (somme des largeurs de ses spans, en chars:
-/// cohérent avec le reste du wrap du transcript).
+/// Display width of a cell (sum of the widths of its spans, in chars:
+/// consistent with the rest of the transcript wrapping).
 fn cell_width(cell: &[Span<'static>]) -> usize {
     cell.iter()
         .map(|s| measure::width(s.content.as_ref()))
         .sum()
 }
 
-/// Met en gras les spans d'une cellule (en-tête de table mis en évidence).
+/// Bolds the spans of a cell (table header highlighted).
 fn bolden(cell: &[Span<'static>]) -> Vec<Span<'static>> {
     cell.iter()
         .map(|s| Span::styled(s.content.to_string(), s.style.add_modifier(Modifier::BOLD)))
         .collect()
 }
 
-/// Largeur du séparateur de colonnes ` │ ` (3 chars).
+/// Width of the ` │ ` column separator (3 chars).
 const SEP_W: usize = 3;
-/// Profondeur d'imbrication max prise en compte pour l'INDENTATION (liste /
-/// blockquote) : borne le coût d'allocation `repeat()` sur un markdown adverse
-/// profondément imbriqué (sinon O(n²) par ligne). Au-delà, l'indent sature.
+/// Max nesting depth taken into account for INDENTATION (list /
+/// blockquote): bounds the `repeat()` allocation cost on adversarial markdown
+/// deeply nested (otherwise O(n^2) per line). Past it, the indent saturates.
 const MAX_NEST: usize = 24;
-/// Colonnes max d'une table rendue : borne l'allocation (`col_w`, `sep_line`) sur
-/// une table adverse à des milliers de colonnes. Au-delà → colonnes excédentaires
-/// ignorées (best-effort, comme une cellule manquante).
+/// Max columns of a rendered table: bounds the allocation (`col_w`, `sep_line`) on
+/// an adversarial table with thousands of columns. Past it -> extra columns
+/// ignored (best-effort, like a missing cell).
 const MAX_COLS: usize = 64;
 const MAX_ROWS: usize = 256;
 const MAX_CELL_WIDTH: usize = 4096;
 
-/// Rend une table : grille alignée si elle tient dans `width`, sinon repli en paires
-/// `clé: valeur` (chaque cellule sur sa ligne, préfixée de son en-tête). Best-effort
-/// sur les tables malformées (lignes ragged : cellules manquantes tolérées).
-/// Note : une table imbriquée dans un blockquote n'hérite pas de la barre `▎`
-/// (cas rare, cosmétique): les lignes de table contournent `flush`.
+/// Renders a table: aligned grid when it fits in `width`, otherwise a fallback of
+/// `key: value` pairs (each cell on its line, prefixed by its header). Best-effort
+/// on malformed tables (ragged rows: missing cells tolerated).
+/// Note: a table nested in a blockquote does not inherit the `▎` bar
+/// (rare, cosmetic case): table lines bypass `flush`.
 fn render_table(t: &TableState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
     let ncols = t
         .header
@@ -427,7 +427,7 @@ fn render_table(t: &TableState, theme: &Theme, width: usize) -> Vec<Line<'static
         }
     }
 
-    // Saturant : pas de panic d'overflow (mode debug) même sur des cellules énormes.
+    // Saturating: no overflow panic (debug mode) even on huge cells.
     let grid_w = col_w
         .iter()
         .copied()
@@ -443,7 +443,7 @@ fn render_table(t: &TableState, theme: &Theme, width: usize) -> Vec<Line<'static
             out.push(grid_row(row, &col_w, &t.aligns, theme, false));
         }
     } else {
-        // Repli clé/valeur : lisible sur terminal étroit sans déborder ni corrompre.
+        // Key/value fallback: readable on a narrow terminal without overflowing nor corrupting.
         for (ri, row) in t.rows.iter().enumerate() {
             if ri > 0 {
                 out.push(Line::default());
@@ -462,8 +462,8 @@ fn render_table(t: &TableState, theme: &Theme, width: usize) -> Vec<Line<'static
     out
 }
 
-/// Une ligne de grille : cellules paddées à la largeur de colonne selon l'alignement,
-/// séparées par ` │ ` (faint). En-tête → cellules en gras.
+/// One grid line: cells padded to the column width according to the alignment,
+/// separated by ` │ ` (faint). Header -> cells in bold.
 fn grid_row(
     cells: &[Vec<Span<'static>>],
     col_w: &[usize],
@@ -499,7 +499,7 @@ fn grid_row(
     Line::from(spans)
 }
 
-/// Filet de séparation sous l'en-tête (`───┼───`, faint).
+/// Separator rule under the header (`───┼───`, faint).
 fn sep_line(col_w: &[usize], theme: &Theme) -> Line<'static> {
     let mut spans = Vec::new();
     for (i, w) in col_w.iter().enumerate() {
@@ -535,7 +535,7 @@ fn should_unwrap_markdown_table(lang: &str, code: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Aplati chaque ligne en sa chaîne de caractères (styles ignorés).
+    /// Flattens each line into its character string (styles ignored).
     fn flat(lines: &[Line<'static>]) -> Vec<String> {
         lines
             .iter()
@@ -572,7 +572,7 @@ mod tests {
     fn wide_table_degrades_to_key_value() {
         let theme = Theme::new(true);
         let md = "| Header One | Header Two |\n|---|---|\n| valeurlongue | autrelongue |\n";
-        // Largeur trop étroite pour la grille → bascule clé/valeur.
+        // Width too narrow for the grid -> switches to key/value.
         let text = flat(&render_markdown(md, &theme, 14));
         assert!(
             text.iter()
@@ -593,7 +593,7 @@ mod tests {
 
     #[test]
     fn code_block_without_truecolor_is_neutral_text() {
-        let theme = Theme::new(false); // pas de coloration → repli dim
+        let theme = Theme::new(false); // no coloring -> dim fallback
         let text = flat(&render_markdown("```rust\nlet x = 1;\n```\n", &theme, 80));
         assert!(text.iter().any(|l| l.contains("let x = 1;")));
     }
@@ -633,18 +633,18 @@ mod tests {
     #[test]
     fn malformed_table_does_not_panic() {
         let theme = Theme::new(true);
-        // Table coupée en plein milieu (stream interrompu).
+        // Table cut in the middle (interrupted stream).
         let _ = render_markdown("| A | B |\n|---|---|\n| 1 ", &theme, 80);
-        // Largeur dégénérée.
+        // Degenerate width.
         let _ = render_markdown("| A | B |\n|---|---|\n| 1 | 2 |\n", &theme, 0);
     }
 
-    // Sécurité (DoS contenu adverse) : imbrication profonde et table à très nombreuses
-    // colonnes sont BORNÉES (pas de freeze O(n²) ni d'allocation géante), sans panic.
+    // Security (adversarial content DoS): deep nesting and a table with very many
+    // columns are BOUNDED (no O(n^2) freeze nor giant allocation), without a panic.
     #[test]
     fn adversarial_nesting_and_wide_table_are_bounded() {
         let theme = Theme::new(true);
-        // 500 niveaux de blockquote → barres `▎` bornées à MAX_NEST.
+        // 500 blockquote levels -> `▎` bars bounded to MAX_NEST.
         let deep = format!("{} x\n", ">".repeat(500));
         let lines = render_markdown(&deep, &theme, 80);
         let max_bars = lines
@@ -658,7 +658,7 @@ mod tests {
             .max()
             .unwrap_or(0);
         assert!(max_bars <= MAX_NEST, "barres non bornées: {max_bars}");
-        // Table à 300 colonnes → rendue bornée à MAX_COLS, sans panic.
+        // Table with 300 columns -> rendered bounded to MAX_COLS, without a panic.
         let cells = (0..300).map(|_| "x").collect::<Vec<_>>().join(" | ");
         let seps = (0..300).map(|_| "---").collect::<Vec<_>>().join("|");
         let md = format!("| {cells} |\n|{seps}|\n| {cells} |\n");

@@ -1,22 +1,22 @@
-//! Harness de snapshot du rendu terminal (US-005, `tasks/prd-harness-parity.md`).
+//! Snapshot harness of the terminal rendering (US-005, `tasks/prd-harness-parity.md`).
 //!
-//! Rend une frame complète sur `TestBackend` à taille de terminal fixe et rend
-//! le buffer sous forme texte. Trois garanties portées ici plutôt que dans
-//! chaque test :
+//! Renders a full frame on `TestBackend` at a fixed terminal size and returns
+//! the buffer as text. Three guarantees carried here rather than in
+//! every test:
 //!
-//! 1. **Déterminisme** (AC2) : la frame est rendue DEUX fois et les deux dumps
-//!    doivent coïncider. Toute lecture d'horloge, d'aléa ou d'environnement qui
-//!    s'inviterait dans le chemin de rendu casse le test à la source, au lieu de
-//!    produire un snapshot instable qui échouerait au hasard en CI.
-//! 2. **Pas de panique nue** (AC5) : le rendu tourne sous `catch_unwind` ; une
-//!    panique devient un échec de test nommant l'état fautif et la géométrie.
-//! 3. **Pas de débordement horizontal** (US-006 AC4) : aucune ligne rendue ne
-//!    dépasse la largeur du terminal, mesurée en colonnes terminal et non en
-//!    octets.
+//! 1. **Determinism** (AC2): the frame is rendered TWICE and both dumps
+//!    must match. Any clock, randomness or environment read that would
+//!    creep into the rendering path breaks the test at the source, instead of
+//!    producing an unstable snapshot failing at random in CI.
+//! 2. **No bare panic** (AC5): the rendering runs under `catch_unwind`; a
+//!    panic becomes a test failure naming the offending state and the geometry.
+//! 3. **No horizontal overflow** (US-006 AC4): no rendered line
+//!    exceeds the terminal width, measured in terminal columns and not in
+//!    bytes.
 //!
-//! Limite connue et assumée : `TestBackend` ne reproduit pas le comportement
-//! d'un PTY réel. Ces snapshots couvrent le RENDU, pas le comportement terminal
-//! (raw mode, scrollback, séquences de synchronisation).
+//! Known and accepted limit: `TestBackend` does not reproduce the behavior
+//! of a real PTY. These snapshots cover the RENDERING, not the terminal behavior
+//! (raw mode, scrollback, synchronization sequences).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -29,16 +29,16 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use unicode_width::UnicodeWidthStr;
 
-/// Rend une frame du chemin `render` (composer, statut, menu, dialog de
-/// permission, transcript legacy) et retourne le dump texte à snapshotter.
+/// Renders a frame of the `render` path (composer, status, menu, permission
+/// dialog, legacy transcript) and returns the text dump to snapshot.
 pub fn frame(label: &str, state: &AppState, width: u16, height: u16) -> String {
     capture(label, width, height, |terminal| {
         terminal.draw(|f| render(f, state)).unwrap();
     })
 }
 
-/// Rend une frame du chemin `render_parity` (surface d'historique réellement
-/// utilisée en mode inline-scrollback).
+/// Renders a frame of the `render_parity` path (history surface actually
+/// used in inline-scrollback mode).
 #[cfg(feature = "codex_tui_parity")]
 pub fn frame_parity(
     label: &str,
@@ -54,7 +54,7 @@ pub fn frame_parity(
     })
 }
 
-/// Cœur du harness : double rendu, capture de panique, contrôle de largeur.
+/// Core of the harness: double rendering, panic capture, width check.
 fn capture(
     label: &str,
     width: u16,
@@ -80,8 +80,8 @@ fn capture(
     first
 }
 
-/// Un rendu isolé. La panique est convertie en échec nommant l'état fautif
-/// (AC5) au lieu de remonter telle quelle depuis les entrailles de ratatui.
+/// A single rendering. The panic is turned into a failure naming the offending state
+/// (AC5) instead of bubbling up as is from the guts of ratatui.
 #[allow(
     clippy::panic,
     reason = "AC5 : une panique de rendu doit devenir un échec de test nommant \
@@ -111,9 +111,9 @@ fn draw_once(
     }
 }
 
-/// Buffer ratatui → texte. Les espaces de fin sont retirés : ils sont invisibles
-/// dans un diff de snapshot et certains éditeurs les réécrivent, ce qui
-/// produirait des faux positifs de régression.
+/// Ratatui buffer -> text. Trailing spaces are removed: they are invisible
+/// in a snapshot diff and some editors rewrite them, which
+/// would produce false regression positives.
 fn dump(buffer: &Buffer) -> String {
     let area = buffer.area();
     let mut out = String::new();

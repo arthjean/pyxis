@@ -1,15 +1,15 @@
-//! Palette de rendu (US-032). Esthétique **monochrome + un accent bleu ciel orbital** : la
-//! hiérarchie passe par le poids et la teinte, pas par la couleur. La couleur est
-//! RÉSERVÉE au fonctionnel : les tons de diff (ajout/suppression) et `success`. En
-//! l'absence de truecolor (AC4), tout dégrade en 16 couleurs / modifiers sans
-//! perdre la distinction (la mise en page est inchangée).
+//! Rendering palette (US-032). Aesthetics: **monochrome + one orbital sky-blue accent**. The
+//! hierarchy comes from weight and tint, not from color. Color is
+//! RESERVED for the functional: diff tones (add/remove) and `success`. Without
+//! truecolor (AC4), everything degrades to 16 colors / modifiers without
+//! losing the distinction (the layout is unchanged).
 //!
-//! Extrait de `render.rs` pour centraliser les couleurs et garder le rendu pur.
+//! Extracted from `render.rs` to centralize the colors and keep the rendering pure.
 
 use ratatui::style::{Color, Modifier, Style};
 
-/// Palette : graphite + un accent bleu ciel + tons fonctionnels (erreur, diff,
-/// succès). `truecolor` pilote la dégradation.
+/// Palette: graphite + one sky-blue accent + functional tones (error, diff,
+/// success). `truecolor` drives the degradation.
 pub struct Theme {
     truecolor: bool,
 }
@@ -19,13 +19,13 @@ impl Theme {
         Self { truecolor }
     }
 
-    /// Le terminal supporte-t-il le 24 bits ? (consommé par le rendu du logo, qui
-    /// interpole une teinte continue uniquement en truecolor.)
+    /// Does the terminal support 24-bit color? (consumed by the logo rendering, which
+    /// interpolates a continuous tint only in truecolor.)
     pub fn truecolor(&self) -> bool {
         self.truecolor
     }
 
-    // ── Chrome monochrome + accent ──────────────────────────────────────────────
+    // ── Monochrome chrome + accent ──────────────────────────────────────────────
 
     pub fn fg(&self) -> Style {
         if self.truecolor {
@@ -62,8 +62,8 @@ impl Theme {
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
         }
     }
-    /// Fond de la ligne sélectionnée (menu de commandes) : voile bleu sombre en
-    /// truecolor, vidéo inverse en 16 couleurs.
+    /// Background of the selected line (command menu): dark blue veil in
+    /// truecolor, reverse video in 16 colors.
     pub fn selection(&self) -> Style {
         if self.truecolor {
             Style::default().bg(Color::Rgb(0x0f, 0x23, 0x34))
@@ -71,7 +71,7 @@ impl Theme {
             Style::default().add_modifier(Modifier::REVERSED)
         }
     }
-    /// Trait horizontal du composer, visible sans enfermer l'input dans un bloc.
+    /// Horizontal rule of the composer, visible without enclosing the input in a block.
     pub fn composer_rule(&self) -> Style {
         if self.truecolor {
             Style::default().fg(Color::Rgb(0x2a, 0x2f, 0x37))
@@ -79,7 +79,7 @@ impl Theme {
             Style::default().add_modifier(Modifier::DIM)
         }
     }
-    /// Surbrillance d'un `/skill` inséré dans l'input : pastille bleu ciel sur fond sombre.
+    /// Highlight of a `/skill` inserted in the input: sky-blue chip on a dark background.
     pub fn skill_chip(&self) -> Style {
         if self.truecolor {
             Style::default()
@@ -91,9 +91,9 @@ impl Theme {
         }
     }
 
-    // ── Tons FONCTIONNELS (couleur autorisée car porteuse de sens) ───────────────
+    // ── FUNCTIONAL tones (color allowed because it carries meaning) ──────────────
 
-    /// Succès / confirmation (ex. objectif atteint).
+    /// Success / confirmation (e.g. goal reached).
     pub fn success(&self) -> Style {
         if self.truecolor {
             Style::default().fg(Color::Rgb(0x78, 0xc9, 0x8a))
@@ -101,8 +101,8 @@ impl Theme {
             Style::default().fg(Color::Green)
         }
     }
-    /// Ligne ajoutée d'un diff : fond vert sombre + texte clair (truecolor) ; en 16
-    /// couleurs, vert simple (le signe `+` porte aussi le sens, pas que la couleur).
+    /// Added line of a diff: dark green background + light text (truecolor); in 16
+    /// colors, plain green (the `+` sign also carries the meaning, not only the color).
     pub fn diff_add(&self) -> Style {
         if self.truecolor {
             Style::default()
@@ -112,7 +112,7 @@ impl Theme {
             Style::default().fg(Color::Green)
         }
     }
-    /// Ligne supprimée d'un diff : fond rouge sombre + texte clair (truecolor).
+    /// Removed line of a diff: dark red background + light text (truecolor).
     pub fn diff_remove(&self) -> Style {
         if self.truecolor {
             Style::default()
@@ -122,7 +122,7 @@ impl Theme {
             Style::default().fg(Color::Red)
         }
     }
-    /// Segment ajouté MOT-À-MOT (emphase intra-ligne) : fond vert saturé.
+    /// WORD-BY-WORD added segment (intra-line emphasis): saturated green background.
     pub fn diff_add_word(&self) -> Style {
         if self.truecolor {
             Style::default()
@@ -134,7 +134,7 @@ impl Theme {
                 .add_modifier(Modifier::REVERSED)
         }
     }
-    /// Segment supprimé MOT-À-MOT : fond rouge saturé.
+    /// WORD-BY-WORD removed segment: saturated red background.
     pub fn diff_remove_word(&self) -> Style {
         if self.truecolor {
             Style::default()

@@ -114,7 +114,7 @@ impl BottomPane {
             self.remove_completed_views();
             return true;
         }
-        // Dialog d'approbation ouvert : le collage est ignoré et le dialog reste
+        // Approval dialog open: the paste is ignored and the dialog stays
         // intact (US-011 AC5).
         if state.pending.is_none() {
             state.insert_paste(pasted);

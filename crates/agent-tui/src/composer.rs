@@ -1,15 +1,15 @@
-//! Disposition du composer multi-ligne (US-010, `tasks/prd-harness-parity.md`).
+//! Layout of the multi-line composer (US-010, `tasks/prd-harness-parity.md`).
 //!
-//! Le modèle de saisie reste un `String` plat avec un curseur en offset byte
-//! (`AppState::input`) : toute la logique de menu et les tests existants lisent
-//! l'input comme un `&str`. Le multi-ligne est donc DÉRIVÉ ici, à la largeur de
-//! rendu, plutôt que stocké sous forme de `Vec<String>`.
+//! The input model stays a flat `String` with a byte-offset cursor
+//! (`AppState::input`): all the menu logic and the existing tests read
+//! the input as a `&str`. Multi-line is therefore DERIVED here, at the rendering
+//! width, rather than stored as a `Vec<String>`.
 //!
-//! Invariant central : les lignes visuelles PARTITIONNENT l'input. Concaténées
-//! dans l'ordre, séparateurs `\n` réinsérés, elles redonnent l'input octet pour
-//! octet. C'est cet invariant qui garantit qu'aucun caractère n'est perdu au
-//! repli (AC1) et que la position écran du curseur correspond exactement à sa
-//! position logique (AC4).
+//! Central invariant: the visual lines PARTITION the input. Concatenated
+//! in order, with the `\n` separators reinserted, they give back the input byte for
+//! byte. That invariant is what guarantees that no character is lost on
+//! folding (AC1) and that the screen position of the cursor matches exactly its
+//! logical position (AC4).
 
 use std::iter::Peekable;
 use std::str::Chars;
@@ -18,31 +18,31 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::measure;
 
-/// Un segment contigu de l'input occupant une ligne à l'écran.
+/// A contiguous segment of the input occupying one line on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VisualRow {
-    /// Offset byte de début dans l'input (inclus).
+    /// Start byte offset in the input (inclusive).
     pub start: usize,
-    /// Offset byte de fin dans l'input (exclu).
+    /// End byte offset in the input (exclusive).
     pub end: usize,
-    /// Premier segment d'une ligne logique (pas une continuation de repli).
+    /// First segment of a logical line (not a fold continuation).
     pub first_of_line: bool,
 }
 
-/// Résultat du calcul de disposition pour une largeur donnée.
+/// Result of the layout computation for a given width.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Layout {
     pub rows: Vec<VisualRow>,
-    /// Index de la ligne visuelle portant le curseur.
+    /// Index of the visual line carrying the cursor.
     pub cursor_row: usize,
-    /// Colonne du curseur dans la zone texte (gouttière exclue), en cellules.
+    /// Cursor column in the text area (gutter excluded), in cells.
     pub cursor_col: usize,
 }
 
-/// Replie `input` sur `width` colonnes et localise le curseur.
+/// Folds `input` at `width` columns and locates the cursor.
 ///
-/// `width` est la largeur de la zone TEXTE (gouttière déjà retranchée) ; une
-/// largeur nulle est ramenée à 1 pour que l'algorithme progresse toujours.
+/// `width` is the width of the TEXT area (gutter already subtracted); a
+/// zero width is raised to 1 so that the algorithm always makes progress.
 pub(crate) fn layout(input: &str, cursor: usize, width: usize) -> Layout {
     let width = width.max(1);
     let mut rows: Vec<VisualRow> = Vec::new();
@@ -63,7 +63,7 @@ pub(crate) fn layout(input: &str, cursor: usize, width: usize) -> Layout {
             }
             seg_start = seg_end;
         }
-        // +1 : le `\n` consommé par `split` n'appartient à aucun segment.
+        // +1: the `\n` consumed by `split` belongs to no segment.
         line_start = line_end + 1;
     }
 
@@ -75,17 +75,17 @@ pub(crate) fn layout(input: &str, cursor: usize, width: usize) -> Layout {
         }
         cursor_row = idx;
         cursor_col = measure::width(&input[row.start..cursor]);
-        // Curseur en fin de segment REPLIÉ : il s'affiche au début de la
-        // continuation, là où le prochain caractère saisi apparaîtra.
+        // Cursor at the end of a FOLDED segment: it shows at the start of the
+        // continuation, where the next typed character will appear.
         if cursor == row.end && rows.get(idx + 1).is_some_and(|next| !next.first_of_line) {
             cursor_row = idx + 1;
             cursor_col = 0;
         }
         break;
     }
-    // Un segment exactement plein place le curseur une colonne au-delà du bord
-    // quand il n'y a pas de continuation (fin de saisie) : on le ramène dans la
-    // zone plutôt que de dessiner hors cadre.
+    // A segment that is exactly full puts the cursor one column past the edge
+    // when there is no continuation (end of input): we bring it back inside the
+    // area rather than draw outside the frame.
     cursor_col = cursor_col.min(width.saturating_sub(1));
 
     Layout {
@@ -95,13 +95,13 @@ pub(crate) fn layout(input: &str, cursor: usize, width: usize) -> Layout {
     }
 }
 
-/// Premier offset byte où couper `s` pour tenir dans `width` colonnes.
+/// First byte offset where to cut `s` so that it fits in `width` columns.
 ///
-/// Retourne `s.len()` si tout tient. Sinon coupe après le dernier espace
-/// rencontré (l'espace reste sur la ligne courante, donc la partition est
-/// préservée), ou en dur si aucun espace n'offre de point de coupure. Progresse
-/// toujours d'au moins un graphème : une largeur de 1 face à un caractère large
-/// ne peut pas boucler.
+/// Returns `s.len()` when everything fits. Otherwise cuts after the last space
+/// encountered (the space stays on the current line, so the partition is
+/// preserved), or hard when no space offers a cut point. Always makes
+/// progress of at least one grapheme: a width of 1 facing a wide character
+/// cannot loop.
 fn wrap_point(s: &str, width: usize) -> usize {
     let mut used = 0usize;
     let mut last_space_end: Option<usize> = None;
@@ -122,7 +122,7 @@ fn wrap_point(s: &str, width: usize) -> usize {
     s.len()
 }
 
-/// Première ligne visible pour que `cursor_row` reste dans la fenêtre.
+/// First visible line so that `cursor_row` stays inside the window.
 pub(crate) fn scroll_offset(cursor_row: usize, total_rows: usize, visible: usize) -> usize {
     let visible = visible.max(1);
     if total_rows <= visible {
@@ -135,24 +135,24 @@ pub(crate) fn scroll_offset(cursor_row: usize, total_rows: usize, visible: usize
         .min(cursor_row)
 }
 
-/// Largeur d'une tabulation collée, convertie en espaces.
+/// Width of a pasted tabulation, converted into spaces.
 const TAB_WIDTH: usize = 4;
 
-/// Neutralise un contenu collé avant qu'il n'entre dans le composer (US-011).
+/// Neutralizes pasted content before it enters the composer (US-011).
 ///
-/// Les séquences d'échappement ANSI sont retirées ENTIÈREMENT (introducteur et
-/// paramètres) : ne supprimer que l'octet `ESC` laisserait `[31m` en texte
-/// visible. Les autres caractères de contrôle sont supprimés, sauf `\n`. `\r\n`
-/// et `\r` isolé deviennent un simple `\n`.
+/// ANSI escape sequences are removed ENTIRELY (introducer and
+/// parameters): removing only the `ESC` byte would leave `[31m` as visible
+/// text. The other control characters are removed, except `\n`. `\r\n`
+/// and a lone `\r` become a plain `\n`.
 ///
-/// La tabulation est convertie en espaces : `unicode-width` lui donne une
-/// largeur nulle alors que le terminal l'étend jusqu'au taquet suivant. Laissée
-/// telle quelle, elle décalerait le cadre entier, exactement comme une séquence
-/// ANSI, sans qu'aucune mesure de largeur ne le voie venir.
+/// Tabulation is converted into spaces: `unicode-width` gives it a
+/// zero width whereas the terminal expands it to the next tab stop. Left
+/// as is, it would shift the whole frame, exactly like an ANSI
+/// sequence, without any width measurement seeing it coming.
 ///
-/// La neutralisation s'applique au contenu STOCKÉ, pas seulement à l'affichage :
-/// le modèle n'a aucun usage d'une séquence de contrôle terminal, et le contenu
-/// envoyé doit être celui qui a été relu à l'écran.
+/// The neutralization applies to the STORED content, not only to the display:
+/// the model has no use for a terminal control sequence, and the content
+/// sent must be the one that was read back on screen.
 pub(crate) fn sanitize_paste(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
@@ -174,10 +174,10 @@ pub(crate) fn sanitize_paste(raw: &str) -> String {
     out
 }
 
-/// Consomme le corps d'une séquence d'échappement, `ESC` déjà lu.
+/// Consumes the body of an escape sequence, `ESC` already read.
 fn skip_escape(chars: &mut Peekable<Chars<'_>>) {
     match chars.next() {
-        // CSI : paramètres puis un octet final dans 0x40..=0x7E.
+        // CSI: parameters then a final byte in 0x40..=0x7E.
         Some('[') => {
             for c in chars.by_ref() {
                 if ('\u{40}'..='\u{7e}').contains(&c) {
@@ -185,7 +185,7 @@ fn skip_escape(chars: &mut Peekable<Chars<'_>>) {
                 }
             }
         }
-        // OSC / DCS / SOS / PM / APC : terminés par BEL ou par ST (`ESC \`).
+        // OSC / DCS / SOS / PM / APC: terminated by BEL or by ST (`ESC \`).
         Some(']' | 'P' | 'X' | '^' | '_') => {
             while let Some(c) = chars.next() {
                 if c == '\u{7}' {
@@ -197,7 +197,7 @@ fn skip_escape(chars: &mut Peekable<Chars<'_>>) {
                 }
             }
         }
-        // Échappement à deux caractères (`ESC c`, `ESC (B`…) : déjà consommé.
+        // Two-character escape (`ESC c`, `ESC (B`, ...): already consumed.
         _ => {}
     }
 }
@@ -206,7 +206,7 @@ fn skip_escape(chars: &mut Peekable<Chars<'_>>) {
 mod tests {
     use super::*;
 
-    /// L'invariant de partition : les segments recollés redonnent l'input.
+    /// The partition invariant: the segments glued back give the input.
     fn recompose(input: &str, layout: &Layout) -> String {
         let mut out = String::new();
         for (idx, row) in layout.rows.iter().enumerate() {
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn cursor_maps_to_logical_position_on_wrapped_line() {
         let input = "aaaa bbbb cccc";
-        // width 10 → « aaaa bbbb » puis « cccc ».
+        // width 10 -> "aaaa bbbb" then "cccc".
         let l = layout(input, 0, 10);
         assert_eq!(l.rows.len(), 2);
         let at_c = layout(input, 10, 10);
@@ -319,8 +319,8 @@ mod tests {
         assert_eq!(sanitize_paste("héllo 漢字 ✅"), "héllo 漢字 ✅");
     }
 
-    /// Aucun caractère survivant à la neutralisation ne peut déplacer le curseur
-    /// du terminal : ni `ESC`, ni un autre contrôle, ni une tabulation.
+    /// No character surviving the neutralization can move the terminal
+    /// cursor: neither `ESC`, nor another control, nor a tabulation.
     #[test]
     fn sanitized_paste_contains_no_cursor_moving_character() {
         let hostile = "\u{1b}[2J\u{1b}[1;1Heffacé\ttab\u{8}\u{c}\u{1b}]0;titre\u{7}fin\r\nsuite";

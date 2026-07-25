@@ -1,6 +1,6 @@
-//! Aperçu statique du rendu (sans terminal réel) : `cargo run -p agent-tui
-//! --example gallery`. Dump une scène représentative dans un `TestBackend` pour
-//! eyeball l'esthétique (gouttière live, tool calls, diff de permission).
+//! Static preview of the rendering (without a real terminal): `cargo run -p agent-tui
+//! --example gallery`. Dumps a representative scene into a `TestBackend` to
+//! eyeball the aesthetics (live gutter, tool calls, permission diff).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use agent_core::AgentEvent;
@@ -28,7 +28,7 @@ fn dump(state: &AppState, w: u16, h: u16, label: &str) {
 }
 
 fn main() {
-    // Scène 1 : conversation en cours de stream.
+    // Scene 1: conversation being streamed.
     let mut s = AppState::new("gpt-5", true);
     s.apply(&AgentEvent::Text("".into()));
     s.blocks.clear();
@@ -52,7 +52,7 @@ fn main() {
     s.apply(&AgentEvent::Text("`todo!()` par un vrai lexer.".into()));
     dump(&s, 64, 16, "session live");
 
-    // Scène 2 : dialog de permission avec diff (edit).
+    // Scene 2: permission dialog with a diff (edit).
     let mut p = AppState::new("gpt-5", true);
     p.push_user("corrige le bug");
     p.apply(&AgentEvent::Text("J'applique le correctif.".into()));
@@ -71,7 +71,7 @@ fn main() {
     ));
     dump(&p, 64, 14, "permission + diff");
 
-    // Scène 3 : dégradation monochrome (sans truecolor).
+    // Scene 3: monochrome degradation (without truecolor).
     let mut m = AppState::new("gpt-5", false);
     m.push_user("liste les fichiers Rust");
     m.apply(&AgentEvent::ToolCall(ToolCallView {

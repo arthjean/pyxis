@@ -1,6 +1,6 @@
-//! Aperçu du rendu de réponse refondu (markdown, reasoning replié, tools
-//! compacts) : `cargo run -p agent-tui --example transcript`. Rend une session
-//! représentative dans un `TestBackend`, sans terminal réel.
+//! Preview of the reworked reply rendering (markdown, collapsed reasoning, compact
+//! tools): `cargo run -p agent-tui --example transcript`. Renders a representative
+//! session into a `TestBackend`, without a real terminal.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use agent_core::AgentEvent;
@@ -90,7 +90,7 @@ fn main() {
 
     dump(&s, 88, 30, "session complète (réponse markdown rendue)");
 
-    // Scène 2 : réflexion EN COURS → repli + aperçu des dernières lignes pensées.
+    // Scene 2: reasoning IN PROGRESS -> collapsed + preview of the last thought lines.
     let mut t = AppState::new("gpt-5.4", true);
     t.workspace = "pyxis".into();
     t.push_user("Refactore le parsing.");

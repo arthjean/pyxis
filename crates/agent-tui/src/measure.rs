@@ -1,5 +1,5 @@
-//! Mesures d'affichage terminal. Les offsets texte internes peuvent rester en bytes,
-//! mais toute largeur visible doit passer par les cellules Unicode du terminal.
+//! Terminal display measurements. Internal text offsets may stay in bytes,
+//! but every visible width must go through the Unicode cells of the terminal.
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 

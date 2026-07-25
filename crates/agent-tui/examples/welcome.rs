@@ -1,6 +1,6 @@
-//! Aperçu de l'écran d'accueil (carte + logo pixel) :
-//! `cargo run -p agent-tui --example welcome`. Rendu à plusieurs tailles via
-//! `TestBackend`, sans terminal réel — pour eyeball avant le live.
+//! Preview of the welcome screen (card + pixel logo):
+//! `cargo run -p agent-tui --example welcome`. Rendered at several sizes through
+//! `TestBackend`, without a real terminal, to eyeball before going live.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use agent_tui::{AppState, render};
@@ -25,9 +25,9 @@ fn dump(state: &AppState, w: u16, h: u16, label: &str) {
     }
 }
 
-/// Réémet le buffer en ANSI truecolor : montre le vrai dégradé du logo dans un
-/// terminal 24-bit (sinon les demi-blocs bi-color paraissent uniformes). Les
-/// codes ne sont émis que sur changement de couleur (sortie compacte).
+/// Re-emits the buffer in truecolor ANSI: shows the real gradient of the logo in a
+/// 24-bit terminal (otherwise the bi-color half-blocks look uniform). The
+/// codes are only emitted on a color change (compact output).
 fn dump_ansi(state: &AppState, w: u16, h: u16, label: &str) {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
     term.draw(|f| render(f, state)).unwrap();

@@ -1,30 +1,30 @@
-//! Coloration syntaxique des code-blocks et des diffs (spike US-040 + US-042).
+//! Syntax coloring of code blocks and diffs (US-040 spike + US-042).
 //!
-//! ## Choix du moteur (décision du spike US-040)
-//! `syntect` 5.3 en **`default-fancy`** (regex `fancy-regex`, **pur Rust** : aucune
-//! toolchain C, contrairement au défaut oniguruma) + **`two-face`** 0.5 pour les
-//! grammaires. Rationale :
-//! - **Pas de dépendance C** → binaire distribuable sans toolchain (contrainte dure
-//!   du PRD) ; `synoptic` est aussi C-free mais ses règles regex sont plus
-//!   grossières que les grammaires Sublime.
-//! - **Qualité** : grammaires Sublime fidèles. Le jeu PAR DÉFAUT de syntect ne
-//!   couvre PAS TypeScript ni TOML (vérifié sur le packdump) ; `two-face` embarque
-//!   le set curé de `bat` qui couvre Rust/TS-JS/JSON/TOML/Markdown (les 5 langages
-//!   exigés). `two-face` n'est que des dumps embarqués (pur Rust, syntect 5.3).
-//! - **Éprouvé** : exactement la stack du Codex CLI (Rust + ratatui).
-//! - **Coût** : ~3 Mo de binaire, acceptable. Écarté : `synoptic` (grammaires plus
-//!   pauvres), `syntect`+`onig` (toolchain C).
+//! ## Engine choice (US-040 spike decision)
+//! `syntect` 5.3 in **`default-fancy`** (`fancy-regex` regexes, **pure Rust**: no C
+//! toolchain, unlike the oniguruma default) + **`two-face`** 0.5 for the
+//! grammars. Rationale:
+//! - **No C dependency** -> binary distributable without a toolchain (hard constraint
+//!   of the PRD); `synoptic` is also C-free but its regex rules are coarser
+//!   than the Sublime grammars.
+//! - **Quality**: faithful Sublime grammars. The DEFAULT syntect set does NOT
+//!   cover TypeScript nor TOML (verified on the packdump); `two-face` embeds
+//!   the curated `bat` set covering Rust/TS-JS/JSON/TOML/Markdown (the 5 required
+//!   languages). `two-face` is only embedded dumps (pure Rust, syntect 5.3).
+//! - **Battle-tested**: exactly the Codex CLI stack (Rust + ratatui).
+//! - **Cost**: ~3 MB of binary, acceptable. Ruled out: `synoptic` (poorer
+//!   grammars), `syntect`+`onig` (C toolchain).
 //!
-//! ## Performance (cf. US-041)
-//! La coloration syntect est STATEFUL ligne à ligne et coûteuse → elle ne tourne
-//! JAMAIS par frame : `render.rs` mémoïse les lignes déjà colorées (cache par bloc).
-//! Le `SyntaxSet` et le `Theme` ne sont chargés QU'UNE fois (`OnceLock` global).
+//! ## Performance (see US-041)
+//! Syntect coloring is STATEFUL line by line and expensive -> it NEVER runs
+//! per frame: `render.rs` memoizes the already colored lines (per-block cache).
+//! The `SyntaxSet` and the `Theme` are loaded ONLY once (global `OnceLock`).
 //!
-//! ## Dégradation
-//! La coloration ne s'applique QU'EN truecolor : syntect n'embarque pas de thème
-//! ANSI 16-couleurs et hardcoder du RGB hors truecolor corromprait la palette
-//! (leçon Codex). Sans truecolor → `None` → l'appelant retombe sur le rendu
-//! monochrome (dim) existant. Langage non couvert → `None` (texte neutre).
+//! ## Degradation
+//! Coloring applies ONLY in truecolor: syntect embeds no 16-color ANSI theme
+//! and hardcoding RGB outside truecolor would corrupt the palette
+//! (Codex lesson). Without truecolor -> `None` -> the caller falls back on the
+//! existing monochrome (dim) rendering. Language not covered -> `None` (neutral text).
 
 use std::sync::OnceLock;
 
@@ -37,31 +37,31 @@ use syntect::util::LinesWithEndings;
 
 use crate::theme::Theme as UiTheme;
 
-/// Borne de longueur (octets) au-delà de laquelle une ligne n'est PAS colorée :
-/// évite de lancer le moteur regex sur une ligne minifiée géante (coût linéaire par
-/// règle de grammaire). Généreux : les vraies lignes de code sont bien en deçà.
+/// Length bound (bytes) past which a line is NOT colored:
+/// avoids running the regex engine on a giant minified line (linear cost per
+/// grammar rule). Generous: real code lines are well below it.
 const MAX_HL_BYTES: usize = 16 * 1024;
 const MAX_CODE_BLOCK_BYTES: usize = 128 * 1024;
 const MAX_CODE_BLOCK_LINES: usize = 2_000;
 
-/// Grammaires (two-face : Rust/TS-JS/JSON/TOML/Markdown…), chargées une seule fois.
+/// Grammars (two-face: Rust/TS-JS/JSON/TOML/Markdown, ...), loaded once.
 fn syntaxes() -> &'static SyntaxSet {
     static SS: OnceLock<SyntaxSet> = OnceLock::new();
     SS.get_or_init(two_face::syntax::extra_newlines)
 }
 
-/// Thème de coloration : `base16-ocean.dark`, sobre et sombre — la couleur du code
-/// est FONCTIONNELLE (lisibilité), pas décorative. Chargé une fois depuis les thèmes
-/// embarqués de syntect ; `None` si absent (dégrade en non-coloré, jamais de panic).
+/// Coloring theme: `base16-ocean.dark`, sober and dark. Code color
+/// is FUNCTIONAL (readability), not decorative. Loaded once from the syntect
+/// embedded themes; `None` when absent (degrades to uncolored, never a panic).
 fn theme() -> Option<&'static Theme> {
     static TH: OnceLock<Option<Theme>> = OnceLock::new();
     TH.get_or_init(|| ThemeSet::load_defaults().themes.remove("base16-ocean.dark"))
         .as_ref()
 }
 
-/// Résout un libellé de langage (ou une extension) vers une grammaire. Normalise les
-/// alias courants vers l'extension canonique (fiable via `find_syntax_by_extension`),
-/// avec repli sur le token. `None` si non couvert → pas de coloration.
+/// Resolves a language label (or an extension) into a grammar. Normalizes common
+/// aliases to the canonical extension (reliable through `find_syntax_by_extension`),
+/// falling back on the token. `None` when not covered -> no coloring.
 fn syntax_for(ss: &'static SyntaxSet, lang: &str) -> Option<&'static SyntaxReference> {
     let l = lang.trim().to_ascii_lowercase();
     if l.is_empty() {
@@ -80,16 +80,16 @@ fn syntax_for(ss: &'static SyntaxSet, lang: &str) -> Option<&'static SyntaxRefer
         .or_else(|| ss.find_syntax_by_token(&l))
 }
 
-/// Couleur ratatui depuis une couleur syntect (RGB ; alpha et fond ignorés — on
-/// garde notre propre fond, et on ne prend QUE la teinte de premier plan).
+/// Ratatui color from a syntect color (RGB; alpha and background ignored: we
+/// keep our own background, and take ONLY the foreground tint).
 fn to_color(c: syntect::highlighting::Color) -> Color {
     Color::Rgb(c.r, c.g, c.b)
 }
 
-/// Colore un code-block MULTI-LIGNES : rendu stateful ligne à ligne (le contexte des
-/// chaînes/commentaires multi-lignes est préservé). Renvoie les spans colorés par
-/// ligne (sans indentation : l'appelant pose la gouttière). `None` si non-truecolor
-/// ou langage non couvert → l'appelant retombe sur le rendu neutre (dim).
+/// Colors a MULTI-LINE code block: stateful line-by-line rendering (the context of
+/// multi-line strings/comments is preserved). Returns the colored spans per
+/// line (without indentation: the caller lays out the gutter). `None` when not truecolor
+/// or the language is not covered -> the caller falls back on the neutral (dim) rendering.
 pub fn code_block(code: &str, lang: &str, ui: &UiTheme) -> Option<Vec<Vec<Span<'static>>>> {
     if !ui.truecolor() {
         return None;
@@ -106,26 +106,26 @@ pub fn code_block(code: &str, lang: &str, ui: &UiTheme) -> Option<Vec<Vec<Span<'
     let mut h = HighlightLines::new(syntax, theme);
     let mut out = Vec::new();
     for line in LinesWithEndings::from(code) {
-        // Une erreur de coloration (rare) ne doit pas casser le rendu : on stoppe et
-        // l'appelant retombe sur le neutre pour le reste.
+        // A coloring error (rare) must not break the rendering: we stop and
+        // the caller falls back on neutral for the rest.
         let ranges = h.highlight_line(line, ss).ok()?;
         out.push(spans_from_ranges(&ranges));
     }
     Some(out)
 }
 
-/// Couleur de syntaxe par CARACTÈRE pour une ligne isolée (état réinitialisé :
-/// best-effort sur les constructions multi-lignes, suffisant pour une ligne de hunk).
-/// Sert à teinter le contenu d'un diff sans toucher au fond ajout/suppression
-/// (US-042). `None` si non-truecolor ou langage non couvert.
+/// Syntax color per CHARACTER for an isolated line (state reset:
+/// best-effort on multi-line constructs, enough for a hunk line).
+/// Used to tint the content of a diff without touching the add/remove background
+/// (US-042). `None` when not truecolor or the language is not covered.
 pub fn line_colors(line: &str, lang: &str, ui: &UiTheme) -> Option<Vec<Color>> {
     if !ui.truecolor() {
         return None;
     }
-    // Borne de coût : une ligne géante (fichier minifié, diff d'un `write`) passerait
-    // toutes les règles regex de la grammaire sur tout son contenu. Au-delà du seuil,
-    // pas de coloration (le diff reste lisible, fond +/- conservé). Seuls les premiers
-    // `width` chars sont affichés de toute façon.
+    // Cost bound: a giant line (minified file, diff of a `write`) would run
+    // every regex rule of the grammar over its whole content. Past the threshold,
+    // no coloring (the diff stays readable, +/- background kept). Only the first
+    // `width` chars are displayed anyway.
     if line.len() > MAX_HL_BYTES {
         return None;
     }
@@ -145,8 +145,8 @@ pub fn line_colors(line: &str, lang: &str, ui: &UiTheme) -> Option<Vec<Color>> {
     Some(cols)
 }
 
-/// Convertit les ranges syntect d'une ligne en spans ratatui (teinte fg seule, fond
-/// par défaut). Le terminateur de ligne est retiré ; les segments vides sont écartés.
+/// Converts the syntect ranges of a line into ratatui spans (fg tint only, default
+/// background). The line terminator is dropped; empty segments are discarded.
 fn spans_from_ranges(ranges: &[(syntect::highlighting::Style, &str)]) -> Vec<Span<'static>> {
     ranges
         .iter()
@@ -158,8 +158,8 @@ fn spans_from_ranges(ranges: &[(syntect::highlighting::Style, &str)]) -> Vec<Spa
         .collect()
 }
 
-/// Devine le langage d'un fichier depuis l'extension de son chemin (pour colorer un
-/// diff). `None` si pas d'extension exploitable.
+/// Guesses the language of a file from its path extension (to color a
+/// diff). `None` when there is no usable extension.
 pub fn lang_from_path(path: &str) -> Option<String> {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let (stem, ext) = name.rsplit_once('.')?;
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn required_languages_resolve() {
-        // Les 5 langages exigés par US-042 doivent avoir une grammaire (two-face).
+        // The 5 languages required by US-042 must have a grammar (two-face).
         let ss = syntaxes();
         for lang in ["rust", "ts", "js", "json", "toml", "md"] {
             assert!(
@@ -208,7 +208,7 @@ mod tests {
         let lines = code_block("let x = 1;\nlet y = 2;\n", "rust", &ui)
             .expect("rust devrait être coloré en truecolor");
         assert_eq!(lines.len(), 2);
-        // Au moins un span coloré (RGB) sur la première ligne.
+        // At least one colored span (RGB) on the first line.
         assert!(
             lines[0]
                 .iter()
@@ -230,8 +230,8 @@ mod tests {
 
     #[test]
     fn line_colors_handles_multibyte() {
-        // Contrat critique pour l'overlay du diff : UNE couleur par `char`, même sur
-        // des caractères multi-octets (sinon la teinte se désaligne en silence).
+        // Critical contract for the diff overlay: ONE color per `char`, even on
+        // multi-byte characters (otherwise the tint drifts silently).
         let ui = UiTheme::new(true);
         let line = "let tea = 1; // ☕";
         let cols = line_colors(line, "rust", &ui).expect("expected highlighting");
@@ -244,8 +244,8 @@ mod tests {
 
     #[test]
     fn line_colors_skips_giant_line() {
-        // Borne de coût : une ligne au-delà du seuil n'est pas colorée (pas de regex
-        // sur un contenu minifié géant) → repli neutre côté appelant.
+        // Cost bound: a line past the threshold is not colored (no regex
+        // on a giant minified content) -> neutral fallback on the caller side.
         let ui = UiTheme::new(true);
         let giant = "a".repeat(MAX_HL_BYTES + 1);
         assert!(

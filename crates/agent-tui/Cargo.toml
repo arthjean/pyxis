@@ -13,9 +13,9 @@ workspace = true
 default = ["codex_tui_parity"]
 codex_tui_parity = []
 
-# Frontend terminal (US-019). CLIENT du cœur : consomme `agent_core::AgentEvent`,
-# décide seul du rendu (jamais d'ANSI venant du cœur). Stack Ratatui + crossterm.
-# Esthétique : monochrome + un accent, épurée (pas de bordures lourdes).
+# Terminal frontend (US-019). CLIENT of the core: consumes `agent_core::AgentEvent`,
+# decides the rendering alone (never ANSI coming from the core). Ratatui + crossterm stack.
+# Aesthetics: monochrome + one accent, spare (no heavy borders).
 [dependencies]
 agent-core.workspace = true
 ratatui.workspace = true
@@ -28,7 +28,7 @@ similar.workspace = true
 syntect.workspace = true
 two-face.workspace = true
 
-# US-005 : harness de snapshot du rendu terminal. `insta` reste ici, hors du
-# graphe de production (`cargo tree -e normal` ne le voit pas).
+# US-005: terminal rendering snapshot harness. `insta` stays here, outside the
+# production graph (`cargo tree -e normal` does not see it).
 [dev-dependencies]
 insta.workspace = true

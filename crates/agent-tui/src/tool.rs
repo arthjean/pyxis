@@ -1,12 +1,12 @@
-//! View-models de rendu des outils (US-035). Transforme un appel d'outil (nom +
-//! `input` JSON) et son résultat en libellé `Verb(cible)` et en résumé secondaire
-//! (`⎿`). C'est l'équivalent Rust des `renderToolUseMessage` /
-//! `renderToolResultMessage` de Claude Code : `render.rs` ne connaît pas les
-//! outils, il délègue ici. Pur et testable ; aucune décision de couleur de chrome
-//! (seuls les nombres sont mis en évidence).
+//! Rendering view-models of the tools (US-035). Turns a tool call (name +
+//! JSON `input`) and its result into a `Verb(target)` label and a secondary summary
+//! (`⎿`). This is the Rust equivalent of Claude Code's `renderToolUseMessage` /
+//! `renderToolResultMessage`: `render.rs` does not know the
+//! tools, it delegates here. Pure and testable; no chrome color decision
+//! (only the numbers are highlighted).
 //!
-//! Les résumés sont dérivés de l'`input` du call et du `content` du résultat :
-//! aucun changement des contrats `agent-core` / `agent-tools` (US-033).
+//! The summaries are derived from the call `input` and the result `content`:
+//! no change to the `agent-core` / `agent-tools` contracts (US-033).
 
 use ratatui::style::Modifier;
 use ratatui::text::Span;
@@ -16,16 +16,16 @@ use crate::measure;
 use crate::render::sanitize;
 use crate::theme::Theme;
 
-/// Libellé d'un appel d'outil : un verbe d'action + une cible optionnelle, rendus
-/// `Verb(cible)`. Verbe en clair (anglais, comme le harness de référence).
+/// Label of a tool call: an action verb + an optional target, rendered as
+/// `Verb(target)`. Verb in plain English, like the reference harness.
 pub struct Label {
     pub verb: String,
     pub target: Option<String>,
 }
 
-/// Verbe + cible affichés pour un appel d'outil, dérivés du nom et de l'input. Un
-/// outil inconnu retombe sur son nom brut comme verbe + une cible best-effort
-/// (US-035 : jamais de panic sur un outil non reconnu).
+/// Verb + target displayed for a tool call, derived from the name and the input. An
+/// unknown tool falls back on its raw name as the verb + a best-effort target
+/// (US-035: never a panic on an unrecognized tool).
 pub fn label(name: &str, input: &Value) -> Label {
     let verb = match name {
         "read" => "Read",
@@ -49,9 +49,9 @@ pub fn label(name: &str, input: &Value) -> Label {
     Label { verb, target }
 }
 
-/// Résumé secondaire (`⎿`) d'un résultat d'outil RÉUSSI, en spans (les nombres
-/// sont mis en évidence). `call` = `(name, input)` apparié par id, ou `None` si le
-/// résultat est orphelin (US-033 : affichage générique dégradé, sans panic).
+/// Secondary summary (`⎿`) of a SUCCESSFUL tool result, as spans (numbers
+/// are highlighted). `call` = `(name, input)` paired by id, or `None` when the
+/// result is orphan (US-033: degraded generic display, without a panic).
 pub fn result_summary(
     call: Option<(&str, &Value)>,
     content: &str,
@@ -65,7 +65,7 @@ pub fn result_summary(
     };
 
     match name {
-        // Lignes lues = lignes numérotées (format `{lineno}\t{ligne}` de l'outil read).
+        // Lines read = numbered lines (`{lineno}\t{line}` format of the read tool).
         "read" => count(
             "Read ",
             content.lines().filter(|l| l.contains('\t')).count(),
@@ -82,8 +82,8 @@ pub fn result_summary(
             dim,
             num,
         ),
-        // Approximation EP-010 (sans lib de diff) : lignes du nouveau vs ancien
-        // texte. Le compte exact (diff réel) arrive en EP-011 (US-038).
+        // EP-010 approximation (without a diff library): lines of the new vs old
+        // text. The exact count (real diff) comes in EP-011 (US-038).
         "edit" => {
             let added = line_count(&str_field(input, "new_string").unwrap_or_default());
             let removed = line_count(&str_field(input, "old_string").unwrap_or_default());
@@ -111,8 +111,8 @@ pub fn result_summary(
     }
 }
 
-/// Message d'erreur d'un résultat d'outil, en une ligne préfixée `Error:`, ANSI
-/// strippé (US-036 : pas de résidu ANSI venant d'une sortie d'outil colorée).
+/// Error message of a tool result, on one line prefixed with `Error:`, ANSI
+/// stripped (US-036: no ANSI residue coming from a colored tool output).
 pub fn error_summary(content: &str) -> String {
     let clean = sanitize(content);
     let first = clean
@@ -128,8 +128,8 @@ pub fn error_summary(content: &str) -> String {
     }
 }
 
-/// Nombre de lignes non vides AU-DELÀ de la première (indicateur `… +N lignes`
-/// quand une erreur multi-lignes est bornée à sa 1re ligne, US-036).
+/// Number of non-empty lines BEYOND the first (indicator `... +N lines`
+/// when a multi-line error is bounded to its 1st line, US-036).
 pub fn extra_lines(content: &str) -> usize {
     sanitize(content)
         .lines()
@@ -139,19 +139,19 @@ pub fn extra_lines(content: &str) -> usize {
         .saturating_sub(1)
 }
 
-/// Le contenu d'un résultat `is_error` correspond-il à un REJET de permission
-/// (refus utilisateur ou refus par le mode) plutôt qu'à une vraie erreur d'outil ?
-/// La distinction pilote la teinte : atténué (rejet volontaire) vs rouge (US-036).
-/// ANCRÉ sur les deux messages du Registry (`registry.rs` : « permission refusée
-/// pour … » / « action « … » refusée par l'utilisateur ») plutôt qu'un substring
-/// flottant « refusée » : une vraie erreur d'outil qui cite ce mot (ex. sortie bash
-/// « connexion refusée ») ne doit pas être prise pour un refus volontaire.
+/// Does the content of an `is_error` result correspond to a permission REJECTION
+/// (user refusal or refusal by the mode) rather than a real tool error?
+/// The distinction drives the tint: muted (deliberate rejection) vs red (US-036).
+/// ANCHORED on the two Registry messages (`registry.rs`: "permission refusée
+/// pour ..." / "action « ... » refusée par l'utilisateur") rather than a floating
+/// "refusée" substring: a real tool error quoting that word (e.g. a bash output
+/// saying "connexion refusée") must not be taken for a deliberate refusal.
 pub fn is_user_rejection(content: &str) -> bool {
     let t = content.trim_start();
     t.starts_with("permission denied for") || t.starts_with("action \"")
 }
 
-/// Libellé d'un rejet (ton atténué) : 1re ligne non vide, ANSI strippé.
+/// Label of a rejection (muted tone): 1st non-empty line, ANSI stripped.
 pub fn reject_summary(content: &str) -> String {
     let clean = sanitize(content);
     let first = clean
@@ -162,13 +162,13 @@ pub fn reject_summary(content: &str) -> String {
     trunc(first, 120)
 }
 
-// ── Helpers purs ────────────────────────────────────────────────────────────────
+// ── Pure helpers ────────────────────────────────────────────────────────────────
 
 fn str_field(input: &Value, key: &str) -> Option<String> {
     input.get(key).and_then(|v| v.as_str()).map(str::to_string)
 }
 
-/// Nombre de lignes affichables d'un listing (exclut le pied de troncature `…`).
+/// Number of displayable lines of a listing (excludes the `…` truncation footer).
 fn listed(content: &str) -> usize {
     content
         .lines()
@@ -176,7 +176,7 @@ fn listed(content: &str) -> usize {
         .count()
 }
 
-/// Nombre de lignes d'un texte (`""` → 0).
+/// Number of lines of a text (`""` -> 0).
 fn line_count(s: &str) -> usize {
     if s.is_empty() { 0 } else { s.lines().count() }
 }
@@ -185,7 +185,7 @@ fn unit(n: usize, singular: &str, plural: &str) -> String {
     if n == 1 { singular } else { plural }.to_string()
 }
 
-/// `{prefix}{n} {unité}` avec le nombre en évidence.
+/// `{prefix}{n} {unit}` with the number highlighted.
 fn count(
     prefix: &str,
     n: usize,
@@ -201,12 +201,12 @@ fn count(
     ]
 }
 
-/// Tronque à `max` colonnes (char-aware, ellipse `…`).
+/// Truncates to `max` columns (char-aware, `…` ellipsis).
 fn trunc(s: &str, max: usize) -> String {
     measure::truncate(s, max)
 }
 
-/// 1re ligne non vide, tronquée (pour bash/commande multi-lignes).
+/// 1st non-empty line, truncated (for bash / a multi-line command).
 fn first_line_trunc(s: &str, max: usize) -> String {
     let line = s
         .lines()

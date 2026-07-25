@@ -464,9 +464,9 @@ impl TranscriptMapper {
                 }
                 updates
             }
-            // US-015 : la surface de parité rend la sortie d'exécution à la
-            // complétion de l'appel ; l'aperçu live est porté par
-            // `AppState.live_output`, rendu par `render`.
+            // US-015: the parity surface renders the execution output when the
+            // call completes; the live preview is carried by
+            // `AppState.live_output`, rendered by `render`.
             AgentEvent::ToolOutputDelta(_) => Vec::new(),
             AgentEvent::ToolResult(view) => {
                 let mut updates = self.drain_active_streams();
@@ -510,8 +510,8 @@ impl TranscriptMapper {
                 }
                 updates
             }
-            // Comptabilité de tour : rien à rendre dans le transcript de parité
-            // Codex, qui n'a pas de cellule équivalente.
+            // Turn accounting: nothing to render in the Codex parity transcript,
+            // which has no equivalent cell.
             AgentEvent::ModelTurn(_) => Vec::new(),
             AgentEvent::TurnDiff(view) => vec![TranscriptUpdate::new(
                 TranscriptLifecycle::Completed,

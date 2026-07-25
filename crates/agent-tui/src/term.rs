@@ -1,5 +1,5 @@
-//! Setup/teardown du terminal : raw mode + écran alternatif (crossterm). Isolé
-//! ici pour que le rendu (`render.rs`) reste pur et testable sans terminal réel.
+//! Terminal setup/teardown: raw mode + alternate screen (crossterm). Isolated
+//! here so that rendering (`render.rs`) stays pure and testable without a real terminal.
 
 use std::io::{self, Stdout};
 
@@ -21,8 +21,8 @@ use ratatui::{TerminalOptions, Viewport};
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
-/// Entre en mode terminal interactif. Le chemin historique utilise l'alt-screen
-/// avec capture souris ; le chemin parity garde le scrollback terminal natif.
+/// Enters interactive terminal mode. The historical path uses the alt-screen
+/// with mouse capture; the parity path keeps the native terminal scrollback.
 pub fn enter() -> io::Result<Tui> {
     enable_raw_mode()?;
     let mut out = io::stdout();
@@ -95,27 +95,27 @@ pub fn clear(tui: &mut Tui) -> io::Result<()> {
     Ok(())
 }
 
-/// Vrai quand le viewport inline ne couvre plus toute la hauteur du terminal.
+/// True when the inline viewport no longer covers the whole terminal height.
 ///
-/// `Viewport::Inline(h)` fige `h` à la construction : ratatui clampe ensuite à
-/// `min(hauteur_écran, h)`. Un terminal RÉTRÉCI est donc suivi correctement, mais
-/// un terminal AGRANDI garde l'ancienne hauteur, et tout le rendu (transcript,
-/// composer, barre de statut) reste enfermé dans cette zone périmée.
+/// `Viewport::Inline(h)` freezes `h` at construction time: ratatui then clamps to
+/// `min(screen_height, h)`. A SHRUNK terminal is therefore tracked correctly, but
+/// an ENLARGED terminal keeps the old height, and the whole rendering (transcript,
+/// composer, status bar) stays locked inside that stale area.
 #[cfg(feature = "codex_tui_parity")]
 pub fn inline_viewport_stale(viewport_height: u16, screen_height: u16) -> bool {
     viewport_height < screen_height
 }
 
-/// Réaligne le viewport inline sur la hauteur courante du terminal, en repartant
-/// d'un `Terminal` neuf : ratatui n'expose aucun moyen de changer la hauteur d'un
-/// `Viewport::Inline`. Renvoie `true` si la reconstruction a eu lieu.
+/// Realigns the inline viewport on the current terminal height, starting from
+/// a fresh `Terminal`: ratatui exposes no way to change the height of a
+/// `Viewport::Inline`. Returns `true` when the rebuild happened.
 ///
-/// Le scrollback déjà émis par `insert_before` n'est pas touché : on efface l'écran
-/// visible et le prochain `draw` repeint depuis l'état, comme au démarrage.
+/// The scrollback already emitted by `insert_before` is untouched: we clear the
+/// visible screen and the next `draw` repaints from the state, as at startup.
 ///
-/// La construction interroge la position du curseur ; l'appelant DOIT donc garantir
-/// qu'aucun `crossterm::event::read()` bloquant ne tourne en parallèle, sans quoi la
-/// réponse du terminal reste captive de ce lecteur et la requête expire.
+/// The construction queries the cursor position; the caller MUST therefore guarantee
+/// that no blocking `crossterm::event::read()` runs in parallel, otherwise the
+/// terminal response stays captive of that reader and the request times out.
 #[cfg(feature = "codex_tui_parity")]
 pub fn sync_inline_viewport(tui: &mut Tui) -> io::Result<bool> {
     let screen = tui.size()?;
@@ -141,7 +141,7 @@ pub fn sync_inline_viewport(tui: &mut Tui) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Restaure le terminal (à appeler en sortie, y compris sur erreur).
+/// Restores the terminal (to be called on exit, including on error).
 pub fn leave(tui: &mut Tui) -> io::Result<()> {
     let mut first_err: Option<io::Error> = None;
     #[cfg(not(feature = "codex_tui_parity"))]
@@ -173,7 +173,7 @@ pub fn leave(tui: &mut Tui) -> io::Result<()> {
     }
 }
 
-/// Détection truecolor → choix de la dégradation monochrome (US-019 AC4).
+/// Truecolor detection -> choice of the monochrome degradation (US-019 AC4).
 pub fn supports_truecolor() -> bool {
     std::env::var("COLORTERM")
         .map(|v| v.contains("truecolor") || v.contains("24bit"))
@@ -195,9 +195,9 @@ mod tests {
         );
     }
 
-    /// Verrouille la contrainte ratatui qui impose la reconstruction du terminal.
-    /// Si ce test casse (hauteur suivie automatiquement), `sync_inline_viewport`
-    /// devient inutile et peut disparaître.
+    /// Pins down the ratatui constraint that forces rebuilding the terminal.
+    /// Should this test break (height tracked automatically), `sync_inline_viewport`
+    /// becomes useless and can disappear.
     #[test]
     fn ratatui_inline_viewport_keeps_its_initial_height_when_the_screen_grows() {
         let mut terminal = Terminal::with_options(

@@ -1,14 +1,14 @@
-//! Couverture snapshot des flux critiques du TUI (US-006,
+//! Snapshot coverage of the critical TUI flows (US-006,
 //! `tasks/prd-harness-parity.md`).
 //!
-//! Chaque test fige une frame complète pour un flux nommé par le critère
-//! d'acceptation. Le harness (`harness/mod.rs`) garantit le déterminisme, la
-//! capture de panique et l'absence de débordement horizontal ; ces tests ne
-//! s'occupent que de construire l'état.
+//! Each test freezes a full frame for a flow named after its acceptance
+//! criterion. The harness (`harness/mod.rs`) guarantees determinism, panic
+//! capture and the absence of horizontal overflow; these tests only
+//! take care of building the state.
 //!
-//! Réviser un diff : `cargo insta review` (ou `cargo insta test --review`).
-//! Toute divergence de rendu assumée par rapport à Codex est enregistrée dans
-//! `docs/codex-port-inventory.md`, section « Divergences de rendu assumées ».
+//! Reviewing a diff: `cargo insta review` (or `cargo insta test --review`).
+//! Every rendering divergence from Codex that we accept is recorded in
+//! `docs/codex-port-inventory.md`, section "Divergences de rendu assumées".
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -23,11 +23,11 @@ use agent_tui::state::{AppState, PermissionPrompt, SessionMeta};
 
 const W: u16 = 80;
 const H: u16 = 24;
-/// Terminal étroit et terminal large (US-006 AC4).
+/// Narrow terminal and wide terminal (US-006 AC4).
 const NARROW: u16 = 40;
 const WIDE: u16 = 200;
 
-/// État de base : modèle fixe, truecolor forcé, aucune lecture d'environnement.
+/// Base state: fixed model, truecolor forced, no environment read.
 fn state() -> AppState {
     let mut s = AppState::new("gpt-5", true);
     s.workspace = "pyxis".into();
@@ -52,7 +52,7 @@ fn tool_result(id: &str, content: &str, is_error: bool) -> AgentEvent {
     })
 }
 
-/// Transcript de référence réutilisé par les snapshots de géométrie.
+/// Reference transcript reused by the geometry snapshots.
 fn conversation() -> AppState {
     let mut s = state();
     s.push_user("Explique la boucle d'agent et montre le code");
@@ -63,7 +63,7 @@ fn conversation() -> AppState {
     s
 }
 
-// ───────────────────────────── Accueil ─────────────────────────────
+// ───────────────────────────── Welcome ─────────────────────────────
 
 #[test]
 fn welcome_screen() {
@@ -86,7 +86,7 @@ fn welcome_screen_wide() {
     insta::assert_snapshot!("welcome_wide", harness::frame("welcome_wide", &s, WIDE, H));
 }
 
-// ────────────────────────── Tour de conversation ──────────────────────────
+// ────────────────────────── Conversation turn ──────────────────────────
 
 #[test]
 fn user_message() {
@@ -156,7 +156,7 @@ fn markdown_table() {
     insta::assert_snapshot!("markdown_table", harness::frame("markdown_table", &s, W, H));
 }
 
-// ─────────────────────────── Exécution d'outils ───────────────────────────
+// ─────────────────────────── Tool execution ───────────────────────────
 
 #[test]
 fn exec_running() {
@@ -174,8 +174,8 @@ fn exec_running() {
 
 #[test]
 fn exec_streaming_output() {
-    // US-015 AC2 : la sortie arrive dans la cellule d'exécution en cours, avant
-    // tout résultat, et reste bornée aux dernières lignes.
+    // US-015 AC2: the output arrives in the running execution cell, before
+    // any result, and stays bounded to the last lines.
     let mut s = state();
     s.push_user("Compile le workspace");
     s.apply(&tool_call(
@@ -256,7 +256,7 @@ fn edit_diff() {
     insta::assert_snapshot!("edit_diff", harness::frame("edit_diff", &s, W, H));
 }
 
-// ─────────────────────── Dialogues, saisie, menus ───────────────────────
+// ─────────────────────── Dialogs, input, menus ───────────────────────
 
 #[test]
 fn approval_dialog() {
@@ -285,8 +285,8 @@ fn pending_input() {
     insta::assert_snapshot!("pending_input", harness::frame("pending_input", &s, W, H));
 }
 
-/// Saisie de dix lignes : la hauteur du composer suit le nombre de lignes
-/// rendues, jusqu'au plafond (US-010 AC2).
+/// Ten-line input: the composer height follows the number of rendered
+/// lines, up to the cap (US-010 AC2).
 #[test]
 fn composer_multiline() {
     let mut s = conversation();
@@ -302,8 +302,8 @@ fn composer_multiline() {
     );
 }
 
-/// Ligne plus large que le terminal : repliée sur plusieurs lignes visuelles,
-/// aucun caractère perdu, aucun débordement horizontal (US-010 AC1).
+/// Line wider than the terminal: folded over several visual lines,
+/// no character lost, no horizontal overflow (US-010 AC1).
 #[test]
 fn composer_wrapped_line() {
     let mut s = conversation();
@@ -318,8 +318,8 @@ fn composer_wrapped_line() {
     );
 }
 
-/// Saisie au-delà du plafond : la zone défile pour garder la ligne du curseur
-/// visible, le transcript garde le reste de l'écran (US-010 AC3).
+/// Input past the cap: the area scrolls to keep the cursor line
+/// visible, the transcript keeps the rest of the screen (US-010 AC3).
 #[test]
 fn composer_scrolled() {
     let mut s = conversation();
@@ -335,8 +335,8 @@ fn composer_scrolled() {
     );
 }
 
-/// Terminal plus court que la hauteur demandée par le composer : transcript et
-/// composer restent visibles tous les deux (US-010 AC6).
+/// Terminal shorter than the height requested by the composer: transcript and
+/// composer both stay visible (US-010 AC6).
 #[test]
 fn composer_short_terminal() {
     let mut s = conversation();
@@ -352,7 +352,7 @@ fn composer_short_terminal() {
     );
 }
 
-/// Collage volumineux : le composer affiche un résumé compact, pas 847 lignes
+/// Large paste: the composer shows a compact summary, not 847 lines
 /// (US-011 AC2).
 #[test]
 fn composer_large_paste() {
@@ -411,8 +411,8 @@ fn resume_menu() {
 #[test]
 fn resumed_session() {
     let mut s = state();
-    // Session reprise : le transcript est reconstruit depuis les messages
-    // persistés, pas depuis des événements live.
+    // Resumed session: the transcript is rebuilt from the persisted
+    // messages, not from live events.
     let messages = vec![
         Message::user("Où en est la réconciliation du transcript ?"),
         Message::assistant_text("Les appels en vol reçoivent un résultat synthétique."),
@@ -438,7 +438,7 @@ fn context_indicator() {
     );
 }
 
-// ──────────────────────── Interruption et erreurs ────────────────────────
+// ──────────────────────── Interruption and errors ────────────────────────
 
 #[test]
 fn interrupted_turn() {
@@ -449,8 +449,8 @@ fn interrupted_turn() {
         "bash",
         serde_json::json!({ "command": "cargo test --workspace" }),
     ));
-    // US-002 : l'appel en vol reçoit son résultat synthétique AVANT l'événement
-    // d'interruption émis par le cœur.
+    // US-002: the in-flight call gets its synthetic result BEFORE the
+    // interruption event emitted by the core.
     s.apply(&tool_result("call_1", "interrupted by user", true));
     s.apply(&AgentEvent::Interrupted);
     insta::assert_snapshot!(
@@ -469,7 +469,7 @@ fn error_block() {
     insta::assert_snapshot!("error_block", harness::frame("error_block", &s, W, H));
 }
 
-// ───────────────────────────── Géométrie ─────────────────────────────
+// ───────────────────────────── Geometry ─────────────────────────────
 
 #[test]
 fn resize_narrow() {
@@ -519,11 +519,11 @@ fn scrolled_transcript() {
     );
 }
 
-// ─────────────── Chemin de rendu réellement embarqué (parity) ───────────────
+// ─────────────── Rendering path actually shipped (parity) ───────────────
 
-/// Le mode inline-scrollback rend le transcript depuis `ChatSurface` et non
-/// depuis `AppState::blocks` : sans ces snapshots, le chemin qui ship reste
-/// découvert.
+/// The inline-scrollback mode renders the transcript from `ChatSurface` and not
+/// from `AppState::blocks`: without these snapshots, the path that ships stays
+/// uncovered.
 #[cfg(feature = "codex_tui_parity")]
 #[test]
 fn parity_surface_conversation() {

@@ -1,9 +1,9 @@
-//! Trace de diagnostic du TUI, écrite dans un FICHIER : le terminal appartient au
-//! rendu, un `eprintln!` y corromprait l'affichage.
+//! TUI diagnostic trace, written to a FILE: the terminal belongs to the
+//! rendering, an `eprintln!` there would corrupt the display.
 //!
-//! Inactive par défaut. `PYXIS_DEBUG_TUI=1` écrit dans `pyxis-tui-debug.log` sous
-//! le répertoire courant (donc dans le workspace, seul emplacement inscriptible
-//! quand le sandbox est actif) ; toute autre valeur est prise comme chemin.
+//! Inactive by default. `PYXIS_DEBUG_TUI=1` writes into `pyxis-tui-debug.log` under
+//! the current directory (hence in the workspace, the only writable location
+//! when the sandbox is active); any other value is taken as a path.
 
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,8 +20,8 @@ fn target() -> Option<String> {
     }
 }
 
-/// Vrai quand la trace est active : permet à l'appelant d'éviter de composer un
-/// message coûteux pour rien.
+/// True when the trace is active: lets the caller avoid composing an
+/// expensive message for nothing.
 pub fn enabled() -> bool {
     target().is_some()
 }

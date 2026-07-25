@@ -1,47 +1,47 @@
-//! Calcul de diff structuré pour le rendu (US-037). Dérive un diff prêt à styler
-//! depuis l'`input` d'un outil mutant : `edit` (old_string → new_string, vrai diff
-//! interligne + emphase intra-ligne via `similar`) ou `write` (contenu = ajouts,
-//! aperçu borné). Sert AUSSI l'aperçu du dialog de permission (US-039), où bash et
-//! les outils inconnus sont représentés en lignes de contexte.
+//! Structured diff computation for rendering (US-037). Derives a diff ready to style
+//! from the `input` of a mutating tool: `edit` (old_string -> new_string, real
+//! inter-line diff + intra-line emphasis through `similar`) or `write` (content = additions,
+//! bounded preview). ALSO serves the permission dialog preview (US-039), where bash and
+//! unknown tools are represented as context lines.
 //!
-//! Pur et BORNÉ (jamais d'I/O, jamais de fichier relu) : le rendu (`render.rs`)
-//! applique seul les couleurs. Numéros de ligne RELATIFS aux fragments d'entrée
-//! (pas les numéros absolus du fichier, qu'on n'a pas sans relire le disque).
+//! Pure and BOUNDED (never any I/O, never a file read back): rendering (`render.rs`)
+//! alone applies the colors. Line numbers RELATIVE to the input fragments
+//! (not the absolute file numbers, which we do not have without reading the disk).
 
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
 
-/// Segment intra-ligne (word-diff) : un fragment de texte et s'il est mis en
-/// emphase (portion réellement changée d'une ligne ajoutée/supprimée).
+/// Intra-line segment (word-diff): a text fragment and whether it is
+/// emphasized (the actually changed portion of an added/removed line).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Seg {
     pub text: String,
     pub emphasized: bool,
 }
 
-/// Une ligne du diff structuré.
+/// One row of the structured diff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row {
-    /// Ligne ajoutée (`+`), avec segments mot-à-mot.
+    /// Added line (`+`), with word-by-word segments.
     Add {
         lineno: Option<usize>,
         segs: Vec<Seg>,
     },
-    /// Ligne supprimée (`-`), avec segments mot-à-mot.
+    /// Removed line (`-`), with word-by-word segments.
     Remove {
         lineno: Option<usize>,
         segs: Vec<Seg>,
     },
-    /// Ligne de contexte (inchangée) ou note (bash/inconnu).
+    /// Context line (unchanged) or note (bash/unknown).
     Context { lineno: Option<usize>, text: String },
-    /// Séparation entre deux hunks non contigus.
+    /// Separation between two non-contiguous hunks.
     Gap,
-    /// `N` lignes de plus non affichées (au-delà de la borne).
+    /// `N` more lines not displayed (past the bound).
     Truncated(usize),
 }
 
 impl Row {
-    /// Numéro de ligne porté par la rangée (pour calibrer la gouttière).
+    /// Line number carried by the row (to calibrate the gutter).
     pub fn lineno(&self) -> Option<usize> {
         match self {
             Row::Add { lineno, .. } | Row::Remove { lineno, .. } | Row::Context { lineno, .. } => {
@@ -52,7 +52,7 @@ impl Row {
     }
 }
 
-/// Diff structuré, prêt à styler par le rendu.
+/// Structured diff, ready to be styled by the rendering.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Diff {
     pub rows: Vec<Row>,
@@ -64,7 +64,7 @@ impl Diff {
     }
 }
 
-/// Lignes de contexte sans diff (aperçu bash/inconnu pour la permission, US-039).
+/// Context lines without a diff (bash/unknown preview for the permission, US-039).
 pub fn note<I, S>(lines: I) -> Diff
 where
     I: IntoIterator<Item = S>,
@@ -72,7 +72,7 @@ where
 {
     let rows = lines
         .into_iter()
-        // Assaini : l'aperçu bash/inconnu peut citer une commande/sortie adverse.
+        // Sanitized: the bash/unknown preview can quote an adversarial command/output.
         .map(|l| Row::Context {
             lineno: None,
             text: crate::render::sanitize(&l.into()),
@@ -81,24 +81,24 @@ where
     Diff { rows }
 }
 
-/// Nombre de lignes de contexte autour d'un changement (comme `diff -U3`).
+/// Number of context lines around a change (like `diff -U3`).
 const CONTEXT: usize = 3;
-/// Borne dure de lignes affichées (gros edit/write) ; au-delà → `Truncated`.
+/// Hard bound of displayed lines (large edit/write); past it -> `Truncated`.
 const MAX_ROWS: usize = 200;
-/// Garde de coût AVANT le diff (US-037 AC4) : le Myers de `similar` est O(N·D) et
-/// `bound()` ne tronque que la SORTIE — au-delà de ces seuils sur l'entrée, on ne
-/// diffe pas (un `old_string`/`new_string` géant fabriqué par le modèle ferait
-/// exploser le coût avant toute borne).
+/// Cost guard BEFORE the diff (US-037 AC4): the Myers of `similar` is O(N*D) and
+/// `bound()` only truncates the OUTPUT. Past these thresholds on the input, we do
+/// not diff (a giant `old_string`/`new_string` crafted by the model would blow up
+/// the cost before any bound).
 const MAX_DIFF_LINES: usize = 4000;
 const MAX_DIFF_BYTES: usize = 512 * 1024;
 
-/// Construit le diff d'un appel d'outil mutant depuis son `input`. `None` si
-/// l'outil n'est pas mutant ou si l'input est inexploitable (US-038 : pas de diff).
+/// Builds the diff of a mutating tool call from its `input`. `None` when
+/// the tool is not mutating or the input is unusable (US-038: no diff).
 pub fn from_tool(name: &str, input: &Value) -> Option<Diff> {
-    // L'`input` vient du modèle (adverse) et est rendu tel quel par `push_diff`
-    // SANS repasser par `sanitize` (le diff ne traverse pas le chemin markdown).
-    // On assainit donc ICI, choke point unique, AVANT de differ : un `new_string`
-    // fabriqué portant de l'OSC/CSI ne doit jamais atteindre le terminal intact.
+    // The `input` comes from the (adversarial) model and is rendered as is by `push_diff`
+    // WITHOUT going through `sanitize` again (the diff does not travel the markdown path).
+    // So we sanitize HERE, a single choke point, BEFORE diffing: a crafted `new_string`
+    // carrying OSC/CSI must never reach the terminal intact.
     use crate::render::sanitize;
     match name {
         "edit" => {
@@ -144,11 +144,11 @@ fn too_large_note(old: &str, new: &str) -> Diff {
     )])
 }
 
-/// Vrai diff interligne old → new, avec emphase intra-ligne (word-diff).
+/// Real inter-line diff old -> new, with intra-line emphasis (word-diff).
 fn from_edit(old: &str, new: &str) -> Diff {
-    // Garde de coût (US-037 AC4) : borner AVANT de differ. Le seuil d'octets attrape
-    // aussi le cas pathologique d'UNE ligne géante (où le diff intra-ligne O(L²)
-    // coûterait cher sans dépasser le seuil de lignes).
+    // Cost guard (US-037 AC4): bound BEFORE diffing. The byte threshold also catches
+    // the pathological case of ONE giant line (where the O(L^2) intra-line diff
+    // would be expensive without crossing the line threshold).
     if old.len() > MAX_DIFF_BYTES
         || new.len() > MAX_DIFF_BYTES
         || old.lines().count() > MAX_DIFF_LINES
@@ -167,8 +167,8 @@ fn from_edit(old: &str, new: &str) -> Diff {
             rows.push(Row::Gap);
         }
         for op in group {
-            // Numéros suivis manuellement depuis les bornes de l'op (robuste quelle
-            // que soit l'API d'indices de `InlineChange`).
+            // Numbers tracked manually from the op bounds (robust whatever
+            // the index API of `InlineChange` is).
             let mut old_ln = op.old_range().start;
             let mut new_ln = op.new_range().start;
             for change in diff.iter_inline_changes(op) {
@@ -210,8 +210,8 @@ fn from_edit(old: &str, new: &str) -> Diff {
     bound(rows)
 }
 
-/// Création/remplacement : tout le contenu écrit présenté en lignes ajoutées,
-/// aperçu borné (on n'a pas l'ancien contenu sans relire le disque).
+/// Creation/replacement: all the written content presented as added lines,
+/// bounded preview (we do not have the old content without reading the disk).
 fn from_write(content: &str) -> Diff {
     let mut rows: Vec<Row> = Vec::new();
     let total = content.lines().count();
@@ -231,7 +231,7 @@ fn from_write(content: &str) -> Diff {
     Diff { rows }
 }
 
-/// Borne le nombre de rangées et ajoute un marqueur de troncature.
+/// Bounds the number of rows and adds a truncation marker.
 fn bound(mut rows: Vec<Row>) -> Diff {
     if rows.len() > MAX_ROWS {
         let extra = rows.len() - MAX_ROWS;
@@ -241,7 +241,7 @@ fn bound(mut rows: Vec<Row>) -> Diff {
     Diff { rows }
 }
 
-/// Retire le terminateur de ligne d'un segment (`similar` conserve les `\n`).
+/// Removes the line terminator of a segment (`similar` keeps the `\n`).
 fn strip_eol(s: &str) -> String {
     s.trim_end_matches(['\n', '\r']).to_string()
 }
@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn edit_produces_remove_then_add_with_word_emphasis() {
         let d = from_edit("let x = 1;\n", "let x = 2;\n");
-        // Une suppression + une addition (remplacement intra-ligne).
+        // One removal + one addition (intra-line replacement).
         let removes = d
             .rows
             .iter()
@@ -266,7 +266,7 @@ mod tests {
             .filter(|r| matches!(r, Row::Add { .. }))
             .count();
         assert_eq!((removes, adds), (1, 1));
-        // Au moins un segment emphasé (le `1`/`2` qui change), et pas TOUTE la ligne.
+        // At least one emphasized segment (the `1`/`2` that changes), and not the WHOLE line.
         let segs = d
             .rows
             .iter()
@@ -293,7 +293,7 @@ mod tests {
         let old = "a\nb\nc\nd\ne\n";
         let new = "a\nb\nC\nd\ne\n";
         let d = from_edit(old, new);
-        // La ligne 3 change ; le contexte (lignes 1,2,4,5) est conservé et numéroté.
+        // Line 3 changes; the context (lines 1,2,4,5) is kept and numbered.
         assert!(d.rows.iter().any(|r| matches!(
             r,
             Row::Context {
@@ -345,12 +345,12 @@ mod tests {
         assert!(from_tool("edit", &json!({"old_string": "a", "new_string": "b"})).is_some());
         assert!(from_tool("write", &json!({"content": "x"})).is_some());
         assert!(from_tool("read", &json!({"path": "a.rs"})).is_none());
-        // input dégénéré → None, pas de panic.
+        // degenerate input -> None, no panic.
         assert!(from_tool("edit", &json!({"path": "a.rs"})).is_none());
     }
 
-    // Sécurité : un `new_string`/`content` adverse portant de l'OSC/CSI est assaini
-    // à la construction du diff (le diff ne repasse pas par `sanitize` au rendu).
+    // Security: an adversarial `new_string`/`content` carrying OSC/CSI is sanitized
+    // when the diff is built (the diff does not go through `sanitize` at render time).
     #[test]
     fn from_tool_sanitizes_adversarial_input() {
         let d = from_tool(
@@ -376,8 +376,8 @@ mod tests {
         );
     }
 
-    // US-037 AC4 : la garde de coût borne `from_edit` sur une entrée géante (le diff
-    // Myers ne tourne pas) → repli `note` borné, sans panic ni explosion de coût.
+    // US-037 AC4: the cost guard bounds `from_edit` on a giant input (the Myers
+    // diff does not run) -> bounded `note` fallback, without a panic nor a cost blow-up.
     #[test]
     fn from_edit_bounds_huge_input() {
         let huge = "x\n".repeat(MAX_DIFF_LINES + 100);
@@ -386,7 +386,7 @@ mod tests {
             d.rows.len() <= 2 && d.rows.iter().all(|r| matches!(r, Row::Context { .. })),
             "bounded fallback expected, not a full diff"
         );
-        // Idem sur une ligne unique géante (seuil d'octets).
+        // Same on a single giant line (byte threshold).
         let big_line = "y".repeat(MAX_DIFF_BYTES + 1);
         let d2 = from_tool("edit", &json!({"old_string": "a", "new_string": big_line})).expect("d");
         assert!(matches!(&d2.rows[0], Row::Context { .. }));

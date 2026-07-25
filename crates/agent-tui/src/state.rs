@@ -1,7 +1,7 @@
-//! État de rendu côté client (US-019). `AppState` consomme les `AgentEvent` du
-//! cœur (jamais d'ANSI) et les range en `Block`s typés ; le rendu (`render.rs`)
-//! décide seul de la présentation. La gestion clavier renvoie une `InputAction`
-//! que la boucle agent-cli interprète (soumission, permission, quit, scroll).
+//! Client-side render state (US-019). `AppState` consumes the core's `AgentEvent`
+//! (never ANSI) and files them into typed `Block`s; rendering (`render.rs`)
+//! alone decides the presentation. Key handling returns an `InputAction`
+//! that the agent-cli loop interprets (submit, permission, quit, scroll).
 
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
@@ -14,26 +14,26 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::measure;
 
-/// Un élément du transcript. Le rendu choisit poids/teinte ; aucune couleur ici.
+/// A transcript item. Rendering picks weight/tint; no color here.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
-    /// Tour utilisateur.
+    /// User turn.
     User(String),
-    /// Tour assistant (texte streamé). `streaming` = curseur live actif.
+    /// Assistant turn (streamed text). `streaming` = live cursor active.
     Assistant { text: String, streaming: bool },
-    /// Raisonnement du modèle (rendu en sourdine).
+    /// Model reasoning (rendered muted).
     Reasoning(String),
-    /// Un outil va s'exécuter. L'`input` brut est CONSERVÉ (US-033) : le rendu en
-    /// dérive le label `Verb(cible)` et, à terme, le diff (EP-011) ; `id` apparie
-    /// l'appel à son résultat.
+    /// A tool is about to run. The raw `input` is KEPT (US-033): rendering
+    /// derives the `Verb(target)` label from it and, eventually, the diff (EP-011); `id` pairs
+    /// the call with its result.
     ToolCall {
         id: ToolCallId,
         name: String,
         input: serde_json::Value,
         input_hash: u64,
     },
-    /// Résultat d'un outil (taint + erreur portés pour le rendu). `call_id` pointe
-    /// vers le `ToolCall` correspondant (US-033) pour le résumé `⎿`.
+    /// Result of a tool (taint + error carried for rendering). `call_id` points
+    /// to the matching `ToolCall` (US-033) for the `⎿` summary.
     ToolResult {
         call_id: ToolCallId,
         content: String,
@@ -41,9 +41,9 @@ pub enum Block {
         is_error: bool,
         error_kind: Option<ToolErrorKind>,
     },
-    /// Information système discrète (compaction, budget…).
+    /// Discreet system information (compaction, budget, ...).
     Notice(String),
-    /// Erreur remontée par le cœur.
+    /// Error surfaced by the core.
     Error(String),
 }
 
@@ -53,10 +53,10 @@ pub enum Status {
     Thinking,
 }
 
-/// Commandes slash : (nom, description, prend-un-argument). Source unique pour le
-/// menu de complétion (rendu) ET l'exécution (boucle agent-cli). `takes_arg` =
-/// la commande ouvre un sous-menu / attend un argument (Entrée complète au lieu
-/// d'exécuter). Ajouter = une ligne ici + une branche dans le dispatch.
+/// Slash commands: (name, description, takes-an-argument). Single source for the
+/// completion menu (rendering) AND execution (agent-cli loop). `takes_arg` =
+/// the command opens a submenu / expects an argument (Enter completes instead
+/// of executing). Adding one = a line here + a branch in the dispatch.
 pub const COMMANDS: &[(&str, &str, bool)] = &[
     ("/help", "Show available commands", false),
     ("/models", "Choose the active model", true),
@@ -76,15 +76,15 @@ pub const COMMANDS: &[(&str, &str, bool)] = &[
     ("/quit", "Quit Pyxis", false),
 ];
 
-/// Niveau 1 de `/providers` : (id, libellé, actif). Seul l'abonnement est
-/// disponible pour l'instant ; la clé API est annoncée mais inactive.
+/// Level 1 of `/providers`: (id, label, active). Only the subscription is
+/// available for now; the API key is announced but inactive.
 pub const AUTH_KINDS: &[(&str, &str, bool)] = &[
     ("subscription", "Use a subscription", true),
     ("apikey", "Use an API key", false),
 ];
 
-/// Niveau 2 de `/providers subscription` : (id, libellé, actif). Seul Codex
-/// (abonnement ChatGPT) est branché ; les autres sont annoncés.
+/// Level 2 of `/providers subscription`: (id, label, active). Only Codex
+/// (ChatGPT subscription) is wired; the others are announced.
 pub const SUB_PROVIDERS: &[(&str, &str, bool)] = &[
     ("codex", "ChatGPT Plus/Pro (Codex Subscription)", true),
     ("anthropic", "Anthropic (Claude Pro/Max)", false),
@@ -144,8 +144,8 @@ pub const GPT5_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
 const EFFORTS_TO_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const EFFORTS_TO_ULTRA: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 
-/// Tag provider affiché en hint dans le sous-menu `/models`. Un seul canal de
-/// modèles est câblé aujourd'hui (abonnement ChatGPT via le backend Codex).
+/// Provider tag shown as a hint in the `/models` submenu. A single model
+/// channel is wired today (ChatGPT subscription through the Codex backend).
 const CODEX_TAG: &str = "[openai-codex]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,10 +156,10 @@ pub struct ModelMeta {
     pub supported_reasoning_efforts: &'static [&'static str],
 }
 
-/// Catalogue de SECOURS, utilisé tant que le backend n'a pas répondu (démarrage,
-/// hors ligne, token expiré). La liste faisant autorité est celle que le compte
-/// connecté renvoie sur `GET /models` : voir `set_models` / `models()`. Snapshot
-/// du 2026-07-24, ordre = priorité backend.
+/// FALLBACK catalog, used until the backend has answered (startup,
+/// offline, expired token). The authoritative list is the one the connected
+/// account returns on `GET /models`: see `set_models` / `models()`. Snapshot
+/// of 2026-07-24, order = backend priority.
 const BUNDLED_MODELS: &[ModelMeta] = &[
     ModelMeta {
         slug: "gpt-5.6-sol",
@@ -205,11 +205,11 @@ const BUNDLED_MODELS: &[ModelMeta] = &[
     },
 ];
 
-/// Catalogue publié par le backend pour le compte connecté. Écrit une seule fois
-/// par process (`set_models`), lu sans verrou par le rendu.
+/// Catalog published by the backend for the connected account. Written once
+/// per process (`set_models`), read without a lock by the rendering.
 static REMOTE_MODELS: OnceLock<&'static [ModelMeta]> = OnceLock::new();
 
-/// Modèle tel que le provider l'a découvert, avant conversion en `ModelMeta`.
+/// Model as the provider discovered it, before conversion into `ModelMeta`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelCatalogEntry {
     pub slug: String,
@@ -217,18 +217,18 @@ pub struct ModelCatalogEntry {
     pub supported_reasoning_efforts: Vec<String>,
 }
 
-/// Catalogue actif : celui du backend dès qu'il est connu, sinon `BUNDLED_MODELS`.
+/// Active catalog: the backend one as soon as it is known, `BUNDLED_MODELS` otherwise.
 pub fn models() -> &'static [ModelMeta] {
     REMOTE_MODELS.get().copied().unwrap_or(BUNDLED_MODELS)
 }
 
-/// Publie le catalogue découvert sur le backend. Renvoie `false` si la liste est
-/// vide (backend qui ne connaît pas notre `client_version`) ou si un catalogue a
-/// déjà été publié : dans les deux cas le catalogue courant reste en place.
+/// Publishes the catalog discovered on the backend. Returns `false` when the list is
+/// empty (backend that does not know our `client_version`) or when a catalog has
+/// already been published: in both cases the current catalog stays in place.
 ///
-/// Les chaînes sont volontairement fuitées : le catalogue est immuable et vit
-/// aussi longtemps que le process, ce qui garde `ModelMeta: Copy` et les
-/// signatures `&'static` de tous les appelants.
+/// The strings are deliberately leaked: the catalog is immutable and lives
+/// as long as the process, which keeps `ModelMeta: Copy` and the
+/// `&'static` signatures of every caller.
 pub fn set_models(entries: Vec<ModelCatalogEntry>) -> bool {
     if entries.is_empty() {
         return false;
@@ -360,11 +360,11 @@ pub fn permission_mode_label(id: &str) -> &'static str {
         .unwrap_or("Ask for approval")
 }
 
-/// Le texte est-il une vraie commande Pyxis ? (1er mot ∈ COMMANDS). Un message
-/// qui commence par un `/<skill>` n'en est PAS une → il part à l'agent.
-/// Offset byte, dans `s`, de la frontière de graphème atteignant au plus `col`
-/// colonnes terminal. Sert à conserver la colonne en navigation verticale sans
-/// jamais tomber au milieu d'un caractère (US-009 AC5).
+/// Is the text a real Pyxis command? (1st word in COMMANDS). A message
+/// starting with a `/<skill>` is NOT one -> it goes to the agent.
+/// Byte offset, in `s`, of the grapheme boundary reaching at most `col`
+/// terminal columns. Used to keep the column during vertical navigation without
+/// ever landing in the middle of a character (US-009 AC5).
 fn offset_at_width(s: &str, col: usize) -> usize {
     let mut used = 0usize;
     for (i, g) in s.grapheme_indices(true) {
@@ -378,8 +378,8 @@ fn offset_at_width(s: &str, col: usize) -> usize {
 }
 
 fn is_command(text: &str) -> bool {
-    // Une commande Pyxis tient sur une ligne : un message multi-ligne qui
-    // commence par `/resume …` est un prompt, pas une commande (US-009).
+    // A Pyxis command fits on one line: a multi-line message starting
+    // with `/resume ...` is a prompt, not a command (US-009).
     if text.contains('\n') {
         return false;
     }
@@ -387,7 +387,7 @@ fn is_command(text: &str) -> bool {
     COMMANDS.iter().any(|(name, _, _)| *name == first)
 }
 
-/// La commande `name` attend-elle un argument / un sous-menu ?
+/// Does the `name` command expect an argument / a submenu?
 fn command_takes_arg(name: &str) -> bool {
     COMMANDS
         .iter()
@@ -396,9 +396,9 @@ fn command_takes_arg(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Un item de menu de complétion (source unifiée : commandes, modèles, sessions,
-/// providers). `id` = valeur passée à l'action ; `label`/`hint` = affichage ;
-/// `enabled` = sélectionnable (les items « bientôt » sont grisés).
+/// A completion menu item (unified source: commands, models, sessions,
+/// providers). `id` = value passed to the action; `label`/`hint` = display;
+/// `enabled` = selectable ("coming soon" items are greyed out).
 #[derive(Debug, Clone)]
 pub struct MenuItem {
     pub id: String,
@@ -418,7 +418,7 @@ impl MenuItem {
     }
 }
 
-/// Quel sous-menu la saisie courante ouvre-t-elle ? (fil d'Ariane dans l'input).
+/// Which submenu does the current input open? (breadcrumb in the input).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Menu {
     None,
@@ -431,27 +431,27 @@ enum Menu {
     Permissions,
     ProviderAuth,
     ProviderList,
-    /// Niveau 3 : actions sur un provider (connect/disconnect).
+    /// Level 3: actions on a provider (connect/disconnect).
     ProviderActions,
-    /// `/mcp ` : liste des serveurs MCP (badge de statut).
+    /// `/mcp `: list of MCP servers (status badge).
     McpList,
-    /// `/mcp <serveur> ` : actions sur un serveur (connect/disconnect/tools).
+    /// `/mcp <server> `: actions on a server (connect/disconnect/tools).
     McpActions,
 }
 
-/// Entrée du sous-menu `/resume` (remplie par agent-cli depuis le disque).
+/// Entry of the `/resume` submenu (filled by agent-cli from the disk).
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
-    /// Identifiant résolu côté CLI (nom de fichier `<id>.jsonl`).
+    /// Identifier resolved on the CLI side (`<id>.jsonl` file name).
     pub id: String,
-    /// Libellé affiché : résumé de la conversation (1er message).
+    /// Displayed label: summary of the conversation (1st message).
     pub label: String,
-    /// Indice secondaire affiché en sourdine (ex. « 12 msgs · il y a 2 h »).
+    /// Secondary hint displayed muted (e.g. "12 msgs - 2 h ago").
     pub hint: String,
 }
 
-/// Statut de connexion d'un serveur MCP (sous-menu `/mcp`). Calque l'enum
-/// `agent_mcp::McpServer` côté affichage — agent-cli fait le mapping.
+/// Connection status of an MCP server (`/mcp` submenu). Mirrors the
+/// `agent_mcp::McpServer` enum on the display side; agent-cli does the mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McpStatus {
     Disconnected,
@@ -460,20 +460,20 @@ pub enum McpStatus {
     Failed,
 }
 
-/// Entrée du sous-menu `/mcp` (remplie par agent-cli depuis le registre MCP).
+/// Entry of the `/mcp` submenu (filled by agent-cli from the MCP registry).
 #[derive(Debug, Clone)]
 pub struct McpServerMeta {
     pub name: String,
     pub status: McpStatus,
     pub source: String,
     pub needs_trust: bool,
-    /// Nombre d'outils exposés (significatif seulement si `Connected`).
+    /// Number of exposed tools (meaningful only when `Connected`).
     pub tool_count: usize,
 }
 
-/// Reconstruit le transcript affichable depuis des messages canoniques (resume
-/// d'une session). Inverse approximatif d'`AppState::apply` : System ignoré,
-/// thinking → reasoning, tool_use → tool call, tool_result → résultat.
+/// Rebuilds the displayable transcript from canonical messages (resuming
+/// a session). Rough inverse of `AppState::apply`: System ignored,
+/// thinking -> reasoning, tool_use -> tool call, tool_result -> result.
 pub fn blocks_from_messages(messages: &[Message]) -> Vec<Block> {
     let mut blocks = Vec::new();
     for m in messages {
@@ -534,8 +534,8 @@ pub fn blocks_from_messages(messages: &[Message]) -> Vec<Block> {
     blocks
 }
 
-/// Extrait l'historique des prompts (messages utilisateur, ancien → récent) d'une
-/// session reprise, pour la navigation aux flèches.
+/// Extracts the prompt history (user messages, oldest -> most recent) of a
+/// resumed session, for arrow-key navigation.
 pub fn prompts_from_messages(messages: &[Message]) -> Vec<String> {
     messages
         .iter()
@@ -545,10 +545,10 @@ pub fn prompts_from_messages(messages: &[Message]) -> Vec<String> {
         .collect()
 }
 
-/// Demande de confirmation présentée à l'utilisateur (générique : la boucle
-/// agent-cli la construit depuis la `PermissionRequest` d'`agent-tools`, en
-/// pré-rendant l'aperçu via `diff` : vrai diff pour `edit`/`write`, lignes de
-/// contexte pour bash/inconnu, PARTAGÉ avec le diff inline du transcript (US-039).
+/// Confirmation request presented to the user (generic: the agent-cli loop
+/// builds it from the `PermissionRequest` of `agent-tools`, pre-rendering
+/// the preview through `diff`: a real diff for `edit`/`write`, context lines
+/// for bash/unknown, SHARED with the inline transcript diff (US-039).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PermissionPrompt {
     pub title: String,
@@ -580,117 +580,117 @@ impl PermissionPrompt {
 pub struct AppState {
     pub blocks: Vec<Block>,
     pub input: String,
-    /// Position du curseur dans l'input, en offset byte UTF-8 valide.
-    /// Les mouvements/suppressions suivent les graphèmes ; le rendu convertit cet
-    /// offset en largeur terminale via `unicode-width`.
+    /// Cursor position in the input, as a valid UTF-8 byte offset.
+    /// Moves/deletions follow graphemes; rendering converts this offset
+    /// into terminal width through `unicode-width`.
     pub cursor: usize,
     pub status: Status,
     pub pending: Option<PermissionPrompt>,
     pub truecolor: bool,
-    /// Décalage de scroll vers le HAUT (0 = collé en bas, suit le live).
+    /// Scroll offset UPWARD (0 = pinned at the bottom, follows the live output).
     pub scroll: usize,
-    /// Borne max du scroll, recalculée à chaque frame par le rendu (lignes APRÈS
-    /// wrap − hauteur visible). Cache de feedback rendu→entrée : permet de clamper
-    /// le scroll sans dupliquer le calcul de wrap hors de `render`.
+    /// Max scroll bound, recomputed on every frame by the rendering (lines AFTER
+    /// wrapping minus visible height). Rendering -> input feedback cache: lets us clamp
+    /// the scroll without duplicating the wrap computation outside of `render`.
     pub scroll_max: Cell<usize>,
-    /// Cache des lignes stylées par bloc (US-041) : ne reconstruire que le bloc en
-    /// stream, servir les autres depuis le cache. Interior mutability (même patron
-    /// que `scroll_max`) pour que `render` reste pur (signature `&AppState`).
+    /// Cache of styled lines per block (US-041): rebuild only the streaming
+    /// block, serve the others from the cache. Interior mutability (same pattern
+    /// as `scroll_max`) so that `render` stays pure (`&AppState` signature).
     pub(crate) render_cache: RefCell<crate::cache::RenderCache>,
     pub model: String,
-    /// Nom du workspace (dossier courant) affiché dans la status line ; vide = masqué.
+    /// Workspace name (current directory) shown in the status line; empty = hidden.
     pub workspace: String,
-    /// Fraction de contexte consommée (0–100). `None` = inconnue → segment masqué.
+    /// Fraction of context consumed (0-100). `None` = unknown -> segment hidden.
     pub context_pct: Option<u8>,
-    /// Effort de raisonnement affiché avec le modèle dans le footer.
+    /// Reasoning effort displayed with the model in the footer.
     pub reasoning_effort: Option<String>,
-    /// Mode de permission affiché dans le footer et le sous-menu `/permissions`.
+    /// Permission mode displayed in the footer and the `/permissions` submenu.
     permission_mode: String,
-    /// Index sélectionné dans le menu de commandes slash (0 = première ligne).
+    /// Selected index in the slash command menu (0 = first line).
     pub completion_index: usize,
-    /// Sessions reprenables (sous-menu `/resume`), remplies par agent-cli.
+    /// Resumable sessions (`/resume` submenu), filled by agent-cli.
     pub sessions: Vec<SessionMeta>,
-    /// Skills disponibles (`~/.agents/skills`), sous-menu `/skills`. Lus avant le
-    /// sandbox (dossier hors workspace) et injectés par agent-cli.
+    /// Available skills (`~/.agents/skills`), `/skills` submenu. Read before the
+    /// sandbox (directory outside the workspace) and injected by agent-cli.
     pub skills: Vec<String>,
-    /// Fichiers mentionnables via `@`, bornés et fournis par agent-cli.
+    /// Files mentionable through `@`, bounded and provided by agent-cli.
     pub files: Vec<String>,
-    /// Connecté au fournisseur actif (badge status line + sous-menu providers).
+    /// Connected to the active provider (status line badge + providers submenu).
     pub provider_connected: bool,
-    /// Serveurs MCP connus + statut (sous-menu `/mcp`), remplis par agent-cli.
+    /// Known MCP servers + status (`/mcp` submenu), filled by agent-cli.
     pub mcp_servers: Vec<McpServerMeta>,
-    /// Historique des prompts soumis (ancien → récent), navigable aux flèches.
+    /// History of submitted prompts (oldest -> most recent), navigable with arrows.
     pub history: Vec<String>,
-    /// Position dans l'historique : `None` = brouillon courant, `Some(i)` = sur
-    /// `history[i]`. Brouillon sauvegardé dans `draft` au premier Haut.
+    /// Position in the history: `None` = current draft, `Some(i)` = on
+    /// `history[i]`. The draft is saved in `draft` on the first Up.
     history_pos: Option<usize>,
     draft: String,
     pub should_quit: bool,
     shutdown_in_progress: bool,
     quit_shortcut_expires_at: Option<Instant>,
-    // ── Progression vivante (EP-013) ────────────────────────────────────────────
-    /// Tick d'animation du spinner, avancé par la boucle (~10 fps) tant qu'un tour
-    /// est actif. Le rendu choisit la frame depuis ce compteur (reste pur).
+    // ── Live progress (EP-013) ──────────────────────────────────────────────────
+    /// Spinner animation tick, advanced by the loop (~10 fps) as long as a turn
+    /// is active. Rendering picks the frame from this counter (stays pure).
     pub spinner_tick: usize,
-    /// Durée écoulée du tour en cours (`None` hors tour) ; alimentée par la boucle
-    /// (qui possède l'horloge) — `render` ne lit jamais l'heure.
+    /// Elapsed time of the current turn (`None` outside a turn); fed by the loop
+    /// (which owns the clock): `render` never reads the time.
     pub turn_elapsed: Option<Duration>,
-    /// Caractères cumulés (texte + raisonnement) du tour en cours → estimation de
-    /// tokens (/4). Sur une boucle `/goal`, cumule l'ensemble des relances (vue coût
-    /// total) : remis à zéro seulement au front montant de `running` (`begin_turn`).
+    /// Cumulated characters (text + reasoning) of the current turn -> token
+    /// estimate (/4). On a `/goal` loop, cumulates every re-prompt (total cost
+    /// view): reset only on the rising edge of `running` (`begin_turn`).
     pub turn_chars: usize,
-    /// Reduced-motion (`NO_COLOR` / `PYXIS_REDUCED_MOTION`) : spinner dégradé en point pulsé.
+    /// Reduced motion (`NO_COLOR` / `PYXIS_REDUCED_MOTION`): spinner degraded to a pulsing dot.
     pub reduced_motion: bool,
-    /// Nouveaux blocs arrivés pendant que l'utilisateur a remonté le transcript
-    /// (pill « revenir en bas », US-046). Remis à 0 dès le retour au bas.
+    /// New blocks that arrived while the user had scrolled up the transcript
+    /// ("back to bottom" pill, US-046). Reset to 0 as soon as the bottom is reached.
     pub unseen: usize,
-    /// Overlay transcript complet, ouvert par Ctrl+T. Son scroll est séparé du
-    /// scroll du fil principal pour revenir exactement où l'utilisateur était.
+    /// Full transcript overlay, opened with Ctrl+T. Its scroll is separate from
+    /// the main thread scroll, to come back exactly where the user was.
     transcript_overlay_open: bool,
     transcript_overlay_scroll: usize,
     transcript_overlay_scroll_max: Cell<usize>,
     transcript_overlay_page_height: Cell<usize>,
-    /// Début du stream live courant : index de bloc et compteur de caractères.
-    /// Utilisé pour retirer les deltas abandonnés quand le core retry/recover.
+    /// Start of the current live stream: block index and character counter.
+    /// Used to drop abandoned deltas when the core retries/recovers.
     stream_start: Option<(usize, usize)>,
-    /// Collages volumineux remplacés par un résumé dans `input` (US-011). Le
-    /// contenu intégral est ré-expansé au moment de la soumission.
+    /// Large pastes replaced by a summary in `input` (US-011). The
+    /// full content is re-expanded at submission time.
     pastes: Vec<PendingPaste>,
-    /// Sortie de l'outil en cours d'exécution, streamée avant son résultat
-    /// (US-015). Vidée à l'arrivée du résultat, sauf interruption : ce que la
-    /// commande avait déjà produit reste alors visible.
+    /// Output of the running tool, streamed before its result
+    /// (US-015). Cleared when the result arrives, except on interruption: what the
+    /// command had already produced then stays visible.
     pub live_output: Option<LiveOutput>,
 }
 
-/// Sortie partielle d'un appel d'outil encore en vol.
+/// Partial output of a tool call still in flight.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveOutput {
     pub call_id: ToolCallId,
     pub text: String,
 }
 
-/// Bornes de l'affichage live (US-015 AC3) : la sortie visible reste courte, la
-/// politique de troncature du résultat final est inchangée.
+/// Bounds of the live display (US-015 AC3): the visible output stays short, the
+/// truncation policy of the final result is unchanged.
 pub const LIVE_OUTPUT_MAX_LINES: usize = 8;
 const LIVE_OUTPUT_MAX_BYTES: usize = 8_192;
 
-/// Un collage résumé : ce qui est affiché, et ce qui sera réellement envoyé.
+/// A summarized paste: what is displayed, and what will really be sent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingPaste {
     placeholder: String,
     content: String,
 }
 
-/// Au-delà de ce nombre de lignes, un collage est résumé dans le composer plutôt
-/// qu'inséré tel quel (US-011 AC2).
+/// Past this line count, a paste is summarized in the composer rather
+/// than inserted as is (US-011 AC2).
 pub const PASTE_SUMMARY_MIN_LINES: usize = 500;
 
-/// Action déduite d'une touche, interprétée par la boucle agent-cli.
+/// Action derived from a key, interpreted by the agent-cli loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
     None,
     Submit(String),
-    /// Commande slash à exécuter (ligne complète, args inclus : `/model gpt-5.5`).
+    /// Slash command to run (full line, args included: `/model gpt-5.5`).
     Command(String),
     Interrupt,
     Quit,
@@ -699,10 +699,10 @@ pub enum InputAction {
     ScrollDown,
 }
 
-/// Modificateurs qui transforment Entrée en insertion de saut de ligne. Maj y
-/// figure : les terminaux qui rapportent les modificateurs sur Entrée rendent
-/// Maj+Entrée équivalent à Alt+Entrée (US-009 AC2). Les autres n'émettent aucun
-/// modificateur, et Entrée soumet comme avant (AC3).
+/// Modifiers that turn Enter into a newline insertion. Shift is among
+/// them: terminals that report modifiers on Enter make
+/// Shift+Enter equivalent to Alt+Enter (US-009 AC2). The others emit no
+/// modifier, and Enter submits as before (AC3).
 const NEWLINE_MODIFIERS: KeyModifiers = KeyModifiers::ALT.union(KeyModifiers::SHIFT);
 
 fn is_ctrl_key(key: &KeyEvent, expected: char) -> bool {
@@ -768,7 +768,7 @@ impl AppState {
         }
     }
 
-    // ── Édition de l'input avec curseur positionnable ──────────────────────────
+    // ── Input editing with a positionable cursor ───────────────────────────────
 
     fn clamp_cursor(&mut self) {
         self.cursor = self.cursor.min(self.input.len());
@@ -792,7 +792,7 @@ impl AppState {
             .or_else(|| (self.cursor < self.input.len()).then_some(self.input.len()))
     }
 
-    /// Remplace l'input et place le curseur en fin (recall, complétion, insertion).
+    /// Replaces the input and puts the cursor at the end (recall, completion, insertion).
     pub fn set_input(&mut self, value: String) {
         self.cursor = value.len();
         self.input = value;
@@ -872,21 +872,21 @@ impl AppState {
         self.pastes.clear();
     }
 
-    /// Insère un char à la position du curseur.
+    /// Inserts a char at the cursor position.
     pub fn insert_char(&mut self, c: char) {
         self.clamp_cursor();
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
     }
 
-    /// Insère une chaîne à la position du curseur (le curseur la suit).
+    /// Inserts a string at the cursor position (the cursor follows it).
     pub fn insert_str(&mut self, s: &str) {
         self.clamp_cursor();
         self.input.insert_str(self.cursor, s);
         self.cursor += s.len();
     }
 
-    /// Supprime le char AVANT le curseur (Backspace).
+    /// Deletes the char BEFORE the cursor (Backspace).
     pub fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
@@ -898,7 +898,7 @@ impl AppState {
         }
     }
 
-    /// Supprime le char SOUS le curseur (Delete).
+    /// Deletes the char UNDER the cursor (Delete).
     pub fn delete(&mut self) {
         self.clamp_cursor();
         if self.cursor >= self.input.len() {
@@ -920,7 +920,7 @@ impl AppState {
             self.cursor = next;
         }
     }
-    /// Début / fin de la ligne LOGIQUE contenant `at` (bornes en offsets byte).
+    /// Start / end of the LOGICAL line containing `at` (bounds as byte offsets).
     fn line_bounds(&self, at: usize) -> (usize, usize) {
         let start = self.input[..at].rfind('\n').map_or(0, |i| i + 1);
         let end = self.input[at..]
@@ -929,8 +929,8 @@ impl AppState {
         (start, end)
     }
 
-    /// Home / Ctrl+A : début de la ligne courante (identique à l'offset 0 tant
-    /// que la saisie tient sur une ligne, donc comportement inchangé).
+    /// Home / Ctrl+A: start of the current line (identical to offset 0 as long
+    /// as the input fits on one line, hence unchanged behavior).
     fn move_home(&mut self) {
         self.clamp_cursor();
         self.cursor = self.line_bounds(self.cursor).0;
@@ -940,9 +940,9 @@ impl AppState {
         self.cursor = self.line_bounds(self.cursor).1;
     }
 
-    /// Monte d'une ligne logique en conservant la colonne affichée. Retourne
-    /// `false` si le curseur est déjà sur la première ligne : l'appelant rappelle
-    /// alors l'historique (US-009 AC4).
+    /// Moves up one logical line while keeping the displayed column. Returns
+    /// `false` when the cursor is already on the first line: the caller then
+    /// recalls the history (US-009 AC4).
     fn move_line_up(&mut self) -> bool {
         self.clamp_cursor();
         let (start, _) = self.line_bounds(self.cursor);
@@ -956,7 +956,7 @@ impl AppState {
         true
     }
 
-    /// Descend d'une ligne logique. `false` = déjà sur la dernière ligne.
+    /// Moves down one logical line. `false` = already on the last line.
     fn move_line_down(&mut self) -> bool {
         self.clamp_cursor();
         let (start, end) = self.line_bounds(self.cursor);
@@ -970,13 +970,13 @@ impl AppState {
         true
     }
 
-    /// Insère un saut de ligne sans soumettre (Alt+Entrée, Ctrl+J, Maj+Entrée).
+    /// Inserts a newline without submitting (Alt+Enter, Ctrl+J, Shift+Enter).
     pub fn insert_newline(&mut self) {
         self.insert_char('\n');
     }
 
-    /// Insère un contenu collé : neutralisé des séquences de contrôle, et résumé
-    /// au-delà de `PASTE_SUMMARY_MIN_LINES` lignes (US-011).
+    /// Inserts pasted content: stripped of control sequences, and summarized
+    /// past `PASTE_SUMMARY_MIN_LINES` lines (US-011).
     pub fn insert_paste(&mut self, raw: &str) {
         let text = crate::composer::sanitize_paste(raw);
         let lines = text.lines().count();
@@ -992,12 +992,12 @@ impl AppState {
         });
     }
 
-    /// Ré-expanse les collages résumés : c'est le contenu INTÉGRAL qui part vers
-    /// le modèle, jamais le résumé affiché (US-011 AC3).
+    /// Re-expands the summarized pastes: it is the FULL content that goes to
+    /// the model, never the displayed summary (US-011 AC3).
     ///
-    /// Appariement par texte, dans l'ordre d'apparition, chaque collage n'étant
-    /// consommé qu'une fois. Limite assumée : deux collages de même volume dont
-    /// l'un a été effacé à la main peuvent être intervertis.
+    /// Matching by text, in order of appearance, each paste being
+    /// consumed only once. Accepted limitation: two pastes of the same size, one of
+    /// which was deleted by hand, can be swapped.
     fn expand_pastes(&self, text: &str) -> String {
         if self.pastes.is_empty() {
             return text.to_string();
@@ -1049,7 +1049,7 @@ impl AppState {
         }
     }
 
-    /// Range un `AgentEvent` du cœur dans le transcript.
+    /// Files an `AgentEvent` from the core into the transcript.
     pub fn apply(&mut self, ev: &AgentEvent) {
         let before = self.blocks.len();
         match ev {
@@ -1092,9 +1092,9 @@ impl AppState {
                 self.push_live_output(&view.id, &view.chunk);
             }
             AgentEvent::ToolResult(view) => {
-                // AC4 : sur interruption, la sortie déjà produite reste affichée —
-                // le résultat synthétique ne la contient pas. Sinon, le résultat
-                // final remplace l'aperçu live.
+                // AC4: on interruption, the output already produced stays displayed;
+                // the synthetic result does not contain it. Otherwise, the final
+                // result replaces the live preview.
                 if self
                     .live_output
                     .as_ref()
@@ -1103,9 +1103,9 @@ impl AppState {
                 {
                     self.live_output = None;
                 }
-                // Symétrie défensive avec ToolCall : si un résultat orphelin arrivait
-                // sans appel préalable, un Assistant{streaming} resté ouvert ne doit pas
-                // garder un curseur live fantôme.
+                // Defensive symmetry with ToolCall: should an orphan result arrive
+                // without a preceding call, an Assistant{streaming} left open must not
+                // keep a phantom live cursor.
                 self.finalize_streaming();
                 self.blocks.push(Block::ToolResult {
                     call_id: view.id.clone(),
@@ -1116,8 +1116,8 @@ impl AppState {
                 });
             }
             AgentEvent::Compacted(_) => self.blocks.push(Block::Notice("context compacted".into())),
-            // Comptabilité de tour (US-017) : contrat machine, sans rendu. Le
-            // compteur de contexte a sa propre source.
+            // Turn accounting (US-017): machine contract, no rendering. The
+            // context counter has its own source.
             AgentEvent::ModelTurn(_) => {}
             AgentEvent::TurnDiff(view) => self.blocks.push(Block::Notice(turn_diff_summary(view))),
             AgentEvent::PermissionAsk(req) => self
@@ -1145,21 +1145,21 @@ impl AppState {
                 self.status = Status::Idle;
             }
         }
-        // Pill « nouveau message » (US-046) : si l'utilisateur a remonté le
-        // transcript, signaler le contenu apparu hors de sa vue.
+        // "New message" pill (US-046): when the user has scrolled up the
+        // transcript, report the content that appeared out of their view.
         if self.scroll > 0 {
             if self.blocks.len() > before {
                 self.unseen += self.blocks.len() - before;
             } else if matches!(ev, AgentEvent::Text(_) | AgentEvent::Reasoning(_)) {
-                // Stream qui APPEND au dernier bloc (pas de nouveau bloc) : signaler au
-                // moins « du contenu est arrivé » sans gonfler le compteur par token.
+                // Stream that APPENDS to the last block (no new block): report at
+                // least "content arrived" without inflating the counter per token.
                 self.unseen = self.unseen.max(1);
             }
         }
     }
 
-    /// Pousse le tour utilisateur (appelé à la soumission) et l'enregistre dans
-    /// l'historique navigable (dédup consécutive, façon `ignoredups`).
+    /// Pushes the user turn (called on submission) and records it in the
+    /// navigable history (consecutive dedup, `ignoredups` style).
     pub fn push_user(&mut self, text: impl Into<String>) {
         let text = text.into();
         if self.history.last().map(String::as_str) != Some(text.as_str()) {
@@ -1174,8 +1174,8 @@ impl AppState {
         self.unseen = 0;
     }
 
-    /// Accumule un fragment de sortie de l'outil en cours, borné en octets puis en
-    /// lignes : un `cargo build` bavard ne pousse pas le transcript hors écran.
+    /// Accumulates an output fragment of the running tool, bounded in bytes then in
+    /// lines: a chatty `cargo build` does not push the transcript off screen.
     fn push_live_output(&mut self, call_id: &ToolCallId, chunk: &str) {
         let live = match &mut self.live_output {
             Some(live) if live.call_id == *call_id => live,
@@ -1206,8 +1206,8 @@ impl AppState {
         }
     }
 
-    /// Lignes de sortie live à afficher sous l'outil en cours (au plus
-    /// `LIVE_OUTPUT_MAX_LINES`, sans séquence ANSI).
+    /// Live output lines to display under the running tool (at most
+    /// `LIVE_OUTPUT_MAX_LINES`, without any ANSI sequence).
     pub fn live_output_lines(&self) -> Vec<String> {
         self.live_output
             .as_ref()
@@ -1225,7 +1225,7 @@ impl AppState {
             .unwrap_or_default()
     }
 
-    /// Remplace l'historique navigable (resume d'une session) et réinitialise la
+    /// Replaces the navigable history (resuming a session) and resets the
     /// navigation.
     pub fn load_history(&mut self, prompts: Vec<String>) {
         self.history = prompts;
@@ -1233,8 +1233,8 @@ impl AppState {
         self.draft.clear();
     }
 
-    /// Flèche Haut : remonte vers un prompt plus ancien. Sauvegarde le brouillon
-    /// au premier appui ; se bloque sur le plus ancien (pas de wrap).
+    /// Up arrow: goes back to an older prompt. Saves the draft on the
+    /// first press; stops on the oldest (no wrap).
     pub fn history_prev(&mut self) {
         if self.history.is_empty() {
             return;
@@ -1253,8 +1253,8 @@ impl AppState {
         self.completion_index = 0;
     }
 
-    /// Flèche Bas : redescend vers un prompt plus récent ; au-delà du plus récent,
-    /// restaure le brouillon.
+    /// Down arrow: goes forward to a more recent prompt; past the most recent,
+    /// restores the draft.
     pub fn history_next(&mut self) {
         match self.history_pos {
             None => {}
@@ -1294,12 +1294,12 @@ impl AppState {
         self.status = Status::Thinking;
     }
 
-    /// Remonte dans le transcript de `n` lignes, clampé à la borne calculée au
-    /// dernier rendu (`scroll_max`) — pas de sur-scroll au-delà du début.
+    /// Scrolls up the transcript by `n` lines, clamped to the bound computed at the
+    /// last render (`scroll_max`): no over-scroll past the beginning.
     pub fn scroll_up(&mut self, n: u16) {
-        // Quitter le bas repart d'un compteur vierge : tout `unseen` résiduel (ex. un
-        // bloc poussé pendant qu'on était déjà collé en bas) est écarté ; on ne
-        // comptera que le contenu arrivant APRÈS ce scroll (US-046).
+        // Leaving the bottom starts from a blank counter: any residual `unseen` (e.g. a
+        // block pushed while we were already pinned at the bottom) is dropped; we only
+        // count the content arriving AFTER this scroll (US-046).
         if self.scroll == 0 {
             self.unseen = 0;
         }
@@ -1309,10 +1309,10 @@ impl AppState {
             .min(self.scroll_max.get());
     }
 
-    /// Redescend de `n` lignes (0 = collé en bas, suit le live).
+    /// Scrolls back down by `n` lines (0 = pinned at the bottom, follows the live output).
     pub fn scroll_down(&mut self, n: u16) {
         self.scroll = self.scroll.saturating_sub(n as usize);
-        // Retour au bas → l'auto-follow reprend, plus de « nouveaux messages » (US-046).
+        // Back at the bottom -> auto-follow resumes, no more "new messages" (US-046).
         if self.scroll == 0 {
             self.unseen = 0;
         }
@@ -1364,47 +1364,47 @@ impl AppState {
         self.transcript_overlay_scroll = 0;
     }
 
-    /// Nombre de blocs reconstruits au dernier rendu (instrumentation US-041) : 0 =
-    /// tout servi depuis le cache. Exposé pour les tests de performance du cache.
+    /// Number of blocks rebuilt at the last render (US-041 instrumentation): 0 =
+    /// everything served from the cache. Exposed for the cache performance tests.
     pub fn render_rebuilds(&self) -> usize {
         self.render_cache.borrow().rebuilds()
     }
 
-    /// Démarre le suivi de progression d'un tour (front montant de `running` côté
-    /// boucle, US-044/045) : remet à zéro spinner, durée et compteur de tokens.
+    /// Starts tracking the progress of a turn (rising edge of `running` on the
+    /// loop side, US-044/045): resets spinner, duration and token counter.
     pub fn begin_turn(&mut self) {
         self.spinner_tick = 0;
         self.turn_elapsed = None;
         self.turn_chars = 0;
     }
 
-    /// Avance l'animation et met à jour la durée écoulée (appelé par le tick de la
-    /// boucle tant qu'un tour est actif, US-044/045). `render` reste pur : il ne lit
-    /// jamais l'horloge, il consomme ces valeurs.
+    /// Advances the animation and updates the elapsed time (called by the loop
+    /// tick as long as a turn is active, US-044/045). `render` stays pure: it never
+    /// reads the clock, it consumes these values.
     pub fn tick_progress(&mut self, elapsed: Duration) {
         self.spinner_tick = self.spinner_tick.wrapping_add(1);
         self.turn_elapsed = Some(elapsed);
     }
 
-    /// Fin de tour (front descendant de `running`) : les indicateurs disparaissent
-    /// proprement, sans compteur qui continue (US-045).
+    /// End of turn (falling edge of `running`): the indicators disappear
+    /// cleanly, without a counter that keeps running (US-045).
     pub fn end_turn(&mut self) {
         self.turn_elapsed = None;
     }
 
-    /// Quel sous-menu la saisie ouvre-t-elle ? (fil d'Ariane dans l'input :
-    /// `/providers subscription …` = niveau 2, `/providers …` = niveau 1, etc.)
+    /// Which submenu does the input open? (breadcrumb in the input:
+    /// `/providers subscription ...` = level 2, `/providers ...` = level 1, etc.)
     fn menu_kind(&self) -> Menu {
         let i = self.input.as_str();
-        // Une saisie multi-ligne n'est jamais une commande : sans ce garde-fou,
-        // un collage commençant par `/resume ` ouvrirait un menu qui capterait
-        // Entrée au lieu de soumettre (US-009).
+        // A multi-line input is never a command: without this guardrail,
+        // a paste starting with `/resume ` would open a menu that would capture
+        // Enter instead of submitting (US-009).
         if i.contains('\n') {
             return Menu::None;
         }
         if let Some(rest) = i.strip_prefix("/providers ") {
             if let Some(rest2) = rest.strip_prefix("subscription ") {
-                // « <provider> » suivi d'un espace → niveau 3 (actions du provider).
+                // "<provider>" followed by a space -> level 3 (provider actions).
                 let prov = rest2.split(' ').next().unwrap_or("");
                 if !prov.is_empty()
                     && rest2.len() > prov.len()
@@ -1418,9 +1418,9 @@ impl AppState {
                 Menu::ProviderAuth
             }
         } else if i.strip_prefix("/mcp ").is_some() {
-            // McpActions dès qu'un serveur connu est entièrement saisi (suivi d'un
-            // espace) ; sinon on filtre encore la liste. `active_mcp_server` gère
-            // les noms contenant des espaces.
+            // McpActions as soon as a known server is fully typed (followed by a
+            // space); otherwise we keep filtering the list. `active_mcp_server` handles
+            // names containing spaces.
             if self.active_mcp_server().is_empty() {
                 Menu::McpList
             } else {
@@ -1445,8 +1445,8 @@ impl AppState {
         }
     }
 
-    /// Items du menu de complétion selon le sous-menu actif. Source unifiée :
-    /// commandes, modèles, sessions (dynamiques), niveaux de `/providers`.
+    /// Completion menu items according to the active submenu. Unified source:
+    /// commands, models, sessions (dynamic), `/providers` levels.
     pub fn menu_items(&self) -> Vec<MenuItem> {
         match self.menu_kind() {
             Menu::None => Vec::new(),
@@ -1588,7 +1588,7 @@ impl AppState {
                     .collect()
             }
             Menu::ProviderActions => {
-                // Connect actif seulement si déconnecté ; Disconnect l'inverse.
+                // Connect active only when disconnected; Disconnect the other way around.
                 let c = self.provider_connected;
                 vec![
                     MenuItem::new(
@@ -1676,19 +1676,19 @@ impl AppState {
         }
     }
 
-    /// Le menu de complétion est-il ouvert ? (au moins un item à proposer).
+    /// Is the completion menu open? (at least one item to offer).
     pub fn menu_open(&self) -> bool {
         !self.menu_items().is_empty()
     }
 
-    /// Aucune conversation encore (transcript vide) : le rendu affiche l'écran
-    /// d'accueil (carte + logo) au lieu du fil. Repart à l'accueil après `/new`
-    /// ou `/clear`, qui vident `blocks`.
+    /// No conversation yet (empty transcript): rendering shows the welcome
+    /// screen (card + logo) instead of the thread. Back to the welcome after `/new`
+    /// or `/clear`, which empty `blocks`.
     pub fn is_welcome(&self) -> bool {
         self.blocks.is_empty() && !self.shutdown_in_progress
     }
 
-    /// Provider ciblé par le niveau 3 (`/providers subscription <provider> …`).
+    /// Provider targeted by level 3 (`/providers subscription <provider> ...`).
     fn active_provider(&self) -> String {
         self.input
             .strip_prefix("/providers subscription ")
@@ -1697,9 +1697,9 @@ impl AppState {
             .to_string()
     }
 
-    /// Serveur MCP ciblé par le niveau 2 (`/mcp <serveur> …`). Le nom peut contenir
-    /// des espaces : on retient le plus long nom connu qui préfixe la saisie et est
-    /// suivi d'un espace.
+    /// MCP server targeted by level 2 (`/mcp <server> ...`). The name can contain
+    /// spaces: we keep the longest known name that prefixes the input and is
+    /// followed by a space.
     fn active_mcp_server(&self) -> String {
         let Some(rest) = self.input.strip_prefix("/mcp ") else {
             return String::new();
@@ -1734,8 +1734,8 @@ impl AppState {
         self.cursor = start + replacement.len();
     }
 
-    /// Tab : complète le fil d'Ariane vers l'item sélectionné (descend d'un
-    /// niveau pour les items à sous-menu, sinon pré-remplit la commande).
+    /// Tab: completes the breadcrumb toward the selected item (goes down one
+    /// level for items with a submenu, otherwise pre-fills the command).
     fn complete(&mut self, kind: Menu, item: &MenuItem) {
         let provider = self.active_provider();
         let value = match kind {
@@ -1746,7 +1746,7 @@ impl AppState {
             Menu::Skills => format!("/{} ", item.id),
             Menu::ProviderAuth if item.id == "subscription" => "/providers subscription ".into(),
             Menu::ProviderAuth => format!("/providers {} ", item.id),
-            // Provider branché → descend aux actions ; sinon pré-remplit.
+            // Wired provider -> go down to the actions; otherwise pre-fill.
             Menu::ProviderList if item.enabled => format!("/providers subscription {} ", item.id),
             Menu::ProviderList => format!("/providers subscription {}", item.id),
             Menu::ProviderActions => format!("/providers subscription {provider} {}", item.id),
@@ -1763,8 +1763,8 @@ impl AppState {
         self.set_input(value);
     }
 
-    /// Entrée : exécute l'item sélectionné — ou descend d'un niveau s'il ouvre un
-    /// sous-menu (commande à argument, `subscription`), ou insère (skill).
+    /// Enter: runs the selected item, or goes down one level when it opens a
+    /// submenu (command with an argument, `subscription`), or inserts (skill).
     fn activate(&mut self, kind: Menu, item: MenuItem) -> InputAction {
         match kind {
             Menu::None => InputAction::None,
@@ -1794,8 +1794,8 @@ impl AppState {
                 InputAction::Command(format!("/resume {}", item.id))
             }
             Menu::Skills => {
-                // INSERTION (pas d'exécution) : `/<skill> ` remplace le `/skills…`
-                // tapé, curseur juste après — l'utilisateur poursuit son message.
+                // INSERTION (no execution): `/<skill> ` replaces the typed
+                // `/skills...`, cursor right after; the user continues their message.
                 self.set_input(format!("/{} ", item.id));
                 InputAction::None
             }
@@ -1813,7 +1813,7 @@ impl AppState {
                 InputAction::Command(format!("/providers {}", item.id))
             }
             Menu::ProviderList if item.enabled => {
-                // Provider branché → descend au menu d'actions (connect/disconnect).
+                // Wired provider -> go down to the actions menu (connect/disconnect).
                 self.set_input(format!("/providers subscription {} ", item.id));
                 InputAction::None
             }
@@ -1826,7 +1826,7 @@ impl AppState {
                 self.clear_input();
                 InputAction::Command(format!("/providers subscription {provider} {}", item.id))
             }
-            // Sélectionner un serveur → descend au menu d'actions (connect/disconnect).
+            // Selecting a server -> go down to the actions menu (connect/disconnect).
             Menu::McpList if item.enabled => {
                 self.set_input(format!("/mcp {} ", item.id));
                 InputAction::None
@@ -1841,7 +1841,7 @@ impl AppState {
         }
     }
 
-    /// Gestion clavier. En attente de permission, seules o/n/Enter/Esc/Ctrl+C comptent.
+    /// Key handling. While waiting for a permission, only y/n/Enter/Esc/Ctrl+C count.
     pub fn on_key(&mut self, key: KeyEvent) -> InputAction {
         let is_ctrl_c = is_ctrl_key(&key, 'c');
         let is_ctrl_t = is_ctrl_key(&key, 't');
@@ -1877,8 +1877,8 @@ impl AppState {
             };
         }
 
-        // Menu de complétion ouvert (commandes ou sous-menus) : flèches / Tab /
-        // Entrée / Esc lui sont dédiés.
+        // Completion menu open (commands or submenus): arrows / Tab /
+        // Enter / Esc are dedicated to it.
         if self.menu_open() {
             let items = self.menu_items();
             let idx = self.completion_index.min(items.len().saturating_sub(1));
@@ -1899,8 +1899,8 @@ impl AppState {
                     }
                     return InputAction::None;
                 }
-                // Entrée NUE seulement : Alt/Maj+Entrée insèrent un saut de ligne
-                // même quand le menu est ouvert (US-009 AC1).
+                // BARE Enter only: Alt/Shift+Enter insert a newline
+                // even when the menu is open (US-009 AC1).
                 KeyCode::Enter if !key.modifiers.intersects(NEWLINE_MODIFIERS) => {
                     self.completion_index = 0;
                     if let Some(item) = items.get(idx).cloned() {
@@ -1928,9 +1928,9 @@ impl AppState {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
-                // Ctrl+J (0x0A en raw mode → `Char('j')`) est le raccourci
-                // d'insertion universel : il ne dépend d'aucun protocole clavier
-                // étendu, contrairement à Maj+Entrée.
+                // Ctrl+J (0x0A in raw mode -> `Char('j')`) is the universal
+                // insertion shortcut: it depends on no extended keyboard
+                // protocol, unlike Shift+Enter.
                 KeyCode::Char('j') | KeyCode::Enter => {
                     self.insert_newline();
                     self.completion_index = 0;
@@ -1962,8 +1962,8 @@ impl AppState {
             KeyCode::Esc if self.status == Status::Thinking && key.modifiers.is_empty() => {
                 InputAction::Interrupt
             }
-            // Alt+Entrée, et Maj+Entrée sur les terminaux qui rapportent le
-            // modificateur : saut de ligne, pas de soumission (US-009 AC1/AC2).
+            // Alt+Enter, and Shift+Enter on terminals that report the
+            // modifier: newline, no submission (US-009 AC1/AC2).
             KeyCode::Enter if key.modifiers.intersects(NEWLINE_MODIFIERS) => {
                 self.insert_newline();
                 self.completion_index = 0;
@@ -1974,13 +1974,13 @@ impl AppState {
                 if text.is_empty() {
                     InputAction::None
                 } else if is_command(&text) {
-                    // Vraie commande Pyxis (1er mot dans COMMANDS, ex `/models …`).
+                    // Real Pyxis command (1st word in COMMANDS, e.g. `/models ...`).
                     self.clear_input();
                     self.completion_index = 0;
                     InputAction::Command(text)
                 } else {
-                    // Tout le reste (dont un message commençant par `/<skill> …`)
-                    // est envoyé à l'agent.
+                    // Everything else (including a message starting with `/<skill> ...`)
+                    // is sent to the agent.
                     self.clear_input();
                     InputAction::Submit(text)
                 }
@@ -2000,7 +2000,7 @@ impl AppState {
                 self.completion_index = 0;
                 InputAction::None
             }
-            // Déplacements du curseur dans l'input.
+            // Cursor moves inside the input.
             KeyCode::Left => {
                 self.move_left();
                 InputAction::None
@@ -2017,9 +2017,9 @@ impl AppState {
                 self.move_end();
                 InputAction::None
             }
-            // Flèches (menu fermé) : navigation entre les lignes de la saisie,
-            // puis rappel d'historique une fois la première/dernière ligne
-            // atteinte (US-009 AC4).
+            // Arrows (menu closed): navigation between the input lines,
+            // then history recall once the first/last line is
+            // reached (US-009 AC4).
             KeyCode::Up => {
                 if !self.move_line_up() {
                     self.history_prev();
@@ -2086,10 +2086,10 @@ impl AppState {
     }
 }
 
-/// Résumé d'une ligne du diff agrégé du tour (US-018) : la réponse à « qu'est-ce
-/// qui a changé ? » sans rejouer un diff déjà vu édition par édition. Les
-/// fichiers touchés par une commande shell, eux, n'ont jamais été affichés
-/// ailleurs — c'est là que la ligne gagne son coût.
+/// Summary of a line of the aggregated turn diff (US-018): the answer to "what
+/// changed?" without replaying a diff already seen edit by edit. The
+/// files touched by a shell command, in contrast, were never displayed
+/// anywhere else: that is where the line earns its cost.
 pub fn turn_diff_summary(view: &TurnDiffView) -> String {
     let (added, removed) = view.totals();
     let n = view.files.len();
@@ -2200,8 +2200,8 @@ mod tests {
 
     #[test]
     fn live_output_shows_while_the_tool_runs_and_clears_on_result() {
-        // US-015 AC2 : les fragments s'affichent sous l'appel en cours ; le
-        // résultat final les remplace.
+        // US-015 AC2: the fragments are displayed under the running call; the
+        // final result replaces them.
         let mut s = AppState::new("gpt-5", false);
         s.apply(&tool_call("c1"));
         s.apply(&delta("c1", "Compiling agent-core\n"));
@@ -2225,8 +2225,8 @@ mod tests {
 
     #[test]
     fn live_output_survives_an_interruption() {
-        // US-015 AC4 : le résultat synthétique d'interruption ne porte pas la
-        // sortie déjà produite — elle doit rester lisible.
+        // US-015 AC4: the synthetic interruption result does not carry the
+        // output already produced, which must stay readable.
         let mut s = AppState::new("gpt-5", false);
         s.apply(&tool_call("c1"));
         s.apply(&delta("c1", "warning: unused\n"));
@@ -2243,8 +2243,8 @@ mod tests {
 
     #[test]
     fn live_output_is_bounded_and_sanitized() {
-        // AC3 : l'affichage reste borné quel que soit le volume produit, et une
-        // séquence ANSI de la sortie ne peut pas altérer le rendu.
+        // AC3: the display stays bounded whatever the produced volume, and an
+        // ANSI sequence in the output cannot alter the rendering.
         let mut s = AppState::new("gpt-5", false);
         s.apply(&tool_call("c1"));
         for i in 0..500 {
@@ -2327,11 +2327,11 @@ mod tests {
         assert!(s.menu_open(), "menu should open on /");
         assert_eq!(s.menu_items().len(), COMMANDS.len());
         s.on_key(key('m'));
-        // «/m» matche /models ET /mcp.
+        // "/m" matches /models AND /mcp.
         let m = s.menu_items();
         assert_eq!(m.len(), 2, "/m matches /models and /mcp");
         assert!(m.iter().all(|it| it.id.starts_with("/m")));
-        // «/mo» désambiguïse vers /models seul.
+        // "/mo" disambiguates to /models alone.
         s.on_key(key('o'));
         let m = s.menu_items();
         assert_eq!(m.len(), 1, "«/mo» ne matche que /models");
@@ -2403,12 +2403,12 @@ mod tests {
         for c in "/mcp ".chars() {
             s.on_key(key(c));
         }
-        // Entrée sur le serveur → descend au menu d'actions (n'exécute pas).
+        // Enter on the server -> goes down to the actions menu (does not execute).
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(action, InputAction::None);
         assert_eq!(s.input, "/mcp fetch ");
-        // Déconnecté: connect visible mais inactif, car les outils MCP ne sont
-        // pas exposés au modèle dans ce build.
+        // Disconnected: connect visible but inactive, because MCP tools are
+        // not exposed to the model in this build.
         let items = s.menu_items();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "connect");
@@ -2461,8 +2461,8 @@ mod tests {
             needs_trust: false,
             tool_count: 1,
         }];
-        // complete() écrit le nom complet (avec espace) ; le menu doit basculer en
-        // actions, pas rester bloqué sur la liste (régression review #7).
+        // complete() writes the full name (with a space); the menu must switch to
+        // actions, not stay stuck on the list (review regression #7).
         s.set_input("/mcp my server ".into());
         let ids: Vec<_> = s.menu_items().into_iter().map(|i| i.id).collect();
         assert_eq!(ids, vec!["disconnect", "tools"]);
@@ -2482,7 +2482,7 @@ mod tests {
         let items = s.menu_items();
         assert_eq!(items.len(), 1);
         assert!(!items[0].enabled, "placeholder non sélectionnable");
-        // Entrée sur le placeholder ne dispatche rien.
+        // Enter on the placeholder dispatches nothing.
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(action, InputAction::None);
     }
@@ -2491,7 +2491,7 @@ mod tests {
     fn enter_on_non_arg_command_executes() {
         let mut s = AppState::new("gpt-5", false);
         s.on_key(key('/'));
-        // Navigue jusqu'à /quit (sans dépendre de l'ordre exact de COMMANDS).
+        // Navigates to /quit (without depending on the exact order of COMMANDS).
         let quit_idx = COMMANDS.iter().position(|(n, _, _)| *n == "/quit").unwrap();
         for _ in 0..quit_idx {
             s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -2503,7 +2503,7 @@ mod tests {
 
     #[test]
     fn goal_command_highlighted_and_routed() {
-        // `/goal` est une vraie commande (routée), pas un message agent.
+        // `/goal` is a real command (routed), not an agent message.
         let mut s = AppState::new("gpt-5", false);
         for c in "/goal vivre de mes produits".chars() {
             s.on_key(key(c));
@@ -2519,18 +2519,18 @@ mod tests {
     fn skills_submenu_inserts_and_routes_to_agent() {
         let mut s = AppState::new("gpt-5", false);
         s.skills = vec!["frontend-design".into(), "meta-code".into()];
-        // Ouvre le sous-menu skills, filtre par sous-chaîne.
+        // Opens the skills submenu, filters by substring.
         s.input = "/skills front".into();
         s.cursor = s.input.len();
         let items = s.menu_items();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "frontend-design");
-        // Sélection → INSÈRE `/frontend-design ` (pas de Command), curseur en fin.
+        // Selection -> INSERTS `/frontend-design ` (no Command), cursor at the end.
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(action, InputAction::None);
         assert_eq!(s.input, "/frontend-design ");
         assert_eq!(s.cursor, s.input.len());
-        // Soumis avec un message → part à l'AGENT (pas une commande Pyxis).
+        // Submitted with a message -> goes to the AGENT (not a Pyxis command).
         for c in "refais l'UI".chars() {
             s.on_key(key(c));
         }
@@ -2571,16 +2571,16 @@ mod tests {
         for c in "helo".chars() {
             s.on_key(key(c));
         }
-        // curseur en fin (4) ; recule de 1 (entre 'l' et 'o') et insère 'l'.
+        // cursor at the end (4); step back by 1 (between 'l' and 'o') and insert 'l'.
         s.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         s.on_key(key('l'));
         assert_eq!(s.input, "hello");
         assert_eq!(s.cursor, 4);
-        // Home puis Backspace ne fait rien (curseur en tête).
+        // Home then Backspace does nothing (cursor at the start).
         s.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         s.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(s.input, "hello");
-        // Delete supprime le char sous le curseur ('h').
+        // Delete removes the char under the cursor ('h').
         s.on_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
         assert_eq!(s.input, "ello");
     }
@@ -2620,13 +2620,13 @@ mod tests {
     fn providers_menu_three_levels_and_badge() {
         let mut s = AppState::new("gpt-5", true);
         s.provider_connected = true;
-        // Niveau 1 : types d'auth.
+        // Level 1: auth types.
         s.input = "/providers ".into();
         let lvl1 = s.menu_items();
         assert_eq!(lvl1.len(), AUTH_KINDS.len());
         assert_eq!(lvl1[0].id, "subscription");
         assert!(!lvl1[1].enabled, "API key inactive");
-        // « subscription » descend au niveau 2 (providers).
+        // "subscription" goes down to level 2 (providers).
         assert_eq!(
             s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             InputAction::None
@@ -2635,19 +2635,19 @@ mod tests {
         let lvl2 = s.menu_items();
         assert_eq!(lvl2[0].id, "codex");
         assert_eq!(lvl2[0].hint, "connected", "connected badge on codex");
-        // Codex (branché) descend au niveau 3 (actions).
+        // Codex (wired) goes down to level 3 (actions).
         assert_eq!(
             s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             InputAction::None
         );
         assert_eq!(s.input, "/providers subscription codex ");
         let lvl3 = s.menu_items();
-        // Connecté → Connect grisé, Disconnect actif.
+        // Connected -> Connect greyed out, Disconnect active.
         assert_eq!(lvl3[0].id, "connect");
         assert!(!lvl3[0].enabled, "Connect disabled while connected");
         assert_eq!(lvl3[1].id, "disconnect");
         assert!(lvl3[1].enabled, "Disconnect enabled while connected");
-        // Sélectionner Disconnect → exécute la commande pleine.
+        // Selecting Disconnect -> runs the full command.
         s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
@@ -2671,22 +2671,22 @@ mod tests {
         let mut s = AppState::new("gpt-5", false);
         s.push_user("premier");
         s.push_user("second");
-        // brouillon en cours de frappe
+        // draft being typed
         for c in "brou".chars() {
             s.on_key(key(c));
         }
         let up = || KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
         let down = || KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
-        // Haut → plus récent ; le brouillon est sauvegardé.
+        // Up -> most recent; the draft is saved.
         s.on_key(up());
         assert_eq!(s.input, "second");
         s.on_key(up());
         assert_eq!(s.input, "premier");
-        s.on_key(up()); // bloqué sur le plus ancien (pas de wrap)
+        s.on_key(up()); // stops on the oldest (no wrap)
         assert_eq!(s.input, "premier");
         s.on_key(down());
         assert_eq!(s.input, "second");
-        s.on_key(down()); // au-delà du récent → brouillon restauré
+        s.on_key(down()); // past the most recent -> draft restored
         assert_eq!(s.input, "brou");
     }
 
@@ -2730,7 +2730,7 @@ mod tests {
         s.input = "/resume ".into();
         assert!(s.menu_open());
         assert_eq!(s.menu_items().len(), 2);
-        s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // → 2e session
+        s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // -> 2nd session
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(action, InputAction::Command("/resume 222.jsonl".into()));
     }
@@ -2791,8 +2791,8 @@ mod tests {
     fn models_submenu_opens_and_selection_routes_command() {
         let mut s = AppState::new("gpt-5", false);
         s.on_key(key('/'));
-        s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // → /models
-        // Entrée sur une commande à argument OUVRE le sous-menu (n'exécute pas).
+        s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // -> /models
+        // Enter on a command with an argument OPENS the submenu (does not execute).
         assert_eq!(
             s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             InputAction::None
@@ -2800,8 +2800,8 @@ mod tests {
         assert_eq!(s.input, "/models ");
         assert!(s.menu_open());
         assert_eq!(s.menu_items().len(), models().len());
-        // Naviguer puis sélectionner un modèle → exécute `/models <slug>`.
-        s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // → 2e du catalogue
+        // Navigate then select a model -> runs `/models <slug>`.
+        s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // -> 2nd of the catalog
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
             action,
@@ -2893,7 +2893,7 @@ mod tests {
     fn tab_completes_command_name() {
         let mut s = AppState::new("gpt-5", false);
         s.on_key(key('/'));
-        s.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // complète /help + espace
+        s.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)); // completes /help + space
         assert_eq!(s.input, "/help ");
         assert!(
             !s.menu_open(),
@@ -2909,10 +2909,10 @@ mod tests {
             "sensible",
             crate::diff::Diff::default(),
         ));
-        // une frappe normale ne tape PAS dans l'input pendant la confirmation
+        // a normal keystroke does NOT type into the input during the confirmation
         assert_eq!(s.on_key(key('x')), InputAction::None);
         assert!(s.input.is_empty());
-        // 'o' accepte
+        // 'y' accepts
         assert_eq!(s.on_key(key('o')), InputAction::Permission(true));
         assert!(s.pending.is_none());
     }
@@ -3114,7 +3114,7 @@ mod tests {
         assert!(!s.transcript_overlay_open());
     }
 
-    // US-044/045 : cycle de vie de la progression d'un tour.
+    // US-044/045: life cycle of a turn's progress.
     #[test]
     fn turn_progress_lifecycle() {
         let mut s = AppState::new("gpt-5", true);
@@ -3133,42 +3133,42 @@ mod tests {
         );
     }
 
-    // US-046 : `unseen` ne compte que les blocs arrivés en scroll haut, et se remet
-    // à zéro au retour en bas (auto-follow).
+    // US-046: `unseen` only counts the blocks that arrived while scrolled up, and resets
+    // to zero when back at the bottom (auto-follow).
     #[test]
     fn unseen_tracks_scrolled_up_content() {
         let mut s = AppState::new("gpt-5", true);
         s.apply(&AgentEvent::Text("a".into()));
         s.apply(&AgentEvent::EndTurn);
         assert_eq!(s.unseen, 0, "collé en bas : rien d'unseen");
-        s.scroll = 2; // l'utilisateur a remonté
-        s.apply(&AgentEvent::Text("b".into())); // nouveau bloc → +1
+        s.scroll = 2; // the user scrolled up
+        s.apply(&AgentEvent::Text("b".into())); // new block -> +1
         assert_eq!(s.unseen, 1);
-        s.scroll_down(5); // retour au bas
+        s.scroll_down(5); // back at the bottom
         assert_eq!(s.scroll, 0);
         assert_eq!(s.unseen, 0, "auto-follow → reset");
     }
 
-    // US-046 (robustesse) : quitter le bas écarte un `unseen` périmé (ex. laissé par
-    // un `scroll = 0` direct du chemin commande, qui ne passe pas par scroll_down).
+    // US-046 (robustness): leaving the bottom drops a stale `unseen` (e.g. left by
+    // a direct `scroll = 0` from the command path, which does not go through scroll_down).
     #[test]
     fn scroll_up_clears_stale_unseen() {
         let mut s = AppState::new("gpt-5", true);
-        s.scroll_max.set(50); // du contenu scrollable
-        s.unseen = 3; // périmé, alors qu'on est collé en bas
-        s.scroll_up(5); // on quitte le bas → compteur vierge
+        s.scroll_max.set(50); // scrollable content
+        s.unseen = 3; // stale, while we are pinned at the bottom
+        s.scroll_up(5); // we leave the bottom -> blank counter
         assert!(s.scroll > 0);
         assert_eq!(s.unseen, 0, "compteur périmé écarté en quittant le bas");
     }
 
-    // US-046 : un stream qui APPEND au dernier bloc Assistant (sans créer de nouveau
-    // bloc) signale quand même du contenu si l'utilisateur a remonté le transcript.
+    // US-046: a stream that APPENDS to the last Assistant block (without creating a new
+    // block) still reports content when the user has scrolled up the transcript.
     #[test]
     fn unseen_floors_on_pure_stream_append() {
         let mut s = AppState::new("gpt-5", true);
         s.apply(&AgentEvent::Text("start ".into()));
-        s.scroll = 2; // l'utilisateur remonte PENDANT le stream
-        s.apply(&AgentEvent::Text("suite".into())); // APPEND (pas de nouveau bloc)
+        s.scroll = 2; // the user scrolls up DURING the stream
+        s.apply(&AgentEvent::Text("suite".into())); // APPEND (no new block)
         assert_eq!(s.blocks.len(), 1, "un seul bloc Assistant (append)");
         assert_eq!(
             s.unseen, 1,
@@ -3176,7 +3176,7 @@ mod tests {
         );
     }
 
-    // ───────────── Composer multi-ligne (EP-003, US-009 / US-011) ─────────────
+    // ───────────── Multi-line composer (EP-003, US-009 / US-011) ─────────────
 
     fn press(s: &mut AppState, code: KeyCode, modifiers: KeyModifiers) -> InputAction {
         s.on_key(KeyEvent::new(code, modifiers))
@@ -3240,12 +3240,12 @@ mod tests {
         let mut s = AppState::new("gpt-5", false);
         s.history = vec!["ancien prompt".into()];
         type_str(&mut s, "premiere\nseconde");
-        // Curseur en fin de « seconde » (colonne 7) : Haut monte d'une ligne en
-        // tenant la colonne, pas en sautant en fin de ligne.
+        // Cursor at the end of "seconde" (column 7): Up moves one line up
+        // holding the column, not jumping to the end of the line.
         press(&mut s, KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(s.input, "premiere\nseconde");
         assert_eq!(&s.input[..s.cursor], "premier");
-        // Déjà sur la première ligne : Haut rappelle l'historique.
+        // Already on the first line: Up recalls the history.
         press(&mut s, KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(s.input, "ancien prompt");
     }
@@ -3260,7 +3260,7 @@ mod tests {
         press(&mut s, KeyCode::Home, KeyModifiers::NONE);
         press(&mut s, KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(s.cursor, 0);
-        // Sur la première ligne, Bas descend au lieu de rappeler l'historique.
+        // On the first line, Down moves down instead of recalling the history.
         press(&mut s, KeyCode::Down, KeyModifiers::NONE);
         assert_eq!(s.input, "un\ndeux");
         assert_eq!(s.cursor, 3);
@@ -3282,7 +3282,7 @@ mod tests {
     #[test]
     fn vertical_navigation_never_lands_inside_a_grapheme() {
         let mut s = AppState::new("gpt-5", false);
-        // Ligne 1 étroite en cellules, ligne 2 pleine de graphèmes composés.
+        // Line 1 narrow in cells, line 2 full of composed graphemes.
         s.set_input("漢字テスト\ne\u{301}👨\u{200d}👩\u{200d}👧 fin".into());
         for _ in 0..8 {
             press(&mut s, KeyCode::Up, KeyModifiers::NONE);
@@ -3348,7 +3348,7 @@ mod tests {
             InputAction::Submit(format!("{big} analyse")),
             "le contenu intégral part vers le modèle, jamais le résumé"
         );
-        // Le collage est consommé : la soumission suivante ne le rejoue pas.
+        // The paste is consumed: the next submission does not replay it.
         type_str(&mut s, "[collage : 847 lignes]");
         assert_eq!(
             press(&mut s, KeyCode::Enter, KeyModifiers::NONE),
