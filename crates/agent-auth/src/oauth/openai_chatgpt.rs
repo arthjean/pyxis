@@ -1,14 +1,14 @@
-//! Auth abonnement ChatGPT (ADR-10). Réutilise le client OAuth du **Codex CLI
-//! officiel OSS** — flow PKCE S256 sur `auth.openai.com` (browser + device-code),
-//! décodage JWT pour `chatgpt_account_id`, refresh tokens rotatifs.
+//! ChatGPT subscription auth (ADR-10). Reuses the OAuth client of the **official
+//! OSS Codex CLI**: PKCE S256 flow on `auth.openai.com` (browser + device-code),
+//! JWT decoding for `chatgpt_account_id`, rotating refresh tokens.
 //!
-//! Constantes vérifiées verbatim contre le repo Pi (`packages/ai/src/utils/oauth/
-//! openai-codex.ts` + `providers/openai-codex-responses.ts`, 45/45 confirmées).
-//! Détail & sources : `docs/openai-subscription-auth.md`.
+//! Constants checked verbatim against the Pi repo (`packages/ai/src/utils/oauth/
+//! openai-codex.ts` + `providers/openai-codex-responses.ts`, 45/45 confirmed).
+//! Details & sources: `docs/openai-subscription-auth.md`.
 //!
-//! ⚠️ Zone grise ToS : se fait passer pour Codex (client_id partagé), **révocable
-//! unilatéralement par OpenAI** (cf. ADR-7 R1, ADR-10). Credential « fragile »,
-//! jamais en chemin critique : c'est une commodité de dogfood derrière BYOK.
+//! ToS grey area: it impersonates Codex (shared client_id), **revocable
+//! unilaterally by OpenAI** (see ADR-7 R1, ADR-10). A "fragile" credential,
+//! never on the critical path: it is a dogfooding convenience behind BYOK.
 
 use std::time::Duration;
 
@@ -20,40 +20,40 @@ use serde::Deserialize;
 use super::pkce::Pkce;
 use crate::{OAuthCredential, ProviderId, Secret};
 
-// ───────────────── Constantes auth (auth.openai.com) — verbatim Pi ─────────────────
+// ───────────────── Auth constants (auth.openai.com), verbatim from Pi ─────────────────
 
-/// `client_id` du Codex CLI OSS (`openai-codex.ts:31`).
+/// `client_id` of the OSS Codex CLI (`openai-codex.ts:31`).
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
 pub const DEVICE_USER_CODE_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/usercode";
 pub const DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
-/// URI affichée à l'utilisateur en device flow.
+/// URI displayed to the user in device flow.
 pub const DEVICE_VERIFICATION_URI: &str = "https://auth.openai.com/codex/device";
-/// `redirect_uri` de l'échange code→token en **device** flow (≠ browser).
+/// `redirect_uri` of the code -> token exchange in **device** flow (different from browser).
 pub const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 pub const SCOPE: &str = "openid profile email offline_access";
 pub const CALLBACK_PORT: u16 = 1455;
 pub const CALLBACK_TIMEOUT: Duration = Duration::from_secs(900);
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEVICE_CODE_TIMEOUT: Duration = Duration::from_secs(900);
-/// Namespace du claim custom où vit `chatgpt_account_id` (`openai-codex.ts:44`).
+/// Namespace of the custom claim where `chatgpt_account_id` lives (`openai-codex.ts:44`).
 pub const JWT_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
-/// ⚠️ Hardcodé par client (Pi met `"pi"`). Le backend ChatGPT **peut** valider
-/// l'`originator` contre une liste connue — à tester au premier run (ADR-10).
+/// Hardcoded per client (Pi uses `"pi"`). The ChatGPT backend **may** validate
+/// the `originator` against a known list: to be tested on the first run (ADR-10).
 pub const ORIGINATOR: &str = "pyxis";
 
-/// Fallback `originator` si le backend rejette `pyxis` (US-021, unhappy path) :
-/// emprunter l'identité du Codex CLI officiel OSS, déjà sur la liste blanche du
-/// backend. Bascule à chaud via `PYXIS_ORIGINATOR` (pas de recompilation).
+/// `originator` fallback when the backend rejects `pyxis` (US-021, unhappy path):
+/// borrow the identity of the official OSS Codex CLI, already on the backend
+/// allow-list. Switched at runtime through `PYXIS_ORIGINATOR` (no recompilation).
 pub const ORIGINATOR_FALLBACK: &str = "codex_cli_rs";
 
-/// `originator` effectif envoyé sur la requête d'INFÉRENCE (US-021). Lit
-/// `PYXIS_ORIGINATOR` (permet de basculer `pyxis` ↔ `codex_cli_rs` pendant le
-/// spike sans recompiler) ; défaut `ORIGINATOR`. N'affecte PAS le flow OAuth :
-/// `build_authorize_url` garde `ORIGINATOR` (changer l'auth casserait le flow
-/// validé en live, hors scope).
+/// Effective `originator` sent on the INFERENCE request (US-021). Reads
+/// `PYXIS_ORIGINATOR` (allows switching `pyxis` <-> `codex_cli_rs` during the
+/// spike without recompiling); default `ORIGINATOR`. Does NOT affect the OAuth flow:
+/// `build_authorize_url` keeps `ORIGINATOR` (changing the auth would break the flow
+/// validated live, out of scope).
 pub fn originator() -> String {
     match std::env::var("PYXIS_ORIGINATOR") {
         Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
@@ -61,8 +61,8 @@ pub fn originator() -> String {
     }
 }
 
-/// Sélection déterministe du fallback (US-021, AC2) : `pyxis` si le backend
-/// l'accepte, sinon `codex_cli_rs` (whitelisté). Pur/testable, indépendant de l'env.
+/// Deterministic selection of the fallback (US-021, AC2): `pyxis` when the backend
+/// accepts it, otherwise `codex_cli_rs` (allow-listed). Pure/testable, independent of the env.
 pub fn originator_for(pyxis_accepted: bool) -> &'static str {
     if pyxis_accepted {
         ORIGINATOR
@@ -71,25 +71,25 @@ pub fn originator_for(pyxis_accepted: bool) -> &'static str {
     }
 }
 
-// ───────────────── Constantes inférence (backend ChatGPT, Responses API) ─────────────────
+// ───────────────── Inference constants (ChatGPT backend, Responses API) ─────────────────
 
 pub const CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const RESPONSES_PATH: &str = "/responses";
 pub const MODELS_PATH: &str = "/models";
 pub const OPENAI_BETA_SSE: &str = "responses=experimental";
 
-/// Version client annoncée au backend sur `/models`. Le backend FILTRE le
-/// catalogue sur le `minimal_client_version` de chaque modèle : annoncer une
-/// version trop basse renvoie une liste vide (mesuré le 2026-07-24 : `0.1.0` → 0
-/// modèle, `0.98.0` → 3, `0.124.0` → 5, `0.145.0` → 8). Ce n'est donc PAS la
-/// version de Pyxis mais un numéro de compatibilité de catalogue Codex.
-/// **Volatile, mise à jour manuelle** : refléter le dernier tag `rust-vX.Y.Z` de
-/// `openai/codex` (`gh release view --repo openai/codex --json tagName`) à chaque
-/// release, sinon les modèles introduits depuis restent invisibles dans `/models`.
-/// Override à chaud via `PYXIS_CODEX_CLIENT_VERSION`.
+/// Client version announced to the backend on `/models`. The backend FILTERS the
+/// catalog on the `minimal_client_version` of each model: announcing a
+/// too low version returns an empty list (measured on 2026-07-24: `0.1.0` -> 0
+/// models, `0.98.0` -> 3, `0.124.0` -> 5, `0.145.0` -> 8). So it is NOT the
+/// Pyxis version but a Codex catalog compatibility number.
+/// **Volatile, manually updated**: mirror the latest `rust-vX.Y.Z` tag of
+/// `openai/codex` (`gh release view --repo openai/codex --json tagName`) on every
+/// release, otherwise the models introduced since stay invisible in `/models`.
+/// Overridable at runtime through `PYXIS_CODEX_CLIENT_VERSION`.
 pub const CODEX_CLIENT_VERSION: &str = "0.145.0"; // openai/codex rust-v0.145.0, 2026-07-21
 
-/// `client_version` effectif envoyé sur `/models` (cf. `CODEX_CLIENT_VERSION`).
+/// Effective `client_version` sent on `/models` (see `CODEX_CLIENT_VERSION`).
 pub fn codex_client_version() -> String {
     match std::env::var("PYXIS_CODEX_CLIENT_VERSION") {
         Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
@@ -97,7 +97,7 @@ pub fn codex_client_version() -> String {
     }
 }
 
-// ──────────────────────────────── Erreurs ────────────────────────────────
+// ──────────────────────────────── Errors ────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -132,10 +132,10 @@ struct TokenResponse {
     expires_in: u64,
 }
 
-// ──────────────────────────── Builders purs (testables) ────────────────────────────
+// ──────────────────────────── Pure builders (testable) ────────────────────────────
 
-/// Construit l'URL d'autorisation (browser flow). Inclut les paramètres
-/// non-standard exigés par le backend Codex (`id_token_add_organizations`,
+/// Builds the authorization URL (browser flow). Includes the
+/// non-standard parameters required by the Codex backend (`id_token_add_organizations`,
 /// `codex_cli_simplified_flow`).
 pub fn build_authorize_url(challenge: &str, state: &str) -> Result<String, AuthError> {
     let mut url = url::Url::parse(AUTHORIZE_URL).map_err(|e| AuthError::Callback(e.to_string()))?;
@@ -153,9 +153,9 @@ pub fn build_authorize_url(challenge: &str, state: &str) -> Result<String, AuthE
     Ok(url.to_string())
 }
 
-/// Décode (sans vérifier la signature) la payload d'un JWT et en extrait
-/// `chatgpt_account_id`. On ne vérifie pas la signature : on lit un claim, la
-/// confiance vient du canal TLS d'OpenAI, pas d'une validation crypto locale.
+/// Decodes (without verifying the signature) the payload of a JWT and extracts
+/// `chatgpt_account_id` from it. We do not verify the signature: we read a claim, and
+/// trust comes from OpenAI's TLS channel, not from a local crypto validation.
 pub fn extract_account_id(access_token: &str) -> Result<String, AuthError> {
     let payload = decode_jwt_payload(access_token)?;
     payload
@@ -183,13 +183,13 @@ fn token_to_credential(token: TokenResponse, now_ms: u64) -> Result<OAuthCredent
         provider: ProviderId::OpenAiChatGpt,
         access: Secret::new(token.access_token),
         refresh: Secret::new(token.refresh_token),
-        // sliding : expires absolu = maintenant + expires_in (secondes → ms)
+        // sliding: absolute expiry = now + expires_in (seconds -> ms)
         expires_at: now_ms.saturating_add(token.expires_in.saturating_mul(1000)),
         account_id: Some(account_id),
     })
 }
 
-/// Résultat d'un callback browser.
+/// Result of a browser callback.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CallbackResult {
     pub code: String,
@@ -205,8 +205,8 @@ impl std::fmt::Debug for CallbackResult {
     }
 }
 
-/// Parse la ligne de requête HTTP du callback (`GET /auth/callback?code=…&state=… HTTP/1.1`)
-/// et valide le `state` (anti-CSRF).
+/// Parses the HTTP request line of the callback (`GET /auth/callback?code=...&state=... HTTP/1.1`)
+/// and validates the `state` (anti-CSRF).
 pub fn parse_callback_request_line(
     line: &str,
     expected_state: &str,
@@ -238,7 +238,7 @@ pub fn parse_callback_request_line(
     Ok(CallbackResult { code, state })
 }
 
-/// Issue d'un poll device-code.
+/// Outcome of a device-code poll.
 #[derive(Clone, PartialEq, Eq)]
 pub enum PollOutcome {
     Pending,
@@ -269,7 +269,7 @@ fn device_error_code(body: &serde_json::Value) -> Option<&str> {
         .and_then(|v| v.as_str())
 }
 
-/// Classifie une réponse de poll device-code (RFC 8628 + spécificités Codex).
+/// Classifies a device-code poll response (RFC 8628 + Codex specifics).
 pub fn classify_device_poll(
     status: u16,
     body: &serde_json::Value,
@@ -280,7 +280,7 @@ pub fn classify_device_poll(
         return match (code, verifier) {
             (Some(c), Some(v)) => Ok(PollOutcome::Done {
                 authorization_code: c.to_string(),
-                // ⚠️ en device flow, le code_verifier vient du SERVEUR, pas local.
+                // in device flow, the code_verifier comes from the SERVER, not locally.
                 code_verifier: v.to_string(),
             }),
             _ => Err(AuthError::TokenResponse(
@@ -300,8 +300,8 @@ pub fn classify_device_poll(
     }
 }
 
-/// Spécification de requête d'inférence pour l'abonnement ChatGPT (backend
-/// Responses API). À brancher dans l'adapter `agent-provider` (`OpenAiChatGpt`).
+/// Inference request specification for the ChatGPT subscription (Responses API
+/// backend). To be plugged into the `agent-provider` adapter (`OpenAiChatGpt`).
 #[derive(Clone)]
 pub struct RequestSpec {
     pub url: String,
@@ -331,8 +331,8 @@ impl std::fmt::Debug for RequestSpec {
     }
 }
 
-/// En-têtes d'inférence SSE pour une credential abonnement ChatGPT. Le
-/// `chatgpt-account-id` (dérivé du JWT) est requis pour router vers le compte.
+/// SSE inference headers for a ChatGPT subscription credential. The
+/// `chatgpt-account-id` (derived from the JWT) is required to route to the account.
 pub fn responses_request(cred: &OAuthCredential) -> Result<RequestSpec, AuthError> {
     let mut headers = auth_headers(cred)?;
     headers.push(("OpenAI-Beta".to_string(), OPENAI_BETA_SSE.to_string()));
@@ -344,9 +344,9 @@ pub fn responses_request(cred: &OAuthCredential) -> Result<RequestSpec, AuthErro
     })
 }
 
-/// Requête de découverte du catalogue de modèles (`GET /models`). Le backend
-/// renvoie les modèles accessibles AU COMPTE connecté (champ `available_in_plans`
-/// déjà appliqué), filtrés par `client_version` (cf. `CODEX_CLIENT_VERSION`).
+/// Model catalog discovery request (`GET /models`). The backend
+/// returns the models accessible TO THE connected ACCOUNT (`available_in_plans` field
+/// already applied), filtered by `client_version` (see `CODEX_CLIENT_VERSION`).
 pub fn models_request(cred: &OAuthCredential) -> Result<RequestSpec, AuthError> {
     let mut headers = auth_headers(cred)?;
     headers.push(("accept".to_string(), "application/json".to_string()));
@@ -360,7 +360,7 @@ pub fn models_request(cred: &OAuthCredential) -> Result<RequestSpec, AuthError> 
     })
 }
 
-/// En-têtes d'identification communs à toutes les requêtes backend Codex.
+/// Identification headers common to every Codex backend request.
 fn auth_headers(cred: &OAuthCredential) -> Result<Vec<(String, String)>, AuthError> {
     if cred.provider != ProviderId::OpenAiChatGpt {
         return Err(AuthError::WrongProvider(cred.provider));
@@ -379,10 +379,10 @@ fn auth_headers(cred: &OAuthCredential) -> Result<Vec<(String, String)>, AuthErr
     ])
 }
 
-// ──────────────────────────── Réseau (token exchange / refresh) ────────────────────────────
+// ──────────────────────────── Network (token exchange / refresh) ────────────────────────────
 
-/// Échange un `authorization_code` contre des tokens. `redirect_uri` diffère
-/// entre browser (`REDIRECT_URI`) et device (`DEVICE_REDIRECT_URI`).
+/// Exchanges an `authorization_code` for tokens. `redirect_uri` differs
+/// between browser (`REDIRECT_URI`) and device (`DEVICE_REDIRECT_URI`).
 pub async fn exchange_code(
     client: &reqwest::Client,
     code: &str,
@@ -406,8 +406,8 @@ pub async fn exchange_code(
     token_to_credential(token, now_ms)
 }
 
-/// Rafraîchit une credention via `grant_type=refresh_token`. Le refresh est
-/// **rotatif** : la nouvelle credential porte un nouveau refresh à réécrire.
+/// Refreshes a credential through `grant_type=refresh_token`. The refresh is
+/// **rotating**: the new credential carries a new refresh token to rewrite.
 pub async fn refresh(
     client: &reqwest::Client,
     refresh_token: &str,
@@ -427,7 +427,7 @@ pub async fn refresh(
     token_to_credential(token, now_ms)
 }
 
-// ──────────────────────────── Browser flow (PKCE + serveur callback local) ────────────────────────────
+// ──────────────────────────── Browser flow (PKCE + local callback server) ────────────────────────────
 
 fn random_state() -> String {
     let mut bytes = [0u8; 16];
@@ -435,9 +435,9 @@ fn random_state() -> String {
     hex::encode(bytes)
 }
 
-/// Login interactif : ouvre le navigateur, attend le callback sur `127.0.0.1:1455`,
-/// échange le code. L'ouverture du navigateur est best-effort — en cas d'échec,
-/// l'URL est imprimée pour collage manuel.
+/// Interactive login: opens the browser, waits for the callback on `127.0.0.1:1455`,
+/// exchanges the code. Opening the browser is best-effort: on failure,
+/// the URL is printed for manual copy-paste.
 pub async fn login_browser(client: &reqwest::Client) -> Result<OAuthCredential, AuthError> {
     login_browser_with_notice(client, |url, opened| {
         if !opened {
@@ -458,7 +458,7 @@ where
     let state = random_state();
     let url = build_authorize_url(&pkce.challenge, &state)?;
 
-    // bind AVANT d'ouvrir le navigateur (sinon course sur le callback)
+    // bind BEFORE opening the browser (otherwise a race on the callback)
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT)).await?;
 
     let opened = open::that(&url).is_ok();
@@ -472,8 +472,8 @@ where
 
 const SUCCESS_BODY: &str = "<!doctype html><meta charset=utf-8><body style=\"font-family:system-ui;background:#0b0b0b;color:#eaeaea;display:grid;place-items:center;height:100vh\"><div><h2>Pyxis connected</h2><p>You can close this tab.</p></div></body>";
 
-/// Accepte des connexions jusqu'à recevoir un callback `/auth/callback` valide.
-/// Les requêtes parasites (favicon, etc.) reçoivent un 404 et la boucle continue.
+/// Accepts connections until a valid `/auth/callback` callback is received.
+/// Irrelevant requests (favicon, etc.) get a 404 and the loop goes on.
 async fn accept_callback(
     listener: &tokio::net::TcpListener,
     expected_state: &str,
@@ -530,7 +530,7 @@ async fn accept_callback_with_read_timeout(
 
 // ──────────────────────────── Device-code flow (headless) ────────────────────────────
 
-/// Informations à présenter à l'utilisateur pour le device flow.
+/// Information to present to the user for the device flow.
 #[derive(Clone)]
 pub struct DeviceAuth {
     pub user_code: String,
@@ -546,7 +546,7 @@ impl std::fmt::Debug for DeviceAuth {
     }
 }
 
-/// État interne de poll (séparé de l'affichage utilisateur).
+/// Internal poll state (separate from the user-facing display).
 #[derive(Clone)]
 pub struct DeviceAuthState {
     device_auth_id: String,
@@ -564,7 +564,7 @@ impl std::fmt::Debug for DeviceAuthState {
     }
 }
 
-/// Démarre le device flow : retourne l'état à poller + les infos à afficher.
+/// Starts the device flow: returns the state to poll + the info to display.
 pub async fn start_device(
     client: &reqwest::Client,
 ) -> Result<(DeviceAuthState, DeviceAuth), AuthError> {
@@ -607,7 +607,7 @@ pub async fn start_device(
     ))
 }
 
-/// Poll jusqu'à autorisation, `slow_down`, ou timeout (900 s). Échange final via
+/// Polls until authorization, `slow_down`, or timeout (900 s). Final exchange through
 /// `DEVICE_REDIRECT_URI`.
 pub async fn poll_device(
     client: &reqwest::Client,
@@ -653,9 +653,9 @@ pub async fn poll_device(
     }
 }
 
-// ──────────────────────────── Horloge ────────────────────────────
+// ──────────────────────────── Clock ────────────────────────────
 
-/// Maintenant en ms epoch (source de `expires_at`).
+/// Now, in epoch ms (source of `expires_at`).
 pub fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -708,7 +708,7 @@ mod tests {
         ] {
             assert!(url.contains(needle), "param absent: {needle}\n{url}");
         }
-        // redirect_uri encodé
+        // encoded redirect_uri
         assert!(url.contains("redirect_uri=http"));
     }
 
@@ -729,12 +729,12 @@ mod tests {
             ),
             Err(AuthError::Callback(_))
         ));
-        // mauvais state → CSRF
+        // wrong state -> CSRF
         assert!(matches!(
             parse_callback_request_line(line, "WRONG"),
             Err(AuthError::StateMismatch)
         ));
-        // requête parasite → erreur Callback (la boucle 404 et continue)
+        // irrelevant request -> Callback error (the loop 404s and goes on)
         assert!(matches!(
             parse_callback_request_line("GET /favicon.ico HTTP/1.1", "s1"),
             Err(AuthError::Callback(_))
@@ -926,14 +926,14 @@ mod tests {
         assert_eq!(cb.code, "abc123");
     }
 
-    // US-021 AC2 : sélection du fallback `originator`. `pyxis` par défaut ;
-    // `codex_cli_rs` si le backend rejette `pyxis` (à trancher en live).
+    // US-021 AC2: selection of the `originator` fallback. `pyxis` by default;
+    // `codex_cli_rs` when the backend rejects `pyxis` (to be settled live).
     #[test]
     fn originator_fallback_selection() {
         assert_eq!(originator_for(true), "pyxis");
         assert_eq!(originator_for(false), "codex_cli_rs");
         assert_eq!(ORIGINATOR_FALLBACK, "codex_cli_rs");
-        // env non défini → défaut `pyxis` (le run live le surchargera si besoin).
+        // env not set -> default `pyxis` (the live run will override it when needed).
         assert_eq!(originator(), "pyxis");
     }
 

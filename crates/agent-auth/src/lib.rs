@@ -1,9 +1,9 @@
-//! `agent-auth` — credentials BYOK + flows OAuth subscription, stockés dans le
-//! secret store OS (US-018). Headless : aucune dépendance TUI/HTTP-serveur lourde.
+//! `agent-auth`: BYOK credentials + OAuth subscription flows, stored in the
+//! OS secret store (US-018). Headless: no heavy TUI/HTTP-server dependency.
 //!
-//! Couvre deux familles de credentials derrière une interface unique :
-//! - `Credential::ApiKey` — BYOK au token (OpenAI Chat US-017, Gemini, OpenRouter…).
-//! - `Credential::Oauth`  — OAuth subscription (Anthropic, abonnement ChatGPT ADR-10).
+//! Covers two families of credentials behind a single interface:
+//! - `Credential::ApiKey`: token-based BYOK (OpenAI Chat US-017, Gemini, OpenRouter, ...).
+//! - `Credential::Oauth`: OAuth subscription (Anthropic, ChatGPT subscription ADR-10).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod oauth;
@@ -11,20 +11,20 @@ pub mod store;
 
 use serde::{Deserialize, Serialize};
 
-/// Identifiant de provider (sous-ensemble Phase 1). Cible MVP = `OpenAiChatGpt`
-/// (abonnement). Les autres s'ajouteront ensuite (Ollama retiré du scope).
+/// Provider identifier (Phase 1 subset). MVP target = `OpenAiChatGpt`
+/// (subscription). The others will be added later (Ollama dropped from the scope).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderId {
-    /// Abonnement ChatGPT, Responses API sur le backend ChatGPT (ADR-10) — MVP.
+    /// ChatGPT subscription, Responses API on the ChatGPT backend (ADR-10): MVP.
     OpenAiChatGpt,
-    /// Chat Completions au token, BYOK (provider futur).
+    /// Token-based Chat Completions, BYOK (future provider).
     OpenAiChat,
     Anthropic,
 }
 
-/// Secret en mémoire. Son `Debug` est expurgé (jamais de token en logs) ; il ne
-/// se sérialise en clair QUE vers le secret store OS (jamais sur disque).
+/// In-memory secret. Its `Debug` is redacted (never a token in the logs); it
+/// serializes in clear text ONLY toward the OS secret store (never to disk).
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Secret(String);
@@ -33,7 +33,7 @@ impl Secret {
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
-    /// Expose la valeur (à n'utiliser qu'au point d'usage : header, body).
+    /// Exposes the value (to be used only at the point of use: header, body).
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -45,7 +45,7 @@ impl std::fmt::Debug for Secret {
     }
 }
 
-/// Credential d'un provider, telle que stockée dans le keyring.
+/// Credential of a provider, as stored in the keyring.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Credential {
@@ -53,20 +53,20 @@ pub enum Credential {
     Oauth(OAuthCredential),
 }
 
-/// Credential OAuth (sliding refresh). `account_id` porte le `chatgpt_account_id`
-/// pour l'abonnement ChatGPT (requis pour router) ; `None` pour Anthropic.
+/// OAuth credential (sliding refresh). `account_id` carries the `chatgpt_account_id`
+/// for the ChatGPT subscription (required for routing); `None` for Anthropic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthCredential {
     pub provider: ProviderId,
     pub access: Secret,
     pub refresh: Secret,
-    /// timestamp ms absolu (cf. Pi `expires`).
+    /// absolute ms timestamp (see Pi's `expires`).
     pub expires_at: u64,
     pub account_id: Option<String>,
 }
 
 impl OAuthCredential {
-    /// Expiré à `now_ms` ? Bord exact, sans marge (comme Pi côté OpenAI).
+    /// Expired at `now_ms`? Exact edge, without a margin (like Pi on the OpenAI side).
     pub fn is_expired(&self, now_ms: u64) -> bool {
         now_ms >= self.expires_at
     }
@@ -93,7 +93,7 @@ mod tests {
             account_id: Some("acct_1".into()),
         });
         let blob = serde_json::to_string(&cred).unwrap();
-        // tokens présents en clair dans le blob (destiné au keyring chiffré par l'OS)
+        // tokens present in clear text in the blob (destined for the OS-encrypted keyring)
         assert!(blob.contains("\"at\"") && blob.contains("\"rt\""));
         assert!(blob.contains("\"kind\":\"oauth\""));
         let back: Credential = serde_json::from_str(&blob).unwrap();

@@ -1,10 +1,10 @@
 //! PKCE S256 (RFC 7636).
 //!
-//! ⚠️ Invariant load-bearing (vérifié contre Pi `pkce.ts:29`) : le `challenge`
-//! hashe les **octets UTF-8 de la STRING `verifier`** (déjà base64url), PAS les
-//! 32 octets aléatoires bruts. `Sha256::digest(verifier.as_bytes())`, jamais
-//! `Sha256::digest(&random_bytes)` — les deux produisent des challenges
-//! différents et le serveur rejetterait le second.
+//! Load-bearing invariant (checked against Pi `pkce.ts:29`): the `challenge`
+//! hashes the **UTF-8 bytes of the `verifier` STRING** (already base64url), NOT the
+//! 32 raw random bytes. `Sha256::digest(verifier.as_bytes())`, never
+//! `Sha256::digest(&random_bytes)`: the two produce different
+//! challenges and the server would reject the second one.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -27,7 +27,7 @@ impl std::fmt::Debug for Pkce {
 }
 
 impl Pkce {
-    /// Génère un couple verifier/challenge frais (32 octets d'entropie).
+    /// Generates a fresh verifier/challenge pair (32 bytes of entropy).
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
         rand::rng().fill_bytes(&mut bytes);
@@ -50,7 +50,7 @@ impl Pkce {
 mod tests {
     use super::*;
 
-    /// Vecteur de référence RFC 7636, Appendix B.
+    /// Reference vector of RFC 7636, Appendix B.
     #[test]
     fn rfc7636_known_vector() {
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
@@ -61,10 +61,10 @@ mod tests {
     #[test]
     fn generated_pkce_has_expected_shape() {
         let p = Pkce::generate();
-        // 32 octets en base64url sans padding = 43 caractères.
+        // 32 bytes in base64url without padding = 43 characters.
         assert_eq!(p.verifier.len(), 43);
         assert_eq!(p.challenge.len(), 43);
-        // le challenge dérive bien du verifier généré
+        // the challenge does derive from the generated verifier
         assert_eq!(p.challenge, Pkce::challenge_for(&p.verifier));
         assert!(
             !p.verifier.contains('=') && !p.verifier.contains('+') && !p.verifier.contains('/')

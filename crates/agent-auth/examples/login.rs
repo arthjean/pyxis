@@ -1,11 +1,11 @@
-//! Login abonnement ChatGPT (flow navigateur PKCE) → stockage keyring.
+//! ChatGPT subscription login (PKCE browser flow) -> keyring storage.
 //!
 //! `cargo run -p agent-auth --example login`
 //!
-//! Ouvre le navigateur sur auth.openai.com, attend le callback local
-//! (127.0.0.1:1455), échange le code, et écrit la credential OAuth dans le
-//! keyring OS sous la clé `oauth:openai_chatgpt`. Le smoke test de l'adapter
-//! (`agent-provider --example smoke`) la relit ensuite.
+//! Opens the browser on auth.openai.com, waits for the local callback
+//! (127.0.0.1:1455), exchanges the code, and writes the OAuth credential into the
+//! OS keyring under the key `oauth:openai_chatgpt`. The adapter smoke test
+//! (`agent-provider --example smoke`) then reads it back.
 
 use agent_auth::oauth::openai_chatgpt;
 use agent_auth::{Credential, store};

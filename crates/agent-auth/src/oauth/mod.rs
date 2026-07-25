@@ -1,5 +1,5 @@
-//! Flows OAuth subscription. `openai_chatgpt` = abonnement ChatGPT (ADR-10) ;
-//! `pkce` = helper RFC 7636 partagé (Anthropic OAuth le réutilisera).
+//! OAuth subscription flows. `openai_chatgpt` = ChatGPT subscription (ADR-10);
+//! `pkce` = shared RFC 7636 helper (Anthropic OAuth will reuse it).
 
 pub mod openai_chatgpt;
 pub mod pkce;
