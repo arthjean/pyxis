@@ -339,6 +339,20 @@ fn run_config_from_args(args: &Args, config: &settings::Config) -> anyhow::Resul
     })
 }
 
+/// US-005: sandbox scope in one line, as `/status` shows it. Resolved here
+/// because enforcement happens before the interactive loop exists, and the loop
+/// has no way to observe it afterwards.
+fn sandbox_scope_label(enforced: bool, extra_roots: &[std::path::PathBuf]) -> String {
+    if !enforced {
+        return "off (writes not restricted)".to_string();
+    }
+    match extra_roots.len() {
+        0 => "enforced (workspace)".to_string(),
+        1 => "enforced (workspace + 1 extra root)".to_string(),
+        n => format!("enforced (workspace + {n} extra roots)"),
+    }
+}
+
 fn permission_policy(headless: bool, yes: bool, _sandbox_enforced: bool) -> CliPermissionPolicy {
     if !headless {
         return CliPermissionPolicy {
@@ -913,8 +927,10 @@ async fn run(
             goal,
             command_hardener: mcp_harden,
             permission_mode,
+            approvals,
             settings_path,
             workspace: workspace.clone(),
+            sandbox_scope: sandbox_scope_label(sandbox_enforced, &config.writable_roots),
         };
         interactive::run(
             deps,

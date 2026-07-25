@@ -161,10 +161,55 @@ pub struct InteractiveConfig {
     pub command_hardener: agent_tools::CommandHardener,
     /// Mutable permission mode, shared with the tool registry.
     pub permission_mode: PermissionModeState,
+    /// Answers remembered this session, shared with the tool registry
+    /// (US-009 inspection surface). In memory only, never persisted.
+    pub approvals: agent_tools::permission::ApprovalMemory,
     /// Global user settings, used to persist the interactive choices.
     pub settings_path: Option<PathBuf>,
     /// Workspace root, scope of the aggregated turn diff (US-018).
     pub workspace: PathBuf,
+    /// Sandbox scope as the binary resolved it, displayed by `/status`
+    /// (US-005). Resolved there because enforcement happens before this loop
+    /// exists.
+    pub sandbox_scope: String,
+}
+
+/// US-006: one line per modified file, in the same scope as the aggregated turn
+/// diff. Bounded on purpose: dumping the unified diffs into the transcript
+/// would flood the view for a command whose job is to say what changed.
+fn workspace_diff_report(diff: &agent_core::TurnDiffView) -> String {
+    if diff.is_empty() {
+        return "No change in the workspace.".to_string();
+    }
+    let mut report = String::from(agent_tui::turn_diff_summary(diff).as_str());
+    for file in &diff.files {
+        let mark = match file.change {
+            agent_core::FileChange::Added => 'A',
+            agent_core::FileChange::Modified => 'M',
+            agent_core::FileChange::Deleted => 'D',
+        };
+        report.push_str(&format!(
+            "\n  {mark} {} +{} -{}",
+            file.path, file.added_lines, file.removed_lines
+        ));
+    }
+    report
+}
+
+/// US-009 AC3: what the session remembers, and how to forget it. The token
+/// sequences are shown as they were approved, so the user can check that no
+/// answer covers more than what was answered.
+fn approvals_report(entries: &[agent_tools::permission::ApprovalEntry]) -> String {
+    if entries.is_empty() {
+        return "No answer remembered this session. They are never persisted to disk.".to_string();
+    }
+    let mut report = format!("Remembered answers ({}):", entries.len());
+    for entry in entries {
+        let verdict = if entry.allow { "allow" } else { "deny" };
+        report.push_str(&format!("\n  {verdict}  {} {}", entry.tool, entry.command));
+    }
+    report.push_str("\nUse /approvals clear to forget them.");
+    report
 }
 
 /// Completion marker emitted by the model when the goal is fully
@@ -1056,6 +1101,105 @@ async fn event_loop(
                                         load_sessions(&sessions_dir, &current_session);
                                 }
                             }
+                            // US-005: purely local surfaces (no network call), pushed
+                            // as notices so they never enter the transcript.
+                            "/status" => {
+                                let session_id = current_session
+                                    .file_name()
+                                    .map(|name| name.to_string_lossy().to_string())
+                                    .unwrap_or_default();
+                                state.blocks.push(Block::Notice(
+                                    agent_tui::session_status_report(
+                                        &state,
+                                        agent_tui::SessionFacts {
+                                            session_id: &session_id,
+                                            sandbox: &cfg.sandbox_scope,
+                                        },
+                                    ),
+                                ));
+                            }
+                            "/usage" => {
+                                let report = agent_tui::session_usage_report(&state);
+                                state.blocks.push(Block::Notice(report));
+                            }
+                            // US-009: inspection surface of the session memory.
+                            // Local only, and the memory never leaves the process.
+                            "/approvals" => {
+                                let report = match arg {
+                                    "clear" => {
+                                        let n = cfg.approvals.clear();
+                                        format!("{n} remembered answer(s) forgotten.")
+                                    }
+                                    "" => approvals_report(&cfg.approvals.entries()),
+                                    other => format!(
+                                        "Unknown argument: {other}. Usage: /approvals [clear]"
+                                    ),
+                                };
+                                state.blocks.push(Block::Notice(report));
+                            }
+                            // US-006: the diff reuses the engine of the aggregated turn
+                            // diff, hence exactly its scope.
+                            "/diff" => {
+                                match agent_tools::turn_diff::workspace_diff(&cfg.workspace).await {
+                                    Ok(agent_tools::turn_diff::WorkspaceDiff::NoRepository) => {
+                                        state.blocks.push(Block::Notice(
+                                            "Diff unavailable: this directory is not a git \
+                                             repository."
+                                                .into(),
+                                        ));
+                                    }
+                                    Ok(agent_tools::turn_diff::WorkspaceDiff::Changes(diff)) => {
+                                        state.blocks.push(Block::Notice(workspace_diff_report(
+                                            &diff,
+                                        )));
+                                    }
+                                    Err(e) => {
+                                        state.blocks.push(Block::Error(format!("diff: {e}")));
+                                    }
+                                }
+                            }
+                            "/compact" if running => state.blocks.push(Block::Notice(
+                                "A turn is in progress.".into(),
+                            )),
+                            "/compact" => {
+                                let mut msgs =
+                                    conversation.lock().map(|g| g.clone()).unwrap_or_default();
+                                let before = msgs.len();
+                                match agent_core::compaction::full_compact(
+                                    &mut msgs,
+                                    &cfg.model,
+                                    deps.provider.as_ref(),
+                                    cfg.run_config.max_output_tokens,
+                                )
+                                .await
+                                {
+                                    // Persisted like an automatic compaction: same
+                                    // checkpoint entry, hence replayable by `/resume`
+                                    // without the session knowing it was manual.
+                                    Ok(_) => match session
+                                        .checkpoint(agent_core::CompactKind::Auto, &msgs)
+                                        .await
+                                    {
+                                        Ok(()) => {
+                                            let after = msgs.len();
+                                            if let Ok(mut g) = conversation.lock() {
+                                                *g = msgs;
+                                            }
+                                            state.blocks.push(Block::Notice(format!(
+                                                "Context compacted ({before} → {after} messages)."
+                                            )));
+                                        }
+                                        Err(e) => state
+                                            .blocks
+                                            .push(Block::Error(format!("compact: {e}"))),
+                                    },
+                                    // `full_compact` leaves the transcript intact on
+                                    // failure: the session stays usable as is.
+                                    Err(e) => {
+                                        state.blocks.push(Block::Error(format!("compact: {e}")));
+                                    }
+                                }
+                            }
                             "/providers" => match arg {
                                 "apikey" => state.blocks.push(Block::Notice(
                                     "API key authentication is coming soon.".into(),
@@ -1755,13 +1899,38 @@ pub(crate) fn new_session_path(dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        GOAL_DONE_MARKER, compose_system, count_encrypted_reasoning, scrub_encrypted_reasoning,
-        session_path_from_arg, take_goal_done, workspace_file_mentions,
+        GOAL_DONE_MARKER, approvals_report, compose_system, count_encrypted_reasoning,
+        scrub_encrypted_reasoning, session_path_from_arg, take_goal_done, workspace_file_mentions,
     };
     use agent_core::message::{ContentBlock, Message};
     use agent_tui::{AppState, Block};
     use std::path::Path;
     use std::time::SystemTime;
+
+    #[test]
+    fn approvals_report_lists_sequences_and_says_they_are_not_persisted() {
+        // US-009 AC3: the user can check exactly what was remembered.
+        use agent_tools::permission::ApprovalEntry;
+        let empty = approvals_report(&[]);
+        assert!(empty.contains("No answer remembered"), "{empty}");
+        assert!(empty.contains("never persisted"), "{empty}");
+
+        let report = approvals_report(&[
+            ApprovalEntry {
+                tool: "bash".into(),
+                command: "git status".into(),
+                allow: true,
+            },
+            ApprovalEntry {
+                tool: "bash".into(),
+                command: "rm -rf target".into(),
+                allow: false,
+            },
+        ]);
+        assert!(report.contains("allow  bash git status"), "{report}");
+        assert!(report.contains("deny  bash rm -rf target"), "{report}");
+        assert!(report.contains("/approvals clear"), "{report}");
+    }
 
     #[test]
     fn compose_system_pins_completion_directive() {

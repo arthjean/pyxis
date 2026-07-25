@@ -78,6 +78,32 @@ pub struct TurnDiffTracker {
     baseline: Option<BTreeMap<String, FileState>>,
 }
 
+/// Result of an on-demand workspace diff (US-006). The absence of a git
+/// repository is not an error: it is an absence of scope, and the caller must be
+/// able to say so instead of showing an empty diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceDiff {
+    NoRepository,
+    Changes(TurnDiffView),
+}
+
+/// Current modifications of the workspace against `HEAD` (US-006). Reuses the
+/// turn engine with an EMPTY baseline: "nothing was dirty when we started"
+/// means every file git reports today is compared to its `HEAD` state, which is
+/// exactly the working-tree diff, with the same scope, the same exclusions and
+/// the same size limits as the aggregated turn diff.
+pub async fn workspace_diff(workspace: &Path) -> Result<WorkspaceDiff, String> {
+    let Some(repo_root) = repo_root(workspace).await else {
+        return Ok(WorkspaceDiff::NoRepository);
+    };
+    let mut tracker = TurnDiffTracker {
+        repo_root,
+        workspace: workspace.to_path_buf(),
+        baseline: Some(BTreeMap::new()),
+    };
+    tracker.turn_diff().await.map(WorkspaceDiff::Changes)
+}
+
 impl TurnDiffTracker {
     /// Captures the reference. Never returns an error: a turn must not fail
     /// because its observability failed.
@@ -403,6 +429,46 @@ mod tests {
         let found = view.files.iter().find(|f| f.path == path);
         assert!(found.is_some(), "{path} absent de {:?}", view.files);
         found.unwrap()
+    }
+
+    fn changes(result: WorkspaceDiff) -> Option<TurnDiffView> {
+        match result {
+            WorkspaceDiff::Changes(view) => Some(view),
+            WorkspaceDiff::NoRepository => None,
+        }
+    }
+
+    /// US-006 AC1: the on-demand diff reports the modifications present at the
+    /// moment it is asked for, against `HEAD`, without any turn having opened.
+    #[tokio::test]
+    async fn workspace_diff_reports_current_changes_against_head() {
+        let repo = Repo::new("workspace").await;
+        repo.write("kept.txt", "un\ndeux\n");
+        repo.commit("initial").await;
+        repo.write("kept.txt", "un\ndeux modifie\n");
+        repo.write("new.txt", "neuf\n");
+
+        let diff = changes(workspace_diff(&repo.dir).await.unwrap()).expect("dépôt git présent");
+        assert_eq!(diff.files.len(), 2, "{:?}", diff.files);
+        assert_eq!(find(&diff, "kept.txt").change, FileChange::Modified);
+        assert_eq!(find(&diff, "new.txt").change, FileChange::Added);
+
+        // A clean workspace has nothing to report, and that is not an error.
+        repo.commit("tout").await;
+        let clean = changes(workspace_diff(&repo.dir).await.unwrap()).expect("dépôt git présent");
+        assert!(clean.is_empty());
+    }
+
+    /// US-006 AC2: outside a repository the absence of scope is named, never
+    /// confused with "nothing changed".
+    #[tokio::test]
+    async fn workspace_diff_reports_absence_of_repository() {
+        let dir = std::env::temp_dir().join(format!("pyxis-nogit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = workspace_diff(&dir).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(result, WorkspaceDiff::NoRepository);
     }
 
     /// AC1 + AC2: a file edited and a file written by a shell command both

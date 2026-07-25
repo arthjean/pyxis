@@ -71,6 +71,15 @@ pub const COMMANDS: &[(&str, &str, bool)] = &[
     ("/providers", "Configure the authentication provider", true),
     ("/mcp", "Inspect MCP servers", true),
     ("/resume", "Resume a past conversation", true),
+    (
+        "/approvals",
+        "List the answers remembered this session (clear to forget)",
+        false,
+    ),
+    ("/status", "Show the session configuration", false),
+    ("/usage", "Show token consumption and quota", false),
+    ("/diff", "Show the current workspace changes", false),
+    ("/compact", "Compact the context now", false),
     ("/new", "Start a new session and clear context", false),
     ("/clear", "Clear context and start fresh", false),
     ("/quit", "Quit Pyxis", false),
@@ -2178,6 +2187,94 @@ impl AppState {
 /// changed?" without replaying a diff already seen edit by edit. The
 /// files touched by a shell command, in contrast, were never displayed
 /// anywhere else: that is where the line earns its cost.
+/// Session facts the frontend does not hold: they belong to the process, not to
+/// the display state (US-005).
+#[derive(Debug, Clone, Copy)]
+pub struct SessionFacts<'a> {
+    /// Name of the persistence file of the current session.
+    pub session_id: &'a str,
+    /// Scope of the active sandbox, as the binary resolved it.
+    pub sandbox: &'a str,
+}
+
+/// Marker for a piece of information the session does not have. Written out
+/// rather than omitting the line: a missing line reads as "nothing to report",
+/// which is a different statement (US-005 AC3).
+const UNAVAILABLE: &str = "unavailable";
+
+/// US-005: session configuration, read from the local state only. No network
+/// call, and the result is displayed as a notice, so it never enters the
+/// transcript sent to the model.
+pub fn session_status_report(state: &AppState, facts: SessionFacts<'_>) -> String {
+    let effort = state
+        .reasoning_effort
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(UNAVAILABLE);
+    let workspace = if state.workspace.is_empty() {
+        UNAVAILABLE
+    } else {
+        &state.workspace
+    };
+    let session = if facts.session_id.is_empty() {
+        UNAVAILABLE
+    } else {
+        facts.session_id
+    };
+    let sandbox = if facts.sandbox.is_empty() {
+        UNAVAILABLE
+    } else {
+        facts.sandbox
+    };
+    format!(
+        "Session status\n  model: {}\n  reasoning effort: {effort}\n  permissions: {}\n  \
+         sandbox: {sandbox}\n  workspace: {workspace}\n  session: {session}",
+        state.model,
+        state.permission_mode_label(),
+    )
+}
+
+/// US-005: consumption of the session. Same rule as above: everything comes
+/// from what the backend already reported, nothing is estimated, and an absent
+/// measure is named.
+pub fn session_usage_report(state: &AppState) -> String {
+    let context = match (state.context_tokens, state.context_window) {
+        (Some(tokens), Some(window)) => format!(
+            "{tokens} / {window} tokens{}",
+            state
+                .context_pct
+                .map(|pct| format!(" ({pct}%)"))
+                .unwrap_or_default()
+        ),
+        (Some(tokens), None) => {
+            format!("{tokens} tokens ({UNAVAILABLE}: context window of the model unknown)")
+        }
+        (None, _) => format!("{UNAVAILABLE}: no usage reported by the backend yet"),
+    };
+    format!(
+        "Session usage\n  input tokens: {}\n  output tokens: {}\n  context: {context}\n  quota: {}",
+        state.total_input_tokens,
+        state.total_output_tokens,
+        quota_line(state.quota.as_ref()),
+    )
+}
+
+fn quota_line(quota: Option<&agent_core::quota::QuotaSnapshot>) -> String {
+    let Some(window) = quota.and_then(|snapshot| snapshot.most_consumed()) else {
+        return format!("{UNAVAILABLE}: not reported by the backend");
+    };
+    let scope = window
+        .window_label()
+        .map(|label| format!(" ({label})"))
+        .unwrap_or_default();
+    let reset = window
+        .resets_at_label()
+        .map(|instant| format!(", resets at {instant}"))
+        .unwrap_or_else(|| format!(", reset time {UNAVAILABLE}"));
+    format!("{:.0}% used{scope}{reset}", window.used_percent)
+}
+
 pub fn turn_diff_summary(view: &TurnDiffView) -> String {
     let (added, removed) = view.totals();
     let n = view.files.len();
@@ -3307,6 +3404,81 @@ mod tests {
         s.apply(&AgentEvent::Compacted(agent_core::CompactKind::Auto));
         s.apply(&model_turn(2, Some(20_000), Some(200_000)));
         assert_eq!(s.context_pct, Some(10), "le remplissage redescend");
+    }
+
+    // US-005: the reports name what the session does not know instead of
+    // silently dropping the line.
+    #[test]
+    fn session_reports_name_missing_data() {
+        let mut s = AppState::new("gpt-5.5", true);
+        s.workspace = "pyxis".into();
+        let facts = SessionFacts {
+            session_id: "20260725-101112.jsonl",
+            sandbox: "enforced (workspace)",
+        };
+
+        let status = session_status_report(&s, facts);
+        assert!(status.contains("model: gpt-5.5"), "{status}");
+        assert!(
+            status.contains(&format!("reasoning effort: {UNAVAILABLE}")),
+            "{status}"
+        );
+        assert!(status.contains("sandbox: enforced (workspace)"), "{status}");
+        assert!(status.contains("workspace: pyxis"), "{status}");
+        assert!(
+            status.contains("session: 20260725-101112.jsonl"),
+            "{status}"
+        );
+        assert!(status.contains("permissions: "), "{status}");
+
+        let usage = session_usage_report(&s);
+        assert!(usage.contains("input tokens: 0"), "{usage}");
+        assert!(
+            usage.contains(&format!("context: {UNAVAILABLE}")),
+            "aucun usage rapporté: dit explicitement ({usage})"
+        );
+        assert!(
+            usage.contains(&format!("quota: {UNAVAILABLE}")),
+            "aucun quota servi: dit explicitement ({usage})"
+        );
+    }
+
+    // US-005 AC2: once the data has arrived, consumption, fill and quota are
+    // reported together.
+    #[test]
+    fn session_usage_reports_measures_once_known() {
+        let mut s = AppState::new("gpt-5.5", true);
+        s.reasoning_effort = Some("medium".into());
+        s.apply(&model_turn(1, Some(50_000), Some(200_000)));
+        s.apply(&AgentEvent::Quota(agent_core::quota::QuotaSnapshot {
+            primary: Some(agent_core::quota::QuotaWindow {
+                used_percent: 42.0,
+                window_minutes: Some(300),
+                resets_at_unix: Some(1_784_989_920),
+            }),
+            secondary: None,
+        }));
+
+        let usage = session_usage_report(&s);
+        assert!(usage.contains("input tokens: 1000"), "{usage}");
+        assert!(
+            usage.contains("context: 50000 / 200000 tokens (25%)"),
+            "{usage}"
+        );
+        assert!(
+            usage.contains("quota: 42% used (5-hour window), resets at 2026-07-25 14:32 UTC"),
+            "{usage}"
+        );
+        assert!(
+            session_status_report(
+                &s,
+                SessionFacts {
+                    session_id: "s.jsonl",
+                    sandbox: "off (writes not restricted)",
+                }
+            )
+            .contains("reasoning effort: medium")
+        );
     }
 
     // US-046: `unseen` only counts the blocks that arrived while scrolled up, and resets
