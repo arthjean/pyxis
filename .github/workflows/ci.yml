@@ -40,10 +40,15 @@ jobs:
 
       # `keyring` tire `dbus-secret-service` → `libdbus-sys`, qui compile contre
       # les headers dbus. L'image runner ne les garantit pas.
+      #
+      # `mold` : `.cargo/config.toml` force `-fuse-ld=mold` pour tout le
+      # workspace. Sans lui, le runner échoue au link dès les build scripts
+      # (`collect2: cannot find 'ld'`). Installer le linker plutôt que
+      # neutraliser la configuration garde la CI fidèle au poste de dev.
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config mold
 
       - uses: dtolnay/rust-toolchain@stable
         with:
