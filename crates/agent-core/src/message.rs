@@ -1,6 +1,6 @@
-//! Types canoniques de message (format Anthropic-like, content blocks — cf.
-//! PROVIDERS §1.1). `agent-core` est le crate des types canoniques : tout le
-//! système (provider, session, tools) ne connaît que ces types.
+//! Canonical message types (Anthropic-like format, content blocks: see
+//! PROVIDERS 1.1). `agent-core` is the crate of canonical types: the whole
+//! system (provider, session, tools) only knows these types.
 
 use std::collections::HashSet;
 
@@ -8,25 +8,25 @@ use serde::{Deserialize, Serialize};
 
 pub type ToolCallId = String;
 
-/// US-002 — contenu du résultat écrit pour un appel d'outil resté sans réponse
-/// après une interruption. Il sert deux publics : le backend, qui rejette en 400
-/// tout `tool_use` sans `tool_result` correspondant, et le modèle, qui doit lire
-/// dans l'historique que l'utilisateur a interrompu l'exécution.
+/// US-002: content of the result written for a tool call left unanswered
+/// after an interruption. It serves two audiences: the backend, which rejects
+/// with a 400 any `tool_use` without a matching `tool_result`, and the model,
+/// which must read in the history that the user interrupted the execution.
 ///
-/// Le message porte la CONSÉQUENCE et pas seulement le fait : un outil interrompu
-/// peut avoir écrit la moitié de ses effets. Sans cette précision, le modèle
-/// suppose par défaut que rien n'a eu lieu et reprend sur un état faux (même
-/// raisonnement que le `<turn_aborted>` de Codex CLI).
+/// The message carries the CONSEQUENCE and not only the fact: an interrupted
+/// tool may have written half of its effects. Without that detail, the model
+/// assumes by default that nothing happened and resumes on a wrong state (same
+/// reasoning as Codex CLI's `<turn_aborted>`).
 pub const INTERRUPTED_TOOL_RESULT: &str = "Interrupted by the user before this tool call \
      completed. No result is available: the tool may have partially executed and any process \
      it started may still be running.";
 
-/// Appels d'outils du transcript restés SANS résultat, dans l'ordre d'apparition.
+/// Transcript tool calls left WITHOUT a result, in order of appearance.
 ///
-/// C'est la définition unique de l'appariement `tool_use` ↔ `tool_result` :
-/// la boucle s'en sert pour réconcilier avant persistance (US-002) et l'adapter
-/// provider pour refuser d'émettre un appel orphelin (US-003). Un même id
-/// n'est rendu qu'une fois : la réparation ne peut pas produire de doublon.
+/// This is the single definition of the `tool_use` <-> `tool_result` pairing:
+/// the loop uses it to reconcile before persisting (US-002) and the provider
+/// adapter to refuse emitting an orphan call (US-003). A given id is
+/// returned only once: the repair cannot produce a duplicate.
 pub fn unanswered_tool_calls(messages: &[Message]) -> Vec<ToolCallId> {
     let mut answered: HashSet<&str> = HashSet::new();
     for block in messages.iter().flat_map(|m| m.content.iter()) {
@@ -78,8 +78,8 @@ pub enum Role {
     Tool,
 }
 
-/// Bloc de contenu canonique (`text` / `thinking` / `tool_use` / `tool_result` /
-/// `image`). À la compaction `full`, les blocs `Image` sont strippés (§5).
+/// Canonical content block (`text` / `thinking` / `tool_use` / `tool_result` /
+/// `image`). On `full` compaction, `Image` blocks are stripped (section 5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
@@ -97,8 +97,8 @@ pub enum ContentBlock {
     ToolResult {
         tool_use_id: ToolCallId,
         content: String,
-        /// Résultat d'outil non fiable par défaut. Les anciens JSONL sans ce champ
-        /// sont relus en fail-closed.
+        /// Tool result untrusted by default. Older JSONL without this field
+        /// are read back fail-closed.
         #[serde(default = "default_untrusted")]
         untrusted: bool,
         #[serde(default)]
@@ -110,21 +110,21 @@ pub enum ContentBlock {
         media_type: String,
         data: String,
     },
-    /// Reasoning item CHIFFRÉ du backend Codex (US-031, replay isolé). Capturé
-    /// quand `reasoning_replay` est actif pour réémission de la paire `rs`/`fc` ;
-    /// DROPPÉ à la compaction (contrainte protocole). Le `encrypted_content` est
-    /// opaque (jamais loggé/affiché).
+    /// ENCRYPTED reasoning item from the Codex backend (US-031, isolated replay).
+    /// Captured when `reasoning_replay` is active, to re-emit the `rs`/`fc` pair;
+    /// DROPPED on compaction (protocol constraint). The `encrypted_content` is
+    /// opaque (never logged nor displayed).
     EncryptedReasoning {
         id: String,
         encrypted_content: String,
     },
-    /// Résumé de compaction typé. Les anciens logs utilisaient un message user texte
-    /// préfixé; ce variant évite les collisions avec un vrai prompt utilisateur.
+    /// Typed compaction summary. Older logs used a prefixed text user message;
+    /// this variant avoids collisions with a genuine user prompt.
     Summary {
         text: String,
-        /// Vrai si le résumé dérive au moins en partie de sorties d'outils ou de
-        /// résumés dont la confiance est inconnue. Les anciens JSONL relus sans ce
-        /// champ échouent en sécurité.
+        /// True if the summary derives at least partly from tool output or from
+        /// summaries whose trust level is unknown. Older JSONL read back without
+        /// this field fail safe.
         #[serde(default = "default_summary_source_untrusted")]
         source_untrusted: bool,
     },
@@ -195,7 +195,7 @@ impl Message {
         }
     }
 
-    /// Concatène tous les blocs `Text` (utile pour résumés / affichage).
+    /// Concatenates every `Text` block (useful for summaries / display).
     pub fn text(&self) -> String {
         let mut out = String::new();
         for b in &self.content {
@@ -209,8 +209,8 @@ impl Message {
         out
     }
 
-    /// Cette message porte-t-elle au moins un `tool_result` ? (cible du
-    /// microcompact : on élague les plus vieux en premier.)
+    /// Does this message carry at least one `tool_result`? (target of the
+    /// microcompact: we prune the oldest ones first.)
     pub fn is_tool_result(&self) -> bool {
         self.content
             .iter()
@@ -223,8 +223,8 @@ impl Message {
             .any(|b| matches!(b, ContentBlock::Image { .. }))
     }
 
-    /// Retire les blocs `Image` (compaction full : on ne re-paye pas la vision).
-    /// Retourne le nombre de blocs retirés.
+    /// Removes `Image` blocks (full compaction: we do not pay for vision twice).
+    /// Returns the number of removed blocks.
     pub fn strip_images(&mut self) -> usize {
         let before = self.content.len();
         self.content
@@ -232,8 +232,8 @@ impl Message {
         before - self.content.len()
     }
 
-    /// Le message transporte-t-il du contenu qui doit rester traité comme non fiable
-    /// par les prochaines décisions d'outils ou de compaction ?
+    /// Does the message carry content that must stay treated as untrusted
+    /// by the next tool or compaction decisions?
     pub fn carries_untrusted_content(&self) -> bool {
         self.content.iter().any(ContentBlock::carries_untrusted_content)
             || (self.role == Role::User
@@ -300,8 +300,8 @@ impl ContentBlock {
     }
 }
 
-/// Indique si la queue récente du transcript contient encore du contenu non fiable.
-/// Utilisé au resume pour re-semer le taint de permission sans scanner tout le log.
+/// Tells whether the recent tail of the transcript still holds untrusted content.
+/// Used at resume to re-seed the permission taint without scanning the whole log.
 pub fn recent_untrusted_content(messages: &[Message], window_messages: usize) -> bool {
     messages
         .iter()
@@ -340,8 +340,8 @@ mod tests {
         assert_eq!(m.text(), "ab");
     }
 
-    // US-031 : la variante EncryptedReasoning sérialise en tag snake_case et
-    // round-trip (rétro-compat JSONL : variante additive, sessions existantes intactes).
+    // US-031: the EncryptedReasoning variant serializes to a snake_case tag and
+    // round-trips (JSONL back-compat: additive variant, existing sessions intact).
     #[test]
     fn encrypted_reasoning_serde_roundtrip() {
         let b = ContentBlock::EncryptedReasoning {
@@ -378,8 +378,8 @@ mod tests {
         assert!(!Message::user("hi").is_tool_result());
     }
 
-    // US-002/US-003 : l'appariement rend les appels SANS résultat, dans l'ordre,
-    // une seule fois chacun — c'est ce qui garantit « ni doublon ni oubli ».
+    // US-002/US-003: the pairing returns the calls WITHOUT a result, in order,
+    // exactly once each. That is what guarantees "no duplicate, none forgotten".
     #[test]
     fn unanswered_tool_calls_reports_each_pending_call_once_in_order() {
         let messages = vec![
@@ -396,7 +396,7 @@ mod tests {
                 },
             ]),
             Message::tool_result("c2", "done", false),
-            // Répétition défensive du même appel : un seul résultat doit en découler.
+            // Defensive repetition of the same call: a single result must follow.
             Message::assistant(vec![ContentBlock::ToolUse {
                 id: "c1".into(),
                 name: "bash".into(),

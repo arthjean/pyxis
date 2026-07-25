@@ -9,9 +9,9 @@ publish = false
 [lints]
 workspace = true
 
-# Invariant 1 (ARCHITECTURE §2) : agent-core ne dépend NI d'agent-tui NI
-# d'agent-provider. Seule dépendance hors-core autorisée : agent-tokenizer
-# (headless). Les I/O (Provider, Session, Clock, Tools) sont injectées via traits.
+# Invariant 1 (ARCHITECTURE 2): agent-core depends NEITHER on agent-tui NOR
+# on agent-provider. The only allowed non-core dependency: agent-tokenizer
+# (headless). The I/O (Provider, Session, Clock, Tools) are injected through traits.
 [dependencies]
 agent-tokenizer.workspace = true
 serde.workspace = true

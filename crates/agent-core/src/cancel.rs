@@ -1,50 +1,50 @@
-//! `CancelToken` — signal d'annulation COOPÉRATIF de la boucle (US-001).
+//! `CancelToken`: COOPERATIVE cancellation signal of the loop (US-001).
 //!
-//! Le cœur est responsable de son propre arrêt : le client signale, la boucle
-//! s'arrête à une frontière connue (fin d'événement de stream, retour de
-//! dispatch, réveil de backoff) puis réconcilie son transcript. Un
-//! `JoinHandle::abort()` côté client couperait le future à un point arbitraire,
-//! entre le push d'un `tool_use` et l'écriture de son résultat.
+//! The core is responsible for its own shutdown: the client signals, the loop
+//! stops at a known boundary (end of a stream event, dispatch return,
+//! backoff wake-up) then reconciles its transcript. A client-side
+//! `JoinHandle::abort()` would cut the future at an arbitrary point,
+//! between pushing a `tool_use` and writing its result.
 //!
-//! Support : `tokio::sync::watch`, déjà disponible via la feature `sync` du
-//! workspace — aucune dépendance nouvelle (ADR-3 : `Deps` reste un sac de
-//! primitives injectées).
+//! Backing: `tokio::sync::watch`, already available through the workspace
+//! `sync` feature: no new dependency (ADR-3: `Deps` stays a bag of injected
+//! primitives).
 
 use std::future::Future;
 use std::sync::Arc;
 
 use tokio::sync::watch;
 
-/// Signal d'annulation clonable. Émettre et observer se font par le même type :
-/// le cœur observe, le client émet, et le `Arc<Sender>` garde le canal ouvert
-/// tant qu'un porteur existe (pas de `changed()` en erreur).
+/// Clonable cancellation signal. Emitting and observing use the same type:
+/// the core observes, the client emits, and the `Arc<Sender>` keeps the channel
+/// open as long as a holder exists (no `changed()` returning an error).
 #[derive(Clone, Debug)]
 pub struct CancelToken {
     tx: Arc<watch::Sender<bool>>,
 }
 
 impl CancelToken {
-    /// Nouveau signal, non annulé.
+    /// New signal, not cancelled.
     pub fn new() -> Self {
         Self {
             tx: Arc::new(watch::Sender::new(false)),
         }
     }
 
-    /// Signale l'annulation. Idempotent : un signal émis après l'arrêt de la
-    /// boucle ne produit ni panique ni effet observable.
+    /// Signals cancellation. Idempotent: a signal emitted after the loop has
+    /// stopped produces neither a panic nor an observable effect.
     pub fn cancel(&self) {
-        // `send_replace` (et non `send`) : un canal sans récepteur vivant — boucle
-        // déjà terminée — ne doit pas remonter d'erreur.
+        // `send_replace` (and not `send`): a channel without a live receiver (loop
+        // already finished) must not surface an error.
         self.tx.send_replace(true);
     }
 
-    /// État courant, sans attente. Utilisé aux frontières de boucle.
+    /// Current state, without waiting. Used at loop boundaries.
     pub fn is_cancelled(&self) -> bool {
         *self.tx.borrow()
     }
 
-    /// Se résout quand l'annulation est signalée. Reste en attente sinon.
+    /// Resolves when cancellation is signalled. Stays pending otherwise.
     pub async fn cancelled(&self) {
         let mut rx = self.tx.subscribe();
         if *rx.borrow_and_update() {
@@ -55,13 +55,13 @@ impl CancelToken {
                 return;
             }
         }
-        // Émetteur disparu sans annulation : rien ne peut plus arriver.
+        // Sender gone without cancellation: nothing can happen anymore.
         std::future::pending::<()>().await
     }
 
-    /// Court `fut` jusqu'à son terme ou jusqu'à l'annulation. Le future est
-    /// interrogé EN PREMIER (`biased`) : un travail déjà terminé au moment du
-    /// signal rend son résultat réel plutôt que d'être perdu (edge case #2).
+    /// Runs `fut` to completion or until cancellation. The future is polled
+    /// FIRST (`biased`): work already finished at signal time yields its real
+    /// result instead of being lost (edge case #2).
     pub async fn guard<F: Future>(&self, fut: F) -> Cancellable<F::Output> {
         tokio::select! {
             biased;
@@ -77,7 +77,7 @@ impl Default for CancelToken {
     }
 }
 
-/// Issue d'un travail placé sous `CancelToken::guard`.
+/// Outcome of work run under `CancelToken::guard`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cancellable<T> {
     Completed(T),
@@ -102,7 +102,7 @@ mod tests {
     async fn cancel_is_idempotent_and_survives_dropped_observers() {
         let token = CancelToken::new();
         token.cancel();
-        // Deuxième signal après « arrêt » : aucun effet, aucune panique.
+        // Second signal after "stop": no effect, no panic.
         token.cancel();
         assert!(token.is_cancelled());
     }

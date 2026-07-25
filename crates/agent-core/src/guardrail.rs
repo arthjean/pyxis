@@ -1,35 +1,35 @@
-//! Garde-fous déterministes (US-014, EP-003) — ils OVERRIDENT la logique
-//! faillible du modèle, depuis l'extérieur de la boucle :
+//! Deterministic guardrails (US-014, EP-003). They OVERRIDE the model's
+//! fallible logic, from outside the loop:
 //!
-//! - `LoopGuard` : détecte le même batch d'outils (mêmes noms + mêmes args)
-//!   répété N fois de suite. Au Nème → **signal explicite** à l'agent (le batch
-//!   n'est PAS exécuté) ; s'il persiste → **abandon** déterministe.
-//! - `UsageBudget` : budget cumulé tokens/coût avec **kill-switch** à 100 % et
-//!   estimation pré-tour pour stopper *avant* un tour trop coûteux.
+//! - `LoopGuard`: detects the same tool batch (same names + same args)
+//!   repeated N times in a row. On the Nth -> **explicit signal** to the agent (the
+//!   batch is NOT executed); if it persists -> deterministic **abort**.
+//! - `UsageBudget`: cumulated token/cost budget with a **kill-switch** at 100% and
+//!   a pre-turn estimate to stop *before* a turn that costs too much.
 //!
-//! Ces garde-fous vivent dans `agent-core` (et non `agent-tools`) car le graphe
-//! de dépendances interdit `core → tools`, et l'arrêt de boucle (`Exhausted`)
-//! est une décision de terminaison qui appartient au cœur. Pures, sans I/O →
-//! testables unitairement.
+//! These guardrails live in `agent-core` (and not `agent-tools`) because the
+//! dependency graph forbids `core -> tools`, and stopping the loop (`Exhausted`)
+//! is a termination decision that belongs to the core. Pure, no I/O ->
+//! unit-testable.
 
 use crate::provider::TokenUsage;
 use crate::tools::ToolInvocation;
 use crate::transition::ExhaustReason;
 
-/// Décision du garde-fou de boucle pour un batch d'outils.
+/// Loop guardrail decision for a tool batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopDecision {
-    /// Pas de boucle : exécuter normalement.
+    /// No loop: run normally.
     Proceed,
-    /// Nème répétition identique : ne pas exécuter, signaler à l'agent.
+    /// Nth identical repeat: do not execute, signal the agent.
     Signal,
-    /// Répétition au-delà du signal : arrêt déterministe de la boucle.
+    /// Repeat past the signal: deterministic stop of the loop.
     Abort,
 }
 
-/// Détecteur de boucle d'outils (ARCHITECTURE §3 garde-fous / FR-05). Compare la
-/// signature du batch courant à la précédente ; compte les répétitions
-/// consécutives.
+/// Tool loop detector (ARCHITECTURE section 3 guardrails / FR-05). Compares the
+/// signature of the current batch to the previous one; counts consecutive
+/// repeats.
 #[derive(Debug)]
 pub struct LoopGuard {
     threshold: u32,
@@ -38,7 +38,7 @@ pub struct LoopGuard {
 }
 
 impl LoopGuard {
-    /// `threshold` = nombre de répétitions identiques avant signal (défaut 3).
+    /// `threshold` = number of identical repeats before the signal (default 3).
     pub fn new(threshold: u32) -> Self {
         Self {
             threshold: threshold.max(1),
@@ -51,7 +51,7 @@ impl LoopGuard {
         self.count
     }
 
-    /// Intègre la signature du batch courant et décide.
+    /// Folds in the signature of the current batch and decides.
     pub fn observe(&mut self, signature: String) -> LoopDecision {
         if self.last_sig.as_deref() == Some(signature.as_str()) {
             self.count = self.count.saturating_add(1);
@@ -69,10 +69,10 @@ impl LoopGuard {
     }
 }
 
-/// Signature déterministe d'un batch d'appels : `nom\0json` par appel, joints.
-/// Le `Display` de `serde_json::Value` produit un JSON compact aux clés triées
-/// (`serde_json::Map` sans `preserve_order`) → signature stable d'un tour à
-/// l'autre. L'ordre des appels dans le batch ne change pas la signature.
+/// Deterministic signature of a call batch: `name\0json` per call, joined.
+/// The `Display` of `serde_json::Value` produces compact JSON with sorted keys
+/// (`serde_json::Map` without `preserve_order`) -> signature stable from one turn
+/// to the next. The order of calls in the batch does not change the signature.
 pub fn batch_signature(calls: &[ToolInvocation]) -> String {
     let mut parts: Vec<String> = calls
         .iter()
@@ -82,8 +82,8 @@ pub fn batch_signature(calls: &[ToolInvocation]) -> String {
     parts.join("\u{1}")
 }
 
-/// Tarif d'un modèle, en micro-USD (1e-6 $) par millier de tokens. `u64` pour
-/// rester `Copy`/`Eq` (pas de `f64` dans la config / l'`ExhaustReason`).
+/// Pricing of a model, in micro-USD (1e-6 $) per thousand tokens. `u64` to
+/// stay `Copy`/`Eq` (no `f64` in the config or in `ExhaustReason`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CostBudget {
     pub limit_micro_usd: u64,
@@ -91,8 +91,8 @@ pub struct CostBudget {
     pub output_micro_per_ktok: u64,
 }
 
-/// Budget cumulé de la session (tokens et/ou coût). Désactivé par défaut
-/// (`token_limit`/`cost` à `None`) → aucun impact sur les sessions sans budget.
+/// Cumulated session budget (tokens and/or cost). Disabled by default
+/// (`token_limit`/`cost` at `None`) -> no impact on sessions without a budget.
 #[derive(Debug, Clone, Default)]
 pub struct UsageBudget {
     token_limit: Option<u64>,
@@ -111,12 +111,12 @@ impl UsageBudget {
         }
     }
 
-    /// Budget actif (au moins un plafond configuré) ?
+    /// Is the budget active (at least one cap configured)?
     pub fn is_active(&self) -> bool {
         self.token_limit.is_some() || self.cost.is_some()
     }
 
-    /// Comptabilise un tour (input + output réels OU estimés).
+    /// Accounts for a turn (real OR estimated input + output).
     pub fn record(&mut self, input: u64, output: u64) {
         self.spent_input = self.spent_input.saturating_add(input);
         self.spent_output = self.spent_output.saturating_add(output);
@@ -130,8 +130,8 @@ impl UsageBudget {
         self.spent_input.saturating_add(self.spent_output)
     }
 
-    /// Détail du cumul, pour l'observabilité (US-017). Comptabilisé même sans
-    /// plafond configuré : `is_active()` ne conditionne que le kill-switch.
+    /// Breakdown of the cumulated usage, for observability (US-017). Accounted
+    /// even without a configured cap: `is_active()` only gates the kill-switch.
     pub fn spent_input(&self) -> u64 {
         self.spent_input
     }
@@ -140,7 +140,7 @@ impl UsageBudget {
         self.spent_output
     }
 
-    /// Coût cumulé en micro-USD (0 si aucun tarif configuré).
+    /// Cumulated cost in micro-USD (0 when no pricing is configured).
     pub fn spent_micro_usd(&self) -> u64 {
         match self.cost {
             Some(c) => micro_cost(self.spent_input, self.spent_output, &c),
@@ -148,8 +148,8 @@ impl UsageBudget {
         }
     }
 
-    /// Kill-switch : le budget est-il atteint (≥ 100 %) ? Priorité tokens puis
-    /// coût.
+    /// Kill-switch: is the budget reached (>= 100%)? Tokens first, then
+    /// cost.
     pub fn exceeded(&self) -> Option<ExhaustReason> {
         if let Some(limit) = self.token_limit {
             let spent = self.spent_tokens();
@@ -169,8 +169,8 @@ impl UsageBudget {
         None
     }
 
-    /// Estimation pré-tour : projette le coût du prochain tour (input + output
-    /// estimés) ; si la projection franchit le plafond, on stoppe AVANT le tour.
+    /// Pre-turn estimate: projects the cost of the next turn (estimated input +
+    /// output); if the projection crosses the cap, we stop BEFORE the turn.
     pub fn would_exceed(&self, next_input: u64, next_output: u64) -> Option<ExhaustReason> {
         if let Some(limit) = self.token_limit {
             let projected = self
@@ -200,7 +200,7 @@ impl UsageBudget {
 }
 
 fn micro_cost(input: u64, output: u64, c: &CostBudget) -> u64 {
-    // (tokens / 1000) * micro_par_ktok, en arithmétique entière (input*prix/1000).
+    // (tokens / 1000) * micro_per_ktok, in integer arithmetic (input*price/1000).
     let in_cost = input
         .saturating_mul(c.input_micro_per_ktok)
         .saturating_div(1000);
@@ -219,8 +219,8 @@ mod tests {
         let mut g = LoopGuard::new(3);
         assert_eq!(g.observe("a".into()), LoopDecision::Proceed); // 1
         assert_eq!(g.observe("a".into()), LoopDecision::Proceed); // 2
-        assert_eq!(g.observe("a".into()), LoopDecision::Signal); // 3 = seuil
-        assert_eq!(g.observe("a".into()), LoopDecision::Abort); // 4 > seuil
+        assert_eq!(g.observe("a".into()), LoopDecision::Signal); // 3 = threshold
+        assert_eq!(g.observe("a".into()), LoopDecision::Abort); // 4 > threshold
     }
 
     #[test]
@@ -259,7 +259,7 @@ mod tests {
         assert!(b.exceeded().is_none());
         b.record(600, 300); // 900 < 1000
         assert!(b.exceeded().is_none());
-        b.record(100, 50); // 1050 ≥ 1000
+        b.record(100, 50); // 1050 >= 1000
         assert!(matches!(
             b.exceeded(),
             Some(ExhaustReason::TokenBudget {
@@ -272,7 +272,7 @@ mod tests {
     #[test]
     fn pre_turn_estimate_stops_before_big_turn() {
         let b = UsageBudget::new(Some(1000), None);
-        // rien dépensé, mais le prochain tour projeté à 1200 > 1000.
+        // nothing spent, but the next turn is projected at 1200 > 1000.
         assert!(matches!(
             b.would_exceed(900, 300),
             Some(ExhaustReason::TokenBudget { .. })
@@ -282,14 +282,14 @@ mod tests {
 
     #[test]
     fn cost_budget_kill_switch() {
-        // 50 micro$/ktok input, 100 micro$/ktok output, plafond 100 micro$.
+        // 50 micro$/ktok input, 100 micro$/ktok output, cap 100 micro$.
         let cost = CostBudget {
             limit_micro_usd: 100,
             input_micro_per_ktok: 50,
             output_micro_per_ktok: 100,
         };
         let mut b = UsageBudget::new(None, Some(cost));
-        b.record(1000, 500); // 1000*50/1000 + 500*100/1000 = 50 + 50 = 100 ≥ 100
+        b.record(1000, 500); // 1000*50/1000 + 500*100/1000 = 50 + 50 = 100 >= 100
         assert!(matches!(
             b.exceeded(),
             Some(ExhaustReason::CostBudget {

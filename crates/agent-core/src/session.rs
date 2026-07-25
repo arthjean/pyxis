@@ -1,15 +1,15 @@
-//! Contrat de persistance de session (injecté). L'implémentation JSONL
-//! append-only + resume est `agent-session` (US-009) ; le cœur ne connaît que
-//! ce trait et les types d'entrée canoniques.
+//! Session persistence contract (injected). The append-only JSONL + resume
+//! implementation is `agent-session` (US-009); the core only knows this trait
+//! and the canonical entry types.
 
 use serde::{Deserialize, Serialize};
 
 use crate::compaction::CompactKind;
 use crate::message::Message;
 
-/// Entrée de log discriminée (ARCHITECTURE §7). Sérialisée une par ligne JSONL.
-/// `CompactBoundary` reste lisible pour les anciens logs ; les nouveaux
-/// checkpoints de compaction passent par `CompactCheckpoint`.
+/// Discriminated log entry (ARCHITECTURE section 7). Serialized one per JSONL line.
+/// `CompactBoundary` stays readable for older logs; new compaction
+/// checkpoints go through `CompactCheckpoint`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "entry", rename_all = "snake_case")]
 pub enum SessionEntry {
@@ -46,22 +46,22 @@ pub enum SessionError {
 
 #[async_trait::async_trait]
 pub trait Session: Send + Sync {
-    /// Persiste les messages pas encore écrits (transcript-before-response,
-    /// invariant 6). DOIT être idempotent : n'écrit que le delta depuis le
-    /// dernier `sync` (l'implémentation tient un curseur).
+    /// Persists the messages not yet written (transcript-before-response,
+    /// invariant 6). MUST be idempotent: it only writes the delta since the
+    /// last `sync` (the implementation holds a cursor).
     async fn sync(&self, messages: &[Message]) -> Result<(), SessionError>;
 
-    /// Checkpoint de compaction **full** (auto/reactive) : écrit le transcript
-    /// post-compaction comme une entrée replayable unique, puis resynchronise le
-    /// curseur sur `messages.len()`. La microcompaction, elle, est purement en
-    /// mémoire et n'appelle PAS ceci.
+    /// **full** compaction checkpoint (auto/reactive): writes the post-compaction
+    /// transcript as a single replayable entry, then resynchronizes the cursor on
+    /// `messages.len()`. Microcompaction, in contrast, is purely in memory and
+    /// does NOT call this.
     async fn checkpoint(&self, kind: CompactKind, messages: &[Message])
     -> Result<(), SessionError>;
 
-    /// Enregistre une redaction durable des blocs de reasoning chiffrés déjà
-    /// persistés. Le replay applique cette redaction aux messages reconstruits.
+    /// Records a durable redaction of the already persisted encrypted reasoning
+    /// blocks. Replay applies that redaction to the rebuilt messages.
     async fn redact_encrypted_reasoning(&self) -> Result<(), SessionError>;
 
-    /// Écrit un snapshot de fichier (entrée discriminée `FileHistorySnapshot`).
+    /// Writes a file snapshot (discriminated `FileHistorySnapshot` entry).
     async fn record_file_snapshot(&self, snapshot: FileSnapshot) -> Result<(), SessionError>;
 }

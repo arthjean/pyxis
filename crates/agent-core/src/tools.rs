@@ -1,13 +1,13 @@
-//! Contrat de dispatch d'outils (injecté). L'implémentation réelle (registry,
-//! permissions, taint, pipeline) est `agent-tools` (EP-003) ; le cœur ne connaît
-//! que ce trait. En EP-002, un mock suffit à fermer la boucle stream→outil.
+//! Tool dispatch contract (injected). The real implementation (registry,
+//! permissions, taint, pipeline) is `agent-tools` (EP-003); the core only knows
+//! this trait. In EP-002, a mock is enough to close the stream -> tool loop.
 
 use tokio::sync::mpsc;
 
 use crate::event::PermissionReq;
 use crate::message::{ToolCallId, ToolErrorKind};
 
-/// Un appel d'outil demandé par le modèle (args déjà réassemblés en JSON valide).
+/// A tool call requested by the model (args already reassembled into valid JSON).
 #[derive(Debug, Clone)]
 pub struct ToolInvocation {
     pub id: ToolCallId,
@@ -15,9 +15,9 @@ pub struct ToolInvocation {
     pub input: serde_json::Value,
 }
 
-/// Résultat d'un outil. `is_error` distingue l'échec applicatif ; `untrusted`
-/// porte le taint (OWASP LLM01) décidé par le pipeline `agent-tools` d'après
-/// `Tool::returns_untrusted()` — fail-closed à `true` par défaut (US-013).
+/// Result of a tool. `is_error` marks an application failure; `untrusted`
+/// carries the taint (OWASP LLM01) decided by the `agent-tools` pipeline from
+/// `Tool::returns_untrusted()`, fail-closed to `true` by default (US-013).
 #[derive(Debug, Clone)]
 pub struct ToolOutcome {
     pub id: ToolCallId,
@@ -30,7 +30,7 @@ pub struct ToolOutcome {
 #[derive(Debug, Clone)]
 pub enum ToolDispatchEvent {
     PermissionAsk(PermissionReq),
-    /// Fragment de sortie d'un outil encore en cours (US-015), corrélé par `id`.
+    /// Output fragment of a tool still running (US-015), correlated by `id`.
     OutputDelta {
         id: ToolCallId,
         chunk: String,
@@ -56,12 +56,12 @@ impl ToolEventSink {
 
 #[async_trait::async_trait]
 pub trait ToolDispatch: Send + Sync {
-    /// Reseed le taint de permission depuis un transcript repris. Les
-    /// implémentations sans taint peuvent ignorer ce signal.
+    /// Reseeds the permission taint from a resumed transcript. Implementations
+    /// without taint can ignore this signal.
     fn seed_taint(&self, _recent_untrusted: bool) {}
 
-    /// Exécute un batch d'appels et retourne leurs résultats (ordre non garanti ;
-    /// chaque résultat est corrélé par `id`).
+    /// Runs a batch of calls and returns their results (order not guaranteed;
+    /// each result is correlated by `id`).
     async fn dispatch(&self, calls: Vec<ToolInvocation>, events: ToolEventSink)
     -> Vec<ToolOutcome>;
 }

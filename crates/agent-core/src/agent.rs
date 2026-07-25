@@ -1,11 +1,11 @@
-//! `run_agent` — la boucle d'agent : state machine à transitions typées, exposée
-//! comme un `Stream<AgentEvent>` (async-stream). Headless : elle ne pousse rien
-//! vers un terminal, elle yield des événements structurés (jamais d'ANSI).
+//! `run_agent`: the agent loop, a state machine with typed transitions, exposed
+//! as a `Stream<AgentEvent>` (async-stream). Headless: it pushes nothing to a
+//! terminal, it yields structured events (never ANSI).
 //!
-//! Implémente : transcript-before-response (invariant 6), withholding
-//! (PendingError de contexte, invariant 8), compaction en cascade (§5), retry
-//! transverse des erreurs transitoires (≠ withholding), et le `match` exhaustif
-//! sur `Transition` (AC1).
+//! Implements: transcript-before-response (invariant 6), withholding
+//! (context PendingError, invariant 8), cascading compaction (section 5),
+//! cross-cutting retry of transient errors (≠ withholding), and the exhaustive
+//! `match` on `Transition` (AC1).
 
 use std::time::Duration;
 
@@ -30,7 +30,7 @@ use crate::transition::{
     pre_stream_transition,
 };
 
-/// Réglages de la boucle (garde-fous, seuils).
+/// Loop settings (guardrails, thresholds).
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     pub max_turns: u32,
@@ -39,14 +39,14 @@ pub struct RunConfig {
     pub micro_keep_recent: usize,
     pub compaction_breaker_limit: u32,
     pub backoff_base_ms: u64,
-    /// US-014 — répétitions identiques de batch d'outils avant signal de boucle
-    /// (défaut 3). Au-delà du signal → arrêt déterministe.
+    /// US-014: identical tool-batch repeats before the loop signal
+    /// (default 3). Past the signal -> deterministic stop.
     pub loop_guard_threshold: u32,
-    /// US-014 — budget cumulé de tokens (kill-switch). `None` = désactivé.
+    /// US-014: cumulated token budget (kill-switch). `None` = disabled.
     pub token_budget: Option<u64>,
-    /// US-014 — budget cumulé de coût (kill-switch). `None` = désactivé.
+    /// US-014: cumulated cost budget (kill-switch). `None` = disabled.
     pub cost_budget: Option<CostBudget>,
-    /// Modèle de repli optionnel après une surcharge provider.
+    /// Optional fallback model after a provider overload.
     pub overload_fallback_model: Option<String>,
 }
 
@@ -67,7 +67,7 @@ impl Default for RunConfig {
     }
 }
 
-/// Contexte d'une exécution d'agent (modèle, system, transcript, outils).
+/// Context of an agent run (model, system, transcript, tools).
 pub struct AgentContext {
     pub model: String,
     pub reasoning_effort: Option<String>,
@@ -75,13 +75,13 @@ pub struct AgentContext {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub config: RunConfig,
-    /// Messages de contexte ÉPHÉMÈRES (US-028) : AGENTS.md + bloc environnement,
-    /// préfixés à CHAQUE requête mais JAMAIS poussés dans `messages` ni persistés
-    /// (rechargés par tour, pas accumulés). Stateless-safe : le contexte projet est
-    /// re-fourni à chaque tour sans polluer le transcript ni `instructions`.
+    /// EPHEMERAL context messages (US-028): AGENTS.md + environment block,
+    /// prefixed to EVERY request but NEVER pushed into `messages` nor persisted
+    /// (reloaded per turn, not accumulated). Stateless-safe: project context is
+    /// re-supplied every turn without polluting the transcript or `instructions`.
     pub context_messages: Vec<Message>,
-    /// Messages de contrôle éphémères ajoutés après le transcript pour la requête
-    /// courante, sans persistance. Exemple: relance automatique d'un objectif.
+    /// Ephemeral control messages appended after the transcript for the current
+    /// request, without persistence. Example: automatic goal re-prompt.
     pub ephemeral_messages: Vec<Message>,
 }
 
@@ -130,9 +130,9 @@ fn make_request(
     tools: &[ToolSpec],
     max_output: u32,
 ) -> CanonicalRequest {
-    // US-028 : préfixe ÉPHÉMÈRE (AGENTS.md + env). Stable avant volatil pour
-    // préserver le préfixe cacheable ; jamais persisté (le transcript reste
-    // `messages` seul).
+    // US-028: EPHEMERAL prefix (AGENTS.md + env). Stable before volatile to
+    // preserve the cacheable prefix; never persisted (the transcript stays
+    // `messages` alone).
     let mut all =
         Vec::with_capacity(context_messages.len() + messages.len() + ephemeral_messages.len());
     all.extend_from_slice(context_messages);
@@ -153,14 +153,14 @@ fn backoff(config: &RunConfig, attempt: u32) -> Duration {
     Duration::from_millis(config.backoff_base_ms.saturating_mul(factor))
 }
 
-/// Plafond du délai `Retry-After` honoré (US-023). Un serveur ne peut pas geler la
-/// boucle indéfiniment : un délai aberrant est borné, on retente puis on abandonne
-/// selon `max_retries`. Identique au cap de Pi (60 s).
+/// Cap on the honored `Retry-After` delay (US-023). A server cannot freeze the
+/// loop forever: an absurd delay is bounded, we retry then give up according
+/// to `max_retries`. Same cap as Pi (60 s).
 const MAX_RETRY_AFTER_MS: u64 = 60_000;
 
-/// Délai de retry effectif (US-023) : `max(backoff exponentiel, Retry-After)`, le
-/// délai serveur (ms exact) primant quand il est plus long, borné à
-/// `MAX_RETRY_AFTER_MS`. Les erreurs sans en-tête serveur retombent sur le backoff.
+/// Effective retry delay (US-023): `max(exponential backoff, Retry-After)`, the
+/// server delay (exact ms) winning when it is longer, bounded by
+/// `MAX_RETRY_AFTER_MS`. Errors without a server header fall back on the backoff.
 fn retry_delay(base: Duration, err: &ProviderError) -> Duration {
     match err {
         ProviderError::Http {
@@ -292,13 +292,13 @@ fn validate_tool_outcomes(
     Ok(())
 }
 
-/// US-002 — écrit un résultat synthétique pour chaque appel d'outil resté sans
-/// réponse au moment de l'interruption, et rend les vues à émettre aux clients.
+/// US-002: writes a synthetic result for every tool call left unanswered at
+/// interruption time, and returns the views to emit to clients.
 ///
-/// Appelée AVANT toute persistance : un transcript porteur d'un `tool_use` sans
-/// `tool_result` est rejeté en 400 par le backend au tour suivant, ce qui rend la
-/// session inexploitable. Les résultats réels déjà collectés sont conservés tels
-/// quels — la réconciliation ne remplace rien, elle complète.
+/// Called BEFORE any persistence: a transcript carrying a `tool_use` without a
+/// `tool_result` is rejected with a 400 by the backend on the next turn, which
+/// makes the session unusable. Real results already collected are kept as they
+/// are: reconciliation replaces nothing, it completes.
 fn reconcile_interrupted_calls(messages: &mut Vec<Message>) -> Vec<ToolResultView> {
     let pending = unanswered_tool_calls(messages);
     let mut views = Vec::with_capacity(pending.len());
@@ -359,7 +359,7 @@ fn rebuild_budget_after_model_switch(
     Ok(budget)
 }
 
-/// Lance l'agent. Renvoie un `Stream<AgentEvent>` à consommer (TUI, `-p`, Paneflow).
+/// Starts the agent. Returns a `Stream<AgentEvent>` to consume (TUI, `-p`, Paneflow).
 pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent> + Send {
     async_stream::stream! {
         let AgentContext {
@@ -373,7 +373,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
             ephemeral_messages,
         } = ctx;
 
-        // ContextBudget calculé pour le modèle actif (recalculé si fallback overload).
+        // ContextBudget computed for the active model (recomputed on overload fallback).
         let max_context = deps.provider.max_context_for_model(&model);
         let mut budget = match ContextBudget::try_for_model(max_context, config.max_output_tokens) {
             Ok(budget) => budget,
@@ -382,9 +382,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                 return;
             }
         };
-        // L'usage backend compte tout ce qui est envoyé : system, contexte
-        // éphémère, schémas d'outils et transcript. Les projections locales doivent
-        // porter le même overhead statique, sinon la compaction arrive trop tard.
+        // Backend usage counts everything that is sent: system, ephemeral
+        // context, tool schemas and transcript. Local projections must carry
+        // the same static overhead, otherwise compaction comes too late.
         let static_input_tokens = estimate_static_input(
             &system,
             &context_messages,
@@ -399,11 +399,11 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
         let mut overload_fallback_used = false;
         let mut iterations: u32 = 0;
         let iter_cap = config.max_turns.saturating_mul(4).saturating_add(32);
-        // US-014 — garde-fous déterministes (override de la logique du modèle).
+        // US-014: deterministic guardrails (override the model's own logic).
         let mut loop_guard = LoopGuard::new(config.loop_guard_threshold);
         let mut usage_budget = UsageBudget::new(config.token_budget, config.cost_budget);
-        // US-030 (MidTurn) : armé quand un long tool_result franchit le seuil →
-        // force la compaction au prochain tour, AVANT de relancer le modèle.
+        // US-030 (MidTurn): armed when a long tool_result crosses the threshold ->
+        // forces compaction on the next turn, BEFORE calling the model again.
         let mut force_compact = false;
 
         loop {
@@ -415,28 +415,28 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                 return;
             }
 
-            // transcript-before-response (invariant 6) — delta idempotent.
+            // transcript-before-response (invariant 6): idempotent delta.
             if let Err(e) = deps.session.sync(&messages).await {
                 yield AgentEvent::Error(AgentError::Session(e.to_string()));
                 return;
             }
 
-            // US-014 — kill-switch budget : seuil cumulé atteint → arrêt (edge
-            // case #3). L'estimation PRÉ-tour est faite plus bas, avant le stream.
+            // US-014: budget kill-switch, cumulated threshold reached -> stop (edge
+            // case #3). The PRE-turn estimate happens below, before the stream.
             if let Some(reason) = usage_budget.exceeded() {
                 yield AgentEvent::Exhausted(reason);
                 return;
             }
 
             let transition: Transition = if deps.cancel.is_cancelled() {
-                // US-001 — frontière d'arrêt UNIQUE : tout point d'annulation profond
-                // reboucle jusqu'ici, où le transcript est dans un état connu.
+                // US-001: SINGLE stop boundary, every deep cancellation point loops
+                // back here, where the transcript is in a known state.
                 Transition::Interrupted
             } else if force_compact && pending.is_none() {
-                // US-030 MidTurn : compaction forcée par un long tool_result au tour
-                // précédent. Le withholding (`pending`) reste PRIORITAIRE : si une
-                // erreur de contexte est en attente, on laisse `pre_stream_transition`
-                // la traiter (Recover) et le force reste armé pour le tour d'après.
+                // US-030 MidTurn: compaction forced by a long tool_result on the
+                // previous turn. Withholding (`pending`) stays PRIORITY: if a
+                // context error is waiting, we let `pre_stream_transition` handle
+                // it (Recover) and the force stays armed for the turn after.
                 force_compact = false;
                 Transition::Compact(CompactKind::Auto)
             } else {
@@ -451,12 +451,12 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     t
                 }
                 None => {
-                    // microcompaction structurelle (cheap) sous pression légère.
-                    // PUREMENT EN MÉMOIRE : elle tronque le contenu de vieux
-                    // tool_results (le log append-only garde l'historique complet ;
-                    // le resume restaurera plus de contexte, jamais moins). On
-                    // n'écrit donc PAS de frontière (sinon le resume clear-on-
-                    // boundary effacerait le transcript à tort).
+                    // structural (cheap) microcompaction under light pressure.
+                    // PURELY IN MEMORY: it truncates the content of old
+                    // tool_results (the append-only log keeps the full history;
+                    // resume will restore more context, never less). So we do
+                    // NOT write a boundary (otherwise the clear-on-boundary
+                    // resume would wrongly wipe the transcript).
                     if budget.should_microcompact() {
                         let pruned = microcompact(&mut messages, config.micro_keep_recent);
                         if pruned > 0 {
@@ -466,9 +466,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         }
                     }
 
-                    // US-014 — estimation pré-tour : stoppe AVANT un tour dont la
-                    // projection (contexte estimé + sortie max) franchirait le
-                    // budget (edge case #3, « avant un gros tour »).
+                    // US-014: pre-turn estimate, stop BEFORE a turn whose
+                    // projection (estimated context + max output) would cross
+                    // the budget (edge case #3, "before a big turn").
                     if usage_budget.is_active() {
                         let est_in = estimate_current_input(&messages, static_input_tokens, &deps) as u64;
                         if let Some(reason) =
@@ -495,8 +495,8 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         return;
                     }
 
-                    // US-001 : l'ouverture du stream peut bloquer plusieurs secondes
-                    // (TLS + first byte) ; l'annulation reprend la main sans l'attendre.
+                    // US-001: opening the stream can block for several seconds
+                    // (TLS + first byte); cancellation takes over without waiting.
                     let opened = match deps.cancel.guard(deps.provider.stream(req)).await {
                         Cancellable::Cancelled => continue,
                         Cancellable::Completed(opened) => opened,
@@ -540,11 +540,11 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     return;
                                 }
                                 transient_retries += 1;
-                                // attempt indexé à partir de 0 → délais 1×,2×,4×.
-                                // US-023 : honore Retry-After (max(backoff, retry_after), borné).
-                                // US-001 : un backoff peut durer jusqu'à 60 s (Retry-After
-                                // borné) ; l'annulation écourte l'attente, la frontière
-                                // d'arrêt étant la tête de boucle.
+                                // attempt indexed from 0 -> delays 1x,2x,4x.
+                                // US-023: honors Retry-After (max(backoff, retry_after), bounded).
+                                // US-001: a backoff can last up to 60 s (bounded
+                                // Retry-After); cancellation cuts the wait short, the stop
+                                // boundary being the loop head.
                                 let _ = deps
                                     .cancel
                                     .guard(deps.clock.sleep(transient_retry_delay(
@@ -580,15 +580,15 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         }},
                     };
 
-                    // Consommation du stream : yields live (jamais d'ANSI).
+                    // Stream consumption: live yields (never ANSI).
                     let mut acc = Accumulator::new();
                     let mut stream_err: Option<ProviderError> = None;
                     let mut last_usage: Option<TokenUsage> = None;
                     let mut interrupted = false;
                     loop {
-                        // US-001 : l'annulation est interrogée EN PREMIER (`biased`) →
-                        // dès qu'elle est signalée, plus aucun `Text` ni `Reasoning`
-                        // n'est émis, même si le stream a des événements prêts.
+                        // US-001: cancellation is polled FIRST (`biased`) -> as soon
+                        // as it is signalled, no more `Text` nor `Reasoning` is
+                        // emitted, even if the stream has events ready.
                         let next = tokio::select! {
                             biased;
                             () = deps.cancel.cancelled() => {
@@ -614,9 +614,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 }
                             }
                             Ok(StreamEvent::Usage { usage }) => {
-                                // Sonde d'observabilité (US-021 AC3 / US-029) : compare
-                                // l'usage backend réel à l'estimation locale. Env-gated,
-                                // défaut OFF → chemin et sortie inchangés en prod.
+                                // Observability probe (US-021 AC3 / US-029): compares
+                                // real backend usage to the local estimate. Env-gated,
+                                // default OFF -> path and output unchanged in prod.
                                 if std::env::var_os("PYXIS_DEBUG_USAGE").is_some() {
                                     let est_in = estimate_input(&messages, deps.tokenizer.as_ref())
                                         .saturating_add(static_input_tokens);
@@ -645,11 +645,11 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     }
 
                     if interrupted {
-                        // Le partiel est COMMITÉ : `to_assistant_message` ne retient que
-                        // les appels complets (un `tool_use` à moitié streamé est
-                        // écarté), et la réconciliation leur écrira un résultat au
-                        // passage par la frontière d'arrêt. Ce que le client a vu
-                        // défiler reste donc dans le transcript.
+                        // The partial is COMMITTED: `to_assistant_message` only keeps
+                        // complete calls (a half-streamed `tool_use` is discarded),
+                        // and reconciliation will write them a result when passing
+                        // the stop boundary. So what the client saw scroll by stays
+                        // in the transcript.
                         if !acc.is_empty() {
                             messages.push(acc.to_assistant_message());
                         }
@@ -714,11 +714,11 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     yield AgentEvent::StreamReset;
                                 }
                                 transient_retries += 1;
-                                // attempt indexé à partir de 0 → délais 1×,2×,4×.
-                                // US-023 : honore Retry-After (max(backoff, retry_after), borné).
-                                // US-001 : un backoff peut durer jusqu'à 60 s (Retry-After
-                                // borné) ; l'annulation écourte l'attente, la frontière
-                                // d'arrêt étant la tête de boucle.
+                                // attempt indexed from 0 -> delays 1x,2x,4x.
+                                // US-023: honors Retry-After (max(backoff, retry_after), bounded).
+                                // US-001: a backoff can last up to 60 s (bounded
+                                // Retry-After); cancellation cuts the wait short, the stop
+                                // boundary being the loop head.
                                 let _ = deps
                                     .cancel
                                     .guard(deps.clock.sleep(transient_retry_delay(
@@ -766,10 +766,10 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     transient_retries = 0;
                     model_turns += 1;
 
-                    // Fallback usage : si pas d'`usage` en stream, estime
-                    // localement pour alimenter le seuil de compaction (invariant 7). On
-                    // comptabilise aussi le tour dans le budget US-014 (réel si
-                    // disponible, sinon estimé : input contexte + output généré).
+                    // Usage fallback: without an `usage` in the stream, estimate
+                    // locally to feed the compaction threshold (invariant 7). We also
+                    // account the turn in the US-014 budget (real when available,
+                    // otherwise estimated: context input + generated output).
                     record_attempt_usage(
                         &mut usage_budget,
                         &mut budget,
@@ -780,10 +780,10 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         &deps,
                     );
 
-                    // US-017 : un aller-retour modèle vient de se terminer. Émis
-                    // ici, après la comptabilisation, pour que les compteurs
-                    // portés par l'événement incluent CE tour. C'est le seul
-                    // point du run où `model_turns` avance.
+                    // US-017: a model round-trip just ended. Emitted here, after
+                    // accounting, so that the counters carried by the event
+                    // include THIS turn. This is the only point of the run
+                    // where `model_turns` advances.
                     yield AgentEvent::ModelTurn(crate::event::ModelTurnView {
                         index: model_turns,
                         input_tokens: usage_budget.spent_input(),
@@ -807,14 +807,14 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
             }
             };
 
-            // Match EXHAUSTIF sur les 6 variantes (AC1) — vérifié à la compilation.
+            // EXHAUSTIVE match over the 6 variants (AC1), checked at compile time.
             match transition {
                 Transition::EndTurn => {
-                    // US-024 — persistance du DERNIER tour assistant : le message
-                    // assistant final (acc.to_assistant_message) vient d'être poussé,
-                    // mais le sync d'en-tête de boucle ne s'exécuterait qu'au tour
-                    // SUIVANT, qui n'aura pas lieu. Sync final (delta-only, idempotent)
-                    // avant de rendre la main, sinon `/resume` perd la dernière réponse.
+                    // US-024: persistence of the LAST assistant turn. The final
+                    // assistant message (acc.to_assistant_message) was just pushed,
+                    // but the loop-head sync would only run on the NEXT turn, which
+                    // will not happen. Final sync (delta-only, idempotent) before
+                    // handing back control, otherwise `/resume` loses the last reply.
                     if let Err(e) = deps.session.sync(&messages).await {
                         yield AgentEvent::Error(AgentError::Session(e.to_string()));
                         return;
@@ -823,19 +823,19 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     return;
                 }
                 Transition::RunTools(calls) => {
-                    // transcript-before-response pour le TOUR ASSISTANT : le message
-                    // assistant (avec ses tool_use, déjà pushé) est persisté AVANT
-                    // d'exécuter les outils. Sinon un crash pendant le dispatch
-                    // laisserait des tool_results orphelins (sans tour assistant) au
-                    // resume — transcript structurellement invalide (#1).
+                    // transcript-before-response for the ASSISTANT TURN: the assistant
+                    // message (with its tool_use, already pushed) is persisted BEFORE
+                    // running the tools. Otherwise a crash during the dispatch would
+                    // leave orphan tool_results (without an assistant turn) at
+                    // resume: a structurally invalid transcript (#1).
                     if let Err(e) = deps.session.sync(&messages).await {
                         yield AgentEvent::Error(AgentError::Session(e.to_string()));
                         return;
                     }
 
-                    // US-014 — garde-fou de boucle déterministe (FR-05) : il OVERRIDE
-                    // la logique du modèle. Au seuil → signal sans exécuter ;
-                    // au-delà → arrêt déterministe (l'iter_cap reste le filet ultime).
+                    // US-014: deterministic loop guardrail (FR-05). It OVERRIDES the
+                    // model's logic. At the threshold -> signal without executing;
+                    // past it -> deterministic stop (iter_cap stays the last resort).
                     match loop_guard.observe(batch_signature(&calls)) {
                         LoopDecision::Abort => {
                             yield AgentEvent::Exhausted(ExhaustReason::ToolLoop {
@@ -844,9 +844,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             return;
                         }
                         LoopDecision::Signal => {
-                            // Hard stop du batch répété : on N'EXÉCUTE PAS, on renvoie
-                            // un signal explicite à l'agent (edge case #2). Un
-                            // tool_result par tool_use → transcript valide.
+                            // Hard stop on the repeated batch: we DO NOT EXECUTE, we send
+                            // an explicit signal back to the agent (edge case #2). One
+                            // tool_result per tool_use -> valid transcript.
                             for c in &calls {
                                 let msg = format!(
                                     "Loop detected on {} (x{}). Stopping. Reframe the approach \
@@ -869,7 +869,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     Some(crate::message::ToolErrorKind::Semantic),
                                 ));
                             }
-                            // reboucle : le modèle reçoit le signal et peut corriger.
+                            // loop back: the model gets the signal and can correct itself.
                         }
                         LoopDecision::Proceed => {
                             for c in &calls {
@@ -887,12 +887,12 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 deps.tools.dispatch(calls, ToolEventSink::new(tool_event_tx));
                             tokio::pin!(dispatch);
                             let mut tool_events_open = true;
-                            // US-001 : `biased` avec le dispatch EN PREMIER — un batch
-                            // qui vient de se terminer rend ses résultats réels au lieu
-                            // d'être écarté par une annulation arrivée dans la même
-                            // fenêtre (edge case #2). Sinon, la boucle reprend la main
-                            // sans attendre les outils, qui sont abandonnés avec le
-                            // future de dispatch.
+                            // US-001: `biased` with the dispatch FIRST. A batch that just
+                            // finished yields its real results instead of being discarded
+                            // by a cancellation that landed in the same window (edge
+                            // case #2). Otherwise the loop takes control back without
+                            // waiting for the tools, which are abandoned along with the
+                            // dispatch future.
                             let outcomes = loop {
                                 tokio::select! {
                                     biased;
@@ -912,8 +912,8 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 }
                             };
                             let Some(outcomes) = outcomes else {
-                                // Appels en vol abandonnés : la tête de boucle
-                                // réconcilie chacun d'eux avant persistance (US-002).
+                                // Abandoned in-flight calls: the loop head
+                                // reconciles each of them before persisting (US-002).
                                 continue;
                             };
                             while let Ok(event) = tool_event_rx.try_recv() {
@@ -946,23 +946,23 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     o.error_kind,
                                 ));
                             }
-                            // US-030 MidTurn : les tool_results qu'on vient d'ajouter
-                            // ne sont PAS encore dans le budget (basé sur l'usage du
-                            // tour précédent). On PROJETTE leur poids (sans écraser le
-                            // budget réel) ; si un long résultat franchit le seuil, on
-                            // force la compaction au prochain tour, avant le modèle.
+                            // US-030 MidTurn: the tool_results we just added are NOT
+                            // in the budget yet (it is based on the previous turn's
+                            // usage). We PROJECT their weight (without overwriting the
+                            // real budget); if a long result crosses the threshold, we
+                            // force compaction on the next turn, before the model.
                             let projected = estimate_current_input(&messages, static_input_tokens, &deps);
                             if budget.would_autocompact(projected) {
                                 force_compact = true;
                             }
-                            // reboucle : le modèle voit les résultats.
+                            // loop back: the model sees the results.
                         }
                     }
                 }
                 Transition::Compact(kind) => {
-                    // US-001 : la compaction est un appel modèle complet ; l'annulation
-                    // ne l'attend pas. Le transcript n'est pas modifié tant que
-                    // `full_compact` n'a pas rendu la main.
+                    // US-001: compaction is a full model call; cancellation does not
+                    // wait for it. The transcript is not modified until
+                    // `full_compact` has handed back control.
                     let compacted = match deps.cancel.guard(full_compact(
                         &mut messages,
                         &model,
@@ -978,15 +978,15 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         Ok(usage) => {
                             usage_budget.record_usage(usage);
                             compaction.record_success();
-                            // checkpoint ATOMIQUE : frontière + transcript résumé en
-                            // une opération ; erreur I/O propagée (pas de let _ qui
-                            // désynchroniserait le curseur de session — #8).
+                            // ATOMIC checkpoint: boundary + summarized transcript in
+                            // one operation; I/O error propagated (no let _ that would
+                            // desynchronize the session cursor, #8).
                             if let Err(e) = deps.session.checkpoint(kind, &messages).await {
                                 yield AgentEvent::Error(AgentError::Session(e.to_string()));
                                 return;
                             }
-                            // US-030 : ancre le baseline sur le PROCHAIN usage réel
-                            // (anti double-compaction immédiate).
+                            // US-030: anchors the baseline on the NEXT real usage
+                            // (guards against an immediate double compaction).
                             let compacted_input = estimate_current_input(&messages, static_input_tokens, &deps);
                             budget.mark_compacted(compacted_input);
                             yield AgentEvent::Compacted(kind);
@@ -997,8 +997,8 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 yield AgentEvent::Error(AgentError::CompactionCircuitBreaker(n));
                                 return;
                             }
-                            // anti error-loop : microcompact structurel pour baisser
-                            // la pression avant de reboucler.
+                            // anti error-loop: structural microcompact to lower the
+                            // pressure before looping back.
                             let pruned = microcompact(&mut messages, config.micro_keep_recent);
                             if pruned > 0 {
                                 compaction.record_success();
@@ -1009,7 +1009,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     }
                 }
                 Transition::Recover(_) => {
-                    // withholding : compaction REACTIVE ; échec confirmé → propagation.
+                    // withholding: REACTIVE compaction; confirmed failure -> propagation.
                     let compacted = match deps.cancel.guard(full_compact(
                         &mut messages,
                         &model,
@@ -1042,9 +1042,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     }
                 }
                 Transition::Interrupted => {
-                    // US-002 — réconciliation AVANT persistance : chaque appel resté
-                    // sans réponse reçoit un résultat explicite, sinon le tour suivant
-                    // réémet un `function_call` orphelin que le backend rejette.
+                    // US-002: reconciliation BEFORE persistence, every call left
+                    // unanswered gets an explicit result, otherwise the next turn
+                    // re-emits an orphan `function_call` that the backend rejects.
                     for view in reconcile_interrupted_calls(&mut messages) {
                         yield AgentEvent::ToolResult(view);
                     }
@@ -1052,8 +1052,8 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         yield AgentEvent::Error(AgentError::Session(e.to_string()));
                         return;
                     }
-                    // US-001 — l'événement est émis par le CŒUR : le client n'a plus à
-                    // le fabriquer après un abort décidé de l'extérieur.
+                    // US-001: the event is emitted by the CORE, the client no longer
+                    // has to build it after an abort decided from the outside.
                     yield AgentEvent::Interrupted;
                     return;
                 }
@@ -1070,7 +1070,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
     }
 }
 
-// ───────────────────────── Mode headless (`-p`) ─────────────────────────
+// ───────────────────────── Headless mode (`-p`) ─────────────────────────
 
 #[derive(Debug)]
 pub enum HeadlessEnd {
@@ -1086,18 +1086,18 @@ pub struct HeadlessResult {
     pub ended: HeadlessEnd,
 }
 
-/// Consomme la boucle en mode headless : agrège le texte, AUCUN Ratatui (AC3).
-/// C'est ce que `pyxis -p` câblera (agent-cli) ; ici, testable sans terminal.
+/// Consumes the loop in headless mode: aggregates text, NO Ratatui (AC3).
+/// This is what `pyxis -p` will wire up (agent-cli); here, testable without a terminal.
 pub async fn run_headless(ctx: AgentContext, deps: Deps) -> HeadlessResult {
     run_headless_observed(ctx, deps, |_| {}).await
 }
 
-/// Même boucle, avec un observateur appelé sur CHAQUE événement dans l'ordre
-/// d'émission (US-017 : sortie JSONL). L'agrégation de texte reste ici, en un
-/// seul endroit : un client qui veut les deux ne réimplémente pas la règle de
-/// consolidation, dont le silence sur `Text` avant un `ToolCall` est subtil.
-/// L'observateur ne fait pas d'I/O asynchrone : il écrit une ligne et rend la
-/// main, ce qui garde le cœur libre de toute dépendance de sortie.
+/// Same loop, with an observer called on EVERY event in emission order
+/// (US-017: JSONL output). Text aggregation stays here, in a single place:
+/// a client that wants both does not reimplement the consolidation rule,
+/// whose silence on `Text` before a `ToolCall` is subtle.
+/// The observer performs no async I/O: it writes a line and hands back
+/// control, which keeps the core free of any output dependency.
 pub async fn run_headless_observed(
     ctx: AgentContext,
     deps: Deps,
@@ -1150,7 +1150,7 @@ mod tests {
         }
     }
 
-    // US-023 : sans en-tête serveur → backoff seul.
+    // US-023: without a server header -> backoff alone.
     #[test]
     fn retry_delay_without_header_uses_backoff() {
         let base = Duration::from_millis(50);
@@ -1161,7 +1161,7 @@ mod tests {
         );
     }
 
-    // US-023 : Retry-After plus long que le backoff → c'est lui qui prime.
+    // US-023: Retry-After longer than the backoff -> it wins.
     #[test]
     fn retry_delay_honors_longer_retry_after() {
         let base = Duration::from_millis(50);
@@ -1171,14 +1171,14 @@ mod tests {
         );
     }
 
-    // US-023 : backoff plus long que Retry-After → le backoff prime (max).
+    // US-023: backoff longer than Retry-After -> the backoff wins (max).
     #[test]
     fn retry_delay_keeps_longer_backoff() {
         let base = Duration::from_millis(5_000);
         assert_eq!(retry_delay(base, &http(Some(1_000))), base);
     }
 
-    // US-023 : un Retry-After aberrant est borné (jamais de gel indéfini).
+    // US-023: an absurd Retry-After is bounded (never an indefinite freeze).
     #[test]
     fn retry_delay_caps_absurd_retry_after() {
         let base = Duration::from_millis(50);
@@ -1243,7 +1243,7 @@ mod tests {
         ));
     }
 
-    // backoff : exponentiel plafonné à 32× (2^5), pas de débordement.
+    // backoff: exponential capped at 32x (2^5), no overflow.
     #[test]
     fn backoff_is_exponential_capped() {
         let cfg = RunConfig {
@@ -1253,7 +1253,7 @@ mod tests {
         assert_eq!(backoff(&cfg, 0), Duration::from_millis(10));
         assert_eq!(backoff(&cfg, 1), Duration::from_millis(20));
         assert_eq!(backoff(&cfg, 2), Duration::from_millis(40));
-        // au-delà de 2^5 le facteur est figé à 32.
+        // past 2^5 the factor is pinned at 32.
         assert_eq!(backoff(&cfg, 5), Duration::from_millis(320));
         assert_eq!(backoff(&cfg, 50), Duration::from_millis(320));
     }

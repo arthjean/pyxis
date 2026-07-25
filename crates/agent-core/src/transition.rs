@@ -1,11 +1,11 @@
-//! State machine à transitions typées (ARCHITECTURE §3.1/§3.5). L'`enum
-//! Transition` est exhaustif : le `match` du driver (agent.rs) force le
-//! traitement de tous les cas → contrôle de flux vérifié à la compilation.
+//! State machine with typed transitions (ARCHITECTURE 3.1/3.5). The `enum
+//! Transition` is exhaustive: the driver `match` (agent.rs) forces every case
+//! to be handled -> control flow checked at compile time.
 //!
-//! Deux fonctions PURES (sans I/O), testables unitairement, décident :
-//! - `pre_stream_transition` : recover (withholding) / compaction / épuisement,
-//!   AVANT l'appel API ;
-//! - `post_stream_transition` : EndTurn / RunTools / Fail, d'après l'accumulateur.
+//! Two PURE functions (no I/O), unit-testable, decide:
+//! - `pre_stream_transition`: recover (withholding) / compaction / exhaustion,
+//!   BEFORE the API call;
+//! - `post_stream_transition`: EndTurn / RunTools / Fail, from the accumulator.
 
 use std::collections::HashMap;
 
@@ -17,8 +17,8 @@ use crate::tools::ToolInvocation;
 use agent_tokenizer::TokenCounter;
 use serde::{Deserialize, Serialize};
 
-/// Erreur de CONTEXTE retenue par le withholding (PTL / max-tokens). Distincte
-/// des erreurs transitoires (backoff) — invariant 8.
+/// CONTEXT error held back by withholding (PTL / max-tokens). Distinct from
+/// transient errors (backoff): invariant 8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextErrorKind {
     PromptTooLong,
@@ -34,51 +34,51 @@ pub struct PendingError {
 #[serde(rename_all = "snake_case")]
 pub enum ExhaustReason {
     MaxTurns(u32),
-    /// Kill-switch budget tokens atteint (US-014) : `spent ≥ limit`.
+    /// Token budget kill-switch reached (US-014): `spent >= limit`.
     TokenBudget {
         spent: u64,
         limit: u64,
     },
-    /// Kill-switch budget coût atteint (US-014), en micro-USD (1e-6 $).
+    /// Cost budget kill-switch reached (US-014), in micro-USD (1e-6 $).
     CostBudget {
         spent_micro_usd: u64,
         limit_micro_usd: u64,
     },
-    /// Boucle d'outils persistante au-delà du signal (US-014) : arrêt
-    /// déterministe après `count` répétitions identiques.
+    /// Tool loop persisting past the signal (US-014): deterministic stop
+    /// after `count` identical repeats.
     ToolLoop {
         count: u32,
     },
-    /// Le modèle a atteint son budget de sortie. Ce n'est pas une fin propre :
-    /// la réponse peut être tronquée, voire vide si le reasoning a consommé le
+    /// The model reached its output budget. This is not a clean end:
+    /// the answer may be truncated, or even empty if reasoning consumed the
     /// budget.
     MaxOutputTokens {
         visible_output: bool,
     },
 }
 
-/// Transition exhaustive. Chaque variante est un événement décisionnel.
+/// Exhaustive transition. Each variant is a decision event.
 #[derive(Debug)]
 pub enum Transition {
-    /// Le modèle a fini sans tool_use → rendre la main.
+    /// The model finished without tool_use -> hand back control.
     EndTurn,
-    /// Le modèle demande des outils → exécuter puis reboucler.
+    /// The model asks for tools -> run them then loop back.
     RunTools(Vec<ToolInvocation>),
-    /// Compaction (proactive auto, ou réactive) avant le prochain appel.
+    /// Compaction (proactive auto, or reactive) before the next call.
     Compact(CompactKind),
-    /// Erreur de contexte retenue (withholding) à récupérer avant de propager.
+    /// Context error held back (withholding), to recover before propagating.
     Recover(PendingError),
-    /// US-001 — annulation coopérative signalée : arrêt à la frontière courante,
-    /// après réconciliation du transcript (US-002).
+    /// US-001: cooperative cancellation signalled, stop at the current boundary,
+    /// after transcript reconciliation (US-002).
     Interrupted,
-    /// Plafond de tours / budget épuisé.
+    /// Turn cap / budget exhausted.
     Exhausted(ExhaustReason),
-    /// Erreur fatale non récupérable.
+    /// Fatal, unrecoverable error.
     Fail(AgentError),
 }
 
-/// Décision AVANT l'appel API. `None` ⇒ procéder au stream. Priorité :
-/// withholding (recover) > épuisement > compaction proactive.
+/// Decision BEFORE the API call. `None` means proceed to the stream. Priority:
+/// withholding (recover) > exhaustion > proactive compaction.
 pub fn pre_stream_transition(
     pending: Option<PendingError>,
     model_turns: u32,
@@ -97,7 +97,7 @@ pub fn pre_stream_transition(
     None
 }
 
-/// Décision APRÈS l'accumulation du stream : EndTurn / RunTools / Fail.
+/// Decision AFTER stream accumulation: EndTurn / RunTools / Fail.
 pub fn post_stream_transition(acc: &Accumulator) -> Transition {
     let calls = acc.tool_calls();
     match acc.stop {
@@ -115,10 +115,10 @@ pub fn post_stream_transition(acc: &Accumulator) -> Transition {
         Some(StopReason::ToolUse) => Transition::Fail(AgentError::Provider(
             ProviderFailure::contract("provider signaled tool_use without tool calls"),
         )),
-        // Output tronqué EN PLEIN tool_call → l'intention d'outil est incomplète
-        // et serait silencieusement perdue. max-tokens alimente le withholding
-        // (invariant 8 / ARCHITECTURE §3.4) : compaction réactive puis re-stream
-        // pour régénérer un appel complet, au lieu d'un EndTurn qui jette le call.
+        // Output truncated IN THE MIDDLE of a tool_call -> the tool intent is
+        // incomplete and would be silently lost. max-tokens feeds withholding
+        // (invariant 8 / ARCHITECTURE 3.4): reactive compaction then re-stream
+        // to regenerate a complete call, instead of an EndTurn that drops it.
         Some(StopReason::MaxTokens) if !calls.is_empty() || acc.has_open_tool_calls() => {
             Transition::Recover(PendingError {
                 kind: ContextErrorKind::MaxTokensInput,
@@ -134,7 +134,7 @@ pub fn post_stream_transition(acc: &Accumulator) -> Transition {
     }
 }
 
-// ───────────────────────────── Accumulateur ─────────────────────────────
+// ───────────────────────────── Accumulator ─────────────────────────────
 
 struct PartialCall {
     name: String,
@@ -146,8 +146,8 @@ struct CompletedCall {
     input: serde_json::Value,
 }
 
-/// Accumule les `StreamEvent` (hors `Usage`, géré par le budget) en un état
-/// décisionnel.
+/// Accumulates `StreamEvent`s (except `Usage`, handled by the budget) into a
+/// decision state.
 #[derive(Default)]
 pub struct Accumulator {
     text: String,
@@ -156,8 +156,8 @@ pub struct Accumulator {
     open: HashMap<ToolCallId, PartialCall>,
     completed: HashMap<ToolCallId, CompletedCall>,
     order: Vec<ToolCallId>,
-    /// Reasoning items chiffrés capturés (US-031, replay isolé) : `(id, contenu)`,
-    /// dans l'ordre d'arrivée (avant leurs function_calls). Vides si replay OFF.
+    /// Captured encrypted reasoning items (US-031, isolated replay): `(id, content)`,
+    /// in arrival order (before their function_calls). Empty when replay is OFF.
     reasonings: Vec<(String, String)>,
 }
 
@@ -166,7 +166,7 @@ impl Accumulator {
         Self::default()
     }
 
-    /// Intègre un événement (le `Usage` est traité par le budget, pas ici).
+    /// Folds in an event (`Usage` is handled by the budget, not here).
     pub fn push(&mut self, ev: StreamEvent) -> Result<(), AgentError> {
         match ev {
             StreamEvent::TextDelta { text } => self.text.push_str(&text),
@@ -234,7 +234,7 @@ impl Accumulator {
         !self.text.is_empty() || !self.reasoning.is_empty()
     }
 
-    /// Appels d'outils complets, validés à `ToolCallEnd`.
+    /// Complete tool calls, validated at `ToolCallEnd`.
     pub fn tool_calls(&self) -> Vec<ToolInvocation> {
         self.order
             .iter()
@@ -248,7 +248,7 @@ impl Accumulator {
             .collect()
     }
 
-    /// Construit le message assistant à persister (text + thinking + tool_use).
+    /// Builds the assistant message to persist (text + thinking + tool_use).
     pub fn to_assistant_message(&self) -> Message {
         let mut content = Vec::new();
         if !self.reasoning.is_empty() {
@@ -261,8 +261,8 @@ impl Accumulator {
                 text: self.text.clone(),
             });
         }
-        // US-031 : reasoning items chiffrés AVANT les function_calls (paire rs/fc).
-        // Vide si replay OFF → message identique au chemin plat.
+        // US-031: encrypted reasoning items BEFORE the function_calls (rs/fc pair).
+        // Empty when replay is OFF -> message identical to the flat path.
         for (id, encrypted_content) in &self.reasonings {
             content.push(ContentBlock::EncryptedReasoning {
                 id: id.clone(),
@@ -291,9 +291,9 @@ impl Accumulator {
             && self.completed.is_empty()
     }
 
-    /// Estimation conservative de la sortie générée quand le provider n'a pas
-    /// envoyé d'`Usage`. Inclut le texte visible, le reasoning, les tool calls et
-    /// les fragments incomplets éventuels avant erreur.
+    /// Conservative estimate of the generated output when the provider did not
+    /// send an `Usage`. Includes visible text, reasoning, tool calls and any
+    /// incomplete fragments before an error.
     pub fn estimate_output(&self, counter: &dyn TokenCounter) -> u32 {
         let mut total = counter
             .count_text(&self.text)
@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn maxtokens_mid_toolcall_recovers_not_drops() {
-        // tronqué en plein tool_call → Recover (withholding), pas EndTurn silencieux
+        // truncated mid tool_call -> Recover (withholding), not a silent EndTurn
         let a = acc_with(vec![
             StreamEvent::ToolCallStart {
                 id: "c1".into(),
@@ -435,8 +435,8 @@ mod tests {
 
     #[test]
     fn maxtokens_plain_text_exhausts() {
-        // texte tronqué sans tool_call en cours : non-success, car le reasoning
-        // peut avoir consommé le budget avant une réponse complète.
+        // text truncated with no tool_call in flight: non-success, because reasoning
+        // may have consumed the budget before a complete answer.
         let a = acc_with(vec![
             StreamEvent::TextDelta {
                 text: "truncated answer".into(),
@@ -461,8 +461,8 @@ mod tests {
         assert!(matches!(post_stream_transition(&a), Transition::Fail(_)));
     }
 
-    // US-031 : l'Accumulator capture les reasoning items et les place AVANT les
-    // tool_use dans le message assistant.
+    // US-031: the Accumulator captures reasoning items and places them BEFORE the
+    // tool_use in the assistant message.
     #[test]
     fn accumulator_orders_reasoning_before_tooluse() {
         let a = acc_with(vec![

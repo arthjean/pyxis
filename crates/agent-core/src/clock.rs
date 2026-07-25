@@ -1,18 +1,18 @@
-//! Horloge injectable (deps injectables, ARCHITECTURE §3.2) : la boucle ne lit
-//! jamais l'heure système directement → tests déterministes, pas de `sleep` réel.
+//! Injectable clock (injectable deps, ARCHITECTURE 3.2): the loop never reads
+//! the system time directly -> deterministic tests, no real `sleep`.
 
 use std::time::Duration;
 
 #[async_trait::async_trait]
 pub trait Clock: Send + Sync {
-    /// Maintenant en ms epoch.
+    /// Now, in epoch ms.
     fn now_ms(&self) -> u64;
-    /// Attend `dur` (backoff). En test, une implémentation no-op rend les tests
-    /// instantanés.
+    /// Waits `dur` (backoff). In tests, a no-op implementation makes the tests
+    /// instant.
     async fn sleep(&self, dur: Duration);
 }
 
-/// Horloge réelle (production).
+/// Real clock (production).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 

@@ -1,4 +1,4 @@
-//! Erreur de haut niveau du cœur, propagée aux clients via `AgentEvent::Error`.
+//! High-level core error, propagated to clients through `AgentEvent::Error`.
 
 use crate::provider::{AuthError, ProviderError};
 use serde::{Deserialize, Serialize};

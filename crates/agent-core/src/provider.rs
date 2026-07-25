@@ -1,11 +1,11 @@
-//! Contrat `Provider` + vocabulaire de streaming canonique.
+//! `Provider` contract + canonical streaming vocabulary.
 //!
-//! ⚠️ Réconciliation Cargo vs docs : `StreamEvent` et le trait `Provider` sont
-//! conceptuellement « couche provider » (PROVIDERS §2), mais l'**invariant 1**
-//! (ARCHITECTURE §2 : `agent-core` ne dépend PAS d'`agent-provider`) impose que
-//! le **contrat** vive ici, dans le crate des types canoniques. `agent-provider`
-//! (futur) implémentera ce trait et dépendra d'`agent-core`. Le cœur consomme
-//! `dyn Provider` injecté — il ne connaît aucun adapter concret.
+//! Cargo vs docs reconciliation: `StreamEvent` and the `Provider` trait are
+//! conceptually the "provider layer" (PROVIDERS section 2), but **invariant 1**
+//! (ARCHITECTURE section 2: `agent-core` does NOT depend on `agent-provider`) requires
+//! the **contract** to live here, in the crate of canonical types. `agent-provider`
+//! (future) will implement this trait and depend on `agent-core`. The core consumes
+//! an injected `dyn Provider`: it knows no concrete adapter.
 
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
@@ -18,18 +18,18 @@ use crate::message::{Message, ToolCallId};
 pub enum ProviderKind {
     Anthropic,
     OpenAiChat,
-    /// Abonnement ChatGPT, Responses API sur le backend ChatGPT (ADR-10) — cible
-    /// du MVP. Les autres providers s'ajouteront ensuite (pas Ollama : retiré du
-    /// scope, jugé trop instable).
+    /// ChatGPT subscription, Responses API on the ChatGPT backend (ADR-10): the MVP
+    /// target. Other providers will be added later (not Ollama: dropped from the
+    /// scope, judged too unstable).
     OpenAiChatGpt,
     OpenAiResponses,
     Gemini,
     OpenRouter,
 }
 
-/// Le seul vocabulaire de streaming que le cœur connaît (PROVIDERS §2). Tout
-/// adapter doit produire CETTE séquence. À `ToolCallEnd`, la concaténation des
-/// `ToolCallDelta.args_json` d'un même id DOIT être un JSON valide.
+/// The only streaming vocabulary the core knows (PROVIDERS section 2). Every
+/// adapter must produce THIS sequence. At `ToolCallEnd`, concatenating the
+/// `ToolCallDelta.args_json` of a same id MUST yield valid JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum StreamEvent {
@@ -56,8 +56,8 @@ pub enum StreamEvent {
     Done {
         stop: StopReason,
     },
-    /// Reasoning item chiffré (US-031, replay isolé) : émis par l'adapter UNIQUEMENT
-    /// si `reasoning_replay` est actif. Capturé par l'`Accumulator`.
+    /// Encrypted reasoning item (US-031, isolated replay): emitted by the adapter ONLY
+    /// when `reasoning_replay` is active. Captured by the `Accumulator`.
     EncryptedReasoning {
         id: String,
         encrypted_content: String,
@@ -126,7 +126,7 @@ pub struct CacheCapabilities {
     pub prompt_cache_key: bool,
 }
 
-/// Définition d'outil exposée au modèle (JSON Schema d'entrée).
+/// Tool definition exposed to the model (input JSON Schema).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
@@ -276,7 +276,7 @@ pub enum ToolSpecValidationError {
     RequiredMustMatchProperties { tool: String },
 }
 
-/// Requête canonique (ce que `ctx.request()` produit). Transcript client-side.
+/// Canonical request (what `ctx.request()` produces). Client-side transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalRequest {
     pub model: String,
@@ -334,7 +334,7 @@ pub enum CanonicalRequestValidationError {
     DuplicateToolName { tool: String },
 }
 
-/// Réponse non-stream (utilitaire : titres, résumés de compaction).
+/// Non-stream response (utility: titles, compaction summaries).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalResponse {
     pub content: Vec<crate::message::ContentBlock>,
@@ -346,9 +346,9 @@ pub struct CanonicalResponse {
 pub enum ProviderError {
     #[error("transport: {0}")]
     Transport(String),
-    /// Erreur HTTP non-2xx. `retry_after_ms` (US-023) porte le délai serveur
-    /// parsé (`Retry-After` / `retry-after-ms`) quand présent : la boucle l'honore
-    /// via `max(backoff, retry_after)`. `None` = pas d'en-tête → backoff seul.
+    /// Non-2xx HTTP error. `retry_after_ms` (US-023) carries the parsed server
+    /// delay (`Retry-After` / `retry-after-ms`) when present: the loop honors it
+    /// through `max(backoff, retry_after)`. `None` = no header -> backoff alone.
     #[error("http {status}: {message}")]
     Http {
         status: u16,
@@ -359,15 +359,15 @@ pub enum ProviderError {
     Decode(String),
     #[error("stream interrupted: {0}")]
     Stream(String),
-    /// Erreur de CONTEXTE (PTL / 413). N'est PAS une classe transitoire : elle
-    /// alimente le withholding (ARCHITECTURE §3.4), pas le backoff.
+    /// CONTEXT error (PTL / 413). It is NOT a transient class: it feeds
+    /// withholding (ARCHITECTURE 3.4), not the backoff.
     #[error("context too long (PTL/413)")]
     ContextLengthExceeded,
 }
 
 impl ProviderError {
-    /// Vrai si l'erreur est une erreur de **contexte** (PTL/413/max-tokens
-    /// d'entrée) → alimente `PendingError`/withholding, jamais le retry.
+    /// True when the error is a **context** error (PTL/413/input max-tokens)
+    /// -> feeds `PendingError`/withholding, never the retry.
     pub fn is_context_error(&self) -> bool {
         matches!(
             self,
@@ -376,7 +376,7 @@ impl ProviderError {
     }
 }
 
-/// Taxonomie d'erreurs canonique (ADR-9). Nommée `ErrorClass` partout.
+/// Canonical error taxonomy (ADR-9). Named `ErrorClass` everywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorClass {
@@ -395,35 +395,35 @@ pub enum AuthError {
     Invalid,
 }
 
-/// Implémenté par chaque adapter (dans `agent-provider`). Object-safe via
-/// `async-trait` → consommé en `dyn Provider`.
+/// Implemented by every adapter (in `agent-provider`). Object-safe through
+/// `async-trait` -> consumed as `dyn Provider`.
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
     fn capabilities(&self) -> &Capabilities;
 
-    /// Fenêtre de contexte à utiliser pour un slug précis. Les providers sans
-    /// table par modèle peuvent conserver la valeur globale des capabilities.
+    /// Context window to use for a precise slug. Providers without a per-model
+    /// table can keep the global capabilities value.
     fn max_context_for_model(&self, model: &str) -> u32 {
         let _ = model;
         self.capabilities().max_context
     }
 
-    /// Chemin chaud : flux d'événements canoniques.
+    /// Hot path: canonical event stream.
     async fn stream(
         &self,
         req: CanonicalRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>;
 
-    /// Non-stream (utilisé par la compaction pour produire un résumé).
+    /// Non-stream (used by compaction to produce a summary).
     async fn complete(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError>;
 
-    /// Classifie une erreur transport/HTTP en `ErrorClass` (source de vérité du
-    /// retry). Les erreurs de contexte ne passent PAS par ici (cf. withholding).
+    /// Classifies a transport/HTTP error into an `ErrorClass` (source of truth for
+    /// the retry). Context errors do NOT go through here (see withholding).
     fn classify_error(&self, err: &ProviderError) -> ErrorClass;
 
-    /// Refresh forcé après une erreur d'auth expirée remontée par le backend.
-    /// Les providers sans OAuth gardent le comportement fatal par défaut.
+    /// Forced refresh after an expired-auth error reported by the backend.
+    /// Providers without OAuth keep the default fatal behavior.
     async fn refresh_auth(&self) -> Result<(), ProviderError> {
         Err(ProviderError::Http {
             status: 401,
@@ -432,8 +432,8 @@ pub trait Provider: Send + Sync {
         })
     }
 
-    /// Invalidation locale d'une credential après logout utilisateur. Les providers
-    /// stateless ou sans credential en mémoire peuvent garder le no-op.
+    /// Local invalidation of a credential after a user logout. Stateless providers,
+    /// or ones without an in-memory credential, can keep the no-op.
     async fn disconnect_auth(&self) -> Result<(), ProviderError> {
         Ok(())
     }

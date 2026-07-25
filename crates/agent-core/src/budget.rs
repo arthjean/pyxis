@@ -1,7 +1,7 @@
-//! `ContextBudget` — calculé UNE FOIS par modèle (invariant 5), source unique de
-//! vérité pour micro/auto-compaction. Lit l'`usage` du stream si présent, sinon
-//! retombe sur le tokenizer local (provider sans `usage` en stream, ARCHITECTURE
-//! §3.3 / PROVIDERS §4.3 ; sert aussi l'estimation pré-tour US-014).
+//! `ContextBudget`: computed ONCE per model (invariant 5), single source of
+//! truth for micro/auto-compaction. Reads the stream `usage` when present,
+//! otherwise falls back on the local tokenizer (provider without `usage` in the
+//! stream, ARCHITECTURE 3.3 / PROVIDERS 4.3; also serves the US-014 pre-turn estimate).
 
 use agent_tokenizer::TokenCounter;
 
@@ -16,20 +16,20 @@ pub struct ContextBudget {
     auto_threshold: u32,
     current_input: u32,
     usage_seen: bool,
-    /// Baseline post-compaction (US-030) : input incompressible juste APRÈS une
-    /// compaction (résumé + system + outils + contexte). Les seuils mesurent
-    /// `current - prefill` (la CROISSANCE depuis la dernière compaction), jamais
-    /// l'absolu — sinon l'overhead fixe re-déclenche une compaction immédiate
-    /// (double-compaction, risk #6). Défaut 0 → comportement absolu d'origine.
+    /// Post-compaction baseline (US-030): incompressible input right AFTER a
+    /// compaction (summary + system + tools + context). Thresholds measure
+    /// `current - prefill` (the GROWTH since the last compaction), never the
+    /// absolute value, otherwise the fixed overhead re-triggers an immediate
+    /// compaction (double compaction, risk #6). Default 0 -> original absolute behavior.
     prefill_input: u32,
-    /// Vrai entre une compaction réussie et le PREMIER `usage` réel suivant : ce
-    /// premier usage devient le `prefill` (ancré sur l'usage backend, pas l'estimé).
+    /// True between a successful compaction and the FIRST real `usage` after it: that
+    /// first usage becomes the `prefill` (anchored on backend usage, not the estimate).
     awaiting_baseline: bool,
 }
 
 impl ContextBudget {
-    /// Variante faillible pour le wiring runtime : une fenêtre inutilisable est une
-    /// erreur de config/provider, pas un budget à seuils zéro.
+    /// Fallible variant for the runtime wiring: an unusable window is a
+    /// config/provider error, not a budget with zeroed thresholds.
     pub fn try_for_model(max_context: u32, output_reserve: u32) -> Result<Self, String> {
         if max_context == 0 {
             return Err("max_context provider nul".to_string());
@@ -45,8 +45,8 @@ impl ContextBudget {
         Ok(Self::for_model(max_context, output_reserve))
     }
 
-    /// Construit le budget depuis la fenêtre du modèle. Seuils : micro à 70 %,
-    /// auto à 80 % de la fenêtre utilisable (`max_context - output_reserve`).
+    /// Builds the budget from the model window. Thresholds: micro at 70%,
+    /// auto at 80% of the usable window (`max_context - output_reserve`).
     pub fn for_model(max_context: u32, output_reserve: u32) -> Self {
         let usable = max_context.saturating_sub(output_reserve);
         Self {
@@ -80,15 +80,15 @@ impl ContextBudget {
         self.usage_seen
     }
 
-    /// Nouveau tour : on remet le flag `usage_seen` (le compte courant, lui,
-    /// reflète l'état du contexte et n'est pas remis).
+    /// New turn: we reset the `usage_seen` flag (the current count itself
+    /// reflects the context state and is not reset).
     pub fn begin_turn(&mut self) {
         self.usage_seen = false;
     }
 
-    /// Chemin nominal : consomme l'`usage` émis par le stream. US-030 : le PREMIER
-    /// usage réel après une compaction devient le baseline `prefill` (overhead
-    /// incompressible), pour mesurer ensuite la croissance et non l'absolu.
+    /// Nominal path: consumes the `usage` emitted by the stream. US-030: the FIRST
+    /// real usage after a compaction becomes the `prefill` baseline (incompressible
+    /// overhead), so that we then measure growth and not the absolute value.
     pub fn observe_usage(&mut self, usage: TokenUsage) {
         self.current_input = usage.input;
         self.usage_seen = true;
@@ -98,16 +98,16 @@ impl ContextBudget {
         }
     }
 
-    /// Fallback (provider sans usage) : alimente le seuil avec une estimation
-    /// locale. NE met PAS `usage_seen` (c'est une estimation, pas un signal réel),
-    /// NI le baseline (ancré uniquement sur l'usage RÉEL, US-030).
+    /// Fallback (provider without usage): feeds the threshold with a local
+    /// estimate. Does NOT set `usage_seen` (it is an estimate, not a real signal),
+    /// NOR the baseline (anchored only on REAL usage, US-030).
     pub fn observe_estimated(&mut self, estimated_input: u32) {
         self.current_input = estimated_input;
     }
 
-    /// US-030 : signale qu'une compaction vient de réussir. Le contexte compacté
-    /// estimé devient un baseline immédiat pour éviter une double-compaction avant
-    /// le prochain stream ; le prochain `usage` réel le remplacera.
+    /// US-030: signals that a compaction just succeeded. The estimated compacted
+    /// context becomes an immediate baseline to avoid a double compaction before
+    /// the next stream; the next real `usage` will replace it.
     pub fn mark_compacted(&mut self, compacted_input: u32) {
         self.current_input = compacted_input;
         self.prefill_input = compacted_input;
@@ -125,10 +125,10 @@ impl ContextBudget {
         self.current_input.saturating_sub(self.prefill_input) >= self.auto_threshold
     }
 
-    /// US-030 (MidTurn) : projette si un input DONNÉ déclencherait l'auto-compaction,
-    /// SANS muter le budget basé sur l'usage réel. Sert à détecter un long
-    /// `tool_result` qui vient de franchir le seuil, pour compacter avant le tour
-    /// modèle suivant.
+    /// US-030 (MidTurn): projects whether a GIVEN input would trigger autocompaction,
+    /// WITHOUT mutating the budget based on real usage. Used to detect a long
+    /// `tool_result` that just crossed the threshold, so we compact before the next
+    /// model turn.
     pub fn would_autocompact(&self, projected_input: u32) -> bool {
         projected_input.saturating_sub(self.prefill_input) >= self.auto_threshold
     }
@@ -138,8 +138,8 @@ fn pct(v: u32, p: u32) -> u32 {
     ((u64::from(v) * u64::from(p)) / 100) as u32
 }
 
-/// Estime les tokens d'entrée d'un transcript via un `TokenCounter` (fallback
-/// quand l'`usage` n'est pas fourni). Approxime les images à 0.
+/// Estimates the input tokens of a transcript through a `TokenCounter` (fallback
+/// when `usage` is not provided). Approximates images to 0.
 pub fn estimate_input(messages: &[Message], counter: &dyn TokenCounter) -> u32 {
     let mut total = 0usize;
     for m in messages {
@@ -153,8 +153,8 @@ pub fn estimate_input(messages: &[Message], counter: &dyn TokenCounter) -> u32 {
                 }
                 ContentBlock::ToolResult { content, .. } => counter.count_text(content),
                 ContentBlock::Image { .. } => 0,
-                // US-031 : le reasoning chiffré est envoyé au backend quand le replay
-                // est actif → compte dans le budget (sinon absent des messages).
+                // US-031: encrypted reasoning is sent to the backend when replay
+                // is active -> it counts in the budget (otherwise absent from messages).
                 ContentBlock::EncryptedReasoning {
                     encrypted_content, ..
                 } => counter.count_text(encrypted_content),
@@ -164,9 +164,9 @@ pub fn estimate_input(messages: &[Message], counter: &dyn TokenCounter) -> u32 {
     u32::try_from(total).unwrap_or(u32::MAX)
 }
 
-/// Estime l'overhead statique envoyé avec chaque requête : system prompt,
-/// contexte éphémère et schémas d'outils. Le backend compte ces tokens dans
-/// `usage.input`; les projections locales doivent donc les inclure aussi.
+/// Estimates the static overhead sent with every request: system prompt,
+/// ephemeral context and tool schemas. The backend counts these tokens in
+/// `usage.input`; local projections must therefore include them too.
 pub fn estimate_static_input(
     system: &Option<String>,
     context_messages: &[Message],
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn budget_thresholds_from_single_source() {
-        // fenêtre 1000, réserve 200 → utilisable 800 ; micro 560, auto 640.
+        // window 1000, reserve 200 -> usable 800; micro 560, auto 640.
         let b = ContextBudget::for_model(1000, 200);
         assert_eq!(b.output_reserve(), 200);
         assert_eq!(b.micro_threshold(), 560);
@@ -232,20 +232,20 @@ mod tests {
         assert!(!b2.should_autocompact());
     }
 
-    // US-030 : après compaction, le 1er usage réel devient baseline → pas de
-    // double-compaction immédiate ; le seuil mesure ensuite la croissance.
+    // US-030: after compaction, the 1st real usage becomes the baseline -> no
+    // immediate double compaction; the threshold then measures growth.
     #[test]
     fn post_compaction_baseline_prevents_immediate_recompaction() {
-        // fenêtre 1000, réserve 200 → auto 640.
+        // window 1000, reserve 200 -> auto 640.
         let mut b = ContextBudget::for_model(1000, 200);
         b.mark_compacted(650);
         assert!(
             !b.should_autocompact(),
             "le baseline estimé bloque la recompaction avant usage réel"
         );
-        // 1er usage réel post-compaction : 650 (overhead incompressible). Sans
-        // baseline, 650 >= 640 → recompaction immédiate. Avec baseline : 650 devient
-        // prefill, donc current - prefill = 0 → pas de compaction.
+        // 1st real usage after compaction: 650 (incompressible overhead). Without a
+        // baseline, 650 >= 640 -> immediate recompaction. With the baseline: 650 becomes
+        // the prefill, so current - prefill = 0 -> no compaction.
         b.observe_usage(TokenUsage {
             input: 650,
             output: 5,
@@ -255,7 +255,7 @@ mod tests {
             !b.should_autocompact(),
             "le baseline neutralise l'overhead post-compaction"
         );
-        // la conversation croît de 640 au-dessus du baseline → re-déclenche.
+        // the conversation grows 640 above the baseline -> triggers again.
         b.observe_usage(TokenUsage {
             input: 650 + 640,
             output: 5,
@@ -272,7 +272,7 @@ mod tests {
         });
         assert!(b.would_autocompact(640), "projection franchit le seuil");
         assert!(!b.would_autocompact(639));
-        // la projection ne mute pas le budget réel.
+        // the projection does not mutate the real budget.
         assert_eq!(b.current_input(), 100);
         assert!(!b.should_autocompact());
     }
@@ -281,7 +281,7 @@ mod tests {
     fn estimate_input_uses_counter() {
         let msgs = vec![Message::user("aaaaaaaa"), Message::assistant_text("bbbb")];
         let est = estimate_input(&msgs, &HeuristicCounter);
-        // 8 octets → 2 tokens ; 4 octets → 1 token
+        // 8 bytes -> 2 tokens; 4 bytes -> 1 token
         assert_eq!(est, 3);
     }
 

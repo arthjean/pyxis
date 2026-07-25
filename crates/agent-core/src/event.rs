@@ -1,6 +1,6 @@
-//! `AgentEvent` — LE contrat cœur → clients (TUI, `-p` headless, Paneflow).
-//! Structuré, sérialisable, AUCUNE décision de présentation, JAMAIS d'ANSI
-//! (ARCHITECTURE §10.1, invariant 2). Distinct de `StreamEvent` (provider→cœur).
+//! `AgentEvent`: THE core -> clients contract (TUI, `-p` headless, Paneflow).
+//! Structured, serializable, NO presentation decision, NEVER ANSI
+//! (ARCHITECTURE 10.1, invariant 2). Distinct from `StreamEvent` (provider -> core).
 
 use crate::compaction::CompactKind;
 use crate::error::AgentError;
@@ -11,35 +11,35 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentEvent {
-    /// Le stream courant a été abandonné avant commit (retry/recover).
-    /// Les clients doivent retirer les deltas live non finalisés.
+    /// The current stream was abandoned before commit (retry/recover).
+    /// Clients must drop the unfinalized live deltas.
     StreamReset,
-    /// Delta de texte assistant.
+    /// Assistant text delta.
     Text(String),
-    /// Delta de raisonnement (si le provider en émet).
+    /// Reasoning delta (when the provider emits any).
     Reasoning(String),
-    /// Un outil va s'exécuter.
+    /// A tool is about to run.
     ToolCall(ToolCallView),
-    /// Fragment de sortie d'un outil encore en cours (US-015). Purement
-    /// informatif : le `ToolResult` final reste la seule source du transcript,
-    /// et un client qui ignore cette variante garde le comportement d'avant.
+    /// Output fragment of a tool still running (US-015). Purely
+    /// informational: the final `ToolResult` stays the only transcript source,
+    /// and a client that ignores this variant keeps the previous behavior.
     ToolOutputDelta(ToolOutputDeltaView),
-    /// Résultat d'outil (le taint vit dans le view-model — US-013).
+    /// Tool result (the taint lives in the view-model, US-013).
     ToolResult(ToolResultView),
-    /// Une compaction vient d'avoir lieu.
+    /// A compaction just happened.
     Compacted(CompactKind),
-    /// Un aller-retour modèle vient de se terminer (US-017). Émis après chaque
-    /// réponse complète du provider, qu'elle close le tour ou qu'elle enchaîne
-    /// sur des outils. Purement informatif : un client qui l'ignore garde le
-    /// comportement d'avant.
+    /// A model round-trip just ended (US-017). Emitted after every complete
+    /// provider response, whether it closes the turn or chains into tools.
+    /// Purely informational: a client that ignores it keeps the previous
+    /// behavior.
     ModelTurn(ModelTurnView),
-    /// Diff agrégé des fichiers modifiés pendant le tour (US-018). Émis par le
-    /// CLIENT à la frontière de fin de tour, pas par la boucle : calculer un diff
-    /// suppose de lire le disque, ce que le cœur ne fait pas (invariant 1). Jamais
-    /// émis quand rien n'a changé.
+    /// Aggregated diff of the files modified during the turn (US-018). Emitted by
+    /// the CLIENT at the end-of-turn boundary, not by the loop: computing a diff
+    /// means reading the disk, which the core does not do (invariant 1). Never
+    /// emitted when nothing changed.
     TurnDiff(TurnDiffView),
-    /// Demande d'autorisation (émis par le pipeline d'outils — US-013, non par
-    /// le cœur en EP-002 ; présent pour fixer le contrat).
+    /// Permission request (emitted by the tool pipeline, US-013, not by the
+    /// core in EP-002; present to pin down the contract).
     PermissionAsk(PermissionReq),
     EndTurn,
     Interrupted,
@@ -54,8 +54,8 @@ pub struct ToolCallView {
     pub input: serde_json::Value,
 }
 
-/// Fragment de sortie produit par un outil avant sa fin (US-015). `chunk` est du
-/// contenu externe : untrusted par construction, comme le résultat final.
+/// Output fragment produced by a tool before it ends (US-015). `chunk` is
+/// external content: untrusted by construction, like the final result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutputDeltaView {
     pub id: ToolCallId,
@@ -69,22 +69,22 @@ pub struct ToolResultView {
     pub is_error: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<ToolErrorKind>,
-    /// Sortie d'outil = untrusted par défaut (taint, US-013).
+    /// Tool output = untrusted by default (taint, US-013).
     pub untrusted: bool,
 }
 
-/// Fin d'un aller-retour modèle (US-017). Les compteurs sont CUMULÉS depuis le
-/// début du run : ce sont ceux qui pilotent le budget, donc réels quand le
-/// provider rapporte son `usage`, estimés localement sinon.
+/// End of a model round-trip (US-017). The counters are CUMULATED since the
+/// start of the run: they are the ones driving the budget, so real when the
+/// provider reports its `usage`, locally estimated otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelTurnView {
-    /// Indice 1-based du tour modèle qui vient de se terminer.
+    /// 1-based index of the model turn that just ended.
     pub index: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
 }
 
-/// Diff agrégé d'un tour (US-018). Vide n'est jamais émis.
+/// Aggregated diff of a turn (US-018). An empty one is never emitted.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnDiffView {
     pub files: Vec<FileDiffView>,
@@ -95,7 +95,7 @@ impl TurnDiffView {
         self.files.is_empty()
     }
 
-    /// Lignes ajoutées puis retirées, tous fichiers confondus.
+    /// Lines added then removed, across all files.
     pub fn totals(&self) -> (u32, u32) {
         self.files.iter().fold((0, 0), |(added, removed), file| {
             (
@@ -108,13 +108,13 @@ impl TurnDiffView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileDiffView {
-    /// Chemin relatif à la racine du workspace.
+    /// Path relative to the workspace root.
     pub path: String,
     pub change: FileChange,
     pub added_lines: u32,
     pub removed_lines: u32,
-    /// Diff unifié. Absent pour un fichier binaire ou plus volumineux que le
-    /// seuil de diff : le fichier reste listé, son contenu n'est pas comparé.
+    /// Unified diff. Absent for a binary file or one larger than the diff
+    /// threshold: the file stays listed, its content is not compared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unified: Option<String>,
 }

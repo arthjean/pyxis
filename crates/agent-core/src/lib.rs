@@ -1,8 +1,8 @@
-//! `agent-core` — le cœur headless de Pyxis : boucle d'agent en state machine,
-//! types canoniques, budget de contexte, compaction. Émet UNIQUEMENT des
-//! `AgentEvent` (jamais d'ANSI). Testable sans API/terminal/disque réels
-//! (deps injectables). Invariants : ARCHITECTURE.md « Invariants à ne jamais
-//! violer ».
+//! `agent-core`: the headless core of Pyxis. State-machine agent loop,
+//! canonical types, context budget, compaction. Emits ONLY
+//! `AgentEvent` (never ANSI). Testable without a real API/terminal/disk
+//! (injectable deps). Invariants: see ARCHITECTURE.md "Invariants never to
+//! violate".
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod agent;
@@ -62,16 +62,16 @@ mod loop_tests {
     use crate::tools::{ToolDispatch, ToolEventSink, ToolInvocation, ToolOutcome};
     use crate::{AgentContext, AgentEvent, CancelToken, Deps, RunConfig, run_agent, run_headless};
 
-    // ───────── doubles de test (injectés via Deps) ─────────
+    // ───────── test doubles (injected through Deps) ─────────
 
     enum MockTurn {
         Stream(Vec<StreamEvent>),
-        /// Erreur à l'OUVERTURE du stream.
+        /// Error when OPENING the stream.
         Err(ProviderError),
-        /// Quelques events PUIS une erreur EN MILIEU de stream.
+        /// A few events THEN an error MID-stream.
         StreamThenErr(Vec<StreamEvent>, ProviderError),
-        /// US-001 : le signal d'annulation tombe pendant la consommation du stream,
-        /// exactement après le premier événement livré.
+        /// US-001: the cancel signal fires while the stream is being consumed,
+        /// exactly after the first delivered event.
         StreamCancelling(Vec<StreamEvent>, crate::CancelToken),
     }
 
@@ -83,8 +83,8 @@ mod loop_tests {
         summary_fails: bool,
         log: Arc<Mutex<Vec<&'static str>>>,
         refreshes: Arc<Mutex<u32>>,
-        /// Capture les `messages` de chaque requête (US-028 : vérifier l'injection
-        /// éphémère sans toucher au transcript persistant).
+        /// Captures the `messages` of every request (US-028: check the ephemeral
+        /// injection without touching the persisted transcript).
         requests: Arc<Mutex<Vec<Vec<Message>>>>,
         request_models: Arc<Mutex<Vec<String>>>,
     }
@@ -203,7 +203,7 @@ mod loop_tests {
             messages: &[Message],
         ) -> Result<(), SessionError> {
             self.boundaries.lock().unwrap().push(kind);
-            // le transcript a été remplacé par le résumé : on resync.
+            // the transcript was replaced by the summary: resync.
             let mut s = self.synced.lock().unwrap();
             s.clear();
             s.extend_from_slice(messages);
@@ -257,7 +257,7 @@ mod loop_tests {
         }
     }
 
-    /// US-015 — outils qui publient des fragments de sortie avant leur résultat.
+    /// US-015: tools that publish output fragments before their result.
     struct StreamingTools;
     #[async_trait::async_trait]
     impl ToolDispatch for StreamingTools {
@@ -297,8 +297,8 @@ mod loop_tests {
         }
     }
 
-    /// US-001 — outils qui signalent l'annulation puis ne rendent JAMAIS la main :
-    /// la boucle doit reprendre le contrôle sans attendre le dispatch.
+    /// US-001: tools that signal cancellation then NEVER hand back control:
+    /// the loop must take control back without waiting for the dispatch.
     struct HangingTools(crate::CancelToken);
     #[async_trait::async_trait]
     impl ToolDispatch for HangingTools {
@@ -312,8 +312,8 @@ mod loop_tests {
         }
     }
 
-    /// Edge case #2 — l'annulation tombe dans la fenêtre entre la fin du dispatch
-    /// et la persistance : les résultats RÉELS doivent survivre.
+    /// Edge case #2: cancellation lands in the window between the end of the
+    /// dispatch and persistence: the REAL results must survive.
     struct RacingTools(crate::CancelToken);
     #[async_trait::async_trait]
     impl ToolDispatch for RacingTools {
@@ -336,9 +336,9 @@ mod loop_tests {
         }
     }
 
-    /// Balaye la fenêtre d'annulation autour d'un dispatch : `yields` points de
-    /// cession avant le signal, puis terminaison (résultats réels) ou blocage
-    /// (appels abandonnés).
+    /// Sweeps the cancellation window around a dispatch: `yields` yield points
+    /// before the signal, then termination (real results) or blocking
+    /// (abandoned calls).
     struct DelayedCancelTools {
         cancel: crate::CancelToken,
         yields: usize,
@@ -371,7 +371,7 @@ mod loop_tests {
         }
     }
 
-    // ───────── harnais ─────────
+    // ───────── harness ─────────
 
     struct Harness {
         log: Arc<Mutex<Vec<&'static str>>>,
@@ -502,7 +502,7 @@ mod loop_tests {
 
     // ───────── tests ─────────
 
-    // US-006 AC1/AC3 : conversation multi-tours headless, sans Ratatui.
+    // US-006 AC1/AC3: headless multi-turn conversation, without Ratatui.
     #[tokio::test]
     async fn multi_turn_headless_runs_without_tui() {
         let h = harness(vec![tool_turn("c1"), text_turn("fini")], false, 100_000);
@@ -512,7 +512,7 @@ mod loop_tests {
         assert!(matches!(res.ended, crate::HeadlessEnd::EndTurn));
     }
 
-    // US-006 AC2 : le message est persisté (sync) AVANT le 1er appel API.
+    // US-006 AC2: the message is persisted (sync) BEFORE the 1st API call.
     #[tokio::test]
     async fn transcript_synced_before_stream() {
         let h = harness(vec![text_turn("ok")], false, 100_000);
@@ -525,9 +525,9 @@ mod loop_tests {
         assert!(sync_at < stream_at, "sync should precede stream: {log:?}");
     }
 
-    // US-024 : le DERNIER message assistant est syncé AVANT EndTurn — sinon
-    // `/resume` perd la dernière réponse. Le sync final est delta-only (idempotent) :
-    // `synced.len() == 2` prouve l'absence de doublon du message user déjà syncé.
+    // US-024: the LAST assistant message is synced BEFORE EndTurn, otherwise
+    // `/resume` loses the last reply. The final sync is delta-only (idempotent):
+    // `synced.len() == 2` proves the already-synced user message is not duplicated.
     #[tokio::test]
     async fn final_assistant_turn_synced_before_endturn() {
         let h = harness(vec![text_turn("final answer")], false, 100_000);
@@ -549,8 +549,8 @@ mod loop_tests {
         );
     }
 
-    // US-028 : les messages de contexte (AGENTS.md + env) sont préfixés à CHAQUE
-    // requête mais JAMAIS persistés ni accumulés dans le transcript (rechargés).
+    // US-028: context messages (AGENTS.md + env) are prefixed to EVERY
+    // request but NEVER persisted nor accumulated in the transcript (reloaded).
     #[tokio::test]
     async fn context_messages_injected_per_request_never_persisted() {
         let h = harness(vec![tool_turn("c1"), text_turn("done")], false, 100_000);
@@ -563,7 +563,7 @@ mod loop_tests {
         let events = drive(ctx, h.deps).await;
         assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
 
-        // 1. Chaque requête envoyée au provider commence par les 2 messages de contexte.
+        // 1. Every request sent to the provider starts with the 2 context messages.
         let reqs = h.requests.lock().unwrap();
         assert!(reqs.len() >= 2, "at least 2 turns");
         for (i, msgs) in reqs.iter().enumerate() {
@@ -580,7 +580,7 @@ mod loop_tests {
             );
         }
 
-        // 2. Le transcript persistant NE contient PAS les messages de contexte.
+        // 2. The persisted transcript does NOT contain the context messages.
         let synced = h.boundaries.synced.lock().unwrap();
         assert!(
             !synced
@@ -611,8 +611,8 @@ mod loop_tests {
         assert!(!synced.iter().any(|m| m.text() == "CONTROL"));
     }
 
-    // US-006 AC4 + US-008 AC4 : erreur de contexte → withholding → compaction
-    // REACTIVE, pas de terminaison prématurée, la conversation continue.
+    // US-006 AC4 + US-008 AC4: context error -> withholding -> REACTIVE
+    // compaction, no premature termination, the conversation goes on.
     #[tokio::test]
     async fn context_error_triggers_withholding_and_reactive_compaction() {
         let h = harness(
@@ -623,7 +623,7 @@ mod loop_tests {
             false,
             100_000,
         );
-        // historique réel (≥ 2 messages) → la compaction a de quoi résumer.
+        // real history (>= 2 messages) -> compaction has something to summarize.
         let ctx = AgentContext::new("mock")
             .push(Message::user("initial context"))
             .push(Message::assistant_text("compris"))
@@ -649,11 +649,11 @@ mod loop_tests {
         );
     }
 
-    // US-008 AC2 : seuil autocompact franchi → résumé proactif (Compacted::Auto).
+    // US-008 AC2: autocompact threshold crossed -> proactive summary (Compacted::Auto).
     #[tokio::test]
     async fn autocompaction_triggers_on_budget_threshold() {
-        // fenêtre 1000, réserve (max_output) 200 → auto à 640. Un gros user (~3000
-        // octets ≈ 750 tokens heuristiques) dépasse le seuil dès l'estimation.
+        // window 1000, reserve (max_output) 200 -> auto at 640. A large user message
+        // (~3000 bytes, roughly 750 heuristic tokens) crosses it at estimation time.
         let huge = "x".repeat(3000);
         let h = harness(vec![tool_turn("c1"), text_turn("done")], false, 1000);
         let ctx = AgentContext::new("mock")
@@ -669,11 +669,11 @@ mod loop_tests {
         );
     }
 
-    // US-007 AC3 : provider SANS usage en stream → le fallback tokenizer alimente
-    // le seuil, l'autocompaction se déclenche quand même.
+    // US-007 AC3: provider WITHOUT usage in the stream -> the tokenizer fallback
+    // feeds the threshold, autocompaction still triggers.
     #[tokio::test]
     async fn fallback_tokenizer_feeds_threshold_without_usage() {
-        let huge = "y".repeat(3000); // ~750 tokens, aucun Usage émis par le mock
+        let huge = "y".repeat(3000); // ~750 tokens, no Usage emitted by the mock
         let h = harness(vec![tool_turn("c1"), text_turn("done")], false, 1000);
         let ctx = AgentContext::new("mock")
             .with_config(RunConfig {
@@ -688,13 +688,13 @@ mod loop_tests {
         );
     }
 
-    // US-008 AC3 : échecs d'autocompact répétés → circuit breaker (pas de boucle).
+    // US-008 AC3: repeated autocompact failures -> circuit breaker (no loop).
     #[tokio::test]
     async fn circuit_breaker_stops_repeated_autocompact_failures() {
         let huge = "z".repeat(3000);
         let h = harness(
-            vec![tool_turn("c1")], // un tour d'outil, puis on boucle sur l'autocompact
-            true,                  // summary_fails → full_compact échoue toujours
+            vec![tool_turn("c1")], // one tool turn, then we loop on autocompact
+            true,                  // summary_fails -> full_compact always fails
             1000,
         );
         let ctx = AgentContext::new("mock")
@@ -716,18 +716,18 @@ mod loop_tests {
         );
     }
 
-    // US-006 AC4 (unhappy) : si la compaction réactive ÉCHOUE, l'erreur de
-    // contexte est propagée (ContextUnrecoverable) — pas de fin prématurée avant
-    // l'échec confirmé du recovery.
+    // US-006 AC4 (unhappy): if reactive compaction FAILS, the context error is
+    // propagated (ContextUnrecoverable), no premature end before the recovery
+    // failure is confirmed.
     #[tokio::test]
     async fn recovery_failure_propagates_context_unrecoverable() {
         let h = harness(
             vec![MockTurn::Err(ProviderError::ContextLengthExceeded)],
-            true, // summary_fails → la compaction réactive échoue (provider.complete KO)
+            true, // summary_fails -> reactive compaction fails (provider.complete KO)
             100_000,
         );
-        // historique ≥ 2 messages : provider.complete EST appelé (et échoue), ce
-        // n'est pas le guard "rien à résumer" qui court-circuite.
+        // history >= 2 messages: provider.complete IS called (and fails), this
+        // is not the "nothing to summarize" guard short-circuiting.
         let ctx = AgentContext::new("mock")
             .push(Message::user("context"))
             .push(Message::assistant_text("ok"))
@@ -744,8 +744,8 @@ mod loop_tests {
         );
     }
 
-    // US-008 AC4 (distinct) : un 413 reçu EN MILIEU de stream déclenche la
-    // compaction réactive (chemin distinct de l'échec à l'ouverture).
+    // US-008 AC4 (distinct): a 413 received MID-stream triggers reactive
+    // compaction (path distinct from the failure at open time).
     #[tokio::test]
     async fn http_413_midstream_triggers_reactive_compaction() {
         let h = harness(
@@ -946,8 +946,8 @@ mod loop_tests {
 
     #[tokio::test]
     async fn tool_output_deltas_do_not_change_headless_text() {
-        // US-015 AC5 : le mode headless ignore les fragments — sa sortie textuelle
-        // reste identique octet pour octet à celle produite sans streaming.
+        // US-015 AC5: headless mode ignores fragments, its textual output stays
+        // byte-for-byte identical to the one produced without streaming.
         let turns = || vec![tool_turn("t1"), text_turn("resultat final")];
         let plain = harness(turns(), false, 100_000);
         let plain_res = run_headless(
@@ -966,8 +966,8 @@ mod loop_tests {
 
         assert_eq!(streamed_res.text, plain_res.text);
         assert_eq!(streamed_res.text, "resultat final");
-        // Les fragments existent bien dans le flux d'événements, ils ne sont
-        // simplement pas rendus par le mode texte.
+        // The fragments do exist in the event flow, they are simply not
+        // rendered by text mode.
         assert!(streamed_res.events > plain_res.events);
     }
 
@@ -1011,8 +1011,8 @@ mod loop_tests {
         );
     }
 
-    // US-006/008 : MaxTokens en plein tool_call → withholding (Recover) → réactive,
-    // l'intention d'outil n'est pas silencieusement jetée.
+    // US-006/008: MaxTokens in the middle of a tool_call -> withholding (Recover)
+    // -> reactive, the tool intent is not silently dropped.
     #[tokio::test]
     async fn maxtokens_midtool_recovers_in_loop() {
         let h = harness(
@@ -1051,11 +1051,11 @@ mod loop_tests {
         );
     }
 
-    // US-008 AC1 : microcompaction déclenchée DANS la boucle (seuil micro 70 %,
-    // sous l'auto 80 %) → Compacted(Micro), sans Auto.
+    // US-008 AC1: microcompaction triggered INSIDE the loop (micro threshold 70%,
+    // below the auto 80%) -> Compacted(Micro), without Auto.
     #[tokio::test]
     async fn microcompaction_triggers_in_loop_below_auto() {
-        // fenêtre 1000, réserve 200 → micro 560, auto 640. usage=600 ∈ [560,640).
+        // window 1000, reserve 200 -> micro 560, auto 640. usage=600 ∈ [560,640).
         let turn = MockTurn::Stream(vec![
             StreamEvent::Usage {
                 usage: TokenUsage {
@@ -1098,11 +1098,11 @@ mod loop_tests {
         );
     }
 
-    // ───────── US-014 : loop guardrails + budgets (kill-switch) ─────────
+    // ───────── US-014: loop guardrails + budgets (kill-switch) ─────────
 
     use crate::transition::ExhaustReason;
 
-    /// Tour d'outil émettant un `usage` explicite (pour piloter le budget).
+    /// Tool turn emitting an explicit `usage` (to drive the budget).
     fn tool_turn_usage(id: &str, input: u32, output: u32) -> MockTurn {
         MockTurn::Stream(vec![
             StreamEvent::Usage {
@@ -1123,11 +1123,11 @@ mod loop_tests {
         ])
     }
 
-    // US-014 AC1 : même outil + mêmes args répétés → signal explicite à l'agent
-    // (batch non exécuté), puis arrêt déterministe si la boucle persiste.
+    // US-014 AC1: same tool + same args repeated -> explicit signal to the agent
+    // (batch not executed), then deterministic stop if the loop persists.
     #[tokio::test]
     async fn loop_guardrail_signals_then_aborts() {
-        // Le modèle redemande le même `bash {cmd:ls}` indéfiniment.
+        // The model keeps asking for the same `bash {cmd:ls}` forever.
         let h = harness(
             vec![
                 tool_turn("c1"),
@@ -1142,7 +1142,7 @@ mod loop_tests {
         let ctx = AgentContext::new("mock").push(Message::user("boucle"));
         let events = drive(ctx, h.deps).await;
 
-        // Signal explicite renvoyé à l'agent (edge case #2).
+        // Explicit signal sent back to the agent (edge case #2).
         assert!(
             events.iter().any(|e| matches!(
                 e,
@@ -1150,7 +1150,7 @@ mod loop_tests {
             )),
             "explicit loop signal expected: {events:?}"
         );
-        // Arrêt déterministe au-delà du signal.
+        // Deterministic stop beyond the signal.
         assert!(
             matches!(
                 events.last(),
@@ -1160,7 +1160,7 @@ mod loop_tests {
         );
     }
 
-    // US-014 : un batch DIFFÉRENT à chaque tour ne déclenche pas le garde-fou.
+    // US-014: a DIFFERENT batch on every turn does not trip the guardrail.
     #[tokio::test]
     async fn loop_guardrail_does_not_false_positive_on_distinct_calls() {
         let distinct = |id: &str, cmd: &str| {
@@ -1200,10 +1200,10 @@ mod loop_tests {
         assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
     }
 
-    // US-014 AC2 : budget de tokens cumulé atteint → kill-switch (edge case #3).
+    // US-014 AC2: cumulated token budget reached -> kill-switch (edge case #3).
     #[tokio::test]
     async fn token_budget_kill_switch_stops_run() {
-        // Tour 1 consomme 150 tokens (>120) ; le tour 2 ne doit jamais démarrer.
+        // Turn 1 consumes 150 tokens (>120); turn 2 must never start.
         let h = harness(
             vec![tool_turn_usage("c1", 100, 50), text_turn("never reached")],
             false,
@@ -1212,7 +1212,7 @@ mod loop_tests {
         let ctx = AgentContext::new("mock")
             .with_config(RunConfig {
                 token_budget: Some(120),
-                max_output_tokens: 10, // petit → l'estimation pré-tour ne stoppe pas le tour 1
+                max_output_tokens: 10, // small, so the pre-turn estimate does not stop turn 1
                 ..RunConfig::default()
             })
             .push(Message::user("go"));
@@ -1227,7 +1227,7 @@ mod loop_tests {
             ),
             "budget kill-switch expected: {events:?}"
         );
-        // Le 1er tour d'outil a bien eu lieu avant le kill-switch.
+        // The 1st tool turn did happen before the kill-switch.
         assert!(
             events
                 .iter()
@@ -1335,14 +1335,14 @@ mod loop_tests {
         );
     }
 
-    // US-014 AC3 : estimation PRÉ-tour → on stoppe AVANT un tour trop coûteux
-    // (aucun appel provider émis).
+    // US-014 AC3: PRE-turn estimation -> we stop BEFORE a turn that costs too much
+    // (no provider call emitted).
     #[tokio::test]
     async fn pre_turn_estimate_stops_before_expensive_turn() {
         let h = harness(vec![text_turn("never")], false, 1_000_000);
         let ctx = AgentContext::new("mock")
             .with_config(RunConfig {
-                token_budget: Some(5), // < max_output → la projection dépasse d'emblée
+                token_budget: Some(5), // < max_output -> the projection overshoots right away
                 max_output_tokens: 100,
                 ..RunConfig::default()
             })
@@ -1355,7 +1355,7 @@ mod loop_tests {
             ),
             "pre-turn stop expected: {events:?}"
         );
-        // Aucun stream provider ne doit avoir été ouvert.
+        // No provider stream must have been opened.
         assert!(
             !h.log.lock().unwrap().contains(&"stream"),
             "provider should not be called: {:?}",
@@ -1363,10 +1363,10 @@ mod loop_tests {
         );
     }
 
-    // ───────── US-001 / US-002 : annulation coopérative ─────────
+    // ───────── US-001 / US-002: cooperative cancellation ─────────
 
-    /// Contenu des `tool_result` PERSISTÉS, dans l'ordre — `Message::text()` ne
-    /// lit que les blocs `Text` et ne dirait rien d'un résultat d'outil.
+    /// Content of the PERSISTED `tool_result`s, in order. `Message::text()` only
+    /// reads `Text` blocks and would say nothing about a tool result.
     fn persisted_tool_results(messages: &[Message]) -> Vec<String> {
         messages
             .iter()
@@ -1388,8 +1388,8 @@ mod loop_tests {
             .collect()
     }
 
-    // US-001 AC4 : signal déjà positionné à l'entrée → arrêt à la première
-    // frontière, `Interrupted` émis par le CŒUR, aucun appel provider.
+    // US-001 AC4: signal already set on entry -> stop at the first boundary,
+    // `Interrupted` emitted by the CORE, no provider call.
     #[tokio::test]
     async fn cancel_before_start_stops_at_the_first_boundary() {
         let h = harness(vec![text_turn("jamais")], false, 100_000);
@@ -1409,8 +1409,8 @@ mod loop_tests {
         );
     }
 
-    // US-001 AC2 : annulation pendant le streaming → aucun `Text` après la
-    // frontière ; ce qui a déjà défilé reste dans le transcript persisté.
+    // US-001 AC2: cancellation during streaming -> no `Text` after the
+    // boundary; whatever already scrolled by stays in the persisted transcript.
     #[tokio::test]
     async fn cancel_during_stream_stops_emitting_deltas() {
         let cancel = CancelToken::new();
@@ -1454,9 +1454,9 @@ mod loop_tests {
         );
     }
 
-    // US-001 AC3 + US-002 AC1/AC3 : interruption pendant un dispatch qui ne rend
-    // jamais la main → la boucle reprend le contrôle, écrit un résultat synthétique
-    // par appel en vol, PUIS persiste.
+    // US-001 AC3 + US-002 AC1/AC3: interruption during a dispatch that never
+    // hands back control -> the loop takes control back, writes a synthetic result
+    // per in-flight call, THEN persists.
     #[tokio::test]
     async fn interrupted_dispatch_writes_synthetic_results_before_persisting() {
         let cancel = CancelToken::new();
@@ -1488,8 +1488,8 @@ mod loop_tests {
         );
     }
 
-    // US-002 AC5 : plusieurs appels concurrents → exactement un résultat par appel,
-    // sans doublon ni oubli.
+    // US-002 AC5: several concurrent calls -> exactly one result per call,
+    // with no duplicate and none forgotten.
     #[tokio::test]
     async fn interrupted_concurrent_dispatch_answers_every_call_once() {
         let cancel = CancelToken::new();
@@ -1516,8 +1516,8 @@ mod loop_tests {
         );
     }
 
-    // Edge case #2 : le dispatch se termine dans la même fenêtre que l'annulation →
-    // le résultat RÉEL est conservé, aucun résultat synthétique ne l'écrase.
+    // Edge case #2: the dispatch completes in the same window as the cancellation
+    // -> the REAL result is kept, no synthetic result overwrites it.
     #[tokio::test]
     async fn tool_finished_before_stop_keeps_its_real_result() {
         let cancel = CancelToken::new();
@@ -1540,10 +1540,10 @@ mod loop_tests {
         assert!(matches!(events.last(), Some(AgentEvent::Interrupted)));
     }
 
-    // Métrique de fiabilité du PRD : 0 session corrompue sur 50 interruptions
-    // pendant un dispatch d'outil. Version CŒUR — le point d'annulation, le nombre
-    // d'appels concurrents et la terminaison ou non des outils varient à chaque
-    // itération. La reprise du même balayage au niveau CLI relève d'US-007.
+    // PRD reliability metric: 0 corrupted sessions out of 50 interruptions
+    // during a tool dispatch. CORE version: the cancellation point, the number
+    // of concurrent calls and whether the tools terminate vary on every
+    // iteration. Replaying the same sweep at CLI level belongs to US-007.
     #[tokio::test]
     async fn fifty_interruptions_during_dispatch_never_corrupt_the_transcript() {
         const IDS: [&str; 3] = ["c1", "c2", "c3"];
@@ -1577,8 +1577,8 @@ mod loop_tests {
         }
     }
 
-    // US-001 AC6 : signal reçu alors que la boucle est déjà terminée → ignoré, sans
-    // panique ni événement supplémentaire.
+    // US-001 AC6: signal received while the loop is already done -> ignored, with
+    // no panic and no extra event.
     #[tokio::test]
     async fn cancel_after_completion_is_ignored() {
         let h = harness(vec![text_turn("done")], false, 100_000);

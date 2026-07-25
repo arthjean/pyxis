@@ -1,6 +1,6 @@
-//! `Deps` — toutes les dépendances I/O de la boucle, injectées en traits
-//! (ARCHITECTURE §3.2). C'est ce qui rend `run_agent` testable sans API réelle,
-//! sans terminal, sans disque réel (DoD EP-002).
+//! `Deps`: all the I/O dependencies of the loop, injected as traits
+//! (ARCHITECTURE 3.2). This is what makes `run_agent` testable without a real
+//! API, without a terminal, without a real disk (EP-002 DoD).
 
 use std::sync::Arc;
 
@@ -19,7 +19,7 @@ pub struct Deps {
     pub tokenizer: Arc<dyn TokenCounter>,
     pub clock: Arc<dyn Clock>,
     pub tools: Arc<dyn ToolDispatch>,
-    /// US-001 — signal d'annulation coopératif. Un token jamais signalé (défaut)
-    /// laisse le comportement de la boucle strictement inchangé.
+    /// US-001: cooperative cancellation signal. A token never signalled (default)
+    /// leaves the loop behavior strictly unchanged.
     pub cancel: CancelToken,
 }
