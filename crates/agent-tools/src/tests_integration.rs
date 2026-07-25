@@ -1114,6 +1114,50 @@ async fn bash_runs_in_the_shell_it_announces() {
     );
 }
 
+#[cfg(not(windows))]
+#[tokio::test]
+async fn bash_streams_output_before_the_command_ends() {
+    // US-015 AC1 : un fragment est publié AVANT que le dispatch ne rende son
+    // résultat. Le test le prouve par une course explicite.
+    use agent_core::tools::{ToolDispatch, ToolDispatchEvent, ToolEventSink};
+
+    let ws = TempWs::new("bash-stream");
+    let reg = mut_registry(&ws, PermissionMode::BypassPermissions);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let calls = vec![call(
+        "a",
+        "bash",
+        serde_json::json!({"command": "echo debut; sleep 1; echo fin"}),
+    )];
+    let dispatch = ToolDispatch::dispatch(&reg, calls, ToolEventSink::new(tx));
+    tokio::pin!(dispatch);
+
+    let first = tokio::select! {
+        _ = &mut dispatch => None,
+        event = rx.recv() => event,
+    }
+    .expect("un fragment de sortie doit précéder la fin du dispatch");
+    let label = format!("{first:?}");
+    assert!(
+        label.contains("OutputDelta"),
+        "événement inattendu: {label}"
+    );
+    if let ToolDispatchEvent::OutputDelta { id, chunk } = first {
+        assert_eq!(id.as_str(), "a");
+        assert!(chunk.contains("debut"), "fragment inattendu: {chunk}");
+    }
+
+    let out = dispatch.await;
+    let o = by_id(&out, "a");
+    assert!(!o.is_error, "{}", o.content);
+    // AC3 : la sortie finale reste celle de la politique de troncature existante.
+    assert!(
+        o.content.contains("debut") && o.content.contains("fin"),
+        "{}",
+        o.content
+    );
+}
+
 #[tokio::test]
 async fn bash_nonzero_exit_is_error_but_keeps_output() {
     let ws = TempWs::new("bash-err");

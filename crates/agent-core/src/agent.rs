@@ -16,7 +16,7 @@ use crate::cancel::Cancellable;
 use crate::compaction::{CompactKind, CompactionState, full_compact, microcompact};
 use crate::deps::Deps;
 use crate::error::{AgentError, ProviderFailure};
-use crate::event::{AgentEvent, ToolCallView, ToolResultView};
+use crate::event::{AgentEvent, ToolCallView, ToolOutputDeltaView, ToolResultView};
 use crate::guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget, batch_signature};
 use crate::message::{
     INTERRUPTED_TOOL_RESULT, Message, ToolCallId, ToolErrorKind, unanswered_tool_calls,
@@ -892,6 +892,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                             Some(ToolDispatchEvent::PermissionAsk(req)) => {
                                                 yield AgentEvent::PermissionAsk(req);
                                             }
+                                            Some(ToolDispatchEvent::OutputDelta { id, chunk }) => {
+                                                yield AgentEvent::ToolOutputDelta(ToolOutputDeltaView { id, chunk });
+                                            }
                                             None => tool_events_open = false,
                                         }
                                     }
@@ -907,6 +910,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 match event {
                                     ToolDispatchEvent::PermissionAsk(req) => {
                                         yield AgentEvent::PermissionAsk(req);
+                                    }
+                                    ToolDispatchEvent::OutputDelta { id, chunk } => {
+                                        yield AgentEvent::ToolOutputDelta(ToolOutputDeltaView { id, chunk });
                                     }
                                 }
                             }

@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"exec_streaming_output\", &s, W, H)"
+---
+› Compile le workspace
+
+● Run(cargo build --workspace)
+  ⎿    Compiling agent-core v0.0.0
+       Compiling agent-session v0.0.0
+       Compiling agent-tools v0.0.0
+       Compiling agent-provider v0.0.0
+
+
+
+
+
+
+
+
+
+
+
+• Working (7s • esc to interrupt)
+
+────────────────────────────────────────────────────────────────────────────────
+›
+────────────────────────────────────────────────────────────────────────────────
+gpt-5 · pyxis · Ask for approval               ctrl+j newline · ctrl+c interrupt

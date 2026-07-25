@@ -254,6 +254,34 @@ mod loop_tests {
         }
     }
 
+    /// US-015 — outils qui publient des fragments de sortie avant leur résultat.
+    struct StreamingTools;
+    #[async_trait::async_trait]
+    impl ToolDispatch for StreamingTools {
+        async fn dispatch(
+            &self,
+            calls: Vec<ToolInvocation>,
+            events: ToolEventSink,
+        ) -> Vec<ToolOutcome> {
+            calls
+                .into_iter()
+                .map(|c| {
+                    events.emit(crate::tools::ToolDispatchEvent::OutputDelta {
+                        id: c.id.clone(),
+                        chunk: "progression...\n".into(),
+                    });
+                    ToolOutcome {
+                        id: c.id,
+                        content: format!("echo:{}", c.input),
+                        is_error: false,
+                        untrusted: true,
+                        error_kind: None,
+                    }
+                })
+                .collect()
+        }
+    }
+
     struct MissingTools;
     #[async_trait::async_trait]
     impl ToolDispatch for MissingTools {
@@ -911,6 +939,33 @@ mod loop_tests {
         let res = run_headless(ctx, h.deps).await;
         assert_eq!(res.text, "final");
         assert!(matches!(res.ended, crate::HeadlessEnd::EndTurn));
+    }
+
+    #[tokio::test]
+    async fn tool_output_deltas_do_not_change_headless_text() {
+        // US-015 AC5 : le mode headless ignore les fragments — sa sortie textuelle
+        // reste identique octet pour octet à celle produite sans streaming.
+        let turns = || vec![tool_turn("t1"), text_turn("resultat final")];
+        let plain = harness(turns(), false, 100_000);
+        let plain_res = run_headless(
+            AgentContext::new("mock").push(Message::user("go")),
+            plain.deps,
+        )
+        .await;
+
+        let mut streamed = harness(turns(), false, 100_000);
+        streamed.deps.tools = Arc::new(StreamingTools);
+        let streamed_res = run_headless(
+            AgentContext::new("mock").push(Message::user("go")),
+            streamed.deps,
+        )
+        .await;
+
+        assert_eq!(streamed_res.text, plain_res.text);
+        assert_eq!(streamed_res.text, "resultat final");
+        // Les fragments existent bien dans le flux d'événements, ils ne sont
+        // simplement pas rendus par le mode texte.
+        assert!(streamed_res.events > plain_res.events);
     }
 
     #[tokio::test]

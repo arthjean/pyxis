@@ -30,6 +30,11 @@ pub struct ToolOutcome {
 #[derive(Debug, Clone)]
 pub enum ToolDispatchEvent {
     PermissionAsk(PermissionReq),
+    /// Fragment de sortie d'un outil encore en cours (US-015), corrélé par `id`.
+    OutputDelta {
+        id: ToolCallId,
+        chunk: String,
+    },
 }
 
 #[derive(Clone, Default)]

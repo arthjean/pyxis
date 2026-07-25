@@ -464,6 +464,10 @@ impl TranscriptMapper {
                 }
                 updates
             }
+            // US-015 : la surface de parité rend la sortie d'exécution à la
+            // complétion de l'appel ; l'aperçu live est porté par
+            // `AppState.live_output`, rendu par `render`.
+            AgentEvent::ToolOutputDelta(_) => Vec::new(),
             AgentEvent::ToolResult(view) => {
                 let mut updates = self.drain_active_streams();
                 let status = if view.is_error {

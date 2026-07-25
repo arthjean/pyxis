@@ -14,6 +14,11 @@ use crate::tool::{MAX_COMMAND_BYTES, Tool, ToolCtx, ToolOutput};
 
 /// Borne de capture (évite un flood de prompt sur une sortie géante).
 const MAX_OUTPUT: usize = 30_000;
+/// Streaming de sortie (US-015) : taille et délai de coalescence des fragments,
+/// et plafond d'un fragment publié.
+const STREAM_FLUSH_BYTES: usize = 4_096;
+const STREAM_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const STREAM_CHUNK_MAX: usize = 8_192;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -121,15 +126,19 @@ impl Tool for Bash {
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        // US-015 : les deux flux sont streamés au fil de l'eau vers le client, en
+        // plus d'être capturés pour le résultat final.
+        let stdout_sink = ctx.output.clone();
+        let stderr_sink = ctx.output.clone();
         let stdout_task = tokio::spawn(async move {
             match stdout {
-                Some(out) => read_tail(out).await,
+                Some(out) => read_tail(out, stdout_sink).await,
                 None => Capture::default(),
             }
         });
         let stderr_task = tokio::spawn(async move {
             match stderr {
-                Some(err) => read_tail(err).await,
+                Some(err) => read_tail(err, stderr_sink).await,
                 None => Capture::default(),
             }
         });
@@ -286,9 +295,17 @@ impl Capture {
     }
 }
 
-async fn read_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> Capture {
+/// Lit un flux jusqu'à EOF : capture la QUEUE pour le résultat final (politique
+/// de troncature inchangée) et, si un consommateur écoute, publie la sortie au
+/// fil de l'eau (US-015).
+async fn read_tail(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    sink: Option<crate::tool::OutputSink>,
+) -> Capture {
     let mut out = Capture::default();
     let mut buf = [0_u8; 8192];
+    let mut pending: Vec<u8> = Vec::new();
+    let mut last_flush = tokio::time::Instant::now();
     loop {
         let n = match reader.read(&mut buf).await {
             Ok(0) => break,
@@ -296,13 +313,59 @@ async fn read_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> Capture {
             Err(_) => break,
         };
         out.bytes.extend_from_slice(&buf[..n]);
+        if sink.is_some() {
+            pending.extend_from_slice(&buf[..n]);
+            // Coalescence : au plus un fragment par `STREAM_FLUSH_INTERVAL`, ce qui
+            // borne le trafic d'événements sur une sortie bavarde tout en gardant la
+            // latence d'affichage très sous la seconde.
+            if pending.len() >= STREAM_FLUSH_BYTES || last_flush.elapsed() >= STREAM_FLUSH_INTERVAL
+            {
+                flush_stream(&mut pending, sink.as_ref());
+                last_flush = tokio::time::Instant::now();
+            }
+        }
         if out.bytes.len() > MAX_OUTPUT {
             let overflow = out.bytes.len() - MAX_OUTPUT;
             out.bytes.drain(0..overflow);
             out.omitted = out.omitted.saturating_add(overflow);
         }
     }
+    flush_stream(&mut pending, sink.as_ref());
     out
+}
+
+/// Publie la partie UTF-8 complète de `pending` et conserve le reliquat : un
+/// caractère multi-octets coupé par une frontière de lecture ne doit pas devenir
+/// un `U+FFFD` dans l'affichage.
+fn flush_stream(pending: &mut Vec<u8>, sink: Option<&crate::tool::OutputSink>) {
+    let Some(sink) = sink else {
+        pending.clear();
+        return;
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let valid_up_to = match std::str::from_utf8(pending) {
+        Ok(_) => pending.len(),
+        Err(e) => e.valid_up_to(),
+    };
+    if valid_up_to == 0 {
+        // Reliquat plus long qu'un caractère UTF-8 : il ne sera jamais complété,
+        // on le rend en lossy plutôt que de le laisser croître.
+        if pending.len() > 4 {
+            sink(String::from_utf8_lossy(pending).into_owned());
+            pending.clear();
+        }
+        return;
+    }
+    let rest = pending.split_off(valid_up_to);
+    let mut text = String::from_utf8_lossy(pending).into_owned();
+    // Backstop : un fragment géant n'apporte rien à un affichage live borné.
+    if text.len() > STREAM_CHUNK_MAX {
+        text = truncate_tail(&text, STREAM_CHUNK_MAX);
+    }
+    *pending = rest;
+    sink(text);
 }
 
 async fn kill_process_tree(pid: u32) {

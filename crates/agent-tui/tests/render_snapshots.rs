@@ -16,7 +16,7 @@ mod harness;
 
 use agent_core::AgentEvent;
 use agent_core::error::AgentError;
-use agent_core::event::{ToolCallView, ToolResultView};
+use agent_core::event::{ToolCallView, ToolOutputDeltaView, ToolResultView};
 use agent_core::message::{Message, ToolErrorKind};
 use agent_tui::blocks_from_messages;
 use agent_tui::state::{AppState, PermissionPrompt, SessionMeta};
@@ -170,6 +170,36 @@ fn exec_running() {
     s.spinner_tick = 2;
     s.tick_progress(std::time::Duration::from_secs(7));
     insta::assert_snapshot!("exec_running", harness::frame("exec_running", &s, W, H));
+}
+
+#[test]
+fn exec_streaming_output() {
+    // US-015 AC2 : la sortie arrive dans la cellule d'exécution en cours, avant
+    // tout résultat, et reste bornée aux dernières lignes.
+    let mut s = state();
+    s.push_user("Compile le workspace");
+    s.apply(&tool_call(
+        "call_1",
+        "bash",
+        serde_json::json!({ "command": "cargo build --workspace" }),
+    ));
+    for krate in [
+        "agent-core",
+        "agent-session",
+        "agent-tools",
+        "agent-provider",
+    ] {
+        s.apply(&AgentEvent::ToolOutputDelta(ToolOutputDeltaView {
+            id: "call_1".to_string(),
+            chunk: format!("   Compiling {krate} v0.0.0\n"),
+        }));
+    }
+    s.spinner_tick = 2;
+    s.tick_progress(std::time::Duration::from_secs(7));
+    insta::assert_snapshot!(
+        "exec_streaming_output",
+        harness::frame("exec_streaming_output", &s, W, H)
+    );
 }
 
 #[test]

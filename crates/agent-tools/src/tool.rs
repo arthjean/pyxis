@@ -31,6 +31,11 @@ pub const MAX_COMMAND_BYTES: usize = 16_000;
 /// Landlock est, lui, process-wide (hérité), donc transparent pour les outils.
 pub type CommandHardener = Arc<dyn Fn(&mut tokio::process::Command) + Send + Sync>;
 
+/// Émetteur de fragments de sortie d'un outil en cours (US-015). Installé par le
+/// Registry pour la durée d'un appel, déjà corrélé à l'`id` de cet appel — un
+/// outil n'a donc rien à savoir du transport ni de son propre identifiant.
+pub type OutputSink = Arc<dyn Fn(String) + Send + Sync>;
+
 /// Contexte d'exécution partagé passé à chaque outil. `&ToolCtx` (partagé) :
 /// les outils concurrents le lisent en parallèle. La mutation d'état d'agent
 /// (context-modifiers) est différée (Phase 2).
@@ -45,6 +50,9 @@ pub struct ToolCtx {
     pub cleanup_grace: Duration,
     /// Durcissement de commande (sandbox réseau Bash), injecté par l'agent-cli.
     pub harden: Option<CommandHardener>,
+    /// Sortie progressive de l'appel en cours (US-015). `None` = aucun
+    /// consommateur : les outils n'émettent alors rien.
+    pub output: Option<OutputSink>,
 }
 
 impl std::fmt::Debug for ToolCtx {
@@ -54,6 +62,7 @@ impl std::fmt::Debug for ToolCtx {
             .field("timeout", &self.timeout)
             .field("cleanup_grace", &self.cleanup_grace)
             .field("harden", &self.harden.as_ref().map(|_| "<fn>"))
+            .field("output", &self.output.as_ref().map(|_| "<fn>"))
             .finish()
     }
 }
@@ -65,6 +74,7 @@ impl ToolCtx {
             timeout: Duration::from_secs(120),
             cleanup_grace: Duration::from_secs(2),
             harden: None,
+            output: None,
         }
     }
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -74,6 +84,18 @@ impl ToolCtx {
     pub fn with_hardener(mut self, harden: CommandHardener) -> Self {
         self.harden = Some(harden);
         self
+    }
+    /// Contexte dérivé pour UN appel, doté de son émetteur de sortie (US-015).
+    pub fn with_output_sink(&self, output: OutputSink) -> Self {
+        let mut ctx = self.clone();
+        ctx.output = Some(output);
+        ctx
+    }
+    /// Publie un fragment de sortie si un consommateur écoute. No-op sinon.
+    pub fn emit_output(&self, chunk: impl Into<String>) {
+        if let Some(sink) = &self.output {
+            sink(chunk.into());
+        }
     }
 }
 

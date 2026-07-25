@@ -20,6 +20,10 @@ pub enum AgentEvent {
     Reasoning(String),
     /// Un outil va s'exécuter.
     ToolCall(ToolCallView),
+    /// Fragment de sortie d'un outil encore en cours (US-015). Purement
+    /// informatif : le `ToolResult` final reste la seule source du transcript,
+    /// et un client qui ignore cette variante garde le comportement d'avant.
+    ToolOutputDelta(ToolOutputDeltaView),
     /// Résultat d'outil (le taint vit dans le view-model — US-013).
     ToolResult(ToolResultView),
     /// Une compaction vient d'avoir lieu.
@@ -38,6 +42,14 @@ pub struct ToolCallView {
     pub id: ToolCallId,
     pub name: String,
     pub input: serde_json::Value,
+}
+
+/// Fragment de sortie produit par un outil avant sa fin (US-015). `chunk` est du
+/// contenu externe : untrusted par construction, comme le résultat final.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolOutputDeltaView {
+    pub id: ToolCallId,
+    pub chunk: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

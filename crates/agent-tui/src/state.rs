@@ -656,7 +656,23 @@ pub struct AppState {
     /// Collages volumineux remplacés par un résumé dans `input` (US-011). Le
     /// contenu intégral est ré-expansé au moment de la soumission.
     pastes: Vec<PendingPaste>,
+    /// Sortie de l'outil en cours d'exécution, streamée avant son résultat
+    /// (US-015). Vidée à l'arrivée du résultat, sauf interruption : ce que la
+    /// commande avait déjà produit reste alors visible.
+    pub live_output: Option<LiveOutput>,
 }
+
+/// Sortie partielle d'un appel d'outil encore en vol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveOutput {
+    pub call_id: ToolCallId,
+    pub text: String,
+}
+
+/// Bornes de l'affichage live (US-015 AC3) : la sortie visible reste courte, la
+/// politique de troncature du résultat final est inchangée.
+pub const LIVE_OUTPUT_MAX_LINES: usize = 8;
+const LIVE_OUTPUT_MAX_BYTES: usize = 8_192;
 
 /// Un collage résumé : ce qui est affiché, et ce qui sera réellement envoyé.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -748,6 +764,7 @@ impl AppState {
             transcript_overlay_page_height: Cell::new(10),
             stream_start: None,
             pastes: Vec::new(),
+            live_output: None,
         }
     }
 
@@ -1063,6 +1080,7 @@ impl AppState {
             }
             AgentEvent::ToolCall(view) => {
                 self.finalize_streaming();
+                self.live_output = None;
                 self.blocks.push(Block::ToolCall {
                     id: view.id.clone(),
                     name: view.name.clone(),
@@ -1070,7 +1088,21 @@ impl AppState {
                     input_hash: crate::cache::value_hash(&view.input),
                 });
             }
+            AgentEvent::ToolOutputDelta(view) => {
+                self.push_live_output(&view.id, &view.chunk);
+            }
             AgentEvent::ToolResult(view) => {
+                // AC4 : sur interruption, la sortie déjà produite reste affichée —
+                // le résultat synthétique ne la contient pas. Sinon, le résultat
+                // final remplace l'aperçu live.
+                if self
+                    .live_output
+                    .as_ref()
+                    .is_some_and(|live| live.call_id == view.id)
+                    && view.content != agent_core::INTERRUPTED_TOOL_RESULT
+                {
+                    self.live_output = None;
+                }
                 // Symétrie défensive avec ToolCall : si un résultat orphelin arrivait
                 // sans appel préalable, un Assistant{streaming} resté ouvert ne doit pas
                 // garder un curseur live fantôme.
@@ -1132,9 +1164,61 @@ impl AppState {
         self.history_pos = None;
         self.draft.clear();
         self.blocks.push(Block::User(text));
+        self.live_output = None;
         self.status = Status::Thinking;
         self.scroll = 0;
         self.unseen = 0;
+    }
+
+    /// Accumule un fragment de sortie de l'outil en cours, borné en octets puis en
+    /// lignes : un `cargo build` bavard ne pousse pas le transcript hors écran.
+    fn push_live_output(&mut self, call_id: &ToolCallId, chunk: &str) {
+        let live = match &mut self.live_output {
+            Some(live) if live.call_id == *call_id => live,
+            _ => {
+                self.live_output = Some(LiveOutput {
+                    call_id: call_id.clone(),
+                    text: String::new(),
+                });
+                match &mut self.live_output {
+                    Some(live) => live,
+                    None => return,
+                }
+            }
+        };
+        live.text.push_str(chunk);
+        if live.text.len() > LIVE_OUTPUT_MAX_BYTES {
+            let mut cut = live.text.len() - LIVE_OUTPUT_MAX_BYTES;
+            while cut < live.text.len() && !live.text.is_char_boundary(cut) {
+                cut += 1;
+            }
+            live.text.drain(..cut);
+        }
+        let lines = live.text.lines().count();
+        if lines > LIVE_OUTPUT_MAX_LINES {
+            let skip = lines - LIVE_OUTPUT_MAX_LINES;
+            let kept: Vec<&str> = live.text.lines().skip(skip).collect();
+            live.text = kept.join("\n");
+        }
+    }
+
+    /// Lignes de sortie live à afficher sous l'outil en cours (au plus
+    /// `LIVE_OUTPUT_MAX_LINES`, sans séquence ANSI).
+    pub fn live_output_lines(&self) -> Vec<String> {
+        self.live_output
+            .as_ref()
+            .map(|live| {
+                live.text
+                    .lines()
+                    .rev()
+                    .take(LIVE_OUTPUT_MAX_LINES)
+                    .map(crate::render::sanitize)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Remplace l'historique navigable (resume d'une session) et réinitialise la
@@ -2001,7 +2085,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::event::{ToolCallView, ToolResultView};
+    use agent_core::event::{ToolCallView, ToolOutputDeltaView, ToolResultView};
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -2075,6 +2159,100 @@ mod tests {
                 input_hash: crate::cache::value_hash(&serde_json::json!({ "command": "ls -la" })),
             }
         );
+    }
+
+    fn delta(id: &str, chunk: &str) -> AgentEvent {
+        AgentEvent::ToolOutputDelta(ToolOutputDeltaView {
+            id: id.into(),
+            chunk: chunk.into(),
+        })
+    }
+
+    fn tool_call(id: &str) -> AgentEvent {
+        AgentEvent::ToolCall(ToolCallView {
+            id: id.into(),
+            name: "bash".into(),
+            input: serde_json::json!({ "command": "cargo build" }),
+        })
+    }
+
+    #[test]
+    fn live_output_shows_while_the_tool_runs_and_clears_on_result() {
+        // US-015 AC2 : les fragments s'affichent sous l'appel en cours ; le
+        // résultat final les remplace.
+        let mut s = AppState::new("gpt-5", false);
+        s.apply(&tool_call("c1"));
+        s.apply(&delta("c1", "Compiling agent-core\n"));
+        s.apply(&delta("c1", "Compiling agent-tui\n"));
+        assert_eq!(
+            s.live_output_lines(),
+            vec![
+                "Compiling agent-core".to_string(),
+                "Compiling agent-tui".to_string()
+            ]
+        );
+        s.apply(&AgentEvent::ToolResult(ToolResultView {
+            id: "c1".into(),
+            content: "done".into(),
+            is_error: false,
+            untrusted: true,
+            error_kind: None,
+        }));
+        assert!(s.live_output_lines().is_empty());
+    }
+
+    #[test]
+    fn live_output_survives_an_interruption() {
+        // US-015 AC4 : le résultat synthétique d'interruption ne porte pas la
+        // sortie déjà produite — elle doit rester lisible.
+        let mut s = AppState::new("gpt-5", false);
+        s.apply(&tool_call("c1"));
+        s.apply(&delta("c1", "warning: unused\n"));
+        s.apply(&AgentEvent::ToolResult(ToolResultView {
+            id: "c1".into(),
+            content: agent_core::INTERRUPTED_TOOL_RESULT.into(),
+            is_error: true,
+            untrusted: false,
+            error_kind: Some(ToolErrorKind::Semantic),
+        }));
+        s.apply(&AgentEvent::Interrupted);
+        assert_eq!(s.live_output_lines(), vec!["warning: unused".to_string()]);
+    }
+
+    #[test]
+    fn live_output_is_bounded_and_sanitized() {
+        // AC3 : l'affichage reste borné quel que soit le volume produit, et une
+        // séquence ANSI de la sortie ne peut pas altérer le rendu.
+        let mut s = AppState::new("gpt-5", false);
+        s.apply(&tool_call("c1"));
+        for i in 0..500 {
+            s.apply(&delta("c1", &format!("line{i}\n")));
+        }
+        let lines = s.live_output_lines();
+        assert_eq!(lines.len(), LIVE_OUTPUT_MAX_LINES);
+        assert!(
+            lines.last().is_some_and(|l| l.contains("line499")),
+            "{lines:?}"
+        );
+
+        s.apply(&delta("c1", "\x1b[2J\x1b]0;titre\x07danger\n"));
+        let lines = s.live_output_lines();
+        assert!(
+            lines.iter().all(|l| !l.contains('\x1b')),
+            "aucune séquence d'échappement ne doit survivre: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("danger")), "{lines:?}");
+    }
+
+    #[test]
+    fn live_output_resets_on_the_next_tool_call() {
+        let mut s = AppState::new("gpt-5", false);
+        s.apply(&tool_call("c1"));
+        s.apply(&delta("c1", "premier\n"));
+        s.apply(&tool_call("c2"));
+        assert!(s.live_output_lines().is_empty());
+        s.apply(&delta("c2", "second\n"));
+        assert_eq!(s.live_output_lines(), vec!["second".to_string()]);
     }
 
     #[test]

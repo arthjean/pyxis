@@ -753,6 +753,25 @@ fn render_transcript(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
     }
     drop(cache);
 
+    // US-015 : sortie de l'outil encore en cours, sous son appel. Hors cache : ce
+    // buffer change à chaque fragment, et il disparaît dès que le résultat arrive.
+    for (i, line) in state.live_output_lines().into_iter().enumerate() {
+        // Même gouttière que le résumé de résultat (`⎿`) : l'aperçu live occupe
+        // visuellement la place que prendra la sortie finale.
+        let prefix = if i == 0 {
+            Span::styled("  ⎿ ", theme.faint())
+        } else {
+            Span::raw("    ")
+        };
+        push_wrapped(
+            &mut lines,
+            vec![Span::styled(line, theme.dim())],
+            prefix,
+            Span::raw("    "),
+            width,
+        );
+    }
+
     // Le wrap manuel ci-dessus pose la gouttière suspendue (puce + indent 2 col) pour
     // le cas courant (largeur comptée en `char`). On garde `Wrap` comme FILET : une
     // ligne qui dépasserait la largeur en COLONNES (wide chars CJK/emoji, que le
