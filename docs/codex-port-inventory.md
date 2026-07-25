@@ -78,8 +78,12 @@ régression, pas comme un rapprochement de parité.
 | Ligne de statut unique en pied d'écran (`modèle · workspace · mode`) | tous les snapshots | Pyxis regroupe le statut en une ligne au lieu des surfaces de statut Codex. |
 | Résumé d'outil sur un connecteur `⎿` et diff inline dérivé de l'input du call | `exec_success`, `exec_error`, `edit_diff` | Pyxis dérive le diff de l'appel d'outil, sans cellule d'exécution dédiée. |
 | Dialogue d'approbation rendu en bas de frame sans overlay modal | `approval_dialog` | Le dialogue remplace la zone de saisie plutôt que de recouvrir le transcript. |
+| Composer multi-ligne : gouttière `› ` sur la première ligne, alignement à deux colonnes sur les continuations, plafond de 10 lignes de texte puis défilement | `composer_multiline`, `composer_scrolled`, `composer_wrapped_line` | Repli et défilement calculés par `crates/agent-tui/src/composer.rs` : les lignes visuelles partitionnent l'input, ce qui rend la position du curseur exacte. Codex passe par sa propre pile de vues. |
+| Un token `/skill` ou `@fichier` coupé par un repli perd sa surbrillance | `composer_wrapped_line` | La surbrillance est calculée par segment visuel. Restituer un span à cheval sur deux lignes coûterait un découpage de spans pour un gain cosmétique nul. |
+| Navigation verticale par ligne LOGIQUE, pas par ligne visuelle | `composer_wrapped_line` | Haut/Bas sautent le paragraphe replié entier. Le modèle de saisie reste ainsi indépendant de la largeur de rendu. |
+| Pied de page annonçant `ctrl+j newline`, abandonné quand la moitié droite de la ligne ne suffit plus | tous les snapshots à 80 colonnes et plus | Ctrl+J est le seul raccourci d'insertion indépendant du protocole clavier du terminal (US-009 AC3). |
 
-Limitation connue : le composer d'une seule ligne visible dans `resize_narrow`
-(la saisie est tronquée à la largeur du terminal) n'est **pas** une divergence
-assumée, c'est le défaut traité par EP-003 de `tasks/prd-harness-parity.md`. Le
-snapshot le fige volontairement pour rendre le correctif visible en diff.
+EP-003 de `tasks/prd-harness-parity.md` a levé la limitation qui figurait ici :
+`resize_narrow` montrait une saisie tronquée à la largeur du terminal, elle est
+maintenant repliée sur deux lignes visuelles. Le diff de ce snapshot est la
+preuve du correctif.
