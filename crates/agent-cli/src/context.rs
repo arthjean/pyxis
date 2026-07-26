@@ -106,8 +106,9 @@ fn read_instructions(dir: &Path) -> Option<String> {
 }
 
 /// Reads at most `cap` bytes of a file (memory bound). Lossy UTF-8 (a non-UTF8
-/// AGENTS.md does not make the read fail).
-fn read_capped(path: &Path, cap: usize) -> Option<String> {
+/// AGENTS.md does not make the read fail). Shared with the skill reader, which
+/// needs the same bound on the same kind of untrusted file.
+pub(crate) fn read_capped(path: &Path, cap: usize) -> Option<String> {
     use std::io::Read;
     let f = std::fs::File::open(path).ok()?;
     let mut buf = Vec::new();

@@ -58,6 +58,14 @@ struct AgentTurnEvent {
     event: AgentEvent,
 }
 
+/// A message typed while a turn was running. The skill invocation is resolved at
+/// submission, not at dequeue: the user is told right away when a skill is
+/// unusable.
+struct QueuedPrompt {
+    text: String,
+    skill: Option<String>,
+}
+
 struct ActiveTurn {
     next_id: u64,
     id: Option<u64>,
@@ -76,6 +84,7 @@ impl ActiveTurn {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start(
         &mut self,
         conversation: &Arc<Mutex<Vec<Message>>>,
@@ -84,6 +93,7 @@ impl ActiveTurn {
         tx: &mpsc::Sender<AgentTurnEvent>,
         user_msg: &str,
         persist_user_message: bool,
+        skill_block: Option<String>,
     ) {
         self.abort();
         let turn_id = self.next_id;
@@ -102,6 +112,7 @@ impl ActiveTurn {
             turn_id,
             user_msg,
             persist_user_message,
+            skill_block,
         ));
         self.cancel = Some(cancel);
     }
@@ -152,8 +163,9 @@ pub struct InteractiveConfig {
     pub reduced_motion: bool,
     /// Provider credential present (connected badge + providers submenu).
     pub connected: bool,
-    /// Available skills (read before the sandbox), `/skills` submenu.
-    pub skills: Vec<String>,
+    /// Skills installed on the machine (US-014): `/skills` submenu, catalog
+    /// exposed to the model, and body injected when one is invoked.
+    pub skills: crate::skills::Catalog,
     /// Persistent session goal (`/goal`), composed into the system prompt on every
     /// turn. Loaded from the session sidecar at startup.
     pub goal: Option<String>,
@@ -321,6 +333,7 @@ pub(crate) fn read_goal(path: &Path) -> Option<String> {
 
 /// Builds the turn context (up-to-date conversation + message) and launches
 /// `run_agent` in a task whose events come back through `tx`.
+#[allow(clippy::too_many_arguments)]
 fn launch_turn(
     conversation: &Arc<Mutex<Vec<Message>>>,
     cfg: &InteractiveConfig,
@@ -329,14 +342,21 @@ fn launch_turn(
     turn_id: u64,
     user_msg: &str,
     persist_user_message: bool,
+    skill_block: Option<String>,
 ) -> JoinHandle<()> {
     let mut msgs = conversation.lock().map(|g| g.clone()).unwrap_or_default();
-    let ephemeral_messages = if persist_user_message {
+    let mut ephemeral_messages = Vec::new();
+    if persist_user_message {
         msgs.push(Message::user(user_msg.to_string()));
-        Vec::new()
     } else {
-        vec![Message::user(user_msg.to_string())]
-    };
+        ephemeral_messages.push(Message::user(user_msg.to_string()));
+    }
+    // US-016: the skill body is injected for THIS turn only and never persisted,
+    // like the project context. The transcript keeps the `/<name>` the user typed,
+    // which is what says afterwards which skill was injected.
+    if let Some(block) = skill_block {
+        ephemeral_messages.push(Message::user(block));
+    }
     // US-027: base system prompt selected by the CURRENT slug (recomputed per turn ->
     // a `/models` changes the template) + tool guidelines + goal directive.
     let base = with_tool_guidelines(
@@ -567,7 +587,7 @@ async fn event_loop(
     state.reasoning_effort = cfg.reasoning_effort.clone();
     state.provider_connected = cfg.connected;
     state.reduced_motion = cfg.reduced_motion;
-    state.skills = std::mem::take(&mut cfg.skills);
+    state.skills = cfg.skills.names();
     state.files = std::env::current_dir()
         .ok()
         .map(|root| workspace_file_mentions(&root, 200))
@@ -655,7 +675,7 @@ async fn event_loop(
     // branch closes for good once the emitter is gone (no hook declared, or
     // registry dropped), so the loop never spins on a closed channel.
     let mut hook_notices_open = true;
-    let mut queued_prompts: VecDeque<String> = VecDeque::new();
+    let mut queued_prompts: VecDeque<QueuedPrompt> = VecDeque::new();
 
     // Spinner animation tick (US-044). 100 ms is about 10 fps: fluid and nearly free
     // (the render cache serves the baked blocks). `Skip` avoids any redraw burst when
@@ -775,29 +795,50 @@ async fn event_loop(
                 #[cfg(not(feature = "codex_tui_parity"))]
                 let action = state.on_key(k);
                 match action {
-                    InputAction::Submit(prompt) if !running => {
-                        state.push_user(prompt.clone());
-                        #[cfg(feature = "codex_tui_parity")]
-                        parity_surface.apply_update(parity_mapper.map_user_message(prompt.clone()));
-                        goal_iters = 0;
-                        active_turn.start(
-                            &conversation,
-                            &cfg,
-                            &deps,
-                            &agent_tx,
-                            &prompt,
-                            true,
-                        );
-                        running = true;
-                    }
                     InputAction::Submit(prompt) => {
+                        // US-016: `/<skill> …` injects the skill instructions instead
+                        // of sending its name. Resolved HERE, at submission, so an
+                        // unreadable skill blocks the turn while the user is looking.
+                        let skill = match crate::skills::invocation(&cfg.skills, &prompt) {
+                            Some(Ok(injection)) => {
+                                if injection.truncated {
+                                    state.blocks.push(Block::Notice(format!(
+                                        "Skill \"{}\" injected, body truncated at the byte budget.",
+                                        injection.name
+                                    )));
+                                }
+                                Some(injection.block)
+                            }
+                            Some(Err(err)) => {
+                                state
+                                    .blocks
+                                    .push(Block::Error(format!("Skill unusable: {err}")));
+                                // Nothing is sent, so the typed message goes back
+                                // to the composer instead of being lost.
+                                state.set_input(prompt);
+                                continue;
+                            }
+                            None => None,
+                        };
                         state.push_user(prompt.clone());
                         #[cfg(feature = "codex_tui_parity")]
                         parity_surface.apply_update(parity_mapper.map_user_message(prompt.clone()));
-                        state.blocks.push(Block::Notice(
-                            "Message queued.".into(),
-                        ));
-                        queued_prompts.push_back(prompt);
+                        if running {
+                            state.blocks.push(Block::Notice("Message queued.".into()));
+                            queued_prompts.push_back(QueuedPrompt { text: prompt, skill });
+                        } else {
+                            goal_iters = 0;
+                            active_turn.start(
+                                &conversation,
+                                &cfg,
+                                &deps,
+                                &agent_tx,
+                                &prompt,
+                                true,
+                                skill,
+                            );
+                            running = true;
+                        }
                     }
                     InputAction::Command(line) => {
                         let mut it = line.splitn(2, ' ');
@@ -980,6 +1021,7 @@ async fn event_loop(
                                         &agent_tx,
                                         g,
                                         true,
+                                        None,
                                     );
                                     running = true;
                                 }
@@ -1383,6 +1425,7 @@ async fn event_loop(
                                     &agent_tx,
                                     GOAL_CONTINUE_PROMPT,
                                     false,
+                                    None,
                                 );
                                 // running stays true: a new turn is launched.
                             } else {
@@ -1406,8 +1449,9 @@ async fn event_loop(
                                 &cfg,
                                 &deps,
                                 &agent_tx,
-                                &next,
+                                &next.text,
                                 true,
+                                next.skill,
                             );
                             running = true;
                         }

@@ -13,6 +13,7 @@ mod jsonl;
 mod prompt;
 mod session;
 mod settings;
+mod skills;
 
 use std::sync::Arc;
 
@@ -436,9 +437,16 @@ fn main() -> anyhow::Result<()> {
     }
     let workspace = std::env::current_dir()?;
 
-    // Skills read BEFORE the sandbox: `~/.agents/skills` is outside the workspace, hence
-    // inaccessible once Landlock is applied.
-    let skills = read_skills();
+    // Skills scanned BEFORE the sandbox, like the rest of the out-of-workspace
+    // configuration (US-014). Only `name` and `description` are preloaded, as the
+    // spec requires; a body is read at invocation time, which the read-only-global
+    // Landlock policy still allows.
+    let skills = skills_root()
+        .map(|root| skills::load(&root))
+        .unwrap_or_default();
+    for issue in &skills.issues {
+        eprintln!("[skills] {issue}");
+    }
 
     // MCP config read BEFORE the sandbox: `~/.claude.json` (reused Claude Code
     // servers) is outside the workspace, hence inaccessible once Landlock is in place. In
@@ -452,7 +460,14 @@ fn main() -> anyhow::Result<()> {
     // Project context (AGENTS.md + env) read BEFORE the sandbox: walking up the
     // ancestors to the `.git` becomes inaccessible once Landlock is in place
     // (US-028). Injected afterwards as ephemeral messages per turn.
-    let context_msgs = context::messages(&workspace, &context::today_utc());
+    let mut context_msgs = context::messages(&workspace, &context::today_utc());
+    // US-015: the skill catalog travels with the project context, framed the same
+    // way. Inserted BEFORE the environment block, which is the volatile part: the
+    // stable prefix stays cacheable.
+    if let Some(block) = skills::catalog_block(&skills.skills) {
+        let before_environment = context_msgs.len().saturating_sub(1);
+        context_msgs.insert(before_environment, Message::user(block));
+    }
 
     let credential = prepare_credential_before_sandbox(&args)?;
 
@@ -771,31 +786,20 @@ fn run_auth_onboarding() -> anyhow::Result<OAuthCredential> {
     })
 }
 
-/// Lists the skills available in `~/.agents/skills` (one directory = one skill,
-/// name = directory name), sorted. Symlink shared between CLIs; best-effort read.
-fn read_skills() -> Vec<String> {
-    let Some(home) = home_dir() else {
-        return Vec::new();
-    };
-    let dir = home.join(".agents").join("skills");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut skills: Vec<String> = entries
-        .flatten()
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|name| !name.starts_with('.'))
-        .collect();
-    skills.sort();
-    skills
+/// Root of the installed skills, shared with the other CLIs through
+/// `~/.agents/skills`. `None` when the home cannot be resolved: falling back on a
+/// relative path would make `.agents/skills` of the current workspace loadable,
+/// and a skill root is a security key that a repository never gets to declare
+/// (FR-13).
+fn skills_root() -> Option<std::path::PathBuf> {
+    Some(home_dir()?.join(".agents").join("skills"))
 }
 
 /// Everything that touches a path outside the workspace, hence loaded or created BEFORE
 /// the Landlock enforcement: past it, only the workspace (and the settings file)
 /// stays writable.
 struct PreSandbox {
-    skills: Vec<String>,
+    skills: skills::Catalog,
     mcp_config: agent_mcp::McpConfigFile,
     context_msgs: Vec<Message>,
     cred: OAuthCredential,
@@ -1019,6 +1023,14 @@ async fn run(
             prompt::select_system_prompt(&args.model),
             &tool_guidelines,
         );
+        // US-016: a prompt opening on `/<skill>` injects that skill's instructions
+        // for this turn. An unreadable skill fails the run instead of sending a
+        // turn that would only carry its name.
+        let skill_messages = match skills::invocation(&skills, &prompt) {
+            Some(Ok(injection)) => vec![Message::user(injection.block)],
+            Some(Err(err)) => anyhow::bail!("skill: {err}"),
+            None => Vec::new(),
+        };
         let mut messages = conversation.lock().map(|g| g.clone()).unwrap_or_default();
         messages.push(Message::user(prompt));
         let ctx = AgentContext {
@@ -1029,7 +1041,7 @@ async fn run(
             tools: tool_specs,
             config: run_config,
             context_messages: context_msgs,
-            ephemeral_messages: Vec::new(),
+            ephemeral_messages: skill_messages,
         };
         let mut events = jsonl::EventWriter::new(args.output_format);
         // US-018: reference taken BEFORE the turn, on the workspace as it is.
