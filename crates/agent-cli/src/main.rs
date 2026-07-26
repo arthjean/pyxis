@@ -952,11 +952,36 @@ async fn run(
         connect_mcp_at_startup(&mcp, &mcp_harden).await
     };
 
+    // US-017: hooks come from the GLOBAL configuration alone (`settings.rs` drops
+    // the key from a workspace file). Without a declaration the registry keeps
+    // `NoHooks`: no process, no clone, no added latency.
+    let (hook_notice_tx, hook_notice_rx) = tokio::sync::mpsc::channel::<String>(16);
+    let hooks: Arc<dyn agent_tools::hooks::Hooks> = if config.hooks.is_empty() {
+        Arc::new(agent_tools::hooks::NoHooks)
+    } else {
+        // A later hook failing is reported to the human, never to the model: in
+        // the TUI as a notice, in headless mode on stderr, where the diagnostics
+        // of this mode already go (stdout stays byte-for-byte identical).
+        let notice: agent_tools::hooks::HookNotice = if headless {
+            Arc::new(|message: String| eprintln!("[hook] {message}"))
+        } else {
+            Arc::new(move |message: String| {
+                let _ = hook_notice_tx.try_send(message);
+            })
+        };
+        Arc::new(
+            agent_tools::hooks::CommandHooks::new(config.hooks.clone(), &workspace)
+                .with_hardener(Arc::clone(&mcp_harden))
+                .with_notice(notice),
+        )
+    };
+
     let mut builder = Registry::builder(&workspace)
         .mode_state(permission_mode.clone())
         .approver(approver)
         .approvals(approvals.clone())
         .initial_taint_recent(initial_taint_recent)
+        .hooks(hooks)
         .command_hardener(harden)
         .register(Read)
         .register(Glob)
@@ -1083,6 +1108,7 @@ async fn run(
             deps,
             conversation,
             perm_rx,
+            hook_notice_rx,
             cfg,
             shared_session,
             sessions_dir,

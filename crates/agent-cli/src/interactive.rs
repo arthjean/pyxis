@@ -518,6 +518,7 @@ pub async fn run(
     deps: Deps,
     conversation: Arc<Mutex<Vec<Message>>>,
     perm_rx: mpsc::Receiver<PermissionMsg>,
+    hook_notices: mpsc::Receiver<String>,
     cfg: InteractiveConfig,
     session: Arc<SharedSession>,
     sessions_dir: PathBuf,
@@ -530,6 +531,7 @@ pub async fn run(
         deps,
         conversation,
         perm_rx,
+        hook_notices,
         cfg,
         session,
         sessions_dir,
@@ -549,6 +551,7 @@ async fn event_loop(
     deps: Deps,
     conversation: Arc<Mutex<Vec<Message>>>,
     mut perm_rx: mpsc::Receiver<PermissionMsg>,
+    mut hook_notices: mpsc::Receiver<String>,
     mut cfg: InteractiveConfig,
     session: Arc<SharedSession>,
     sessions_dir: PathBuf,
@@ -648,6 +651,10 @@ async fn event_loop(
         0
     };
     let mut pending_resp: Option<oneshot::Sender<agent_tools::permission::ApprovalResponse>> = None;
+    // US-019: a hook running after a tool call reports its failures here. The
+    // branch closes for good once the emitter is gone (no hook declared, or
+    // registry dropped), so the loop never spins on a closed channel.
+    let mut hook_notices_open = true;
     let mut queued_prompts: VecDeque<String> = VecDeque::new();
 
     // Spinner animation tick (US-044). 100 ms is about 10 fps: fluid and nearly free
@@ -1468,6 +1475,12 @@ async fn event_loop(
                         }
                     }
                     state.mcp_servers = mcp_metas(&mcp);
+                }
+            }
+            notice = hook_notices.recv(), if hook_notices_open => {
+                match notice {
+                    Some(message) => state.blocks.push(Block::Notice(format!("Hook: {message}"))),
+                    None => hook_notices_open = false,
                 }
             }
             // Animation tick: wakes the loop ONLY during an ACTIVE turn

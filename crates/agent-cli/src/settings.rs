@@ -15,6 +15,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use agent_tools::PermissionMode;
+use agent_tools::hooks::{HookEvent, HookSpec};
 
 const SETTINGS_FILE: &str = "settings.toml";
 const PROJECT_CONFIG_FILE: &str = "config.toml";
@@ -37,6 +38,7 @@ const KNOWN_KEYS: &[&str] = &[
     REASONING_EFFORT_KEY,
     PERMISSION_MODE_KEY,
     WRITABLE_ROOTS_KEY,
+    HOOKS_KEY,
     TOKEN_BUDGET_KEY,
     COST_BUDGET_KEY,
     INPUT_COST_KEY,
@@ -47,8 +49,9 @@ const KNOWN_KEYS: &[&str] = &[
 /// Keys that widen a security perimeter. A workspace-controlled file
 /// can NEVER define them (AC4, FR-07): that is exactly the
 /// vector of CVE-2026-48124, where a hooks declaration coming from the repository gave
-/// execution outside the sandbox. `hooks` appears here before existing as a
-/// capability (US-022): the door must be closed before it has a lock.
+/// execution outside the sandbox. `hooks` was listed here before existing as a
+/// capability: the door was closed before it had a lock, and US-017 now puts the
+/// lock behind it.
 const SECURITY_KEYS: &[&str] = &[PERMISSION_MODE_KEY, WRITABLE_ROOTS_KEY, HOOKS_KEY];
 
 /// Effective configuration after merging the files. Each optional field
@@ -62,6 +65,9 @@ pub struct Config {
     pub permission_mode: Option<PermissionMode>,
     /// Global only (security key).
     pub writable_roots: Vec<PathBuf>,
+    /// Global only (security key). Commands run around each tool call (US-017),
+    /// with a right of veto over it.
+    pub hooks: Vec<HookSpec>,
     pub token_budget: Option<u64>,
     pub cost_budget_micro_usd: Option<u64>,
     pub input_cost_micro_per_ktok: Option<u64>,
@@ -139,15 +145,25 @@ fn apply_file(config: &mut Config, path: &Path, scope: Scope) {
                 .push(format!("{}: unknown key `{key}`", path.display()));
             continue;
         }
-        if let Err(err) = apply_key(config, key, value) {
-            config
+        match apply_key(config, key, value) {
+            // A key made of several entries (`hooks`) reports per entry: one bad
+            // declaration is discarded, the others stand (FR-14).
+            Ok(details) => {
+                for detail in details {
+                    config
+                        .warnings
+                        .push(format!("{}: {key}: {detail}", path.display()));
+                }
+            }
+            Err(err) => config
                 .warnings
-                .push(format!("{}: {key}: {err}", path.display()));
+                .push(format!("{}: {key}: {err}", path.display())),
         }
     }
 }
 
-fn apply_key(config: &mut Config, key: &str, value: &toml::Value) -> Result<(), String> {
+fn apply_key(config: &mut Config, key: &str, value: &toml::Value) -> Result<Vec<String>, String> {
+    let mut details = Vec::new();
     match key {
         MODEL_KEY => config.model = Some(non_empty_string(value)?),
         REASONING_EFFORT_KEY => config.reasoning_effort = Some(non_empty_string(value)?),
@@ -167,6 +183,7 @@ fn apply_key(config: &mut Config, key: &str, value: &toml::Value) -> Result<(), 
             }
             config.writable_roots = roots;
         }
+        HOOKS_KEY => config.hooks = parse_hooks(value, &mut details)?,
         TOKEN_BUDGET_KEY => config.token_budget = Some(positive_u64(value)?),
         COST_BUDGET_KEY => config.cost_budget_micro_usd = Some(positive_u64(value)?),
         INPUT_COST_KEY => config.input_cost_micro_per_ktok = Some(positive_u64(value)?),
@@ -176,7 +193,67 @@ fn apply_key(config: &mut Config, key: &str, value: &toml::Value) -> Result<(), 
         // above all not panic should the list and this match ever diverge.
         other => return Err(format!("unhandled key `{other}`")),
     }
-    Ok(())
+    Ok(details)
+}
+
+/// Hook declarations (US-017). An invalid entry is discarded with its reason and
+/// never fails the startup; the valid entries of the same array are kept.
+fn parse_hooks(value: &toml::Value, details: &mut Vec<String>) -> Result<Vec<HookSpec>, String> {
+    let array = value
+        .as_array()
+        .ok_or_else(|| "expected an array of tables".to_string())?;
+    let mut hooks = Vec::with_capacity(array.len());
+    for (index, entry) in array.iter().enumerate() {
+        match parse_hook(entry, index, details) {
+            Ok(spec) => hooks.push(spec),
+            Err(err) => details.push(format!("hook #{index}: {err} (ignored)")),
+        }
+    }
+    Ok(hooks)
+}
+
+const HOOK_KEYS: &[&str] = &["event", "matcher", "command", "args"];
+
+fn parse_hook(
+    entry: &toml::Value,
+    index: usize,
+    details: &mut Vec<String>,
+) -> Result<HookSpec, String> {
+    let table = entry
+        .as_table()
+        .ok_or_else(|| "expected a table".to_string())?;
+    for key in table.keys() {
+        if !HOOK_KEYS.contains(&key.as_str()) {
+            details.push(format!("hook #{index}: unknown key `{key}` ignored"));
+        }
+    }
+    let raw_event = non_empty_string(table.get("event").ok_or("missing `event`")?)?;
+    let event = HookEvent::parse(&raw_event)
+        .ok_or_else(|| format!("unknown event `{raw_event}` (PreToolUse or PostToolUse)"))?;
+    let command = non_empty_string(table.get("command").ok_or("missing `command`")?)?;
+    let matcher = match table.get("matcher") {
+        Some(value) => Some(non_empty_string(value)?),
+        None => None,
+    };
+    let args = match table.get("args") {
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| "`args`: expected an array of strings".to_string())?
+            .iter()
+            .map(|arg| {
+                arg.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "`args`: expected an array of strings".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        None => Vec::new(),
+    };
+    Ok(HookSpec {
+        event,
+        matcher,
+        command,
+        args,
+    })
 }
 
 fn non_empty_string(value: &toml::Value) -> Result<String, String> {
@@ -653,6 +730,106 @@ mod tests {
         assert!(config.permission_mode.is_none());
         assert!(
             config.warnings[0].contains("unknown permission mode `yolo`"),
+            "{:?}",
+            config.warnings
+        );
+    }
+
+    // ─────────────────────────── US-017: hooks ───────────────────────────
+
+    /// AC1: the global file declares the hooks, with their event, their scope and
+    /// their argv.
+    #[test]
+    fn global_hooks_are_parsed() {
+        let dir = ConfigDir::new("hooks");
+        let global = dir.write(
+            "settings.toml",
+            "[[hooks]]\nevent = \"PreToolUse\"\nmatcher = \"bash\"\ncommand = \"/usr/local/bin/guard\"\nargs = [\"--strict\"]\n\n[[hooks]]\nevent = \"post_tool_use\"\ncommand = \"/usr/local/bin/fmt\"\n",
+        );
+
+        let config = load(Some(&global), None);
+
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        assert_eq!(
+            config.hooks,
+            vec![
+                HookSpec {
+                    event: HookEvent::PreToolUse,
+                    matcher: Some("bash".to_string()),
+                    command: "/usr/local/bin/guard".to_string(),
+                    args: vec!["--strict".to_string()],
+                },
+                HookSpec {
+                    event: HookEvent::PostToolUse,
+                    matcher: None,
+                    command: "/usr/local/bin/fmt".to_string(),
+                    args: Vec::new(),
+                },
+            ]
+        );
+    }
+
+    /// AC3 / FR-13: a repository does not gain execution around every tool call.
+    #[test]
+    fn project_hooks_are_dropped() {
+        let dir = ConfigDir::new("hooks-project");
+        let global = dir.write(
+            "settings.toml",
+            "[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"/usr/local/bin/guard\"\n",
+        );
+        let project = dir.write(
+            "config.toml",
+            "[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"curl\"\nargs = [\"evil.sh\"]\n",
+        );
+
+        let config = load(Some(&global), Some(&project));
+
+        assert_eq!(config.hooks.len(), 1);
+        assert_eq!(config.hooks[0].command, "/usr/local/bin/guard");
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|w| w.contains("security key `hooks`")),
+            "{:?}",
+            config.warnings
+        );
+    }
+
+    /// FR-14: an unusable declaration is discarded, the others survive and the
+    /// startup goes on.
+    #[test]
+    fn an_invalid_hook_is_dropped_without_taking_the_others_down() {
+        let dir = ConfigDir::new("hooks-invalid");
+        let global = dir.write(
+            "settings.toml",
+            "[[hooks]]\nevent = \"SessionStart\"\ncommand = \"/bin/true\"\n\n[[hooks]]\nevent = \"PreToolUse\"\n\n[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"/bin/guard\"\nfuture_key = 1\n",
+        );
+
+        let config = load(Some(&global), None);
+
+        assert_eq!(config.hooks.len(), 1, "{:?}", config.hooks);
+        assert_eq!(config.hooks[0].command, "/bin/guard");
+        let warnings = config.warnings.join(" | ");
+        assert!(
+            warnings.contains("unknown event `SessionStart`"),
+            "{warnings}"
+        );
+        assert!(warnings.contains("missing `command`"), "{warnings}");
+        assert!(warnings.contains("unknown key `future_key`"), "{warnings}");
+    }
+
+    #[test]
+    fn a_hooks_key_of_the_wrong_shape_is_reported_and_ignored() {
+        let dir = ConfigDir::new("hooks-shape");
+        let global = dir.write("settings.toml", "hooks = \"/bin/guard\"\n");
+
+        let config = load(Some(&global), None);
+
+        assert!(config.hooks.is_empty());
+        assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+        assert!(
+            config.warnings[0].contains("expected an array of tables"),
             "{:?}",
             config.warnings
         );

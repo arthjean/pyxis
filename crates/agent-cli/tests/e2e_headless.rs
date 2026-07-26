@@ -255,6 +255,16 @@ fn harness(
     turns: impl IntoIterator<Item = &'static str>,
     extra_tool: Option<BlockingTool>,
 ) -> Harness {
+    harness_with_hooks(workspace, turns, extra_tool, None)
+}
+
+/// Same wiring, with a hook engine plugged into the registry (US-017).
+fn harness_with_hooks(
+    workspace: &TempWorkspace,
+    turns: impl IntoIterator<Item = &'static str>,
+    extra_tool: Option<BlockingTool>,
+    hooks: Option<Arc<dyn agent_tools::hooks::Hooks>>,
+) -> Harness {
     let sessions_dir = workspace.path.join(".pyxis").join("sessions");
     std::fs::create_dir_all(&sessions_dir).unwrap();
     let session_path = sessions_dir.join("e2e.jsonl");
@@ -263,6 +273,9 @@ fn harness(
     let mut builder = Registry::builder(&workspace.path).register(Read);
     if let Some(tool) = extra_tool {
         builder = builder.register(tool);
+    }
+    if let Some(hooks) = hooks {
+        builder = builder.hooks(hooks);
     }
     let registry = builder.build();
     let tool_specs = registry.tool_specs();
@@ -588,4 +601,64 @@ async fn observing_events_does_not_change_the_textual_result() {
     assert_eq!(plain.text, observed.text);
     assert_eq!(plain.events, observed.events);
     assert!(matches!(observed.ended, HeadlessEnd::EndTurn));
+}
+
+/// US-018 AC1/AC5: a hook declared as a real process refuses the tool call the
+/// model asked for; the refusal reaches the model, the turn goes on, and the
+/// persisted session stays replayable. Proves the whole chain (configuration
+/// shape -> engine -> pipeline -> transcript), which no unit test sees.
+#[tokio::test]
+async fn a_hook_vetoes_a_tool_call_without_breaking_the_session() {
+    let workspace = TempWorkspace::new("hook-veto");
+    workspace.write("note.txt", "la phrase attendue\n");
+
+    let hooks = agent_tools::hooks::CommandHooks::new(
+        vec![agent_tools::hooks::HookSpec {
+            event: agent_tools::hooks::HookEvent::PreToolUse,
+            matcher: Some("read".to_string()),
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "echo 'lecture interdite par la politique locale' >&2; exit 2".to_string(),
+            ],
+        }],
+        &workspace.path,
+    );
+    let h = harness_with_hooks(
+        &workspace,
+        [TOOL_CALL_TURN, FINAL_TURN],
+        None,
+        Some(Arc::new(hooks)),
+    );
+
+    let result = run_headless(
+        context("Lis note.txt", h.tool_specs.clone()),
+        h.deps.clone(),
+    )
+    .await;
+
+    assert!(
+        matches!(result.ended, HeadlessEnd::EndTurn),
+        "le refus d'un hook ne doit pas casser le tour : {:?}",
+        result.ended
+    );
+
+    // The refusal, and only it, is what the model receives as the tool result.
+    let bodies = h.provider.bodies();
+    let second = serde_json::to_string(&bodies[1]).unwrap();
+    assert!(
+        second.contains("lecture interdite par la politique locale"),
+        "la raison du hook doit être transmise au modèle : {second}"
+    );
+    assert!(
+        !second.contains("la phrase attendue"),
+        "le fichier ne doit pas avoir été lu : {second}"
+    );
+
+    // The session stays valid: the refused call has its result, nothing dangles.
+    let messages = resumed_messages(&h.session_path);
+    assert!(
+        orphan_tool_calls(&messages).is_empty(),
+        "un appel refusé doit rester apparié à son résultat"
+    );
 }
