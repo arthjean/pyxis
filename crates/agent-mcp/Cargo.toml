@@ -16,3 +16,9 @@ tokio = { workspace = true, features = ["process"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# MCP tools are exposed through the SAME `DynTool` contract as the native tools
+# (ARCHITECTURE 4.1/6): no parallel dispatch path. `agent-core` comes with it for
+# `ToolSpec`, the exact object the provider will send.
+agent-tools = { workspace = true }
+agent-core = { workspace = true }
+async-trait = { workspace = true }

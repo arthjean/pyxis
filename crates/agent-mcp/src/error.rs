@@ -17,6 +17,15 @@ pub enum McpError {
     },
     #[error("serveur « {server} » : {message}")]
     Connect { server: String, message: String },
+    /// Transport or protocol failure of a tool call. A *functional* failure of the
+    /// tool never lands here: it comes back as a tool result in error, per the
+    /// separation the MCP protocol imposes.
+    #[error("serveur MCP « {server} », outil « {tool} » : {message}")]
+    Call {
+        server: String,
+        tool: String,
+        message: String,
+    },
     #[error("serveur MCP « {0} » inconnu")]
     Unknown(String),
 }

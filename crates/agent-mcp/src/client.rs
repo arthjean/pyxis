@@ -70,10 +70,17 @@ impl McpConnection {
             }
             command.env(k, v);
         }
-        let transport = TokioChildProcess::new(command).map_err(|e| McpError::Spawn {
-            server: name.to_string(),
-            source: e,
-        })?;
+        // Server stderr is discarded on purpose: `rmcp` inherits it by default, and
+        // since the servers are now spawned at startup (US-012) a chatty server
+        // would write straight over the TUI, which owns the terminal. A handshake
+        // failure is already reported through `McpError::Connect`.
+        let (transport, _no_stderr) = TokioChildProcess::builder(command)
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| McpError::Spawn {
+                server: name.to_string(),
+                source: e,
+            })?;
         // On timeout, the `serve()` future is dropped in place and the subprocess is
         // killed through the `Drop` of the transport (detached kill). Enough for a
         // long-running CLI; an explicit graceful shutdown (serve_with_ct) stays possible.
@@ -89,6 +96,14 @@ impl McpConnection {
                     message: e.to_string(),
                 })?;
         Ok(Self { service })
+    }
+
+    /// Cloneable call handle for this connection (US-010). Cloning the `Peer` does
+    /// not clone the connection: the lifecycle stays owned by this
+    /// `McpConnection`, and a call issued after `cancel` fails with a transport
+    /// error rather than resurrecting a dead server.
+    pub fn client(&self, server: &str) -> crate::call::McpClient {
+        crate::call::McpClient::new(server, self.service.peer().clone())
     }
 
     /// Lists the tools exposed by the server (descriptions capped at 2048 chars).

@@ -68,6 +68,9 @@ dependencies = [
 name = "agent-mcp"
 version = "0.0.0"
 dependencies = [
+ "agent-core",
+ "agent-tools",
+ "async-trait",
  "rmcp",
  "serde",
  "serde_json",
