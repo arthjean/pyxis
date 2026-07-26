@@ -16,6 +16,7 @@ pub mod edit;
 pub mod error;
 pub mod glob;
 pub mod grep;
+pub mod hooks;
 pub mod path;
 pub mod permission;
 pub mod read;
@@ -35,6 +36,7 @@ pub use edit::Edit;
 pub use error::{ToolError, ValidationError};
 pub use glob::Glob;
 pub use grep::Grep;
+pub use hooks::{CommandHooks, HookDecision, HookEvent, HookSpec, Hooks, NoHooks};
 pub use permission::{
     ApprovalEntry, ApprovalKey, ApprovalMemo, ApprovalMemory, ApprovalResponse, Approver,
     AutoApprove, AutoDeny, PermCtx, PermissionDecision, PermissionMode, PermissionModeState,

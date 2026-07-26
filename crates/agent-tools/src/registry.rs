@@ -3,7 +3,8 @@
 //! confirmations serially, then puts every call through the **strict pipeline** (4.3):
 //!
 //! ```text
-//! parse+validate -> permission(mode x taint) -> call() under timeout -> taint -> outcome
+//! parse+validate -> hooks PreToolUse -> permission(mode x taint) -> call() under
+//! timeout -> taint -> hooks PostToolUse -> outcome
 //! ```
 //!
 //! Invariants: one `ToolOutcome` per `ToolInvocation` (even a refusal/unknown/failed
@@ -23,6 +24,7 @@ use async_trait::async_trait;
 use futures_util::stream::{self, StreamExt};
 
 use crate::error::ToolError;
+use crate::hooks::{HookDecision, HookEvent, HookToolResult, Hooks, NoHooks};
 use crate::permission::{
     ApprovalKey, ApprovalMemo, ApprovalMemory, Approver, AutoDeny, PermCtx, PermissionMode,
     PermissionModeState, PermissionRequest, Resolved, resolve_permission,
@@ -34,6 +36,9 @@ use crate::tool::{DynTool, ToolCtx, into_dyn};
 const MAX_DESCRIPTION: usize = 2048;
 /// Reason shown when the taint defense forbids remembering an answer (US-008 AC5).
 const TAINT_NOT_MEMOIZABLE: &str = "untrusted content was read in this turn";
+/// Reason shown when a hook is what forces the confirmation (US-018 AC2): a
+/// remembered answer would silence that hook for the rest of the session.
+const HOOK_NOT_MEMOIZABLE: &str = "the confirmation comes from a hook";
 /// Concurrency cap of the read-only batch (ARCHITECTURE 4.2).
 const CONCURRENCY: usize = 10;
 
@@ -45,6 +50,7 @@ pub struct Registry {
     approver: Arc<dyn Approver>,
     approvals: ApprovalMemory,
     taint: TaintTracker,
+    hooks: Arc<dyn Hooks>,
     ctx: ToolCtx,
 }
 
@@ -57,6 +63,7 @@ impl Registry {
             approvals: ApprovalMemory::new(),
             taint_window: crate::taint::DEFAULT_WINDOW,
             initial_taint_recent: false,
+            hooks: None,
             ctx: ToolCtx::new(workspace),
         }
     }
@@ -146,7 +153,30 @@ impl Registry {
             return err_outcome(id, e.to_string(), e.kind());
         }
 
-        // 2. permission: tool baseline shaped by mode + taint (4.4/4.6).
+        // 2. hooks PreToolUse (4.3): a user rule runs BEFORE the permission
+        // decision and can only TIGHTEN it. A refusal returns here, hence ahead
+        // of every mode, including `BypassPermissions` (US-018 AC4).
+        let mut hook_ask: Option<String> = None;
+        if self.hooks.intercepts(HookEvent::PreToolUse, &call.name) {
+            match self.hooks.pre_tool_use(&call.name, &call.input).await {
+                HookDecision::Deny(reason) => {
+                    return err_outcome(
+                        id,
+                        // The reason already names the hook when it comes from the
+                        // process engine (US-017 AC6): no need to say it twice.
+                        format!(
+                            "action \"{}\" refused before execution: {reason}",
+                            call.name
+                        ),
+                        ToolErrorKind::PermissionDenied,
+                    );
+                }
+                HookDecision::Ask(reason) => hook_ask = Some(reason),
+                HookDecision::NoObjection => {}
+            }
+        }
+
+        // 3. permission: tool baseline shaped by mode + taint (4.4/4.6).
         let mode = self.mode();
         let pctx = PermCtx {
             mode,
@@ -161,6 +191,13 @@ impl Registry {
             tool.is_taint_sensitive(),
             pctx.taint_recent,
         );
+        // A hook that asks turns an authorization into a question, in every mode
+        // (US-018 AC2). It never turns a refusal into a question.
+        let resolved = match resolved {
+            Resolved::Deny => Resolved::Deny,
+            _ if hook_ask.is_some() => Resolved::Ask,
+            other => other,
+        };
         match resolved {
             Resolved::Deny => {
                 return err_outcome(
@@ -174,15 +211,21 @@ impl Registry {
                 // US-008: a remembered answer applies only outside a tainted
                 // context. The taint defense outranks the memory, in both
                 // directions: it re-asks, and it forbids remembering.
-                let memo = tool.approval_memo(&call.input);
-                let (key, memo_refused) = match (&memo, taint_forced) {
-                    (_, true) => (None, Some(TAINT_NOT_MEMOIZABLE.to_string())),
-                    (ApprovalMemo::Key(tokens), false) => (
-                        Some(ApprovalKey::new(&call.name, tokens, &self.ctx.workspace)),
-                        None,
-                    ),
-                    (ApprovalMemo::Refused(reason), false) => (None, Some((*reason).to_string())),
-                    (ApprovalMemo::NotApplicable, false) => (None, None),
+                let (key, memo_refused) = if taint_forced {
+                    (None, Some(TAINT_NOT_MEMOIZABLE.to_string()))
+                } else if hook_ask.is_some() {
+                    // No key -> the memory is neither read nor written: a hook keeps
+                    // its say on every call of the session.
+                    (None, Some(HOOK_NOT_MEMOIZABLE.to_string()))
+                } else {
+                    match tool.approval_memo(&call.input) {
+                        ApprovalMemo::Key(tokens) => (
+                            Some(ApprovalKey::new(&call.name, &tokens, &self.ctx.workspace)),
+                            None,
+                        ),
+                        ApprovalMemo::Refused(reason) => (None, Some(reason.to_string())),
+                        ApprovalMemo::NotApplicable => (None, None),
+                    }
                 };
                 match key.as_ref().and_then(|k| self.approvals.lookup(k)) {
                     // Remembered allow: no question, the user already answered
@@ -202,7 +245,7 @@ impl Registry {
                         let req = PermissionRequest {
                             call_id: id.clone(),
                             tool: call.name.clone(),
-                            reason: ask_reason(taint_forced),
+                            reason: ask_reason(taint_forced, hook_ask.as_deref()),
                             taint_forced,
                             mode: format!("{mode:?}"),
                             input_summary: summarize(&call.input),
@@ -238,10 +281,16 @@ impl Registry {
             Resolved::Allow => {}
         }
 
-        // 3. call() under timeout (a tool that hangs does not block the loop).
+        // 4. call() under timeout (a tool that hangs does not block the loop).
         // The context of THIS call carries its output emitter (US-015): the
         // fragments travel on the same channel as permission requests, already
         // correlated by `id`.
+        // The input is kept only when a later hook is watching this tool: without
+        // a declaration, nothing is cloned (US-017 AC5).
+        let post_input = self
+            .hooks
+            .intercepts(HookEvent::PostToolUse, &call.name)
+            .then(|| call.input.clone());
         let ctx = self.ctx.with_output_sink({
             let events = events.clone();
             let id = id.clone();
@@ -253,38 +302,56 @@ impl Registry {
             })
         });
         let untrusted = tool.returns_untrusted();
-        match tokio::time::timeout(tool.timeout(&ctx), tool.invoke(call.input, &ctx)).await {
-            Err(_elapsed) => {
-                if untrusted {
-                    self.taint.mark();
+        let outcome =
+            match tokio::time::timeout(tool.timeout(&ctx), tool.invoke(call.input, &ctx)).await {
+                Err(_elapsed) => {
+                    if untrusted {
+                        self.taint.mark();
+                    }
+                    err_outcome_tainted(
+                        id,
+                        ToolError::Timeout.to_string(),
+                        untrusted,
+                        ToolErrorKind::Timeout,
+                    )
                 }
-                err_outcome_tainted(
-                    id,
-                    ToolError::Timeout.to_string(),
-                    untrusted,
-                    ToolErrorKind::Timeout,
+                Ok(Err(e)) => {
+                    if untrusted {
+                        self.taint.mark();
+                    }
+                    err_outcome_tainted(id, e.to_string(), untrusted, e.kind())
+                }
+                Ok(Ok(out)) => {
+                    // 5. taint: an untrusted output just entered the context.
+                    if untrusted {
+                        self.taint.mark();
+                    }
+                    ToolOutcome {
+                        id,
+                        content: out.content,
+                        is_error: out.is_error,
+                        untrusted,
+                        error_kind: out.is_error.then_some(ToolErrorKind::Semantic),
+                    }
+                }
+            };
+
+        // 6. hooks PostToolUse (4.3): only after a call that actually ran. The
+        // outcome is already decided and is passed by reference: a later hook
+        // observes, it does not rewrite (US-019 AC4).
+        if let Some(input) = post_input {
+            self.hooks
+                .post_tool_use(
+                    &call.name,
+                    &input,
+                    HookToolResult {
+                        content: &outcome.content,
+                        is_error: outcome.is_error,
+                    },
                 )
-            }
-            Ok(Err(e)) => {
-                if untrusted {
-                    self.taint.mark();
-                }
-                err_outcome_tainted(id, e.to_string(), untrusted, e.kind())
-            }
-            Ok(Ok(out)) => {
-                // 4. taint: an untrusted output just entered the context.
-                if untrusted {
-                    self.taint.mark();
-                }
-                ToolOutcome {
-                    id,
-                    content: out.content,
-                    is_error: out.is_error,
-                    untrusted,
-                    error_kind: out.is_error.then_some(ToolErrorKind::Semantic),
-                }
-            }
+                .await;
         }
+        outcome
     }
 
     fn can_run_parallel_without_permission(&self, call: &ToolInvocation) -> bool {
@@ -292,6 +359,11 @@ impl Registry {
             return false;
         };
         if !(tool.is_concurrency_safe() && tool.is_read_only() && !tool.is_taint_sensitive()) {
+            return false;
+        }
+        // A watched call leaves the parallel segment: a hook may turn it into a
+        // question, and two confirmations must never overlap.
+        if self.hooks.intercepts(HookEvent::PreToolUse, &call.name) {
             return false;
         }
         if tool.precheck(&call.input, &self.ctx).is_err() {
@@ -407,9 +479,11 @@ fn err_outcome_tainted(
     }
 }
 
-fn ask_reason(taint_forced: bool) -> String {
+fn ask_reason(taint_forced: bool, hook: Option<&str>) -> String {
     if taint_forced {
         "sensitive action derived from untrusted content (injection defense)".to_string()
+    } else if let Some(reason) = hook {
+        format!("confirmation required by a hook: {reason}")
     } else {
         "sensitive action requires confirmation".to_string()
     }
@@ -445,6 +519,7 @@ pub struct RegistryBuilder {
     approvals: ApprovalMemory,
     taint_window: u64,
     initial_taint_recent: bool,
+    hooks: Option<Arc<dyn Hooks>>,
     ctx: ToolCtx,
 }
 
@@ -479,6 +554,12 @@ impl RegistryBuilder {
         self.ctx.timeout = timeout;
         self
     }
+    /// User hooks run around each tool call (US-017). Default: `NoHooks`, which
+    /// costs nothing and lets no one intervene.
+    pub fn hooks(mut self, hooks: Arc<dyn Hooks>) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
     /// Shell command hardening closure (Bash network sandbox), injected
     /// by agent-cli from `agent-sandbox`.
     pub fn command_hardener(mut self, harden: crate::tool::CommandHardener) -> Self {
@@ -506,6 +587,7 @@ impl RegistryBuilder {
             approver: self.approver.unwrap_or_else(|| Arc::new(AutoDeny)),
             approvals: self.approvals,
             taint: TaintTracker::new(self.taint_window),
+            hooks: self.hooks.unwrap_or_else(|| Arc::new(NoHooks)),
             ctx: self.ctx,
         };
         registry.seed_taint(self.initial_taint_recent);

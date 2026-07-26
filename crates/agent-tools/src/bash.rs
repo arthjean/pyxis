@@ -388,7 +388,10 @@ fn flush_stream(pending: &mut Vec<u8>, sink: Option<&crate::tool::OutputSink>) {
     sink(text);
 }
 
-async fn kill_process_tree(pid: u32) {
+/// Kills a subprocess AND its group: a hook or a shell command usually spawns
+/// children, and `kill_on_drop` only reaches the direct child. Shared with the
+/// hook engine, which starts its processes with the same `process_group(0)`.
+pub(crate) async fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
     {
         let _ = tokio::process::Command::new("taskkill")

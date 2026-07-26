@@ -1939,3 +1939,291 @@ async fn registry_collects_tool_behavioral_guidelines() {
         "the edit guideline should be collected: {guidelines:?}"
     );
 }
+
+// ══════════════════════════ US-017 -> US-019: hooks ══════════════════════════
+
+/// What a hook saw before a call: tool and arguments.
+type PreHookCall = (String, serde_json::Value);
+/// What a hook saw after a call: tool, arguments, result, error flag.
+type PostHookCall = (String, serde_json::Value, String, bool);
+
+/// Scripted hook engine: answers a fixed decision and records what it saw. Lets
+/// the pipeline be tested without a process.
+struct ScriptedHooks {
+    decision: crate::hooks::HookDecision,
+    watched: Option<&'static str>,
+    pre_calls: Arc<Mutex<Vec<PreHookCall>>>,
+    post_calls: Arc<Mutex<Vec<PostHookCall>>>,
+}
+
+impl ScriptedHooks {
+    fn new(decision: crate::hooks::HookDecision) -> Arc<Self> {
+        Arc::new(Self {
+            decision,
+            watched: None,
+            pre_calls: Arc::new(Mutex::new(Vec::new())),
+            post_calls: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+    fn watching(tool: &'static str, decision: crate::hooks::HookDecision) -> Arc<Self> {
+        Arc::new(Self {
+            decision,
+            watched: Some(tool),
+            pre_calls: Arc::new(Mutex::new(Vec::new())),
+            post_calls: Arc::new(Mutex::new(Vec::new())),
+        })
+    }
+}
+
+#[async_trait]
+impl crate::hooks::Hooks for ScriptedHooks {
+    fn intercepts(&self, _event: crate::hooks::HookEvent, tool: &str) -> bool {
+        self.watched.is_none_or(|watched| watched == tool)
+    }
+    async fn pre_tool_use(
+        &self,
+        tool: &str,
+        input: &serde_json::Value,
+    ) -> crate::hooks::HookDecision {
+        self.pre_calls
+            .lock()
+            .unwrap()
+            .push((tool.to_string(), input.clone()));
+        self.decision.clone()
+    }
+    async fn post_tool_use(
+        &self,
+        tool: &str,
+        input: &serde_json::Value,
+        result: crate::hooks::HookToolResult<'_>,
+    ) {
+        self.post_calls.lock().unwrap().push((
+            tool.to_string(),
+            input.clone(),
+            result.content.to_string(),
+            result.is_error,
+        ));
+    }
+}
+
+fn hooked_registry(hooks: Arc<ScriptedHooks>, mode: PermissionMode) -> Registry {
+    Registry::builder("/tmp")
+        .mode(mode)
+        .approver(allow_approver())
+        .hooks(hooks)
+        .register(AskProbe {
+            name: "ask",
+            read_only: false,
+            concurrency_safe: false,
+        })
+        .register(Probe::new("p", true, true))
+        .build()
+}
+
+/// US-018 AC1: a refused call never runs, and the model learns why.
+#[tokio::test]
+async fn a_hook_refusal_stops_the_call_and_carries_its_reason() {
+    let hooks = ScriptedHooks::new(crate::hooks::HookDecision::Deny(
+        "interdit par la politique locale".to_string(),
+    ));
+    let reg = hooked_registry(Arc::clone(&hooks), PermissionMode::DontAsk);
+
+    let out = reg
+        .dispatch(vec![call("a", "ask", serde_json::json!({"x": 1}))])
+        .await;
+
+    let o = by_id(&out, "a");
+    assert!(o.is_error);
+    assert_eq!(o.error_kind, Some(ToolErrorKind::PermissionDenied));
+    assert!(
+        o.content.contains("interdit par la politique locale"),
+        "{}",
+        o.content
+    );
+    assert_ne!(o.content, "approved", "l'outil ne doit pas s'exécuter");
+    // The hook saw the call it was deciding on.
+    let seen = hooks.pre_calls.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, "ask");
+    assert_eq!(seen[0].1["x"], 1);
+}
+
+/// US-018 AC4: the refusal outranks the mode that bypasses every confirmation.
+#[tokio::test]
+async fn a_hook_refusal_outranks_bypass_permissions() {
+    let hooks = ScriptedHooks::new(crate::hooks::HookDecision::Deny("non".to_string()));
+    let reg = hooked_registry(hooks, PermissionMode::BypassPermissions);
+
+    let out = reg
+        .dispatch(vec![call("a", "ask", serde_json::json!({}))])
+        .await;
+
+    let o = by_id(&out, "a");
+    assert!(o.is_error, "{}", o.content);
+    assert_eq!(o.error_kind, Some(ToolErrorKind::PermissionDenied));
+}
+
+/// US-018 AC5: a refusal leaves the session usable, the following calls run.
+#[tokio::test]
+async fn the_batch_survives_a_hook_refusal() {
+    let hooks = ScriptedHooks::watching("ask", crate::hooks::HookDecision::Deny("non".to_string()));
+    let reg = hooked_registry(hooks, PermissionMode::DontAsk);
+
+    let out = reg
+        .dispatch(vec![
+            call("a", "ask", serde_json::json!({})),
+            call("b", "p", serde_json::json!({})),
+        ])
+        .await;
+
+    assert!(by_id(&out, "a").is_error);
+    let second = by_id(&out, "b");
+    assert!(!second.is_error, "{}", second.content);
+    assert_eq!(second.content, "p ok");
+}
+
+/// US-018 AC2: a hook asking for a confirmation is heard even in a mode that
+/// would not have interrupted.
+#[tokio::test]
+async fn a_hook_can_force_a_confirmation_in_a_silent_mode() {
+    let hooks = ScriptedHooks::watching(
+        "p",
+        crate::hooks::HookDecision::Ask("vérifie ça".to_string()),
+    );
+    let (approver, seen) = RecordingApprover::new(true);
+    let reg = Registry::builder("/tmp")
+        .mode(PermissionMode::DontAsk)
+        .approver(approver)
+        .hooks(Arc::clone(&hooks) as Arc<dyn crate::hooks::Hooks>)
+        .register(Probe::new("p", true, true))
+        .build();
+
+    let out = reg
+        .dispatch(vec![call("a", "p", serde_json::json!({}))])
+        .await;
+
+    assert!(!by_id(&out, "a").is_error);
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 1, "la confirmation doit être demandée");
+    assert!(
+        requests[0].reason.contains("vérifie ça"),
+        "{}",
+        requests[0].reason
+    );
+    // The answer is not rememberable: a remembered `allow` would silence the
+    // hook for the rest of the session.
+    assert!(!requests[0].memoizable);
+    assert!(requests[0].memo_refused.is_some());
+}
+
+/// A previously remembered answer must not silence a hook either.
+#[tokio::test]
+async fn a_remembered_answer_does_not_silence_a_hook() {
+    let hooks = ScriptedHooks::watching(
+        "ask",
+        crate::hooks::HookDecision::Ask("re-demande".to_string()),
+    );
+    let (approver, seen) = RecordingApprover::new(true);
+    let approvals = crate::permission::ApprovalMemory::new();
+    approvals.remember(
+        crate::permission::ApprovalKey::new("ask", &["ask".to_string()], "/tmp"),
+        true,
+    );
+    let reg = Registry::builder("/tmp")
+        .mode(PermissionMode::Default)
+        .approver(approver)
+        .approvals(approvals)
+        .hooks(hooks)
+        .register(AskProbe {
+            name: "ask",
+            read_only: false,
+            concurrency_safe: false,
+        })
+        .build();
+
+    let out = reg
+        .dispatch(vec![call("a", "ask", serde_json::json!({}))])
+        .await;
+
+    assert!(!by_id(&out, "a").is_error);
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "le hook doit reposer la question"
+    );
+}
+
+/// A hook never widens: `NoObjection` leaves the baseline decision alone.
+#[tokio::test]
+async fn a_hook_without_objection_changes_nothing() {
+    let hooks = ScriptedHooks::new(crate::hooks::HookDecision::NoObjection);
+    let (approver, seen) = RecordingApprover::new(true);
+    let reg = Registry::builder("/tmp")
+        .mode(PermissionMode::Default)
+        .approver(approver)
+        .hooks(hooks)
+        .register(AskProbe {
+            name: "ask",
+            read_only: false,
+            concurrency_safe: false,
+        })
+        .build();
+
+    let out = reg
+        .dispatch(vec![call("a", "ask", serde_json::json!({}))])
+        .await;
+
+    assert_eq!(by_id(&out, "a").content, "approved");
+    // The tool's own baseline still asks: the hook did not lift it.
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+/// US-017 AC5: a tool nobody watches costs nothing.
+#[tokio::test]
+async fn an_unwatched_tool_reaches_no_hook() {
+    let hooks =
+        ScriptedHooks::watching("other", crate::hooks::HookDecision::Deny("non".to_string()));
+    let reg = hooked_registry(Arc::clone(&hooks), PermissionMode::DontAsk);
+
+    let out = reg
+        .dispatch(vec![call("a", "p", serde_json::json!({}))])
+        .await;
+
+    assert!(!by_id(&out, "a").is_error);
+    assert!(hooks.pre_calls.lock().unwrap().is_empty());
+    assert!(hooks.post_calls.lock().unwrap().is_empty());
+}
+
+/// US-019 AC1/AC4: the later hook sees the name, the input and the result, and
+/// changes nothing.
+#[tokio::test]
+async fn the_post_hook_observes_without_rewriting() {
+    let hooks = ScriptedHooks::new(crate::hooks::HookDecision::NoObjection);
+    let reg = hooked_registry(Arc::clone(&hooks), PermissionMode::DontAsk);
+
+    let out = reg
+        .dispatch(vec![call("a", "p", serde_json::json!({"k": "v"}))])
+        .await;
+
+    assert_eq!(by_id(&out, "a").content, "p ok");
+    let seen = hooks.post_calls.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, "p");
+    assert_eq!(seen[0].1["k"], "v");
+    assert_eq!(seen[0].2, "p ok");
+    assert!(!seen[0].3);
+}
+
+/// A call refused before execution produces no later event: there is no result
+/// to observe.
+#[tokio::test]
+async fn a_refused_call_triggers_no_post_hook() {
+    let hooks = ScriptedHooks::new(crate::hooks::HookDecision::Deny("non".to_string()));
+    let reg = hooked_registry(Arc::clone(&hooks), PermissionMode::DontAsk);
+
+    let _ = reg
+        .dispatch(vec![call("a", "p", serde_json::json!({}))])
+        .await;
+
+    assert!(hooks.post_calls.lock().unwrap().is_empty());
+}
