@@ -10,6 +10,7 @@ mod approver;
 mod context;
 mod interactive;
 mod jsonl;
+mod observability;
 mod prompt;
 mod session;
 mod settings;
@@ -388,6 +389,7 @@ fn sandbox_enforced_from_args(
     args: &Args,
     workspace: &std::path::Path,
     settings_path: Option<&std::path::Path>,
+    diagnostics: &observability::Diagnostics,
     writable_roots: &agent_sandbox::WritableRoots,
 ) -> bool {
     if !args.sandbox {
@@ -408,7 +410,10 @@ fn sandbox_enforced_from_args(
             ignored.reason.message()
         );
     }
-    let writable: Vec<&std::path::Path> = settings_path.into_iter().collect();
+    // Settings + diagnostic files (US-020): the only paths outside the workspace
+    // that stay writable, each granted individually.
+    let mut writable: Vec<&std::path::Path> = settings_path.into_iter().collect();
+    writable.extend(diagnostics.writable_files());
     match agent_sandbox::enforce_process(workspace, &writable, &writable_roots.as_paths()) {
         Ok(status) => {
             if let Some(w) = status.warning() {
@@ -435,6 +440,19 @@ fn main() -> anyhow::Result<()> {
         print!("{HELP}");
         return Ok(());
     }
+
+    // US-020: diagnostics prepared FIRST. The panic net must cover the whole
+    // startup, and its file must exist before Landlock, which cannot grant a write
+    // right on a path that does not open yet.
+    let diagnostics = observability::prepare(settings::pyxis_home().as_deref());
+    for warning in &diagnostics.warnings {
+        eprintln!("[trace] {warning}");
+    }
+    observability::install_panic_hook(diagnostics.panic_log.clone());
+    if let Some(path) = observability::install_tracing(&diagnostics) {
+        eprintln!("[trace] {}", path.display());
+    }
+
     let workspace = std::env::current_dir()?;
 
     // Skills scanned BEFORE the sandbox, like the rest of the out-of-workspace
@@ -506,8 +524,13 @@ fn main() -> anyhow::Result<()> {
     );
 
     // FS sandbox BEFORE the runtime (main thread -> inherited by the workers).
-    let sandbox_enforced =
-        sandbox_enforced_from_args(&args, &workspace, settings_path.as_deref(), &writable_roots);
+    let sandbox_enforced = sandbox_enforced_from_args(
+        &args,
+        &workspace,
+        settings_path.as_deref(),
+        &diagnostics,
+        &writable_roots,
+    );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

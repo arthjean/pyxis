@@ -21,3 +21,4 @@ async-stream.workspace = true
 futures-util.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+tracing.workspace = true

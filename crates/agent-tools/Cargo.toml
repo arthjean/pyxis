@@ -26,6 +26,10 @@ walkdir.workspace = true
 # aggregated turn diff (US-018): diff engine already present in the workspace,
 # used here to produce the unified text. No new dependency.
 similar.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+# US-020: proves what the trace carries per level, without a real subscriber
+# process-wide (the binary owns that install).
+tracing-subscriber.workspace = true

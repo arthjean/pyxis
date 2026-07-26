@@ -436,17 +436,11 @@ fn random_state() -> String {
 }
 
 /// Interactive login: opens the browser, waits for the callback on `127.0.0.1:1455`,
-/// exchanges the code. Opening the browser is best-effort: on failure,
-/// the URL is printed for manual copy-paste.
-pub async fn login_browser(client: &reqwest::Client) -> Result<OAuthCredential, AuthError> {
-    login_browser_with_notice(client, |url, opened| {
-        if !opened {
-            println!("Open this URL to authorize Pyxis:\n{url}");
-        }
-    })
-    .await
-}
-
+/// exchanges the code. Opening the browser is best-effort, and this crate does not
+/// decide what a failure looks like: the caller receives the URL through
+/// `on_auth_url` and prints it itself. That is FR-15 (US-020): only a binary writes
+/// on a process output, because only a binary knows whether a TUI owns the
+/// terminal.
 pub async fn login_browser_with_notice<F>(
     client: &reqwest::Client,
     on_auth_url: F,

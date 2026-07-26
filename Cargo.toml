@@ -75,6 +75,12 @@ anyhow = "1"
 # (`toml::Table` + serde): writing the settings stays a line upsert, which
 # preserves the comments without pulling `toml_edit` into the graph.
 toml = "1"
+# Observability (US-020): the libraries EMIT through the facade, the binary alone
+# installs a subscriber. `tracing` was already in the graph transitively; the
+# subscriber stays minimal on purpose (no ansi in a log file, no env-filter: a
+# level is what `PYXIS_LOG` needs).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 # terminal rendering snapshots (US-005): DEV-ONLY. Declared here for the single
 # workspace version, but reserved for `[dev-dependencies]`, never in the
 # graph of the distributed `pyxis` binary.

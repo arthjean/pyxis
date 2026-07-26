@@ -198,6 +198,23 @@ impl Registry {
             _ if hook_ask.is_some() => Resolved::Ask,
             other => other,
         };
+        // US-020: what the pipeline decided, without the arguments. The input can
+        // carry a file body or a command: it only appears at the highest verbosity
+        // (AC6), never at `debug`.
+        tracing::debug!(
+            target: "pyxis::tools",
+            tool = %call.name,
+            ?mode,
+            ?resolved,
+            taint_recent = pctx.taint_recent,
+            "tool permission resolved"
+        );
+        tracing::trace!(
+            target: "pyxis::tools",
+            tool = %call.name,
+            input = %summarize(&call.input),
+            "tool input"
+        );
         match resolved {
             Resolved::Deny => {
                 return err_outcome(

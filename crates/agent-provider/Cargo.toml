@@ -28,6 +28,7 @@ thiserror.workspace = true
 # US-029: generation of the session_id (UUID v4) for prompt_cache_key. `rand` is
 # already pinned at the workspace level (agent-auth) -> no new crate downloaded.
 rand.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

@@ -300,11 +300,18 @@ pub fn permission_mode_from_arg(arg: &str) -> Option<PermissionMode> {
     }
 }
 
-pub fn default_settings_path() -> Option<PathBuf> {
+/// Root of the user state: `$PYXIS_HOME` when set, `~/.pyxis` otherwise. Single
+/// source for everything Pyxis writes outside a workspace (settings, and the
+/// diagnostics of US-020).
+pub fn pyxis_home() -> Option<PathBuf> {
     if let Some(root) = std::env::var_os("PYXIS_HOME") {
-        return Some(PathBuf::from(root).join(SETTINGS_FILE));
+        return Some(PathBuf::from(root));
     }
-    home_dir().map(|home| home.join(".pyxis").join(SETTINGS_FILE))
+    home_dir().map(|home| home.join(".pyxis"))
+}
+
+pub fn default_settings_path() -> Option<PathBuf> {
+    pyxis_home().map(|root| root.join(SETTINGS_FILE))
 }
 
 pub fn save_permission_mode(path: &Path, mode: PermissionMode) -> io::Result<()> {

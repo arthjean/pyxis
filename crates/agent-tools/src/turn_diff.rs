@@ -120,7 +120,11 @@ impl TurnDiffTracker {
         match tracker.snapshot_dirty().await {
             Ok(baseline) => tracker.baseline = Some(baseline),
             // The repository exists but git failed: the turn goes on without a diff.
-            Err(err) => eprintln!("[diff] baseline unavailable: {err}"),
+            // Reported through the facade (US-020): a library never writes on a
+            // process output, the TUI owns that terminal.
+            Err(err) => {
+                tracing::warn!(target: "pyxis::diff", %err, "turn diff baseline unavailable")
+            }
         }
         tracker
     }

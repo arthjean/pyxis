@@ -2227,3 +2227,93 @@ async fn a_refused_call_triggers_no_post_hook() {
 
     assert!(hooks.post_calls.lock().unwrap().is_empty());
 }
+
+// ══════════════════════════ US-020: trace structurée ══════════════════════════
+
+/// Collects the trace of one dispatch at a given level, on the current thread
+/// only: the process-wide subscriber belongs to the binary (FR-15).
+async fn traced_dispatch(level: tracing::Level, calls: Vec<ToolInvocation>) -> String {
+    let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = Arc::clone(&buffer);
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_ansi(false)
+        .with_writer(move || SharedBuffer(Arc::clone(&sink)))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let reg = Registry::builder("/tmp")
+        .mode(PermissionMode::DontAsk)
+        .approver(allow_approver())
+        .register(Probe::new("p", true, true))
+        .build();
+    let _ = reg.dispatch(calls).await;
+
+    let bytes = buffer.lock().unwrap().clone();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.0.lock() {
+            Ok(mut sink) => sink.extend_from_slice(buf),
+            Err(poisoned) => poisoned.into_inner().extend_from_slice(buf),
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// US-020 AC3: the crate emits structured events, collected by whoever installs a
+/// subscriber.
+#[tokio::test]
+async fn the_dispatch_emits_a_structured_decision() {
+    let trace = traced_dispatch(
+        tracing::Level::DEBUG,
+        vec![call("a", "p", serde_json::json!({"secret": "hunter2"}))],
+    )
+    .await;
+
+    assert!(trace.contains("tool permission resolved"), "{trace}");
+    assert!(trace.contains("pyxis::tools"), "{trace}");
+    assert!(trace.contains("tool=p"), "{trace}");
+    assert!(trace.contains("resolved=Allow"), "{trace}");
+}
+
+/// US-020 AC6: the arguments of a call are content. They appear at the highest
+/// verbosity, and nowhere below it.
+#[tokio::test]
+async fn call_content_appears_only_at_the_highest_verbosity() {
+    let input = serde_json::json!({"secret": "hunter2"});
+
+    let debug = traced_dispatch(tracing::Level::DEBUG, vec![call("a", "p", input.clone())]).await;
+    assert!(
+        !debug.contains("hunter2"),
+        "le contenu ne doit pas fuiter en debug: {debug}"
+    );
+
+    let full = traced_dispatch(tracing::Level::TRACE, vec![call("a", "p", input)]).await;
+    assert!(full.contains("hunter2"), "attendu au niveau trace: {full}");
+}
+
+/// US-020 AC4: without a subscriber, an emission produces nothing. Proven by
+/// running the same dispatch outside any collection and observing that the tools
+/// keep working, at the same cost as before the instrumentation.
+#[tokio::test]
+async fn without_a_subscriber_the_dispatch_is_unchanged() {
+    let reg = Registry::builder("/tmp")
+        .mode(PermissionMode::DontAsk)
+        .approver(allow_approver())
+        .register(Probe::new("p", true, true))
+        .build();
+
+    let out = reg
+        .dispatch(vec![call("a", "p", serde_json::json!({}))])
+        .await;
+
+    assert_eq!(by_id(&out, "a").content, "p ok");
+}

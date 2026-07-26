@@ -789,6 +789,19 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         &deps,
                     );
 
+                    // US-020: structured trace of the round-trip. EMISSION only:
+                    // without a subscriber installed by the binary this is an
+                    // atomic level check, which keeps the core free of I/O
+                    // (ADR-3, invariant 1). No message content here, only counters.
+                    tracing::debug!(
+                        target: "pyxis::turn",
+                        index = model_turns,
+                        input_tokens = usage_budget.spent_input(),
+                        output_tokens = usage_budget.spent_output(),
+                        context_tokens = last_usage.map(|usage| usage.input),
+                        "model round-trip ended"
+                    );
+
                     // US-017: a model round-trip just ended. Emitted here, after
                     // accounting, so that the counters carried by the event
                     // include THIS turn. This is the only point of the run

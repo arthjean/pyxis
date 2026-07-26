@@ -98,13 +98,13 @@ pub fn inject_cache_key(body: &mut Value, session_id: &str) {
     body["prompt_cache_key"] = json!(clamp_cache_key(session_id));
 }
 
-/// Transcript anomaly trace (US-003). Silent by default: standard
-/// error output is shared with the TUI. Same convention as
-/// `PYXIS_DEBUG_USAGE` on the loop side.
+/// Transcript anomaly trace (US-003, rewired by US-020). Emitted through the
+/// facade: this crate no longer writes to a process output, and the binary alone
+/// decides whether a subscriber listens (FR-15). `trace` and not `debug` because
+/// the detail carries transcript fragments, and message content is only allowed at
+/// the highest verbosity (US-020 AC6).
 fn trace_transcript_anomaly(detail: &str) {
-    if std::env::var_os("PYXIS_DEBUG_TRANSCRIPT").is_some() {
-        eprintln!("[transcript] {detail}");
-    }
+    tracing::trace!(target: "pyxis::transcript", detail, "transcript anomaly");
 }
 
 /// Converts the canonical transcript into the `input[]` of the Responses API.

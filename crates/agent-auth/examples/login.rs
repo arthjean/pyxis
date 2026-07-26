@@ -16,7 +16,12 @@ const ACCOUNT: &str = "oauth:openai_chatgpt";
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     println!("Authorize Pyxis with your ChatGPT subscription...");
-    let cred = openai_chatgpt::login_browser(&client).await?;
+    let cred = openai_chatgpt::login_browser_with_notice(&client, |url, opened| {
+        if !opened {
+            println!("Open this URL to authorize Pyxis:\n{url}");
+        }
+    })
+    .await?;
     store::save(ACCOUNT, &Credential::Oauth(cred))?;
     println!("Connected. Credential stored in the keyring ({ACCOUNT}).");
     println!("Smoke test: cargo run -p agent-provider --example smoke -- \"say hello\"");

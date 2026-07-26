@@ -82,7 +82,7 @@ pub use state::{
 };
 #[cfg(feature = "codex_tui_parity")]
 pub use streaming::{StreamController, StreamView};
-pub use term::{Tui, clear, enter, leave, supports_truecolor};
+pub use term::{Tui, clear, enter, is_active, leave, restore, supports_truecolor};
 #[cfg(feature = "codex_tui_parity")]
 pub use term::{inline_viewport_stale, sync_inline_viewport};
 #[cfg(feature = "codex_tui_parity")]
