@@ -10,10 +10,11 @@ use tokio::io::AsyncReadExt;
 
 use crate::error::{ToolError, ValidationError};
 use crate::permission::{PermCtx, PermissionDecision};
-use crate::tool::{MAX_COMMAND_BYTES, Tool, ToolCtx, ToolOutput};
+use crate::tool::{MAX_COMMAND_BYTES, Tool, ToolCtx, ToolOutput, truncate_tail};
 
-/// Capture bound (avoids flooding the prompt with a giant output).
-const MAX_OUTPUT: usize = 30_000;
+/// Capture bound (avoids flooding the prompt with a giant output). Shared with
+/// the other tool outputs.
+const MAX_OUTPUT: usize = crate::tool::MAX_TOOL_OUTPUT_BYTES;
 /// Output streaming (US-015): size and coalescing delay of the fragments,
 /// and cap of a published fragment.
 const STREAM_FLUSH_BYTES: usize = 4_096;
@@ -419,24 +420,6 @@ async fn kill_process_tree(pid: u32) {
             .status()
             .await;
     }
-}
-
-/// Truncates `body` keeping the TAIL within `max` bytes (US-026): on a long
-/// output (compilation: warnings first, errors + exit code last),
-/// the tail preserves the critical information. The cut point is aligned on a
-/// UTF-8 character boundary (never an indexing panic).
-fn truncate_tail(body: &str, max: usize) -> String {
-    if body.len() <= max {
-        return body.to_string();
-    }
-    let mut cut = body.len() - max;
-    while cut < body.len() && !body.is_char_boundary(cut) {
-        cut += 1;
-    }
-    format!(
-        "[... output truncated, {cut} bytes, beginning omitted]\n{}",
-        &body[cut..]
-    )
 }
 
 #[cfg(test)]

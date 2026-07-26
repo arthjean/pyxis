@@ -20,6 +20,9 @@ use crate::permission::{ApprovalMemo, PermCtx, PermissionDecision};
 /// Global caps of the native tools. These limits bound allocations before
 /// a model payload can become a memory or disk problem.
 pub const MAX_TOOL_INPUT_BYTES: usize = 4_000_000;
+/// Cap of the text a tool returns to the model. Shared by `bash` and by the MCP
+/// tools so one truncation policy covers every tool output.
+pub const MAX_TOOL_OUTPUT_BYTES: usize = 30_000;
 pub const MAX_WRITE_BYTES: usize = 2_000_000;
 pub const MAX_EDIT_FILE_BYTES: u64 = 5_000_000;
 pub const MAX_EDIT_ANCHOR_BYTES: usize = 200_000;
@@ -311,7 +314,28 @@ pub fn into_dyn<T: Tool + 'static>(tool: T) -> Box<dyn DynTool> {
     Box::new(DynToolAdapter::new(tool))
 }
 
-fn estimate_json_bytes(value: &serde_json::Value) -> usize {
+/// Truncates `body` keeping the TAIL within `max` bytes (US-026): on a long
+/// output (compilation: warnings first, errors + exit code last), the tail
+/// preserves the critical information. The cut point is aligned on a UTF-8
+/// character boundary (never an indexing panic).
+pub fn truncate_tail(body: &str, max: usize) -> String {
+    if body.len() <= max {
+        return body.to_string();
+    }
+    let mut cut = body.len() - max;
+    while cut < body.len() && !body.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!(
+        "[... output truncated, {cut} bytes, beginning omitted]\n{}",
+        &body[cut..]
+    )
+}
+
+/// Cheap size estimate of a JSON payload, without serializing it. Public so a
+/// `DynTool` implemented outside this crate (MCP tools) can apply the same
+/// input bound as `DynToolAdapter`.
+pub fn estimate_json_bytes(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::Null => 4,
         serde_json::Value::Bool(_) => 5,
