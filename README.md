@@ -51,7 +51,7 @@ $ pyxis -p "summarize the changes in the last commit"
 
 **Early, single-provider, Linux-first. No packaged releases yet, you build from source.** This is an honest snapshot, not a roadmap fantasy:
 
-- **It runs today.** The agentic loop, the tool suite, the Linux filesystem sandbox, JSONL sessions with resume, MCP configuration/diagnostics, and the monochrome TUI all work.
+- **It runs today.** The agentic loop, the tool suite, the Linux filesystem sandbox, JSONL sessions with resume, MCP tools called by the model, and the monochrome TUI all work.
 - **One model channel ships so far: your ChatGPT subscription.** GPT / Codex models served through the Codex backend (Responses API, SSE, stateless). The provider layer is written multi-provider from day one, but this is the only adapter wired up. Anthropic, OpenAI BYOK, Gemini, and others are architecture-ready, not yet built. See [Roadmap](#roadmap).
 - **Linux is the supported platform.** The filesystem sandbox uses Landlock (Linux kernel) and credentials use the Secret Service keyring. macOS Seatbelt and broader support come later; off-Linux, FS confinement degrades explicitly.
 - **The subscription auth is unofficial and revocable.** It reuses the open-source Codex CLI OAuth client, which is ToS-grey and could be cut off at any time (it happened to Anthropic Pro/Max for third-party tools in 2026). Treat it as a convenience, not a foundation. See [Authentication](#authentication).
@@ -98,7 +98,10 @@ Shipped today:
 - **Execution sandbox**: Landlock confines writes to the workspace on Linux (the agent *and* its `bash` subprocesses); a local proxy gates cooperative outbound HTTP(S) subprocess traffic via `--allow <host>`.
 - **Persistent sessions**: one append-only JSONL file per conversation under `.pyxis/sessions/`, with `/resume` to reopen a past session and a workspace-wide prompt history.
 - **`/goal` completion loop**: set a session objective and Pyxis re-runs the agentic loop until it emits a done marker (capped at 25 iterations), persisted in a `.pyxis/goal` sidecar so it survives restarts.
-- **MCP config and diagnostics (stdio)**: load servers from `.mcp.json` or your existing `~/.claude.json`, inspect lifecycle state, and list exposed tools from the `/mcp` submenu. Exposing MCP tools to the model loop is still future work.
+- **MCP tools (stdio)**: load servers from `.mcp.json` or your existing `~/.claude.json`, connect them at startup, and let the model call their tools as `mcp__<server>__<tool>`. Every MCP result is untrusted content, every MCP call asks for confirmation by default, and a server declared by the workspace stays behind an explicit `/mcp <server> trust`. An unavailable server never blocks the session: its tools are simply absent. Lifecycle and config diagnostics live in the `/mcp` submenu.
+- **Agent Skills (open spec)**: a `~/.agents/skills/<name>/SKILL.md` installed for another agent works as is. Names and descriptions are exposed to the model; `/<name>` injects that skill's instructions for the turn, framed as user-level content. An invalid skill is dropped with a trace instead of failing the startup.
+- **Hooks with a veto**: declare `[[hooks]]` in `~/.pyxis/settings.toml` and your own command decides, on the Claude Code contract (JSON event on stdin, `hookSpecificOutput.permissionDecision` on stdout, exit code 2 blocks). A hook can only tighten: `deny` outranks even `--yes`, `ask` forces a confirmation in any mode, and any failure (missing binary, 5 s timeout, unreadable output) denies. A repository cannot declare one.
+- **Diagnosable crashes**: a panic restores the terminal *before* saying anything, appends a dated report to `~/.pyxis/logs/panic.log`, and tells you where to look. `PYXIS_LOG=debug` (or `trace`) writes a structured `tracing` log of the run next to it; unset, nothing is installed and nothing is emitted. Message and tool-input content only ever appears at `trace`.
 - **Markdown rendering**: assistant replies are rendered to styled spans (CommonMark + GFM).
 - **Monochrome Ratatui UI**: clean, modern, Rauch/Vercel-flavored, with a braille Dyson-sphere logo and a welcome screen, not a double-bordered retro TUI.
 - **Headless mode**: `pyxis -p "..."` runs without the TUI, so the core is scriptable and testable without a terminal or a live API.
@@ -138,7 +141,7 @@ The founding invariant: **`agent-core` depends on neither the TUI nor the provid
 | `agent-core` | Agent loop, transition state machine, canonical message/transcript types (headless) |
 | `agent-provider` | `Provider` trait + adapters (reqwest + SSE), canonical `StreamEvent`, error taxonomy |
 | `agent-tools` | Tool registry, fail-closed trait, concurrent/serial dispatch, permissions, taint |
-| `agent-mcp` | `rmcp`-based MCP client (stdio), config loading, server registry |
+| `agent-mcp` | `rmcp`-based MCP client (stdio), config loading, server registry, MCP tools as `DynTool` |
 | `agent-tui` | Ratatui + crossterm frontend, decoupled from the core via channels |
 | `agent-session` | Append-only JSONL persistence, resume, compaction boundaries |
 | `agent-sandbox` | Landlock FS confinement + local network allow-list proxy |
@@ -218,7 +221,7 @@ pyxis "<prompt>"               # bare prompt is treated as -p
 | `/help` | List available commands |
 | `/models` | Switch the active model for this session |
 | `/goal` | Set an objective and work until it is reached |
-| `/skills` | Insert a skill from `~/.agents/skills` into the message |
+| `/skills` | Invoke a skill from `~/.agents/skills` (injects its instructions) |
 | `/providers` | Inspect / configure the auth provider |
 | `/mcp` | Manage MCP server connections |
 | `/resume` | Reopen a past conversation |
@@ -239,9 +242,12 @@ Pyxis reads and writes a few well-known paths:
 |------|---------|
 | `<workspace>/.pyxis/sessions/*.jsonl` | One append-only transcript per conversation; backs `/resume` |
 | `<workspace>/.pyxis/goal` | Persistent `/goal` objective (survives restarts) |
+| `~/.pyxis/settings.toml` | Global settings: model, reasoning effort, permission mode, `writable_roots`, `[[hooks]]` |
+| `~/.pyxis/logs/panic.log` | Panic reports (version, location, message), appended across runs |
+| `~/.pyxis/logs/trace-*.log` | Structured trace of one run, written only when `PYXIS_LOG` is set |
 | `<workspace>/.mcp.json` | Workspace MCP servers (highest priority) |
 | `~/.claude.json` | Reused `mcpServers` from Claude Code, merged underneath |
-| `~/.agents/skills/<name>/` | Skills surfaced by `/skills` (one directory per skill) |
+| `~/.agents/skills/<name>/SKILL.md` | Agent Skills, open spec: YAML frontmatter with `name` and `description` |
 
 These paths outside the workspace (skills, MCP config, keyring) are read **before** the Landlock sandbox is applied, since they would be unreachable afterward.
 
@@ -251,14 +257,15 @@ These paths outside the workspace (skills, MCP config, keyring) are read **befor
 - **Network**: a local CONNECT proxy with an allow-list for cooperative HTTP(S) subprocesses. Tool subprocesses get `HTTP(S)_PROXY` pointing at it (`--allow` opens specific hosts), but raw sockets are not kernel-confined. The agent's own provider calls go direct.
 - **Prompt injection (OWASP LLM01)**: tool output is tainted as untrusted and the taint propagates; a destructive or network action following recent taint is forced to ask.
 - **Fail-closed tools**: a tool that declares nothing is treated as non-concurrent, mutating, and untrusted.
+- **Hooks**: only `~/.pyxis/settings.toml` may declare them, never a file the workspace controls. They run without a shell, inherit the Landlock confinement (so a hook cannot write outside the writable roots either), are bounded to 5 seconds and to a capped output, and every failure denies the tool call rather than letting it through.
 - **Credentials**: OAuth tokens live in the OS keyring, never in plaintext on disk.
 
 ## Roadmap
 
 The MVP target was deliberately narrow: **make Pyxis excellent with one model channel (the ChatGPT subscription) and dogfood it daily**, rather than ship six empty provider columns. The multi-provider architecture is the invariant; adapters land incrementally.
 
-- **Now (shipped)**: agentic loop, tool suite + Linux FS sandbox, sessions + resume, `/goal`, MCP config/diagnostics, monochrome TUI, ChatGPT subscription provider.
-- **Next**: more provider adapters behind the existing `Provider` trait, MCP tools wired into the model loop, stable MCP connect UX, richer TUI (plan trees, hunk review).
+- **Now (shipped)**: agentic loop, tool suite + Linux FS sandbox, sessions + resume, `/goal`, MCP tools in the model loop, monochrome TUI, ChatGPT subscription provider.
+- **Next**: more provider adapters behind the existing `Provider` trait, mid-session MCP tool registration, per-server MCP OAuth, richer TUI (plan trees, hunk review).
 - **Later**: vector memory (`sqlite-vec`), sub-agents, macOS Seatbelt hardening, VCR provider tests in CI.
 
 Phases and the de-risking spikes live in [`docs/ROADMAP.md`](docs/ROADMAP.md).

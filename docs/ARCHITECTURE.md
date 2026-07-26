@@ -64,13 +64,18 @@ Le projet est un workspace Cargo. Chaque crate a une responsabilité unique et u
 | `agent-core` | Boucle d'agent, state machine, types canoniques (messages, content blocks, transcript, budget). | Aucune dépendance TUI / HTTP. Ne connaît ni Ratatui ni reqwest. |
 | `agent-provider` | Trait `Provider` + adapters (reqwest + eventsource-stream). Normalisation vers le format canonique, émission de `StreamEvent`. | Ne dépend pas de `agent-tui`. |
 | `agent-tools` | `Registry`, trait `Tool`, dispatch concurrent/série, permissions, hooks, taint. | — |
-| `agent-mcp` | Wrapper autour de `rmcp` (SDK MCP Rust officiel). Charge la config, suit le lifecycle stdio et liste les outils. L'exposition des outils MCP comme `DynTool` est le contrat cible, pas encore l'état livré. | — |
+| `agent-mcp` | Wrapper autour de `rmcp` (SDK MCP Rust officiel). Charge la config, suit le lifecycle stdio, liste les outils et les expose au modèle comme `DynTool` (nommage sûr, schéma strict, taint intégral). | — |
 | `agent-tui` | Frontend Ratatui + crossterm. **Découplé du core via canaux.** | **Jamais importé par le core.** |
 | `agent-session` | Persistance JSONL append-only, compaction, resume. | — |
 | `agent-sandbox` | Landlock FS + proxy réseau local + `PolicyEngine`. | — |
 | `agent-auth` | Stockage de credentials (Secret Service / keyring), OAuth PKCE ChatGPT, refresh token. Les futurs flows BYOK/OAuth provider restent isolés ici. | — |
 | `agent-tokenizer` | Comptage de tokens local (tiktoken-rs / tokenizers). Indispensable pour la compaction sur les providers sans usage fiable en stream. Headless. | Aucune dépendance TUI / HTTP. |
 | `agent-cli` | Binaire `pyxis`, wiring. **Seul crate qui dépend de tout.** | — |
+
+Observabilité (US-020) : les crates **émettent** via la façade `tracing`, jamais sur
+une sortie de processus. Le binaire est le seul à installer un souscripteur
+(`PYXIS_LOG`) et le seul à écrire sur stdout/stderr. Émettre sans souscripteur
+n'est pas une I/O : l'invariant 1 (cœur headless) reste tenu.
 
 ### Graphe de dépendances (sens des flèches = « dépend de »)
 
@@ -402,7 +407,7 @@ Articulation withholding ↔ reactive (rappel explicite) : seules les erreurs **
 
 ## 6. MCP via `rmcp`
 
-Pyxis consomme MCP via le SDK Rust officiel `rmcp` (wrappé dans `agent-mcp`). État livré courant : config, lifecycle stdio et listing d'outils. Le modèle ci-dessous est le contrat cible pour l'intégration complète des outils MCP dans la boucle agent.
+Pyxis consomme MCP via le SDK Rust officiel `rmcp` (wrappé dans `agent-mcp`). État livré courant : config, lifecycle stdio, listing d'outils et **appel des outils par le modèle** (EP-003 de `tasks/prd-harness-capabilities.md`).
 
 L'état d'un serveur MCP est un **enum discriminé** : le `client` n'est **accessible que dans la variante `Connected`.** Impossible d'appeler un serveur non connecté — le compilateur l'interdit.
 
@@ -417,10 +422,13 @@ enum McpServer {
 
 Règles MCP :
 
-- **Description cappée à 2048 caractères** (un serveur ne peut pas polluer le prompt).
+- **Description cappée à 2048 caractères** et **schéma d'entrée plafonné** (un serveur ne peut polluer le prompt ni par sa description ni par son schéma).
 - **OAuth PKCE par serveur** (creds via `agent-auth`) : cible Phase 2, pas livré dans le MVP courant.
-- Outils MCP enregistrés comme `DynTool` (uniformité §4.1) : cible Phase 2, pas encore exposé au modèle.
-- **Tous** les outils MCP auront `returns_untrusted() == true` une fois câblés dans la boucle agent ; le taint (§4.6) devra s'appliquer intégralement à leurs sorties.
+- Outils MCP enregistrés comme `DynTool` (uniformité §4.1) : livré. Le nom exposé est `mcp__{serveur}__{outil}`, assaini sur `^[A-Za-z0-9_-]+$`, raccourci de façon déterministe (empreinte FNV-1a) sous les 64 octets de l'API modèle, et l'unicité est vérifiée à l'enregistrement sur l'ensemble des serveurs. Le nom d'origine reste porté par l'outil : un nom raccourci atteint le bon serveur.
+- Le schéma d'entrée servi par un serveur est **réécrit en mode strict** (`additionalProperties: false`, toute propriété dans `required`, propriété optionnelle rendue nullable puis null retiré avant l'appel) parce que le provider émet `strict: true` et qu'un `ToolSpec` invalide ferait échouer le tour entier. Un outil dont le schéma résiste est écarté avec un diagnostic, jamais laissé casser la session.
+- **Tous** les outils MCP ont `returns_untrusted() == true`, `is_sensitive() == true` et un baseline de permission `Ask` ; le taint (§4.6) s'applique intégralement à leurs sorties. Les `annotations` d'un serveur ne sont jamais lues comme une décision de sécurité.
+- Un serveur déclaré par l'espace de travail (ou masquant une entrée utilisateur, ou portant une variable d'environnement sensible) n'est **pas** connecté au démarrage : il reste derrière `/mcp <serveur> trust`. Ouvrir un dépôt ne suffit jamais à obtenir un spawn de processus.
+- Séparation d'échec imposée par le protocole : `Ok(CallToolResult { is_error: true })` devient un résultat d'outil en erreur destiné au modèle ; `Err(ServiceError)` devient une erreur de pipeline nommant le serveur.
 
 ---
 
