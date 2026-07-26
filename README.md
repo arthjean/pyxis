@@ -25,10 +25,10 @@ Pyxis is built around a **headless core** (`agent-core`) that emits only structu
 </p>
 
 <p align="center">
-  <img src="assets/images/welcome.png" alt="Pyxis's welcome screen: a monochrome terminal card with a braille Dyson-sphere logo, running on a ChatGPT subscription (codex, gpt-5.5)" width="100%" />
+  <img src="assets/images/session.png" alt="A Pyxis session in flight: streamed tool calls (read, grep, bash) with collapsed output, a working spinner, and the status line showing the model, the workspace, the permission mode, and the remaining context" width="100%" />
 </p>
 <p align="center">
-  <sub>The welcome screen: a native terminal agent on your ChatGPT subscription (gpt-5.5 via codex), monochrome, no window.</sub>
+  <sub>A session in flight: streamed tool calls with collapsed output, and a status line carrying the model, the workspace, the permission mode, and the remaining context.</sub>
 </p>
 
 ```console
