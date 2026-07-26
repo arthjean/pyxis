@@ -159,6 +159,10 @@ pub struct InteractiveConfig {
     pub goal: Option<String>,
     /// Hardening applied to the MCP subprocesses (env scrub + proxy).
     pub command_hardener: agent_tools::CommandHardener,
+    /// Diagnostics of the MCP startup connection (US-012): unavailable server,
+    /// server left behind the trust gate, tool not exposable. Successes are silent,
+    /// the `/mcp` submenu already shows them.
+    pub mcp_notices: Vec<String>,
     /// Mutable permission mode, shared with the tool registry.
     pub permission_mode: PermissionModeState,
     /// Answers remembered this session, shared with the tool registry
@@ -228,9 +232,6 @@ const GOAL_CONTINUE_PROMPT: &str = "Continue the session goal. If work remains, 
 /// typing, long enough not to monopolize the crossterm event queue
 /// while another call reads the terminal answer from it.
 const KEY_POLL_INTERVAL: Duration = Duration::from_millis(25);
-
-const MCP_DISABLED_NOTICE: &str =
-    "MCP: config diagnostics only. MCP tool execution is not exposed in this build.";
 
 fn persist_model(state: &mut AppState, settings_path: Option<&Path>, model: &str) {
     if let Some(path) = settings_path
@@ -570,6 +571,11 @@ async fn event_loop(
         .unwrap_or_default();
     state.sessions = load_sessions(&sessions_dir, &current_session);
     state.mcp_servers = mcp_metas(&mcp);
+    // US-012: only the problems are shown. A silent startup keeps the welcome
+    // screen; a server left out is worth losing it.
+    for notice in std::mem::take(&mut cfg.mcp_notices) {
+        state.blocks.push(Block::Notice(notice));
+    }
     let mut goal_path = goal_path_for_session(&current_session);
     let mut goal_iters_path = goal_iters_path_for_session(&current_session);
     // Prompt history of the WHOLE directory (every conversation).
@@ -1436,8 +1442,11 @@ async fn event_loop(
                                             "MCP \"{name}\": connection canceled."
                                         )));
                                     } else {
+                                        // The registry of exposed tools is composed at
+                                        // startup: a mid-session connection changes the
+                                        // lifecycle, not what the model can call.
                                         state.blocks.push(Block::Notice(format!(
-                                            "MCP \"{name}\" connected ({n} tools)."
+                                            "MCP \"{name}\" connected ({n} tools). Tools are exposed to the model at startup: relaunch Pyxis to use them."
                                         )));
                                     }
                                 }
@@ -1508,10 +1517,6 @@ fn handle_mcp(
     }
     match action {
         "connect" | "reconnect" => {
-            if !mcp_connect_enabled() {
-                state.blocks.push(Block::Notice(MCP_DISABLED_NOTICE.into()));
-                return;
-            }
             if let Some(cfg) = mcp_config_for(mcp, server)
                 && mcp_requires_trust(&cfg)
             {
@@ -1525,10 +1530,6 @@ fn handle_mcp(
             start_mcp_connect(server, mcp, mcp_tx, command_hardener, state, None);
         }
         "trust" => {
-            if !mcp_connect_enabled() {
-                state.blocks.push(Block::Notice(MCP_DISABLED_NOTICE.into()));
-                return;
-            }
             let cfg = match mcp_config_for(mcp, server) {
                 Some(cfg) => cfg,
                 None => {
@@ -1588,10 +1589,6 @@ fn handle_mcp(
             .blocks
             .push(Block::Notice(format!("Unknown MCP action: {other}"))),
     }
-}
-
-fn mcp_connect_enabled() -> bool {
-    std::env::var_os("PYXIS_EXPERIMENTAL_MCP_CONNECT").is_some()
 }
 
 fn start_mcp_connect(
@@ -1710,7 +1707,11 @@ fn show_mcp_issues(mcp: &Arc<Mutex<agent_mcp::McpRegistry>>, state: &mut AppStat
     )));
 }
 
-fn mcp_requires_trust(cfg: &agent_mcp::McpServerConfig) -> bool {
+/// Does this server need an explicit `/mcp <server> trust` before being spawned?
+/// A workspace-controlled declaration, a config shadowing a user entry, and a
+/// sensitive env key are the three cases where a repository could otherwise obtain
+/// an execution. The startup connection (`main`) honors the same gate.
+pub(crate) fn mcp_requires_trust(cfg: &agent_mcp::McpServerConfig) -> bool {
     matches!(cfg.source.origin, agent_mcp::McpConfigOrigin::Workspace)
         || cfg.shadows_lower_priority
         || !mcp_sensitive_env_keys(cfg).is_empty()
@@ -1900,12 +1901,58 @@ pub(crate) fn new_session_path(dir: &Path) -> PathBuf {
 mod tests {
     use super::{
         GOAL_DONE_MARKER, approvals_report, compose_system, count_encrypted_reasoning,
-        scrub_encrypted_reasoning, session_path_from_arg, take_goal_done, workspace_file_mentions,
+        mcp_requires_trust, scrub_encrypted_reasoning, session_path_from_arg, take_goal_done,
+        workspace_file_mentions,
     };
     use agent_core::message::{ContentBlock, Message};
     use agent_tui::{AppState, Block};
     use std::path::Path;
     use std::time::SystemTime;
+
+    /// US-013 AC5: the startup connection (US-012) and `/mcp connect` share this
+    /// gate, so a repository-controlled declaration never earns a spawn on its own.
+    #[test]
+    fn a_workspace_controlled_server_stays_behind_the_trust_gate() {
+        use agent_mcp::{McpConfigOrigin, McpConfigSource, McpServerConfig};
+        use std::collections::BTreeMap;
+
+        let server = |origin: McpConfigOrigin, shadows: bool, env: BTreeMap<String, String>| {
+            McpServerConfig {
+                command: "srv".into(),
+                args: Vec::new(),
+                env,
+                source: McpConfigSource::new(origin, ""),
+                shadows_lower_priority: shadows,
+            }
+        };
+
+        // User-scope, no shadowing, no sensitive env: connected at startup.
+        assert!(!mcp_requires_trust(&server(
+            McpConfigOrigin::ClaudeUser,
+            false,
+            BTreeMap::new()
+        )));
+        // Declared by the workspace: never auto-connected.
+        assert!(mcp_requires_trust(&server(
+            McpConfigOrigin::Workspace,
+            false,
+            BTreeMap::new()
+        )));
+        // Hides a user entry: same treatment.
+        assert!(mcp_requires_trust(&server(
+            McpConfigOrigin::ClaudeUser,
+            true,
+            BTreeMap::new()
+        )));
+        // Carries an env key that changes what gets executed.
+        let mut env = BTreeMap::new();
+        env.insert("LD_PRELOAD".to_string(), "/tmp/evil.so".to_string());
+        assert!(mcp_requires_trust(&server(
+            McpConfigOrigin::ClaudeUser,
+            false,
+            env
+        )));
+    }
 
     #[test]
     fn approvals_report_lists_sequences_and_says_they_are_not_persisted() {

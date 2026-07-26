@@ -600,6 +600,142 @@ fn save_chatgpt_credential(cred: OAuthCredential) -> anyhow::Result<()> {
     }
 }
 
+/// Per-server bound of the startup connection (spawn + handshake + `tools/list`).
+/// Every server is dialed concurrently, so this is also the ceiling this step adds
+/// to the total launch time (US-012 AC3).
+const MCP_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Connects the configured MCP servers and wraps their tools as `DynTool`
+/// (US-012). Returns the tools to register and the notices the session must show.
+///
+/// A server declared by the workspace, shadowing a user entry, or carrying a
+/// sensitive env key is deliberately NOT connected here: it stays behind the
+/// explicit `/mcp <server> trust` gate (US-013 AC5). Opening a repository must
+/// never be enough to obtain a process spawn.
+///
+/// A server that fails or exceeds its bound is left out: the healthy servers keep
+/// their tools and the session starts (US-012 AC2).
+async fn connect_mcp_at_startup(
+    mcp: &Arc<std::sync::Mutex<agent_mcp::McpRegistry>>,
+    harden: &agent_tools::CommandHardener,
+) -> (Vec<Box<dyn agent_tools::DynTool>>, Vec<String>) {
+    let mut notices: Vec<String> = Vec::new();
+    let mut candidates: Vec<String> = Vec::new();
+    match mcp.lock() {
+        Ok(reg) => {
+            for (name, server) in reg.iter() {
+                if interactive::mcp_requires_trust(server.config()) {
+                    notices.push(format!(
+                        "MCP \"{name}\" not connected: explicit trust required (/mcp {name} trust)."
+                    ));
+                } else {
+                    candidates.push(name.clone());
+                }
+            }
+        }
+        Err(_) => {
+            return (
+                Vec::new(),
+                vec!["MCP: registry unavailable at startup.".to_string()],
+            );
+        }
+    }
+    if candidates.is_empty() {
+        return (Vec::new(), notices);
+    }
+
+    let mut pending = tokio::task::JoinSet::new();
+    for name in candidates {
+        let begin = match mcp.lock() {
+            Ok(mut reg) => reg.begin_connect(&name),
+            Err(_) => continue,
+        };
+        let (cfg, old) = match begin {
+            Ok(pair) => pair,
+            Err(err) => {
+                notices.push(format!("MCP: {err}"));
+                continue;
+            }
+        };
+        if let Some(old) = old {
+            tokio::spawn(async move { old.cancel().await });
+        }
+        let harden = Arc::clone(harden);
+        pending.spawn(async move {
+            let attempt = async {
+                let conn =
+                    agent_mcp::McpConnection::connect_hardened(&name, &cfg, Some(&harden)).await?;
+                match conn.list_tools(&name).await {
+                    Ok(tools) => Ok((conn, tools)),
+                    Err(err) => {
+                        conn.cancel().await;
+                        Err(err)
+                    }
+                }
+            };
+            // On expiry the future is dropped: the transport `Drop` kills the
+            // subprocess, so a slow server leaves nothing behind.
+            match tokio::time::timeout(MCP_STARTUP_TIMEOUT, attempt).await {
+                Ok(Ok(connected)) => (name, Ok(connected)),
+                Ok(Err(err)) => (name, Err(err.to_string())),
+                Err(_) => (
+                    name,
+                    Err(format!(
+                        "connection timeout after {}s",
+                        MCP_STARTUP_TIMEOUT.as_secs()
+                    )),
+                ),
+            }
+        });
+    }
+
+    let mut tools: Vec<Box<dyn agent_tools::DynTool>> = Vec::new();
+    // Shared across every server: uniqueness of the exposed names is a property of
+    // the whole set (US-011 AC1).
+    let mut taken = std::collections::BTreeSet::new();
+    while let Some(joined) = pending.join_next().await {
+        let (name, outcome) = match joined {
+            Ok(pair) => pair,
+            Err(err) => {
+                notices.push(format!("MCP: connection task failed: {err}"));
+                continue;
+            }
+        };
+        let (conn, listed) = match outcome {
+            Ok(connected) => connected,
+            Err(err) => {
+                if let Ok(mut reg) = mcp.lock() {
+                    reg.fail(&name, err.clone());
+                }
+                notices.push(format!(
+                    "MCP \"{name}\" unavailable: {err} (its tools are absent)."
+                ));
+                continue;
+            }
+        };
+        let client = conn.client(&name);
+        let (mut exposed, skipped) = agent_mcp::dyn_tools(&name, &listed, &client, &mut taken);
+        for skip in skipped {
+            notices.push(skip.summary());
+        }
+        tools.append(&mut exposed);
+        match mcp.lock() {
+            Ok(mut reg) => {
+                if let Some(orphan) = reg.finish_connect(&name, conn, listed) {
+                    tokio::spawn(async move { orphan.cancel().await });
+                }
+            }
+            Err(_) => {
+                tokio::spawn(async move { conn.cancel().await });
+                notices.push(format!(
+                    "MCP \"{name}\": registry unavailable, connection closed."
+                ));
+            }
+        }
+    }
+    (tools, notices)
+}
+
 fn run_auth_onboarding() -> anyhow::Result<OAuthCredential> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -802,7 +938,21 @@ async fn run(
     // US-008: session approval memory, shared with the frontend like the
     // permission mode. In memory only: nothing is written to disk.
     let approvals = agent_tools::permission::ApprovalMemory::new();
-    let registry = Registry::builder(&workspace)
+
+    // US-012: MCP servers connected BEFORE the tool registry is built, because the
+    // tools they expose enter it as `DynTool` and the specs are composed from it.
+    // Headless mode reads no MCP config (see `main`), hence connects nothing and
+    // keeps its output byte-for-byte identical.
+    let mcp = Arc::new(std::sync::Mutex::new(agent_mcp::McpRegistry::from_config(
+        mcp_config,
+    )));
+    let (mcp_tools, mcp_notices) = if headless {
+        (Vec::new(), Vec::new())
+    } else {
+        connect_mcp_at_startup(&mcp, &mcp_harden).await
+    };
+
+    let mut builder = Registry::builder(&workspace)
         .mode_state(permission_mode.clone())
         .approver(approver)
         .approvals(approvals.clone())
@@ -813,8 +963,11 @@ async fn run(
         .register(Grep)
         .register(Write)
         .register(Edit)
-        .register(Bash)
-        .build();
+        .register(Bash);
+    for tool in mcp_tools {
+        builder = builder.register_dyn(tool);
+    }
+    let registry = builder.build();
     let tool_specs = registry.tool_specs();
     // US-026/US-027: behavioral guidelines of the tools, collected BEFORE
     // `registry` is moved into `Deps`. The base system prompt is now
@@ -903,13 +1056,6 @@ async fn run(
             }
         }
     } else {
-        // MCP registry built from the config discovered before the sandbox
-        // (workspace + ~/.claude.json). Every server starts disconnected;
-        // the connection happens on demand through `/mcp`.
-        let mcp = Arc::new(std::sync::Mutex::new(agent_mcp::McpRegistry::from_config(
-            mcp_config,
-        )));
-
         let cfg = InteractiveConfig {
             model: args.model,
             reasoning_effort: initial_reasoning_effort,
@@ -925,7 +1071,8 @@ async fn run(
             connected: true,
             skills,
             goal,
-            command_hardener: mcp_harden,
+            command_hardener: Arc::clone(&mcp_harden),
+            mcp_notices,
             permission_mode,
             approvals,
             settings_path,
