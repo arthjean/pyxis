@@ -69,6 +69,9 @@ pub struct ToolCtx {
     /// capabilities. Fail-closed default: `false`, so a caller that does not
     /// declare vision never gets an image sent on its behalf.
     pub vision: bool,
+    /// Persistent shell sessions of the run (US-012). Shared by `exec_command`
+    /// and `write_stdin`; empty and inert as long as neither is called.
+    pub sessions: crate::exec_session::ExecSessions,
     /// Command hardening (Bash network sandbox), injected by agent-cli.
     pub harden: Option<CommandHardener>,
     /// Progressive output of the current call (US-015). `None` = no
@@ -107,6 +110,7 @@ impl ToolCtx {
             timeout: Duration::from_secs(120),
             cleanup_grace: Duration::from_secs(2),
             vision: false,
+            sessions: crate::exec_session::ExecSessions::new(),
             harden: None,
             output: None,
         }

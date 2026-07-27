@@ -14,6 +14,7 @@ pub mod bash;
 pub mod command;
 pub mod edit;
 pub mod error;
+pub mod exec_session;
 pub mod glob;
 pub mod grep;
 pub mod hooks;
@@ -24,6 +25,7 @@ pub mod permission;
 pub mod plan;
 pub mod read;
 pub mod registry;
+pub mod sandbox;
 pub mod shell;
 pub mod taint;
 pub mod tool;
@@ -37,9 +39,12 @@ pub use bash::Bash;
 pub use command::{CommandClass, classify};
 pub use edit::Edit;
 pub use error::{ToolError, ValidationError};
+pub use exec_session::{ExecCommand, ExecSessions, WriteStdin};
 pub use glob::Glob;
 pub use grep::Grep;
-pub use hooks::{CommandHooks, HookDecision, HookEvent, HookSpec, Hooks, NoHooks};
+pub use hooks::{
+    CommandHooks, HOOK_EVENT_NAMES, HookDecision, HookEvent, HookSpec, Hooks, Lifecycle, NoHooks,
+};
 pub use image::ViewImage;
 pub use patch::ApplyPatch;
 pub use permission::{
@@ -50,14 +55,20 @@ pub use permission::{
 pub use plan::UpdatePlan;
 pub use read::Read;
 pub use registry::{Registry, RegistryBuilder};
+pub use sandbox::{
+    EscalationGuard, SandboxDenial, SandboxEscalator, SandboxObserver, classify_failure,
+};
 pub use shell::ShellChoice;
 pub use tool::{CommandHardener, DynTool, DynToolAdapter, Tool, ToolCtx, ToolOutput, into_dyn};
 pub use write::Write;
 
 use std::sync::Arc;
 
-/// Builds a `Registry` wired with the 6 base tools (Read, Glob, Grep,
-/// Write, Edit, Bash): what agent-cli will inject as `Arc<dyn ToolDispatch>`.
+/// Builds a `Registry` wired with the native tools: what agent-cli injects as
+/// `Arc<dyn ToolDispatch>`. Six of them predate EP-003 (Read, Glob, Grep,
+/// Write, Edit, Bash); the four families ported by that epic bring the count to
+/// eleven, `exec_command` and `write_stdin` being one family split in two tools
+/// like Codex does.
 pub fn default_registry(
     workspace: impl Into<std::path::PathBuf>,
     mode: PermissionMode,
@@ -75,5 +86,7 @@ pub fn default_registry(
         .register(UpdatePlan)
         .register(ApplyPatch)
         .register(ViewImage)
+        .register(ExecCommand)
+        .register(WriteStdin)
         .build()
 }
