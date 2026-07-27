@@ -11,11 +11,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent_core::sandbox::SandboxPolicy;
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 
 use crate::error::{ToolError, ValidationError};
 use crate::permission::{ApprovalMemo, PermCtx, PermissionDecision};
+use crate::sandbox::{SandboxDenial, SandboxObserver};
 
 /// Global caps of the native tools. These limits bound allocations before
 /// a model payload can become a memory or disk problem.
@@ -47,6 +49,16 @@ pub struct ToolCtx {
     /// Workspace root: anchor of relative paths and confinement boundary
     /// (enforced at kernel level by process-wide Landlock, US-020).
     pub workspace: PathBuf,
+    /// Confinement perimeter in force (US-001). Evaluated BEFORE execution,
+    /// which is the only level able to subtract a subpath from a root the
+    /// kernel has already opened (US-002).
+    pub sandbox: SandboxPolicy,
+    /// Is the kernel confinement really applied? Distinguishes a refusal caused
+    /// by the sandbox from an ordinary permission problem (US-004).
+    pub sandbox_enforced: bool,
+    /// What the confinement blocked during a call (US-004). Injected by
+    /// agent-cli over the network proxy; `None` outside the binary.
+    pub sandbox_observer: Option<Arc<dyn SandboxObserver>>,
     /// Timeout applied by the Registry around `call()`.
     pub timeout: Duration,
     /// Grace given to tools that must clean up after their internal timeout.
@@ -62,6 +74,8 @@ impl std::fmt::Debug for ToolCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolCtx")
             .field("workspace", &self.workspace)
+            .field("sandbox", &self.sandbox.id())
+            .field("sandbox_enforced", &self.sandbox_enforced)
             .field("timeout", &self.timeout)
             .field("cleanup_grace", &self.cleanup_grace)
             .field("harden", &self.harden.as_ref().map(|_| "<fn>"))
@@ -72,8 +86,18 @@ impl std::fmt::Debug for ToolCtx {
 
 impl ToolCtx {
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        let workspace = workspace.into();
         Self {
-            workspace: workspace.into(),
+            // Default policy = what Pyxis did before US-001: writes confined to
+            // the workspace, with the deferred-execution subpaths subtracted.
+            sandbox: SandboxPolicy::workspace_write(
+                workspace.clone(),
+                Vec::new(),
+                crate::path::PROTECTED_SUBPATHS.iter().map(PathBuf::from),
+            ),
+            sandbox_enforced: false,
+            sandbox_observer: None,
+            workspace,
             timeout: Duration::from_secs(120),
             cleanup_grace: Duration::from_secs(2),
             harden: None,
@@ -86,6 +110,16 @@ impl ToolCtx {
     }
     pub fn with_hardener(mut self, harden: CommandHardener) -> Self {
         self.harden = Some(harden);
+        self
+    }
+    /// Confinement perimeter in force for the session (US-001).
+    pub fn with_sandbox(mut self, policy: SandboxPolicy, enforced: bool) -> Self {
+        self.sandbox = policy;
+        self.sandbox_enforced = enforced;
+        self
+    }
+    pub fn with_sandbox_observer(mut self, observer: Arc<dyn SandboxObserver>) -> Self {
+        self.sandbox_observer = Some(observer);
         self
     }
     /// Context derived for ONE call, equipped with its output emitter (US-015).
@@ -110,6 +144,10 @@ impl ToolCtx {
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+    /// Set when the tool attributes its failure to the confinement (US-004).
+    /// The Registry, which owns the approver, is what turns it into an
+    /// escalation offer; the tool only states the cause.
+    pub denial: Option<SandboxDenial>,
 }
 
 impl ToolOutput {
@@ -118,6 +156,7 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: false,
+            denial: None,
         }
     }
     /// Output marked as a semantic error (the content is kept for the model).
@@ -125,7 +164,13 @@ impl ToolOutput {
         Self {
             content: content.into(),
             is_error: true,
+            denial: None,
         }
+    }
+    /// Attributes the failure to the confinement (US-004 AC1).
+    pub fn with_denial(mut self, denial: SandboxDenial) -> Self {
+        self.denial = Some(denial);
+        self
     }
 }
 

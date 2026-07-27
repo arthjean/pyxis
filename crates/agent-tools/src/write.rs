@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::error::{ToolError, ValidationError};
-use crate::path::{confine, ensure_not_protected, guard_protected_path, replace_file_confined};
+use crate::path::{confine, ensure_policy_allows_write, guard_write_target, replace_file_confined};
 use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{MAX_WRITE_BYTES, Tool, ToolCtx, ToolOutput};
 
@@ -62,8 +62,9 @@ impl Tool for Write {
                 "content too large: {bytes} bytes > {MAX_WRITE_BYTES}"
             )));
         }
-        // US-013: refusal of deferred-execution zones, before the permission.
-        guard_protected_path(&ctx.workspace, &input.path)
+        // US-013/US-001: read-only policy and deferred-execution zones refused
+        // before the permission decision, hence liftable by no mode.
+        guard_write_target(&ctx.sandbox, &ctx.workspace, &input.path)
     }
     fn permission(&self, _input: &Self::Input, _ctx: &PermCtx) -> PermissionDecision {
         PermissionDecision::Ask
@@ -73,7 +74,7 @@ impl Tool for Write {
         let path = confine(&ctx.workspace, &input.path)?;
         // Re-checked right before the write: between validation and here, a link
         // may have appeared in the workspace (US-013).
-        ensure_not_protected(&ctx.workspace, &path, &input.path)?;
+        ensure_policy_allows_write(&ctx.sandbox, &ctx.workspace, &path, &input.path)?;
         let bytes = input.content.len();
         replace_file_confined(&ctx.workspace, &path, &input.path, input.content.as_bytes()).await?;
         Ok(ToolOutput::text(format!(

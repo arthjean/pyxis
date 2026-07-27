@@ -80,7 +80,7 @@ impl Tool for Bash {
     fn returns_untrusted(&self) -> bool {
         true
     }
-    fn validate_input(&self, input: &Self::Input, _ctx: &ToolCtx) -> Result<(), ValidationError> {
+    fn validate_input(&self, input: &Self::Input, ctx: &ToolCtx) -> Result<(), ValidationError> {
         if input.command.trim().is_empty() {
             return Err(ValidationError::new("empty command"));
         }
@@ -90,7 +90,10 @@ impl Tool for Bash {
                 "command too large: {bytes} bytes > {MAX_COMMAND_BYTES}"
             )));
         }
-        Ok(())
+        // US-002: the read-only subpaths of a writable root are subtracted HERE,
+        // before execution, because the kernel cannot subtract what it granted.
+        // Pre-permission, so no mode lifts it.
+        crate::path::guard_command_paths(&ctx.sandbox, &ctx.workspace, &input.command)
     }
     /// US-007: the decision follows the command. A program of the
     /// side-effect-free set invoked with harmless arguments runs without a
@@ -122,6 +125,9 @@ impl Tool for Bash {
 
     async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let shell = crate::shell::resolve();
+        // US-004: position in the confinement's block log, taken BEFORE the
+        // command runs. What appears after it is this call's doing.
+        let sandbox_mark = ctx.sandbox_observer.as_ref().map(|o| o.mark());
         let mut child = match build_command(&shell, &input.command, ctx).spawn() {
             Ok(child) => child,
             // AC4: a login shell that cannot be found or refuses to start does not
@@ -247,14 +253,38 @@ impl Tool for Bash {
             }
             Some(n) => {
                 body.push_str(&format!("\n[exit code {n}]"));
-                Ok(ToolOutput::error(body))
+                Ok(finish_failure(body, ctx, sandbox_mark))
             }
             None => {
                 body.push_str("\n[terminated by signal]");
-                Ok(ToolOutput::error(body))
+                Ok(finish_failure(body, ctx, sandbox_mark))
             }
         }
     }
+}
+
+/// Attributes a failed command to the confinement when the sandbox actually
+/// refused something (US-004 AC1). The cause is named IN the result the model
+/// reads, which is what stops it from retrying variants of the same command,
+/// and is carried structurally so the Registry can offer an escalation.
+fn finish_failure(mut body: String, ctx: &ToolCtx, mark: Option<usize>) -> ToolOutput {
+    let blocked = match (ctx.sandbox_observer.as_ref(), mark) {
+        (Some(observer), Some(mark)) => observer.blocked_since(mark),
+        _ => Vec::new(),
+    };
+    let allowed = ctx
+        .sandbox_observer
+        .as_ref()
+        .map(|o| o.allowed())
+        .unwrap_or_else(|| "none".to_string());
+    let Some(denial) =
+        crate::sandbox::classify_failure(ctx.sandbox_enforced, &blocked, &allowed, &body)
+    else {
+        return ToolOutput::error(body);
+    };
+    body.push('\n');
+    body.push_str(&denial.explain());
+    ToolOutput::error(body).with_denial(denial)
 }
 
 /// Builds the shell command (same options as before US-014, only the executed

@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::error::{ToolError, ValidationError};
 use crate::path::{
-    confine, ensure_existing_path_no_links, ensure_not_protected, guard_protected_path,
+    confine, ensure_existing_path_no_links, ensure_policy_allows_write, guard_write_target,
     replace_file_confined,
 };
 use crate::permission::{PermCtx, PermissionDecision};
@@ -90,8 +90,9 @@ impl Tool for Edit {
                 input.new_string.len()
             )));
         }
-        // US-013: refusal of deferred-execution zones, before the permission.
-        guard_protected_path(&ctx.workspace, &input.path)
+        // US-013/US-001: read-only policy and deferred-execution zones refused
+        // before the permission decision, hence liftable by no mode.
+        guard_write_target(&ctx.sandbox, &ctx.workspace, &input.path)
     }
     fn permission(&self, _input: &Self::Input, _ctx: &PermCtx) -> PermissionDecision {
         PermissionDecision::Ask
@@ -99,7 +100,7 @@ impl Tool for Edit {
 
     async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let path = confine(&ctx.workspace, &input.path)?;
-        ensure_not_protected(&ctx.workspace, &path, &input.path)?;
+        ensure_policy_allows_write(&ctx.sandbox, &ctx.workspace, &path, &input.path)?;
         ensure_existing_path_no_links(&ctx.workspace, &path, &input.path)?;
         let meta = tokio::fs::metadata(&path)
             .await
