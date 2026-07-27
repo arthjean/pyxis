@@ -24,6 +24,12 @@ unwrap_in_result = "warn"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+# Thread runtime (EP-001): `CancellationToken` gives the PARENT->CHILD cancellation
+# tree the in-house `CancelToken` cannot express, and `TaskTracker` (feature `rt`)
+# accounts for dynamically spawned tasks so a shutdown can wait for them before
+# aborting the stragglers. Already in the graph transitively (rmcp); promoted to a
+# direct dependency instead of maintaining a second supervision mechanism.
+tokio-util = { version = "0.7", features = ["rt"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -100,6 +106,7 @@ sse-stream = "0.2"
 agent-tokenizer = { path = "crates/agent-tokenizer" }
 agent-mcp = { path = "crates/agent-mcp" }
 agent-core = { path = "crates/agent-core" }
+agent-runtime = { path = "crates/agent-runtime" }
 agent-session = { path = "crates/agent-session" }
 agent-tools = { path = "crates/agent-tools" }
 agent-auth = { path = "crates/agent-auth" }
