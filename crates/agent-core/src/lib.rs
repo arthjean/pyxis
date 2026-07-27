@@ -47,7 +47,9 @@ pub use provider::{
 pub use quota::{QuotaSnapshot, QuotaWindow, format_unix_utc};
 pub use sandbox::{SandboxPolicy, WritableRoot, WriteRefusal};
 pub use session::{Session, SessionEntry, SessionError};
-pub use tools::{ToolDispatch, ToolDispatchEvent, ToolEventSink, ToolInvocation, ToolOutcome};
+pub use tools::{
+    ToolDispatch, ToolDispatchEvent, ToolEventSink, ToolImage, ToolInvocation, ToolOutcome,
+};
 
 #[cfg(test)]
 mod loop_tests {
@@ -265,6 +267,7 @@ mod loop_tests {
                     is_error: false,
                     untrusted: true,
                     error_kind: None,
+                    images: Vec::new(),
                 })
                 .collect()
         }
@@ -292,6 +295,7 @@ mod loop_tests {
                         is_error: false,
                         untrusted: true,
                         error_kind: None,
+                        images: Vec::new(),
                     }
                 })
                 .collect()
@@ -344,6 +348,7 @@ mod loop_tests {
                     is_error: false,
                     untrusted: true,
                     error_kind: None,
+                    images: Vec::new(),
                 })
                 .collect()
         }
@@ -379,6 +384,7 @@ mod loop_tests {
                     is_error: false,
                     untrusted: true,
                     error_kind: None,
+                    images: Vec::new(),
                 })
                 .collect()
         }
@@ -1746,6 +1752,75 @@ mod loop_tests {
         assert!(
             !events.iter().any(|e| matches!(e, AgentEvent::Interrupted)),
             "{events:?}"
+        );
+    }
+
+    // ───────── EP-003: what a tool sends back besides its text ─────────
+
+    /// Dispatcher that produces the two structured side channels EP-003 adds:
+    /// an image in the outcome (US-011) and a plan as an event (US-009).
+    struct RichTools;
+    #[async_trait::async_trait]
+    impl ToolDispatch for RichTools {
+        async fn dispatch(
+            &self,
+            calls: Vec<ToolInvocation>,
+            events: ToolEventSink,
+        ) -> Vec<ToolOutcome> {
+            events.emit(crate::tools::ToolDispatchEvent::Plan(crate::PlanView {
+                explanation: None,
+                steps: vec![crate::PlanStep {
+                    step: "étape".into(),
+                    status: crate::PlanStatus::InProgress,
+                }],
+            }));
+            calls
+                .into_iter()
+                .map(|c| ToolOutcome {
+                    images: vec![crate::tools::ToolImage {
+                        media_type: "image/png".into(),
+                        data: "QUJD".into(),
+                    }],
+                    ..ToolOutcome::new(c.id, "read".into(), false, true, None)
+                })
+                .collect()
+        }
+    }
+
+    /// US-011 AC1: an image read by a tool enters the transcript as an image
+    /// block and is therefore sent to the provider on the next round-trip.
+    /// US-009 AC3: the plan reaches the client as an `AgentEvent`.
+    #[tokio::test]
+    async fn tool_images_reach_the_provider_and_the_plan_reaches_the_client() {
+        let h = harness(vec![tool_turn("call-1"), text_turn("done")], false, 100_000);
+        let mut deps = h.deps.clone();
+        deps.tools = Arc::new(RichTools);
+        let events = drive(AgentContext::new("mock").push(Message::user("look")), deps).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Plan(view) if view.steps.len() == 1)),
+            "the plan must be surfaced to the client: {events:?}"
+        );
+
+        let reqs = h.requests.lock().unwrap();
+        let second = reqs.get(1).expect("a second round-trip is expected");
+        let image = second
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .find_map(|b| match b {
+                ContentBlock::Image { media_type, data } => Some((media_type, data)),
+                _ => None,
+            })
+            .expect("the image must have entered the transcript");
+        assert_eq!(image.0, "image/png");
+        assert_eq!(image.1, "QUJD");
+        assert!(
+            second
+                .iter()
+                .any(|m| matches!(m.role, crate::Role::User) && m.has_images()),
+            "the image travels as a user message, next to the textual result"
         );
     }
 }

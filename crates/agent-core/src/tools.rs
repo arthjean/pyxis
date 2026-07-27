@@ -25,6 +25,38 @@ pub struct ToolOutcome {
     pub is_error: bool,
     pub untrusted: bool,
     pub error_kind: Option<ToolErrorKind>,
+    /// Images the tool brought into the turn (US-011). A `tool_result` block
+    /// carries text only, so the loop turns these into a user message right
+    /// after the result. Empty for every other tool.
+    pub images: Vec<ToolImage>,
+}
+
+impl ToolOutcome {
+    /// Text outcome, the shape every tool but `view_image` produces.
+    pub fn new(
+        id: ToolCallId,
+        content: String,
+        is_error: bool,
+        untrusted: bool,
+        error_kind: Option<ToolErrorKind>,
+    ) -> Self {
+        Self {
+            id,
+            content,
+            is_error,
+            untrusted,
+            error_kind,
+            images: Vec::new(),
+        }
+    }
+}
+
+/// Image a tool read for the model (US-011). Base64 payload plus its media
+/// type: the exact pair `ContentBlock::Image` carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolImage {
+    pub media_type: String,
+    pub data: String,
 }
 
 #[derive(Debug, Clone)]

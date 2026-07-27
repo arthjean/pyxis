@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use agent_core::event::PlanView;
 use agent_core::sandbox::SandboxPolicy;
+use agent_core::tools::ToolImage;
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 
@@ -64,6 +65,10 @@ pub struct ToolCtx {
     pub timeout: Duration,
     /// Grace given to tools that must clean up after their internal timeout.
     pub cleanup_grace: Duration,
+    /// Does the active model read images (US-011)? Comes from the provider
+    /// capabilities. Fail-closed default: `false`, so a caller that does not
+    /// declare vision never gets an image sent on its behalf.
+    pub vision: bool,
     /// Command hardening (Bash network sandbox), injected by agent-cli.
     pub harden: Option<CommandHardener>,
     /// Progressive output of the current call (US-015). `None` = no
@@ -101,6 +106,7 @@ impl ToolCtx {
             workspace,
             timeout: Duration::from_secs(120),
             cleanup_grace: Duration::from_secs(2),
+            vision: false,
             harden: None,
             output: None,
         }
@@ -111,6 +117,11 @@ impl ToolCtx {
     }
     pub fn with_hardener(mut self, harden: CommandHardener) -> Self {
         self.harden = Some(harden);
+        self
+    }
+    /// Declares that the active model reads images (US-011).
+    pub fn with_vision(mut self, vision: bool) -> Self {
+        self.vision = vision;
         self
     }
     /// Confinement perimeter in force for the session (US-001).
@@ -153,6 +164,9 @@ pub struct ToolOutput {
     /// not to the model: the Registry forwards it as a dispatch event, next to
     /// the textual result the model reads.
     pub plan: Option<PlanView>,
+    /// Images the call brought into the turn (US-011), forwarded by the
+    /// Registry into the outcome so the loop can turn them into content blocks.
+    pub images: Vec<ToolImage>,
 }
 
 impl ToolOutput {
@@ -163,6 +177,7 @@ impl ToolOutput {
             is_error: false,
             denial: None,
             plan: None,
+            images: Vec::new(),
         }
     }
     /// Output marked as a semantic error (the content is kept for the model).
@@ -172,6 +187,7 @@ impl ToolOutput {
             is_error: true,
             denial: None,
             plan: None,
+            images: Vec::new(),
         }
     }
     /// Attributes the failure to the confinement (US-004 AC1).
@@ -182,6 +198,11 @@ impl ToolOutput {
     /// Publishes a plan alongside the textual result (US-009).
     pub fn with_plan(mut self, plan: PlanView) -> Self {
         self.plan = Some(plan);
+        self
+    }
+    /// Brings images into the turn (US-011).
+    pub fn with_images(mut self, images: Vec<ToolImage>) -> Self {
+        self.images = images;
         self
     }
 }

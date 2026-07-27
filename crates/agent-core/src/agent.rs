@@ -978,6 +978,25 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     o.untrusted,
                                     o.error_kind,
                                 ));
+                                // US-011: a `tool_result` block carries text only. The
+                                // images the tool read therefore enter as a user message
+                                // right after it, which is also what makes them
+                                // strippable by the full compaction (already
+                                // implemented, section 5).
+                                if !o.images.is_empty() {
+                                    let mut blocks: Vec<crate::message::ContentBlock> =
+                                        Vec::with_capacity(o.images.len());
+                                    for image in &o.images {
+                                        blocks.push(crate::message::ContentBlock::Image {
+                                            media_type: image.media_type.clone(),
+                                            data: image.data.clone(),
+                                        });
+                                    }
+                                    messages.push(Message {
+                                        role: crate::message::Role::User,
+                                        content: blocks,
+                                    });
+                                }
                             }
                             // US-030 MidTurn: the tool_results we just added are NOT
                             // in the budget yet (it is based on the previous turn's

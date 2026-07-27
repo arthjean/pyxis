@@ -138,8 +138,16 @@ fn pct(v: u32, p: u32) -> u32 {
     ((u64::from(v) * u64::from(p)) / 100) as u32
 }
 
+/// Cost charged to an image block in the local estimate (US-011). Zero was
+/// correct as long as no tool ever produced an image; now that `view_image`
+/// does, an image billed at nothing would be a transcript the projection can
+/// never see growing, hence a compaction that never triggers. The value is the
+/// HIGH end of what the vision backends bill for one image, because
+/// underestimating is what silently overflows the context.
+const IMAGE_TOKENS: usize = 1_100;
+
 /// Estimates the input tokens of a transcript through a `TokenCounter` (fallback
-/// when `usage` is not provided). Approximates images to 0.
+/// when `usage` is not provided). An image is charged a flat [`IMAGE_TOKENS`].
 pub fn estimate_input(messages: &[Message], counter: &dyn TokenCounter) -> u32 {
     let mut total = 0usize;
     for m in messages {
@@ -152,7 +160,7 @@ pub fn estimate_input(messages: &[Message], counter: &dyn TokenCounter) -> u32 {
                     counter.count_text(name) + counter.count_text(&input.to_string())
                 }
                 ContentBlock::ToolResult { content, .. } => counter.count_text(content),
-                ContentBlock::Image { .. } => 0,
+                ContentBlock::Image { .. } => IMAGE_TOKENS,
                 // US-031: encrypted reasoning is sent to the backend when replay
                 // is active -> it counts in the budget (otherwise absent from messages).
                 ContentBlock::EncryptedReasoning {
