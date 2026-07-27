@@ -737,28 +737,12 @@ fn main() -> anyhow::Result<()> {
     // Project context (AGENTS.md + env) read BEFORE the sandbox: walking up the
     // ancestors to the `.git` becomes inaccessible once Landlock is in place
     // (US-028). Injected afterwards as ephemeral messages per turn.
-    let mut context_msgs = context::messages(&workspace, &context::today_utc());
     // US-015: the skill catalog travels with the project context, framed the same
-    // way. Inserted BEFORE the environment block, which is the volatile part: the
-    // stable prefix stays cacheable.
-    if let Some(block) = skills::catalog_block(&skills.skills) {
-        let before_environment = context_msgs.len().saturating_sub(1);
-        context_msgs.insert(before_environment, Message::user(block));
-    }
+    // way, and `project_messages` is the single place that decides that order
+    // (shared with the `/init` refresh, US-019).
+    let context_msgs = context::project_messages(&workspace, &context::today_utc(), &skills);
 
     let credential = prepare_credential_before_sandbox(&args)?;
-
-    // Configuration read BEFORE the sandbox and in BOTH modes (US-016 AC6): the
-    // global file is outside the workspace, hence inaccessible once Landlock is in place,
-    // and the headless mode needs its settings as much as the interactive one. Reading
-    // is not persisting: `-p` never rewrites the file (see below).
-    let config = settings::load(
-        settings::default_settings_path().as_deref(),
-        Some(&settings::project_config_path(&workspace)),
-    );
-    for warning in &config.warnings {
-        eprintln!("[config] {warning}");
-    }
 
     // Persistent settings (`~/.pyxis/settings.toml`): the file must exist
     // BEFORE Landlock to receive its write rule. In headless (-p) nothing
@@ -1110,6 +1094,13 @@ fn run_auth_onboarding() -> anyhow::Result<OAuthCredential> {
 /// (FR-13).
 fn skills_root() -> Option<std::path::PathBuf> {
     Some(home_dir()?.join(".agents").join("skills"))
+}
+
+/// Root of the project skills (US-018). The path is FIXED here: the repository
+/// supplies skill content, never the location it is read from, which is what keeps
+/// the root itself out of a workspace file's reach (FR-13, FR-18).
+fn project_skills_root(workspace: &std::path::Path) -> std::path::PathBuf {
+    workspace.join(".agents").join("skills")
 }
 
 /// Everything that touches a path outside the workspace, hence loaded or created BEFORE
