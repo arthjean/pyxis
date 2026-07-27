@@ -14,11 +14,13 @@ pub mod deps;
 pub mod error;
 pub mod event;
 pub mod guardrail;
+pub mod input;
 pub mod message;
 pub mod provider;
 pub mod quota;
 pub mod sandbox;
 pub mod session;
+pub mod step;
 pub mod tools;
 pub mod transition;
 
@@ -36,6 +38,7 @@ pub use event::{
     TurnDiffView,
 };
 pub use guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget};
+pub use input::InputQueue;
 pub use message::{
     ContentBlock, INTERRUPTED_TOOL_RESULT, Message, Role, ToolErrorKind, unanswered_tool_calls,
 };
@@ -47,6 +50,7 @@ pub use provider::{
 pub use quota::{QuotaSnapshot, QuotaWindow, format_unix_utc};
 pub use sandbox::{SandboxPolicy, WritableRoot, WriteRefusal};
 pub use session::{Session, SessionEntry, SessionError};
+pub use step::{StepContextSource, StepFrame};
 pub use tools::{
     ToolDispatch, ToolDispatchEvent, ToolEventSink, ToolImage, ToolInvocation, ToolOutcome,
 };

@@ -7,6 +7,7 @@
 //! cross-cutting retry of transient errors (≠ withholding), and the exhaustive
 //! `match` on `Transition` (AC1).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{Stream, StreamExt};
@@ -18,12 +19,14 @@ use crate::deps::Deps;
 use crate::error::{AgentError, ProviderFailure};
 use crate::event::{AgentEvent, ToolCallView, ToolOutputDeltaView, ToolResultView};
 use crate::guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget, batch_signature};
+use crate::input::InputQueue;
 use crate::message::{
     INTERRUPTED_TOOL_RESULT, Message, ToolCallId, ToolErrorKind, unanswered_tool_calls,
 };
 use crate::provider::{
     AuthError, CanonicalRequest, ErrorClass, ProviderError, StreamEvent, TokenUsage, ToolSpec,
 };
+use crate::step::StepContextSource;
 use crate::tools::{ToolDispatchEvent, ToolEventSink, ToolOutcome};
 use crate::transition::{
     Accumulator, ContextErrorKind, ExhaustReason, PendingError, Transition, post_stream_transition,
@@ -89,6 +92,13 @@ pub struct AgentContext {
     /// Ephemeral control messages appended after the transcript for the current
     /// request, without persistence. Example: automatic goal re-prompt.
     pub ephemeral_messages: Vec<Message>,
+    /// US-006: rebuilds `tools` and `context_messages` before EVERY model
+    /// request. `None` keeps the values above frozen for the whole run, which is
+    /// the historical behavior.
+    pub step_source: Option<Arc<dyn StepContextSource>>,
+    /// US-007: inputs accepted for THIS turn while it runs. Drained at a safe
+    /// point, never mid-stream. `None` disables steering.
+    pub inputs: Option<Arc<dyn InputQueue>>,
 }
 
 impl AgentContext {
@@ -102,6 +112,8 @@ impl AgentContext {
             config: RunConfig::default(),
             context_messages: Vec::new(),
             ephemeral_messages: Vec::new(),
+            step_source: None,
+            inputs: None,
         }
     }
     pub fn with_system(mut self, system: impl Into<String>) -> Self {
@@ -123,6 +135,25 @@ impl AgentContext {
     pub fn with_ephemeral_messages(mut self, messages: Vec<Message>) -> Self {
         self.ephemeral_messages = messages;
         self
+    }
+    pub fn with_step_source(mut self, source: Arc<dyn StepContextSource>) -> Self {
+        self.step_source = Some(source);
+        self
+    }
+    pub fn with_inputs(mut self, inputs: Arc<dyn InputQueue>) -> Self {
+        self.inputs = Some(inputs);
+        self
+    }
+}
+
+/// Waits for a steering input, or forever when the run has no input queue.
+///
+/// A dedicated future rather than an `Option` arm in the `select!`: an absent
+/// queue must stay pending, never resolve, otherwise the sampling loop would spin.
+async fn steer_ready(inputs: &Option<Arc<dyn InputQueue>>) {
+    match inputs {
+        Some(queue) => queue.ready().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -373,10 +404,12 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
             reasoning_effort,
             system,
             mut messages,
-            tools,
+            mut tools,
             config,
-            context_messages,
+            mut context_messages,
             ephemeral_messages,
+            step_source,
+            inputs,
         } = ctx;
 
         // ContextBudget computed for the active model (recomputed on overload fallback).
@@ -391,13 +424,16 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
         // Backend usage counts everything that is sent: system, ephemeral
         // context, tool schemas and transcript. Local projections must carry
         // the same static overhead, otherwise compaction comes too late.
-        let static_input_tokens = estimate_static_input(
+        let mut static_input_tokens = estimate_static_input(
             &system,
             &context_messages,
             &tools,
             deps.tokenizer.as_ref(),
         )
         .saturating_add(estimate_input(&ephemeral_messages, deps.tokenizer.as_ref()));
+        // US-006: generation of the step frame currently installed. `None` until
+        // the first frame, so a source whose first generation is 0 is still read.
+        let mut step_generation: Option<u64> = None;
         let mut compaction = CompactionState::default();
         let mut pending: Option<PendingError> = None;
         let mut model_turns: u32 = 0;
@@ -457,6 +493,45 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     t
                 }
                 None => {
+                    // US-007: THE safe point. A steer enters the transcript here,
+                    // right before the request is built, never in the middle of a
+                    // sampling nor between a `tool_use` and its result. Taking is
+                    // what removes it from the queue, so it enters exactly once
+                    // and in acceptance order.
+                    if let Some(queue) = &inputs {
+                        for input in queue.take() {
+                            messages.push(input);
+                        }
+                    }
+
+                    // US-006: the model-visible context is captured per request.
+                    // An unchanged generation keeps the previous bytes, which is
+                    // what makes two steps without a source change produce the
+                    // same cacheable prefix and skip the static re-estimate.
+                    if let Some(source) = &step_source {
+                        let frame = source.next_frame();
+                        if step_generation != Some(frame.generation) {
+                            step_generation = Some(frame.generation);
+                            tools = frame.tools;
+                            context_messages = frame.context_messages;
+                            static_input_tokens = estimate_static_input(
+                                &system,
+                                &context_messages,
+                                &tools,
+                                deps.tokenizer.as_ref(),
+                            )
+                            .saturating_add(estimate_input(
+                                &ephemeral_messages,
+                                deps.tokenizer.as_ref(),
+                            ));
+                            budget.observe_estimated(estimate_current_input(
+                                &messages,
+                                static_input_tokens,
+                                &deps,
+                            ));
+                        }
+                    }
+
                     // structural (cheap) microcompaction under light pressure.
                     // PURELY IN MEMORY: it truncates the content of old
                     // tool_results (the append-only log keeps the full history;
@@ -592,14 +667,22 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     let mut last_usage: Option<TokenUsage> = None;
                     let mut estimated_input: Option<u32> = None;
                     let mut interrupted = false;
+                    let mut steered = false;
                     loop {
                         // US-001: cancellation is polled FIRST (`biased`) -> as soon
                         // as it is signalled, no more `Text` nor `Reasoning` is
                         // emitted, even if the stream has events ready.
+                        // US-007: a steer comes SECOND, before the stream itself:
+                        // an input accepted while the model is talking must cut
+                        // this sampling, not wait for the whole answer to drain.
                         let next = tokio::select! {
                             biased;
                             () = deps.cancel.cancelled() => {
                                 interrupted = true;
+                                break;
+                            }
+                            () = steer_ready(&inputs) => {
+                                steered = true;
                                 break;
                             }
                             ev = stream.next() => ev,
@@ -661,6 +744,19 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         // in the transcript.
                         if !acc.is_empty() {
                             messages.push(acc.to_assistant_message());
+                        }
+                        continue;
+                    }
+
+                    if steered {
+                        // US-007 AC2: the deltas of this sampling were NEVER
+                        // committed, so they are dropped with `acc` and the client
+                        // is told to erase what it displayed. The loop head then
+                        // re-samples with the steer already in the transcript.
+                        // Nothing is persisted here: an abandoned sampling has no
+                        // assistant turn to reconcile.
+                        if acc.has_visible_output() {
+                            yield AgentEvent::StreamReset;
                         }
                         continue;
                     }

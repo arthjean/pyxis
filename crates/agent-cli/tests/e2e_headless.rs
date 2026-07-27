@@ -306,6 +306,8 @@ fn context(prompt: &str, tools: Vec<agent_core::provider::ToolSpec>) -> AgentCon
         config: RunConfig::default(),
         context_messages: Vec::new(),
         ephemeral_messages: Vec::new(),
+        step_source: None,
+        inputs: None,
     }
 }
 

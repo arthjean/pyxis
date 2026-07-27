@@ -1558,6 +1558,10 @@ async fn run(
                 config: run_config,
                 context_messages: context_msgs,
                 ephemeral_messages: skill_messages,
+                // US-018 wires the headless client on the runtime; a one-shot
+                // run has no steering and no mid-run context refresh yet.
+                step_source: None,
+                inputs: None,
             };
             let mut events = jsonl::EventWriter::new(args.output_format);
             // US-018: reference taken BEFORE the turn, on the workspace as it is.

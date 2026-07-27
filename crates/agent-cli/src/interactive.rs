@@ -606,6 +606,11 @@ fn launch_turn(
         // US-028: project context re-injected every turn, never persisted.
         context_messages: cfg.context_messages.clone(),
         ephemeral_messages,
+        // US-017 moves this client onto `ThreadHandle`, which is what supplies
+        // the per-step context and the steering queue. Until then the turn keeps
+        // the catalog it was started with.
+        step_source: None,
+        inputs: None,
     };
     // The received `Deps` already carries the turn cancellation signal (`ActiveTurn::start`).
     let deps = deps.clone();

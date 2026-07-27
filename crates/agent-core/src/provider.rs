@@ -134,7 +134,11 @@ pub struct CacheCapabilities {
 }
 
 /// Tool definition exposed to the model (input JSON Schema).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` is what lets US-006 decide that a step frame did not move: a
+/// catalog compared equal keeps its generation, hence its bytes and its cache
+/// prefix.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
