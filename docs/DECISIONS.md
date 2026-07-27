@@ -399,3 +399,24 @@ Décisions dérivées prises dans le même spike :
 - Un store qui bloque indéfiniment bloque l'actor dans `on_submit` et échappe au budget de shutdown. Acceptable en v1 (écritures fichier locales) ; à revoir si un adapter distant apparaît.
 - `agent-session` dépend désormais d'`agent-runtime`. L'inverse est interdit : c'est ce qui garde le runtime sans accès disque.
 - **Conséquence sur les autres documents** : `docs/ARCHITECTURE.md` (nouveau crate et sa place dans le graphe) et `docs/EVENT_SCHEMA.md` (entrées `thread_meta` / `thread_event`) sont mis à jour à la livraison d'EP-005 (US-019), qui possède la relecture documentaire de ce PRD.
+
+### Mesures EP-003 — reprise et fork (US-009 AC5, US-010 AC6)
+
+Mesurées le 2026-07-27 sur la machine de référence, build release, adapter JSONL (`cargo test --release -p agent-session -- --ignored --nocapture`).
+
+| Opération | Volume | Mesure | Cible PRD |
+|---|---|---|---|
+| Reprise (`ThreadStore::read`) | 10 000 événements, 2,5 Mo | **p95 = 12,6 ms** sur 20 runs | < 500 ms p95 |
+| Fork matérialisé (`ThreadStore::fork`) | 10 000 événements | **23,3 ms**, 2 527 919 octets copiés | aucune, à consigner |
+
+**Question ouverte du PRD tranchée.** Un store référencé (copy-on-write entre fichiers) n'est **pas** justifié en v1 : copier le préfixe entier d'une session de 10 000 événements coûte 23 ms et 2,5 Mo, soit deux ordres de grandeur sous le budget de reprise. La matérialisation reste le choix par défaut ; elle est aussi ce qui rend une branche lisible après suppression de sa source. Le trait `ThreadStore` garde la porte ouverte si une session dogfood dépasse un ordre de grandeur de plus.
+
+**Un index ou un checkpoint de reprise** n'est pas nécessaire non plus : le scan linéaire est 40 fois sous la cible.
+
+**Décisions dérivées d'EP-003.**
+
+- **Identité d'une session v1.** `ThreadId` dérivé du hash du chemin canonique **et** de la première ligne durable, puis matérialisé une seule fois dans la ligne `thread_meta`. La dépendance au chemin ne dure donc que jusqu'au premier append ; après, déplacer ou renommer la session ne change plus rien. Deux copies du même transcript dans deux répertoires restent deux threads distincts, ce qui est le comportement voulu.
+- **Provenance d'une branche.** Portée par la **dernière** ligne `thread_meta` du fichier enfant, écrite après le préfixe hérité. Le préfixe est donc copié **verbatim**, sans réécriture d'octets, et l'ancienne liaison du parent qu'il contient est simplement dépassée par celle de l'enfant.
+- **Fermeture des turns au resume.** Tout turn laissé non terminal par un arrêt (`queued`, `running`, `needs_input`) est fermé en `interrupted` par un unique événement de recovery, après réconciliation des tool calls sans résultat. Aucun turn ne reste ouvert pour toujours (FR-04), et un transcript repris ne porte jamais de `tool_use` orphelin.
+- **Configuration du turn durable.** Le `TurnContext` capturé voyage avec la transition qui démarre le turn, plutôt que dans un second événement : un thread repris sait sous quel modèle, quel mode de permission et quel sandbox son dernier turn a tourné, sans coût d'écriture supplémentaire.
+- **Idempotence.** La table `client_message_id -> (TurnId, EventId)` est reconstruite depuis le log au resume, donc un retry client qui traverse un redémarrage est toujours dédupliqué.
