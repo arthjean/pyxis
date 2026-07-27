@@ -17,6 +17,7 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/CURRENT_S
 | ADR-9 | Taxonomie d'erreurs canonique : `ErrorClass` | Accepté |
 | ADR-10 | Auth abonnement ChatGPT = `ProviderKind::OpenAiChatGpt` (Responses API backend ChatGPT, SSE stateless, gated) | Accepté (2026-06-15) |
 | ADR-11 | Scope MVP recentré : abonnement ChatGPT d'abord, Ollama retiré, autres providers différés | Accepté (2026-06-15) |
+| ADR-12 | Runtime de thread `agent-runtime` au-dessus de `run_agent` | Accepté (2026-07-27) |
 
 ---
 
@@ -353,3 +354,48 @@ Cela entre en conflit frontal avec **US-017** (« cible Chat Completions ; Respo
 **Pire scénario.** OpenAI révoque le client Codex → l'unique provider livré tombe → Pyxis est temporairement inutilisable jusqu'à l'ajout d'un adapter BYOK. Probabilité moyenne, impact élevé mais borné (le code adapter + auth BYOK est petit, le cœur intact). C'est le prix conscient de la vélocité dogfood.
 
 **Conséquences sur les autres documents.** `docs/PROVIDERS.md §6` (Ollama n'est plus le provider non-bloqué du MVP — l'abonnement ChatGPT est la cible ; la stratégie model-agnostic reste l'assurance), tableau §3 (colonne Ollama caduque), `tasks/prd-pyxis.md` (Goals/FR-02/US-016/edge #9 : Ollama hors scope), `ARCHITECTURE.md` invariant 7 (le fallback tokenizer n'est plus motivé par Ollama mais reste valide). Mise à jour incrémentale ; non bloquant pour le code.
+
+---
+
+## ADR-12 — Runtime de thread `agent-runtime` au-dessus de `run_agent`
+
+**Statut.** Accepté 2026-07-27. Conclusion du spike US-001 de `tasks/prd-runtime-orchestration-durable.md` (EP-001). N'altère ni ADR-3 (cœur headless) ni le trait `Provider` (ADR-4/ADR-11).
+
+**Contexte.** Pyxis possédait une boucle d'agent, un transcript durable, des outils, un sandbox, MCP, des skills et deux clients, mais aucun objet durable ne possédait une conversation. `agent-cli` relançait un `run_agent` par tour et gardait l'activité dans un `ActiveTurn` process-local : un redémarrage restaurait des messages, pas l'état d'un thread, d'un turn ou d'une opération de contrôle. Le risque numéro un du PRD était qu'un nouveau module réimplémente progressivement la boucle modèle-outils et laisse deux orchestrateurs vivants.
+
+**Décision.** Un crate `agent-runtime` entre `agent-core` et les clients, avec quatre responsabilités **disjointes** :
+
+1. **Runtime de thread** (`agent-runtime`) : identité durable (`ThreadId`, `TurnId`, `StepId`, `EventId`, `AgentId`), mailbox de contrôle bornée, cycle de vie des turns, persistance des opérations d'orchestration, arbre d'annulation et shutdown. Un thread est possédé par **un** actor ; les clients ne touchent ni `JoinHandle` ni writer JSONL.
+2. **Moteur de turn** (`agent-core::run_agent`) : reste l'**unique** boucle modèle-outils. Retry, compaction, withholding et dispatch d'outils lui appartiennent. Le runtime l'atteint par la seule interface `TurnRunner`, forwarde ses `AgentEvent` sans les modifier et lit exactement un `TurnOutcome`.
+3. **Contexte par requête** : la fabrique de contexte injectée dans `RunAgentRunner` est le point où US-006 branchera `TurnContext` et `StepContext`. Le runtime ne construit aucune requête modèle.
+4. **Clients** (TUI, headless) : consomment `ThreadHandle` (soumettre, observer, lire le dernier état, arrêter) et le flux `RuntimeEvent`.
+
+Décisions dérivées prises dans le même spike :
+
+- **Store.** Le trait `ThreadStore` et l'adapter mémoire vivent dans `agent-runtime`, qui ne touche pas au disque ; l'adapter JSONL vit dans `agent-session` (dépendance à sens unique `agent-session` → `agent-runtime` → `agent-core`). Les deux adapters passent le **même** test de contrat.
+- **Format.** Les événements d'orchestration sont des entrées JSONL **additives** dans le fichier de session existant (`thread_meta`, `thread_event`). `SESSION_SCHEMA_VERSION` n'est **pas** incrémenté : un lecteur v1 les mappe sur `SessionEntry::Unknown` et les ignore, alors qu'un bump rendrait tout fichier neuf illisible par un binaire antérieur qui refuse `schema_version > 1`. Poursuivre une session v1 laisse son préfixe byte-identique.
+- **Identifiants.** Pas de dépendance `uuid` : charge opaque de 128 bits rendue `<prefixe>_<32 hex>`, produite par un `IdGenerator` injecté (`rand` en production, compteur déterministe en test). Le préfixe est le discriminant de type au parsing, ce qui fait échouer un `TurnId` reçu là où un `ThreadId` est attendu, y compris après un aller-retour par un fichier.
+- **Annulation.** `tokio-util` devient une dépendance directe : `CancellationToken` donne l'arbre parent-enfant que le `CancelToken` maison ne sait pas exprimer, `TaskTracker` compte les tâches dynamiques. Le token maison reste le signal **coopératif du moteur** (lui seul sait où est une frontière sûre) et n'est plus qu'un point de traduction dans `RunAgentRunner`. US-008 supprimera le dernier appelant direct : la règle est un seul arbre de tokens, pas deux mécanismes.
+- **Événements live.** `broadcast` borné à 256 plutôt que `mpsc`, contrairement à la recommandation non normative des *Technical Considerations* du PRD : un client lent ou déconnecté ne doit jamais bloquer l'actor, et perdre un événement **live** est récupérable puisque l'état durable est le store (`RecvError::Lagged` dit au client de relire). Le dernier état voyage bien par `watch`.
+- **Exhausted.** `AgentEvent::Exhausted` est mappé sur l'état terminal `failed` avec une cause préfixée, jamais sur `completed` : un arrêt par garde-fou n'a pas terminé le travail et ne doit pas être lu comme un succès.
+- **Limites v1.** Mailbox 64, flux live 256, inputs pending 16, grâce d'abort 2 s, shutdown 3 s sont des **constantes** de `agent-runtime::thread`. Zéro clé de configuration publique (FR-20).
+
+**Verdict du spike (US-001 AC5).** Le prototype pilote `run_agent` avec un provider et un store factices sans réécrire une seconde boucle : dans `crates/agent-runtime/tests/turn_seam.rs`, un échec provider en milieu de flux est **retenté par le moteur**, un outil est dispatché par le pipeline injecté et le turn se termine sur un unique événement terminal, alors que le code du runner ne contient ni retry, ni compaction, ni dispatch. La réconciliation des tool calls sans résultat reste celle du cœur : une annulation par token hiérarchique produit `Interrupted` après réconciliation. **US-002 et les stories dépendantes ne sont donc pas bloquées.**
+
+**Alternatives écartées.**
+
+| Option | Raison de l'écart |
+|---|---|
+| Mettre le runtime dans `agent-core` | Trois appelants réels (TUI, headless, sous-agents) et un besoin d'état durable ; `agent-core` doit rester le moteur de turn headless sans possession de conversation. |
+| Extraire un `AgentRun` pilotable en remplacement de `run_agent` | Refonte du cœur pour un besoin que le seam `TurnRunner` couvre déjà. À rouvrir seulement si US-006 prouve qu'un contexte par step est impossible via la fabrique injectée. |
+| Remplacer `SessionEntry` par un nouveau format v2 | Casse la contrainte « toute session v1 reste lisible et poursuivable » et interdit un fork par copie de préfixe. |
+| Garder le `CancelToken` maison comme unique mécanisme | Il n'a ni filiation ni comptage de tâches : impossible de garantir « aucun processus orphelin » ni « stragglers abortés puis drainés ». |
+| Ajouter `uuid` (UUIDv7) | Coût de dépendance pour une propriété (ordonnancement temporel) dont aucune acceptance n'a besoin ; `seq` par thread ordonne déjà le log. |
+| Store SQLite ou fork référencé copy-on-write | Hors scope v1 explicite du PRD ; le trait `ThreadStore` laisse la porte ouverte sans changer l'interface. |
+
+**Conséquences & risques.**
+- **Risque principal** : `agent-runtime` peut dériver vers une seconde boucle. Garde-fou : `TurnRunner` reste le seul seam, et toute logique de retry, compaction ou dispatch qui y apparaîtrait invalide ADR-12.
+- **Risque de double orchestration** pendant la migration : `ActiveTurn`, son compteur `u64`, son `JoinHandle` direct et la FIFO de prompts legacy vivent encore dans `crates/agent-cli/src/interactive.rs`. US-017 doit les supprimer, pas les faire cohabiter.
+- Un store qui bloque indéfiniment bloque l'actor dans `on_submit` et échappe au budget de shutdown. Acceptable en v1 (écritures fichier locales) ; à revoir si un adapter distant apparaît.
+- `agent-session` dépend désormais d'`agent-runtime`. L'inverse est interdit : c'est ce qui garde le runtime sans accès disque.
+- **Conséquence sur les autres documents** : `docs/ARCHITECTURE.md` (nouveau crate et sa place dans le graphe) et `docs/EVENT_SCHEMA.md` (entrées `thread_meta` / `thread_event`) sont mis à jour à la livraison d'EP-005 (US-019), qui possède la relecture documentaire de ce PRD.
