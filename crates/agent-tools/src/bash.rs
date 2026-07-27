@@ -149,6 +149,11 @@ impl Tool for Bash {
             Err(e) => return Err(ToolError::Io(format!("shell launch: {e}"))),
         };
         let pid = child.id();
+        // US-008 AC4: an interrupted turn drops this future instead of polling
+        // it to the end. `kill_on_drop` then reaps the shell alone and leaves its
+        // children (a `cargo`, a `make`, a dev server) running past the terminal
+        // event. The guard signals the whole GROUP on the way out.
+        let mut reaper = GroupReaper { pid };
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -189,6 +194,9 @@ impl Tool for Bash {
                 (None, true)
             }
         };
+        // The command reached an end of its own (exit or timeout cleanup): the
+        // group must not be signalled again, or a recycled pid would be.
+        reaper.disarm();
 
         let (stdout, stderr) = if cleanup_timed_out {
             stdout_task.abort();
@@ -418,6 +426,49 @@ fn flush_stream(pending: &mut Vec<u8>, sink: Option<&crate::tool::OutputSink>) {
     sink(text);
 }
 
+/// Kills the process GROUP of a command whose future is dropped before it ends
+/// (US-008 AC4: a cancelled turn).
+///
+/// `Drop` cannot await, so the signal is sent with the blocking `std::process`,
+/// exactly like the exec sessions do. Disarmed as soon as the command reached an
+/// end of its own: signalling a group whose leader was reaped could reach a
+/// process that recycled the pid.
+struct GroupReaper {
+    pid: Option<u32>,
+}
+
+impl GroupReaper {
+    fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for GroupReaper {
+    fn drop(&mut self) {
+        let Some(pid) = self.pid else { return };
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .arg("/PID")
+                .arg(pid.to_string())
+                .arg("/T")
+                .arg("/F")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::process::Command::new("kill")
+                .arg("-KILL")
+                .arg(format!("-{pid}"))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
 /// Kills a subprocess AND its group: a hook or a shell command usually spawns
 /// children, and `kill_on_drop` only reaches the direct child. Shared with the
 /// hook engine, which starts its processes with the same `process_group(0)`.
@@ -483,5 +534,75 @@ mod tests {
     #[test]
     fn short_output_is_untouched() {
         assert_eq!(truncate_tail("short", 30_000), "short");
+    }
+
+    /// US-008 AC4: a cancelled turn drops the tool future instead of polling it
+    /// to the end. What must not survive is the process TREE, not just the shell
+    /// `kill_on_drop` reaps: a `cargo`, a `make` or a dev server started by the
+    /// command would otherwise outlive the terminal event the user just saw.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn dropping_a_running_command_kills_its_whole_process_group() {
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("pyxis-bash-drop-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let pidfile = dir.join("grandchild.pid");
+        let _ = std::fs::remove_file(&pidfile);
+
+        let ctx = ToolCtx::new(dir.clone());
+        let input = BashInput {
+            command: format!("sleep 300 & echo $! > {}; sleep 300", pidfile.display()),
+        };
+
+        // Poll the call just long enough for the grandchild to exist, then let
+        // the future be dropped at the end of the block: this is exactly what
+        // the loop does when its dispatch is abandoned. The scope is what drops
+        // it, since `tokio::pin!` rebinds the name to a pinned borrow.
+        let grandchild = {
+            let call = Bash.call(input, &ctx);
+            tokio::pin!(call);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut found = None;
+            while Instant::now() < deadline {
+                tokio::select! {
+                    _ = &mut call => panic!("the command was supposed to still be running"),
+                    () = tokio::time::sleep(Duration::from_millis(25)) => {}
+                }
+                if let Ok(raw) = std::fs::read_to_string(&pidfile)
+                    && let Ok(pid) = raw.trim().parse::<u32>()
+                {
+                    found = Some(pid);
+                    break;
+                }
+            }
+            let found = found.expect("the grandchild announced its pid");
+            assert!(alive(found), "the grandchild is running before the drop");
+            found
+        };
+
+        // The kill is a signal, not a promise of immediacy: let the OS reap.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && alive(grandchild) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            !alive(grandchild),
+            "the grandchild {grandchild} outlived the dropped command"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    fn alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 }
