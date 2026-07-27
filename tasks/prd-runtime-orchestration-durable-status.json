@@ -25,10 +25,10 @@
     {
       "id": "EP-003",
       "title": "Reprise et branches",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 3,
-      "stories_done": 0
+      "stories_done": 3
     },
     {
       "id": "EP-004",
@@ -166,44 +166,45 @@
       "id": "US-009",
       "title": "Reprendre un thread et dédupliquer les soumissions",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-003",
         "US-005"
       ],
-      "started_at": null,
-      "completed_at": null,
+      "started_at": "2026-07-27",
+      "completed_at": "2026-07-27",
       "reviewed_at": null
     },
     {
       "id": "US-010",
       "title": "Forker à une frontière de turn matérialisée",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "M",
       "blocked_by": [
         "US-009"
       ],
-      "started_at": null,
-      "completed_at": null,
+      "started_at": "2026-07-27",
+      "completed_at": "2026-07-27",
       "reviewed_at": null
     },
     {
       "id": "US-011",
-      "title": "Rewind non destructif et commandes de branche",
+      "title": "Rewind non destructif et provenance des branches",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "M",
       "blocked_by": [
         "US-010"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-27",
+      "completed_at": "2026-07-28",
+      "reviewed_at": null,
+      "note": "PRD v1.2 : story recentrée sur l'opération de branche et sa provenance (runtime et store). La surface de commande `/fork` et `/rewind` est re-hébergée dans US-017, dont l'AC1 la nommait déjà, et y figure désormais comme trois critères explicites. Aucun critère abandonné."
     },
     {
       "id": "US-012",

@@ -5,6 +5,7 @@
 
 | Version | Date | Author | Summary |
 |---------|------|--------|---------|
+| 1.2 | 2026-07-28 | Arthur Jean | US-011 recentrée sur le runtime et le store ; la surface de commande `/fork` et `/rewind`, que US-017 AC1 portait déjà, y est explicitement re-hébergée au lieu d'être décrite deux fois |
 | 1.1 | 2026-07-27 | Arthur Jean | Ajout du codebase Codex CLI local comme référence primaire d'implémentation |
 | 1.0 | 2026-07-27 | Arthur Jean | Draft initial fondé sur l'audit croisé de Codex CLI et Pyxis, la recherche concurrentielle et les primitives Tokio |
 
@@ -297,7 +298,7 @@ Cet epic rend la reprise idempotente et transforme fork et rewind en opérations
 - [ ] Given un turn actif, un identifiant inconnu ou une erreur de copie, when le fork est demandé, then l'opération échoue sans publier d'enfant partiel et le parent reste byte-identique
 - [ ] Given une session de 10 000 événements, when elle est forkée, then la durée et les octets copiés sont consignés pour décider ultérieurement si un store référencé est justifié
 
-#### US-011: Rewind non destructif et commandes de branche
+#### US-011: Rewind non destructif et provenance des branches
 
 **Description:** As a utilisateur, I want revenir à un turn antérieur par création de branche so that l'historique original reste auditable et récupérable.
 
@@ -305,12 +306,13 @@ Cet epic rend la reprise idempotente et transforme fork et rewind en opérations
 **Size:** M (3 pts)
 **Dependencies:** Blocked by US-010
 
+**Scope note (v1.2):** cette story possède l'opération de branche et sa provenance, au niveau du runtime et du store. La surface de commande (`/fork` sans argument, `/fork <turn-id>`, `/rewind <turn-id>`, bascule du client vers la branche) appartient à US-017, dont l'AC1 la nommait déjà ; elle y est reprise mot pour mot plutôt que décrite deux fois. Aucun critère n'est abandonné : les trois critères de commande sont listés dans US-017.
+
 **Acceptance Criteria:**
-- [ ] Given `/fork` sans argument, when il est exécuté, then il crée un fork au dernier turn terminal via le runtime
-- [ ] Given `/fork <turn-id>` ou `/rewind <turn-id>`, when le turn appartient au thread et est terminal, then une branche matérialisée est créée à cette frontière
-- [ ] Given `/rewind`, when la branche est prête, then le client bascule vers elle sans tronquer, réécrire ni supprimer le thread source
-- [ ] Given la liste des sessions, when une branche est affichée, then sa relation au parent et son point de fork sont inspectables
-- [ ] Given un turn actif, un turn non terminal ou un ID étranger, when fork ou rewind est demandé, then la commande est refusée avec la raison et aucun fichier n'est créé
+- [ ] Given un turn terminal nommé du thread, when une branche est demandée au runtime, then elle est matérialisée à cette frontière et le thread source n'est ni tronqué, ni réécrit, ni supprimé
+- [ ] Given un turn actif, un turn non terminal ou un identifiant étranger, when une branche est demandée, then elle est refusée avec une raison typée et aucun fichier n'est créé
+- [ ] Given la liste des sessions, when une branche y figure, then son `ThreadId`, son `parent_thread_id` et son point de fork sont inspectables sans ouvrir le thread ni lire son transcript
+- [ ] Given une branche dont la source a été supprimée, when la liste est reconstruite, then la branche garde sa provenance
 
 ### EP-004: Sous-agents bornés
 
@@ -414,6 +416,9 @@ Cet epic fait consommer le runtime par les deux clients, retire l'orchestration 
 
 **Acceptance Criteria:**
 - [ ] Given le mode interactif, when un prompt, steer, interrupt, fork, rewind ou shutdown est demandé, then le TUI soumet une opération au `ThreadHandle`
+- [ ] Given `/fork` sans argument, when il est exécuté, then il crée une branche au dernier turn terminal via le runtime *(re-hébergé depuis US-011 en v1.2)*
+- [ ] Given `/fork <turn-id>` ou `/rewind <turn-id>`, when le turn appartient au thread et est terminal, then la commande demande la branche au runtime à cette frontière *(re-hébergé depuis US-011 en v1.2)*
+- [ ] Given `/rewind`, when la branche est prête, then le client bascule vers elle sans tronquer, réécrire ni supprimer le thread source *(re-hébergé depuis US-011 en v1.2)*
 - [ ] Given les événements du runtime, when ils arrivent, then l'état TUI affiche thread, turn, état, nombre d'inputs pending et activité sans relire le store
 - [ ] Given un prompt envoyé pendant `running`, when Enter est pressé, then il devient un steer et non une FIFO post-turn
 - [ ] Given la migration terminée, when le code est recherché, then `ActiveTurn`, son compteur `u64`, son `JoinHandle` direct et la FIFO de prompts legacy sont supprimés
