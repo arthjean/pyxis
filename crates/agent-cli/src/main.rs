@@ -1195,8 +1195,30 @@ async fn run(
     }
     let provider: Arc<dyn Provider> = chatgpt;
 
+    // Notices addressed to the HUMAN (hooks, blocked hosts): TUI history in
+    // interactive mode, stderr in headless mode where the diagnostics of this
+    // mode already go (stdout stays byte-for-byte identical).
+    let (notice_tx, hook_notice_rx) = tokio::sync::mpsc::channel::<String>(16);
+
     // 2. Network allow-list proxy (fail-closed). Hardens the Bash commands.
-    let proxy = agent_sandbox::spawn_proxy(ProxyPolicy::new(args.allow_hosts.clone())).await?;
+    // US-003 AC1: whether the network is reachable at all is a property of the
+    // sandbox policy; the allow-list only narrows it further.
+    let (proxy_policy, network_conflict) =
+        ProxyPolicy::from_sandbox(&sandbox.policy, args.allow_hosts.clone());
+    if let Some(conflict) = network_conflict {
+        // AC5: the conflict resolution is announced, never silent.
+        eprintln!("[sandbox] {conflict}");
+    }
+    // US-003 AC6: a refusal is restituted to the user, not merely logged.
+    let proxy_notice: agent_sandbox::ProxyNotice = if headless {
+        Arc::new(|message: String| eprintln!("[sandbox] {message}"))
+    } else {
+        let tx = notice_tx.clone();
+        Arc::new(move |message: String| {
+            let _ = tx.try_send(format!("sandbox: {message}"));
+        })
+    };
+    let proxy = agent_sandbox::spawn_proxy(proxy_policy, Some(proxy_notice)).await?;
     let proxy_addr = proxy.addr.clone();
     let harden: agent_tools::CommandHardener =
         Arc::new(move |cmd: &mut tokio::process::Command| set_proxy_env(cmd, &proxy_addr));

@@ -171,6 +171,12 @@ pub struct InteractiveConfig {
     /// Persistent session goal (`/goal`), composed into the system prompt on every
     /// turn. Loaded from the session sidecar at startup.
     pub goal: Option<String>,
+    /// Lifecycle hooks (US-017). Shared with the tool registry, which uses the
+    /// same engine for `PreToolUse` and `PostToolUse`.
+    pub hooks: Arc<dyn agent_tools::hooks::Hooks>,
+    /// The same hooks as declared, kept for `/hooks` (US-019 AC6). The engine
+    /// above answers "does anything watch this?", not "what is installed?".
+    pub hook_specs: Vec<agent_tools::hooks::HookSpec>,
     /// Hardening applied to the MCP subprocesses (env scrub + proxy).
     pub command_hardener: agent_tools::CommandHardener,
     /// Diagnostics of the MCP startup connection (US-012): unavailable server,
@@ -811,6 +817,22 @@ async fn event_loop(
                 let action = state.on_key(k);
                 match action {
                     InputAction::Submit(prompt) => {
+                        // US-017 AC2: the submission is gated by its hooks before
+                        // anything else happens. A refusal keeps the message in the
+                        // composer and names the reason, so the user can amend it.
+                        if cfg.hooks.watches(agent_tools::HookEvent::UserPromptSubmit) {
+                            let hooks = Arc::clone(&cfg.hooks);
+                            if let agent_tools::HookDecision::Deny(reason) = hooks
+                                .lifecycle(agent_tools::Lifecycle::UserPromptSubmit {
+                                    prompt: &prompt,
+                                })
+                                .await
+                            {
+                                state.blocks.push(Block::Error(format!("Prompt refused: {reason}")));
+                                state.set_input(prompt);
+                                continue;
+                            }
+                        }
                         // US-016: `/<skill> …` injects the skill instructions instead
                         // of sending its name. Resolved HERE, at submission, so an
                         // unreadable skill blocks the turn while the user is looking.
@@ -1477,6 +1499,13 @@ async fn event_loop(
                                 next.skill,
                             );
                             running = true;
+                        }
+                        // US-017: `Stop` fires when the agent really stops, hence
+                        // not when the goal loop or a queued prompt launches
+                        // another turn right away.
+                        if !running && cfg.hooks.watches(agent_tools::HookEvent::Stop) {
+                            let hooks = Arc::clone(&cfg.hooks);
+                            hooks.lifecycle(agent_tools::Lifecycle::Stop).await;
                         }
                     }
                 }

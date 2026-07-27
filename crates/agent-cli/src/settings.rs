@@ -648,10 +648,24 @@ fn parse_hook(
         }
     }
     let raw_event = non_empty_string(table.get("event").ok_or("missing `event`")?)?;
-    let event = HookEvent::parse(&raw_event)
-        .ok_or_else(|| format!("unknown event `{raw_event}` (PreToolUse or PostToolUse)"))?;
+    let event = HookEvent::parse(&raw_event).ok_or_else(|| {
+        format!(
+            "unknown event `{raw_event}` (expected one of: {})",
+            agent_tools::HOOK_EVENT_NAMES.join(", ")
+        )
+    })?;
     let command = non_empty_string(table.get("command").ok_or("missing `command`")?)?;
     let matcher = match table.get("matcher") {
+        // A lifecycle event names no tool: a matcher there would select nothing,
+        // so it is dropped with its reason rather than silently kept.
+        Some(value) if !event.is_tool_scoped() => {
+            let matcher = non_empty_string(value)?;
+            details.push(format!(
+                "hook #{index}: `matcher` (`{matcher}`) ignored on {}, which watches no tool",
+                event.name()
+            ));
+            None
+        }
         Some(value) => Some(non_empty_string(value)?),
         None => None,
     };
@@ -1259,7 +1273,9 @@ mod tests {
         );
         let project = dir.write(
             "config.toml",
-            "[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"curl\"\nargs = [\"evil.sh\"]\n",
+            // US-017 AC5: a lifecycle event is no way in either. `hooks` is a
+            // security key whatever the event it declares.
+            "[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"curl\"\nargs = [\"evil.sh\"]\n\n[[hooks]]\nevent = \"SessionStart\"\ncommand = \"curl\"\nargs = [\"evil.sh\"]\n",
         );
 
         let config = load(Some(&global), Some(&project));
@@ -1283,7 +1299,7 @@ mod tests {
         let dir = ConfigDir::new("hooks-invalid");
         let global = dir.write(
             "settings.toml",
-            "[[hooks]]\nevent = \"SessionStart\"\ncommand = \"/bin/true\"\n\n[[hooks]]\nevent = \"PreToolUse\"\n\n[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"/bin/guard\"\nfuture_key = 1\n",
+            "[[hooks]]\nevent = \"Rewind\"\ncommand = \"/bin/true\"\n\n[[hooks]]\nevent = \"PreToolUse\"\n\n[[hooks]]\nevent = \"PreToolUse\"\ncommand = \"/bin/guard\"\nfuture_key = 1\n",
         );
 
         let config = load(Some(&global), None);
@@ -1291,12 +1307,62 @@ mod tests {
         assert_eq!(config.hooks.len(), 1, "{:?}", config.hooks);
         assert_eq!(config.hooks[0].command, "/bin/guard");
         let warnings = config.warnings.join(" | ");
-        assert!(
-            warnings.contains("unknown event `SessionStart`"),
-            "{warnings}"
-        );
+        assert!(warnings.contains("unknown event `Rewind`"), "{warnings}");
+        // The refusal lists what does exist, so the fix does not need the source.
+        assert!(warnings.contains("SessionStart"), "{warnings}");
         assert!(warnings.contains("missing `command`"), "{warnings}");
         assert!(warnings.contains("unknown key `future_key`"), "{warnings}");
+    }
+
+    /// AC1: the four lifecycle events are declarable next to the two tool events.
+    #[test]
+    fn lifecycle_hooks_are_parsed() {
+        let dir = ConfigDir::new("hooks-lifecycle");
+        let global = dir.write(
+            "settings.toml",
+            "[[hooks]]\nevent = \"SessionStart\"\ncommand = \"/bin/a\"\n\n[[hooks]]\nevent = \"UserPromptSubmit\"\ncommand = \"/bin/b\"\n\n[[hooks]]\nevent = \"Stop\"\ncommand = \"/bin/c\"\n\n[[hooks]]\nevent = \"session_end\"\ncommand = \"/bin/d\"\n",
+        );
+
+        let config = load(Some(&global), None);
+
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        assert_eq!(
+            config
+                .hooks
+                .iter()
+                .map(|hook| hook.event)
+                .collect::<Vec<_>>(),
+            vec![
+                HookEvent::SessionStart,
+                HookEvent::UserPromptSubmit,
+                HookEvent::Stop,
+                HookEvent::SessionEnd,
+            ]
+        );
+    }
+
+    /// A lifecycle event watches the session, not a tool: a matcher is reported
+    /// and dropped instead of silently selecting nothing.
+    #[test]
+    fn a_matcher_on_a_lifecycle_hook_is_reported_and_dropped() {
+        let dir = ConfigDir::new("hooks-matcher");
+        let global = dir.write(
+            "settings.toml",
+            "[[hooks]]\nevent = \"SessionStart\"\nmatcher = \"bash\"\ncommand = \"/bin/a\"\n",
+        );
+
+        let config = load(Some(&global), None);
+
+        assert_eq!(config.hooks.len(), 1);
+        assert_eq!(config.hooks[0].matcher, None);
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|w| w.contains("`matcher`") && w.contains("SessionStart")),
+            "{:?}",
+            config.warnings
+        );
     }
 
     #[test]

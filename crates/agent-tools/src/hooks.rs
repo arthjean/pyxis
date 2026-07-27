@@ -1,4 +1,5 @@
-//! Hooks: user commands run around a tool call (US-017 to US-019).
+//! Hooks: user commands run around a tool call (US-017 to US-019) and around the
+//! session lifecycle (US-017 of the parity PRD).
 //!
 //! Contract of the converging ecosystem (Claude Code): a JSON event on the hook's
 //! standard input, a JSON decision on its standard output under
@@ -41,21 +42,50 @@ const MAX_HOOK_STDOUT: usize = 64_000;
 const MAX_HOOK_STDERR: usize = 4_000;
 /// Cap of a reason shown to the user and sent to the model.
 const MAX_REASON: usize = 500;
+/// Cap of the prompt carried by a `UserPromptSubmit` event. A paste of a hundred
+/// kilobytes is still a prompt; it is not a reason to make every hook read one.
+const MAX_HOOK_PROMPT_BYTES: usize = 16_000;
 
-/// Lifecycle event a hook can watch. Two of them: the reference contract
-/// declares a dozen, this version implements what surrounds a tool call.
+/// Event a hook can watch: the two that surround a tool call, and the four of the
+/// session lifecycle. The reference contract declares eleven; these six are the
+/// ones something in Pyxis actually happens at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
     PreToolUse,
     PostToolUse,
+    SessionStart,
+    SessionEnd,
+    UserPromptSubmit,
+    Stop,
 }
+
+/// Every declared event, for the messages that list them.
+pub const HOOK_EVENT_NAMES: &[&str] = &[
+    "PreToolUse",
+    "PostToolUse",
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "Stop",
+];
 
 impl HookEvent {
     pub fn name(self) -> &'static str {
         match self {
             Self::PreToolUse => "PreToolUse",
             Self::PostToolUse => "PostToolUse",
+            Self::SessionStart => "SessionStart",
+            Self::SessionEnd => "SessionEnd",
+            Self::UserPromptSubmit => "UserPromptSubmit",
+            Self::Stop => "Stop",
         }
+    }
+
+    /// Whether the event names a tool, hence whether a `matcher` means anything.
+    /// A lifecycle event watches the session, not a tool: there is nothing for a
+    /// matcher to select.
+    pub fn is_tool_scoped(self) -> bool {
+        matches!(self, Self::PreToolUse | Self::PostToolUse)
     }
 
     /// Reads the event name of the reference contract. Tolerant on case and on
@@ -69,7 +99,63 @@ impl HookEvent {
         {
             "pretooluse" | "pre" => Some(Self::PreToolUse),
             "posttooluse" | "post" => Some(Self::PostToolUse),
+            "sessionstart" => Some(Self::SessionStart),
+            "sessionend" => Some(Self::SessionEnd),
+            "userpromptsubmit" => Some(Self::UserPromptSubmit),
+            "stop" => Some(Self::Stop),
             _ => None,
+        }
+    }
+}
+
+/// One occurrence of a lifecycle event, with the field the reference contract
+/// carries for it. Passing the occurrence rather than the bare event is what
+/// keeps the payload and the event name from drifting apart.
+#[derive(Debug, Clone, Copy)]
+pub enum Lifecycle<'a> {
+    /// Before the first turn. `source` is `startup` or `resume`.
+    SessionStart { source: &'a str },
+    /// Before a submitted prompt becomes a turn.
+    UserPromptSubmit { prompt: &'a str },
+    /// After a turn ends and nothing follows it.
+    Stop,
+    /// After the session, whatever ended it.
+    SessionEnd { reason: &'a str },
+}
+
+impl Lifecycle<'_> {
+    pub fn event(self) -> HookEvent {
+        match self {
+            Self::SessionStart { .. } => HookEvent::SessionStart,
+            Self::UserPromptSubmit { .. } => HookEvent::UserPromptSubmit,
+            Self::Stop => HookEvent::Stop,
+            Self::SessionEnd { .. } => HookEvent::SessionEnd,
+        }
+    }
+
+    /// Whether a refusal still has something to stop. `Stop` and `SessionEnd` fire
+    /// once the thing they observe is already over: like `PostToolUse`, they have
+    /// no decision to make, and a hook that fails there is REPORTED to the human
+    /// rather than denying a call that no longer exists. A `Stop` that could force
+    /// the model to keep going would also be a hook widening the run, which the
+    /// restrictive-only rule of this module forbids.
+    fn gates(self) -> bool {
+        matches!(
+            self,
+            Self::SessionStart { .. } | Self::UserPromptSubmit { .. }
+        )
+    }
+
+    /// Event-specific field of the payload, named as the reference contract names
+    /// it.
+    fn field(self) -> Option<(&'static str, String)> {
+        match self {
+            Self::SessionStart { source } => Some(("source", source.to_string())),
+            Self::SessionEnd { reason } => Some(("reason", reason.to_string())),
+            Self::UserPromptSubmit { prompt } => {
+                Some(("prompt", truncate_head(prompt, MAX_HOOK_PROMPT_BYTES)))
+            }
+            Self::Stop => None,
         }
     }
 }
@@ -91,7 +177,8 @@ pub enum HookDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookSpec {
     pub event: HookEvent,
-    /// Exact name of the watched tool. `None` = every tool.
+    /// Exact name of the watched tool. `None` = every tool. Always `None` on a
+    /// lifecycle event, which watches the session and not a tool.
     pub matcher: Option<String>,
     /// Executable run directly (no shell): the declaration is an argv, not a
     /// command line, so nothing is re-interpreted between the configuration and
@@ -126,6 +213,21 @@ pub trait Hooks: Send + Sync {
     /// this FIRST: without a declaration nothing is prepared, nothing is cloned
     /// and no process is started (US-017 AC5).
     fn intercepts(&self, event: HookEvent, tool: &str) -> bool;
+
+    /// Same question for an event that names no tool. Call sites of the lifecycle
+    /// ask this before building a payload, so a session without hooks pays
+    /// nothing.
+    fn watches(&self, _event: HookEvent) -> bool {
+        false
+    }
+
+    /// Runs the hooks of a lifecycle event. Returns `Deny` only for the events
+    /// that still gate something (`SessionStart`, `UserPromptSubmit`); for the
+    /// others a failure travels through the engine's notice channel and the
+    /// decision stays `NoObjection`.
+    async fn lifecycle(&self, _event: Lifecycle<'_>) -> HookDecision {
+        HookDecision::NoObjection
+    }
 
     /// Runs the hooks preceding a tool call and returns the strictest decision.
     async fn pre_tool_use(&self, tool: &str, input: &serde_json::Value) -> HookDecision;
@@ -174,6 +276,9 @@ pub struct CommandHooks {
     timeout: Duration,
     harden: Option<CommandHardener>,
     notice: Option<HookNotice>,
+    /// Session the lifecycle events belong to. Empty when the caller has none to
+    /// give, in which case the field is simply absent from the payload.
+    session_id: String,
 }
 
 impl std::fmt::Debug for CommandHooks {
@@ -184,6 +289,7 @@ impl std::fmt::Debug for CommandHooks {
             .field("timeout", &self.timeout)
             .field("harden", &self.harden.as_ref().map(|_| "<fn>"))
             .field("notice", &self.notice.as_ref().map(|_| "<fn>"))
+            .field("session_id", &self.session_id)
             .finish()
     }
 }
@@ -196,7 +302,15 @@ impl CommandHooks {
             timeout: DEFAULT_HOOK_TIMEOUT,
             harden: None,
             notice: None,
+            session_id: String::new(),
         }
+    }
+
+    /// Session identifier carried by the lifecycle payloads.
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = session_id.into();
+        self
     }
 
     /// Same hardening as the tool subprocesses (network through the allow-list
@@ -226,6 +340,19 @@ impl CommandHooks {
     fn report(&self, message: String) {
         if let Some(notice) = &self.notice {
             notice(message);
+        }
+    }
+
+    /// What a refusal means on a lifecycle event: a `Deny` for the events that
+    /// still gate something, a notice for the ones that observe an already
+    /// finished thing.
+    fn lifecycle_refusal(&self, event: Lifecycle<'_>, reason: String) -> HookDecision {
+        let message = format!("{}: {reason}", event.event().name());
+        if event.gates() {
+            HookDecision::Deny(message)
+        } else {
+            self.report(message);
+            HookDecision::NoObjection
         }
     }
 
@@ -299,6 +426,41 @@ impl CommandHooks {
 impl Hooks for CommandHooks {
     fn intercepts(&self, event: HookEvent, tool: &str) -> bool {
         self.matching(event).any(|spec| spec.matches(tool))
+    }
+
+    fn watches(&self, event: HookEvent) -> bool {
+        self.matching(event).next().is_some()
+    }
+
+    async fn lifecycle(&self, event: Lifecycle<'_>) -> HookDecision {
+        let kind = event.event();
+        // US-017 AC6: no declaration, no payload, no process.
+        if !self.watches(kind) {
+            return HookDecision::NoObjection;
+        }
+        let payload = match serde_json::to_vec(&lifecycle_payload(
+            event,
+            &self.session_id,
+            &self.workspace,
+        )) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return self.lifecycle_refusal(event, format!("event not serializable: {e}"));
+            }
+        };
+        for spec in self.matching(kind) {
+            let decision = match self.run(spec, payload.clone()).await {
+                Ok(exit) => lifecycle_decision(spec.label(), &exit),
+                // Missing executable, timeout: fail-closed, as everywhere else.
+                Err(failure) => HookDecision::Deny(failure),
+            };
+            // A refusal ends the sequence: nothing left to gate, and the
+            // remaining hooks would only cost time.
+            if let HookDecision::Deny(reason) = decision {
+                return self.lifecycle_refusal(event, reason);
+            }
+        }
+        HookDecision::NoObjection
     }
 
     async fn pre_tool_use(&self, tool: &str, input: &serde_json::Value) -> HookDecision {
@@ -460,6 +622,40 @@ fn interpret_stdout(label: &str, stdout: &str) -> HookDecision {
     }
 }
 
+/// Reads the decision of a finished LIFECYCLE hook. Same reading as a tool hook,
+/// except that `ask` has nowhere to go: a lifecycle event carries no per-call
+/// confirmation, so a hook asking for one gets the fail-closed answer rather than
+/// a silent pass.
+fn lifecycle_decision(label: &str, exit: &HookExit) -> HookDecision {
+    match interpret(label, exit) {
+        HookDecision::Ask(reason) => HookDecision::Deny(format!(
+            "hook `{label}`: `ask` has no confirmation to request on a lifecycle event ({reason})"
+        )),
+        other => other,
+    }
+}
+
+/// The lifecycle event handed to a hook on its standard input.
+fn lifecycle_payload(event: Lifecycle<'_>, session_id: &str, cwd: &Path) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "hook_event_name": event.event().name(),
+        "cwd": cwd.display().to_string(),
+    });
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    if !session_id.is_empty() {
+        object.insert(
+            "session_id".to_string(),
+            serde_json::Value::String(session_id.to_string()),
+        );
+    }
+    if let Some((key, field)) = event.field() {
+        object.insert(key.to_string(), serde_json::Value::String(field));
+    }
+    value
+}
+
 /// The event handed to a hook on its standard input.
 fn payload(
     event: HookEvent,
@@ -516,6 +712,19 @@ fn detail(stderr: &str) -> String {
         reason if reason.is_empty() => String::new(),
         reason => format!(": {reason}"),
     }
+}
+
+/// Bounds a payload field, keeping its HEAD: a prompt says what it is about at
+/// the start, and a hook reading it needs a predictable size.
+fn truncate_head(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
 }
 
 /// Bounds a reason before it reaches a dialog or the model.
@@ -688,8 +897,227 @@ mod tests {
             HookEvent::parse("post_tool_use"),
             Some(HookEvent::PostToolUse)
         );
-        assert_eq!(HookEvent::parse("SessionStart"), None);
+        assert_eq!(HookEvent::parse("Rewind"), None);
         assert_eq!(HookEvent::PreToolUse.name(), "PreToolUse");
+    }
+
+    /// AC1: the four lifecycle events join the two existing ones, under the names
+    /// of the reference contract.
+    #[test]
+    fn the_lifecycle_events_are_declared_and_readable() {
+        for name in HOOK_EVENT_NAMES {
+            assert_eq!(
+                HookEvent::parse(name).map(HookEvent::name),
+                Some(*name),
+                "{name} unreadable"
+            );
+        }
+        assert_eq!(HOOK_EVENT_NAMES.len(), 6);
+        assert_eq!(
+            HookEvent::parse("session-start"),
+            Some(HookEvent::SessionStart)
+        );
+        // A lifecycle event watches the session: a matcher would have nothing to
+        // select.
+        assert!(HookEvent::PreToolUse.is_tool_scoped());
+        assert!(!HookEvent::SessionStart.is_tool_scoped());
+        assert!(!HookEvent::Stop.is_tool_scoped());
+    }
+
+    #[test]
+    fn a_lifecycle_payload_carries_the_field_of_its_event() {
+        let start = lifecycle_payload(
+            Lifecycle::SessionStart { source: "resume" },
+            "2026-07-27.jsonl",
+            Path::new("/ws"),
+        );
+        assert_eq!(start["hook_event_name"], "SessionStart");
+        assert_eq!(start["session_id"], "2026-07-27.jsonl");
+        assert_eq!(start["cwd"], "/ws");
+        assert_eq!(start["source"], "resume");
+
+        let stop = lifecycle_payload(Lifecycle::Stop, "", Path::new("/ws"));
+        assert_eq!(stop["hook_event_name"], "Stop");
+        // No session to name, no key: a hook reads an absence, never an empty
+        // string it would have to interpret.
+        assert!(stop.get("session_id").is_none());
+        assert!(stop.get("source").is_none());
+
+        let long = "p".repeat(MAX_HOOK_PROMPT_BYTES * 2);
+        let submit = lifecycle_payload(
+            Lifecycle::UserPromptSubmit { prompt: &long },
+            "s",
+            Path::new("/ws"),
+        );
+        let carried = submit["prompt"].as_str().unwrap();
+        assert!(
+            carried.len() <= MAX_HOOK_PROMPT_BYTES + 8,
+            "prompt unbounded"
+        );
+        assert!(carried.ends_with('…'));
+    }
+
+    /// AC6: no declaration, nothing runs.
+    #[tokio::test]
+    async fn a_session_without_hooks_watches_nothing() {
+        assert!(!NoHooks.watches(HookEvent::SessionStart));
+        assert_eq!(
+            NoHooks
+                .lifecycle(Lifecycle::UserPromptSubmit { prompt: "hello" })
+                .await,
+            HookDecision::NoObjection
+        );
+        let hooks = engine(vec![shell_hook(HookEvent::PreToolUse, "exit 2")]);
+        assert!(!hooks.watches(HookEvent::UserPromptSubmit));
+        assert_eq!(
+            hooks
+                .lifecycle(Lifecycle::UserPromptSubmit { prompt: "hello" })
+                .await,
+            HookDecision::NoObjection
+        );
+    }
+
+    /// AC2: a `UserPromptSubmit` hook that refuses stops the turn, and the reason
+    /// names both the event and the hook.
+    #[tokio::test]
+    async fn a_user_prompt_submit_hook_can_refuse_the_turn() {
+        let hooks = engine(vec![shell_hook(
+            HookEvent::UserPromptSubmit,
+            r#"grep -q '"prompt":"deploy prod"' && { echo "pas en prod" >&2; exit 2; }"#,
+        )]);
+        let decision = hooks
+            .lifecycle(Lifecycle::UserPromptSubmit {
+                prompt: "deploy prod",
+            })
+            .await;
+        let reason = deny_reason(&decision);
+        assert!(reason.contains("UserPromptSubmit"), "{decision:?}");
+        assert!(reason.contains("pas en prod"), "{decision:?}");
+    }
+
+    /// AC3: failure, timeout and unknown decision all deny on a gating event.
+    #[tokio::test]
+    async fn a_gating_lifecycle_hook_fails_closed() {
+        let missing = CommandHooks::new(
+            vec![HookSpec {
+                event: HookEvent::SessionStart,
+                matcher: None,
+                command: "/nonexistent/pyxis-hook".to_string(),
+                args: Vec::new(),
+            }],
+            std::env::temp_dir(),
+        );
+        assert!(matches!(
+            missing
+                .lifecycle(Lifecycle::SessionStart { source: "startup" })
+                .await,
+            HookDecision::Deny(_)
+        ));
+
+        let hanging = engine(vec![shell_hook(HookEvent::SessionStart, "sleep 30")])
+            .with_timeout(Duration::from_millis(150));
+        assert!(
+            deny_reason(
+                &hanging
+                    .lifecycle(Lifecycle::SessionStart { source: "startup" })
+                    .await
+            )
+            .contains("timed out")
+        );
+
+        let unknown = engine(vec![shell_hook(
+            HookEvent::SessionStart,
+            r#"printf '{"hookSpecificOutput":{"permissionDecision":"maybe"}}'"#,
+        )]);
+        assert!(matches!(
+            unknown
+                .lifecycle(Lifecycle::SessionStart { source: "startup" })
+                .await,
+            HookDecision::Deny(_)
+        ));
+    }
+
+    /// A lifecycle event has no per-call confirmation to request, so `ask` is
+    /// answered fail-closed instead of being read as a pass.
+    #[tokio::test]
+    async fn ask_on_a_lifecycle_event_is_a_refusal() {
+        let hooks = engine(vec![shell_hook(
+            HookEvent::UserPromptSubmit,
+            r#"printf '{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"prudence"}}'"#,
+        )]);
+        let decision = hooks
+            .lifecycle(Lifecycle::UserPromptSubmit { prompt: "go" })
+            .await;
+        assert!(
+            deny_reason(&decision).contains("no confirmation"),
+            "{decision:?}"
+        );
+    }
+
+    /// AC4: `allow` stays "no objection" on the lifecycle too.
+    #[tokio::test]
+    async fn allow_on_a_lifecycle_event_stays_no_objection() {
+        let hooks = engine(vec![shell_hook(
+            HookEvent::SessionStart,
+            r#"printf '{"hookSpecificOutput":{"permissionDecision":"allow"}}'"#,
+        )]);
+        assert_eq!(
+            hooks
+                .lifecycle(Lifecycle::SessionStart { source: "startup" })
+                .await,
+            HookDecision::NoObjection
+        );
+    }
+
+    /// `Stop` and `SessionEnd` observe something already over: a failure is
+    /// reported to the human, and nothing is denied.
+    #[tokio::test]
+    async fn an_observing_lifecycle_hook_reports_instead_of_denying() {
+        let notices = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&notices);
+        let hooks = engine(vec![
+            shell_hook(HookEvent::Stop, "echo journal illisible >&2; exit 1"),
+            shell_hook(HookEvent::SessionEnd, "exit 2"),
+        ])
+        .with_notice(Arc::new(move |msg| {
+            sink.lock().unwrap_or_else(|e| e.into_inner()).push(msg);
+        }));
+
+        assert_eq!(
+            hooks.lifecycle(Lifecycle::Stop).await,
+            HookDecision::NoObjection
+        );
+        assert_eq!(
+            hooks
+                .lifecycle(Lifecycle::SessionEnd { reason: "exit" })
+                .await,
+            HookDecision::NoObjection
+        );
+        let notices = notices.lock().unwrap();
+        assert_eq!(notices.len(), 2, "{notices:?}");
+        assert!(notices[0].starts_with("Stop: "), "{notices:?}");
+        assert!(notices[0].contains("journal illisible"), "{notices:?}");
+        assert!(notices[1].starts_with("SessionEnd: "), "{notices:?}");
+    }
+
+    /// The session identifier reaches the hook, so a lifecycle command can find
+    /// the transcript it is about.
+    #[tokio::test]
+    async fn a_lifecycle_hook_reads_the_session_on_its_standard_input() {
+        let hooks = CommandHooks::new(
+            vec![shell_hook(
+                HookEvent::SessionStart,
+                r#"p=$(cat); case "$p" in *'"session_id":"abc.jsonl"'*) ;; *) exit 2;; esac; case "$p" in *'"source":"resume"'*) ;; *) exit 2;; esac"#,
+            )],
+            std::env::temp_dir(),
+        )
+        .with_session_id("abc.jsonl");
+        assert_eq!(
+            hooks
+                .lifecycle(Lifecycle::SessionStart { source: "resume" })
+                .await,
+            HookDecision::NoObjection
+        );
     }
 
     #[test]
