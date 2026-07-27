@@ -2,32 +2,166 @@
 //! filter the network (ADR-7 R3) -> **best-effort** application-level filtering: the
 //! tool subprocesses get `HTTP(S)_PROXY` pointing here; a client that
 //! honors the variable for CONNECT tunnels is filtered. Fail-closed: any
-//! hostname outside the allow-list is blocked (403) and logged. Non-CONNECT HTTP
+//! hostname outside the allow-list is blocked (403) and reported. Non-CONNECT HTTP
 //! requests are refused, not forwarded.
 //!
 //! Accepted best-effort: a binary that opens a raw socket while ignoring
 //! `HTTP_PROXY` escapes the filter (the Landlock FS confinement, in contrast, stays hard).
 //! Hard network confinement (Landlock AccessNet V4 / nftables) is deferred.
+//!
+//! US-003: network access is a property of the [`SandboxPolicy`], not an
+//! independent setting, and an authorization covers the SUBDOMAINS of the host
+//! it names, on a label boundary. US-004 adds one-call grants, the only
+//! perimeter Pyxis can widen without restarting.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use agent_core::sandbox::SandboxPolicy;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+/// Reported to the user when the proxy blocks a host. The refusal is restituted,
+/// not merely logged (US-003 AC6).
+pub type ProxyNotice = Arc<dyn Fn(String) + Send + Sync>;
 
 /// Network policy: hostname allow-list (fail-closed). Empty = no network
 /// allowed for the tools (safe default).
 #[derive(Debug, Clone, Default)]
 pub struct ProxyPolicy {
-    pub allow: Vec<String>,
+    allow: Vec<String>,
+    /// Carried by the sandbox policy (US-003 AC1). When false the allow-list is
+    /// moot: the policy closed the network, and no list reopens it.
+    network_access: bool,
 }
 
 impl ProxyPolicy {
+    /// Allow-list with network access open: what `--allow` alone expresses.
     pub fn new(allow: Vec<String>) -> Self {
-        Self { allow }
+        Self {
+            allow: allow.iter().map(|host| normalize_host(host)).collect(),
+            network_access: true,
+        }
     }
+
+    /// Derives the network policy from the sandbox policy (US-003 AC1). Returns
+    /// the notice to show when the two disagree: a closed policy WINS over the
+    /// allow-list, deterministically, and says so (AC5, edge case #5).
+    pub fn from_sandbox(policy: &SandboxPolicy, allow: Vec<String>) -> (Self, Option<String>) {
+        if policy.network_access() {
+            return (Self::new(allow), None);
+        }
+        let notice = (!allow.is_empty()).then(|| {
+            format!(
+                "network closed by the `{}` sandbox policy; the allow-list ({}) is ignored",
+                policy.id(),
+                allow.join(", ")
+            )
+        });
+        (
+            Self {
+                allow: Vec::new(),
+                network_access: false,
+            },
+            notice,
+        )
+    }
+
+    /// Hosts the tools may reach, for the message shown on a refusal.
+    pub fn allowed(&self) -> &[String] {
+        &self.allow
+    }
+
+    /// Is `host` covered by the allow-list?
+    ///
+    /// Matching is on a DOMAIN LABEL boundary (US-003 AC3): allowing
+    /// `github.com` covers `api.github.com` but never `evil-github.com` nor
+    /// `github.com.evil.test`. And it only DESCENDS: allowing `api.github.com`
+    /// does not allow `github.com` (AC4).
     pub fn is_allowed(&self, host: &str) -> bool {
-        self.allow.iter().any(|h| h == host)
+        if !self.network_access {
+            return false;
+        }
+        let host = normalize_host(host);
+        self.allow
+            .iter()
+            .any(|allowed| is_suffix_match(&host, allowed))
+    }
+}
+
+/// Case and trailing dot are not part of a host's identity; normalizing both
+/// sides removes a class of allow-list bypass (`GitHub.com`, `github.com.`).
+fn normalize_host(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// `host` is `allowed` itself, or one of its subdomains. The character before
+/// the suffix must be a dot, which is exactly what makes the test a label
+/// boundary and not a substring (`evil-github.com` vs `github.com`).
+fn is_suffix_match(host: &str, allowed: &str) -> bool {
+    if allowed.is_empty() {
+        return false;
+    }
+    if host == allowed {
+        return true;
+    }
+    host.len() > allowed.len()
+        && host.ends_with(allowed)
+        && host.as_bytes()[host.len() - allowed.len() - 1] == b'.'
+}
+
+/// Hosts granted for the duration of ONE tool call (US-004). Kept apart from
+/// the policy on purpose: an escalation must never look like a policy change.
+#[derive(Clone, Default)]
+pub struct NetworkGrants {
+    inner: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl NetworkGrants {
+    /// Opens a grant for `host`. The widening lasts exactly as long as the
+    /// returned guard (US-004 AC3): dropping it is what revokes the grant, so
+    /// no code path can forget to.
+    pub fn grant(&self, host: &str) -> NetworkGrant {
+        let host = normalize_host(host);
+        if let Ok(mut map) = self.inner.lock() {
+            *map.entry(host.clone()).or_insert(0) += 1;
+        }
+        NetworkGrant {
+            grants: self.clone(),
+            host,
+        }
+    }
+
+    fn allows(&self, host: &str) -> bool {
+        match self.inner.lock() {
+            Ok(map) => map.contains_key(host),
+            Err(poisoned) => poisoned.into_inner().contains_key(host),
+        }
+    }
+
+    fn release(&self, host: &str) {
+        let Ok(mut map) = self.inner.lock() else {
+            return;
+        };
+        if let Some(count) = map.get_mut(host) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(host);
+            }
+        }
+    }
+}
+
+/// RAII token of a one-call network grant. Revokes on drop.
+pub struct NetworkGrant {
+    grants: NetworkGrants,
+    host: String,
+}
+
+impl Drop for NetworkGrant {
+    fn drop(&mut self) {
+        self.grants.release(&self.host);
     }
 }
 
@@ -36,35 +170,78 @@ impl ProxyPolicy {
 pub struct ProxyHandle {
     /// `127.0.0.1:PORT` address to export as `HTTP(S)_PROXY`.
     pub addr: String,
-    /// Log of the blocked hosts (AC2 "logged"), readable by the frontend.
+    /// Log of the blocked hosts (AC2 "logged"), readable by the frontend. Append
+    /// only: its length is the mark a caller takes around one tool call.
     pub blocked: Arc<Mutex<Vec<String>>>,
+    /// One-call grants (US-004), shared with the running proxy.
+    pub grants: NetworkGrants,
+    /// Hosts the policy allows, for the message a refusal must carry.
+    pub allowed: Vec<String>,
+}
+
+impl ProxyHandle {
+    /// Hosts blocked since a previous [`ProxyHandle::mark`].
+    pub fn blocked_since(&self, mark: usize) -> Vec<String> {
+        let log = match self.blocked.lock() {
+            Ok(log) => log,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        log.get(mark..).map(<[String]>::to_vec).unwrap_or_default()
+    }
+
+    /// Opaque position in the block log, to be passed back to
+    /// [`ProxyHandle::blocked_since`].
+    pub fn mark(&self) -> usize {
+        match self.blocked.lock() {
+            Ok(log) => log.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
+    }
 }
 
 /// Starts the proxy on a free local port. Returns its handle.
-pub async fn spawn(policy: ProxyPolicy) -> std::io::Result<ProxyHandle> {
+///
+/// `notice` restitutes a refusal to the user (US-003 AC6). `None` keeps the
+/// block in the log only, which is what the tests and the headless path want.
+pub async fn spawn(
+    policy: ProxyPolicy,
+    notice: Option<ProxyNotice>,
+) -> std::io::Result<ProxyHandle> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?.to_string();
     let blocked = Arc::new(Mutex::new(Vec::new()));
+    let grants = NetworkGrants::default();
+    let allowed = policy.allowed().to_vec();
     let policy = Arc::new(policy);
 
     let blocked_bg = Arc::clone(&blocked);
+    let grants_bg = grants.clone();
     tokio::spawn(async move {
         while let Ok((sock, _)) = listener.accept().await {
             let policy = Arc::clone(&policy);
             let blocked = Arc::clone(&blocked_bg);
+            let grants = grants_bg.clone();
+            let notice = notice.clone();
             tokio::spawn(async move {
-                let _ = handle_conn(sock, policy, blocked).await;
+                let _ = handle_conn(sock, policy, grants, blocked, notice).await;
             });
         }
     });
 
-    Ok(ProxyHandle { addr, blocked })
+    Ok(ProxyHandle {
+        addr,
+        blocked,
+        grants,
+        allowed,
+    })
 }
 
 async fn handle_conn(
     mut client: TcpStream,
     policy: Arc<ProxyPolicy>,
+    grants: NetworkGrants,
     blocked: Arc<Mutex<Vec<String>>>,
+    notice: Option<ProxyNotice>,
 ) -> std::io::Result<()> {
     // Read the headers up to CRLFCRLF.
     let mut buf = Vec::new();
@@ -96,13 +273,23 @@ async fn handle_conn(
     let host = target.split(':').next().unwrap_or(target).to_string();
     let port = target.split(':').nth(1).unwrap_or("443");
 
-    if !policy.is_allowed(&host) {
+    // A one-call grant (US-004) is checked alongside the policy, never merged
+    // into it: the policy of the session stays what the user configured.
+    if !policy.is_allowed(&host) && !grants.allows(&normalize_host(&host)) {
         if let Ok(mut log) = blocked.lock() {
             log.push(host.clone());
         }
-        let _ = client
-            .write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nblocked by pyxis network allow-list")
-            .await;
+        // US-003 AC6: the refusal names the host AND the active allow-list, on
+        // both channels -> the body reaches the model through the tool output,
+        // the notice reaches the user.
+        let allowed = describe_allowed(policy.allowed());
+        if let Some(notice) = notice {
+            notice(format!("network blocked: {host} (allowed: {allowed})"));
+        }
+        let body = format!(
+            "HTTP/1.1 403 Forbidden\r\n\r\nblocked by pyxis network allow-list: {host} (allowed: {allowed})"
+        );
+        let _ = client.write_all(body.as_bytes()).await;
         return Ok(());
     }
 
@@ -121,6 +308,16 @@ async fn handle_conn(
     Ok(())
 }
 
+/// Renders the allow-list for a refusal message. An empty list is stated, not
+/// left blank: "nothing is allowed" is the actual policy, not a missing value.
+pub fn describe_allowed(allowed: &[String]) -> String {
+    if allowed.is_empty() {
+        "none".to_string()
+    } else {
+        allowed.join(", ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +331,89 @@ mod tests {
         assert!(!p.is_allowed("api.openai.com.evil.test"));
         // empty default = nothing allowed.
         assert!(!ProxyPolicy::default().is_allowed("anything"));
+    }
+
+    #[test]
+    fn authorization_covers_subdomains_on_a_label_boundary() {
+        // US-003 AC2/AC3: `github.com` covers its subdomains, and nothing that
+        // merely ends with the same characters.
+        let p = ProxyPolicy::new(vec!["github.com".to_string()]);
+        assert!(p.is_allowed("github.com"));
+        assert!(p.is_allowed("api.github.com"));
+        assert!(p.is_allowed("raw.githubusercontent.com.github.com"));
+        for refused in [
+            "notgithub.com",
+            "evil-github.com",
+            "github.com.evil.test",
+            "xgithub.com",
+        ] {
+            assert!(!p.is_allowed(refused), "{refused} must stay blocked");
+        }
+    }
+
+    #[test]
+    fn authorization_descends_but_never_climbs() {
+        // US-003 AC4: allowing a subdomain says nothing about its parent.
+        let p = ProxyPolicy::new(vec!["api.github.com".to_string()]);
+        assert!(p.is_allowed("api.github.com"));
+        assert!(p.is_allowed("v3.api.github.com"));
+        assert!(!p.is_allowed("github.com"));
+        assert!(!p.is_allowed("other.github.com"));
+    }
+
+    #[test]
+    fn host_identity_ignores_case_and_trailing_dot() {
+        let p = ProxyPolicy::new(vec!["GitHub.com.".to_string()]);
+        assert!(p.is_allowed("api.GITHUB.com"));
+        assert!(p.is_allowed("github.com."));
+    }
+
+    #[test]
+    fn a_closed_policy_wins_over_the_allowlist() {
+        // US-003 AC5 / edge case #5: deterministic resolution, announced.
+        let read_only = SandboxPolicy::ReadOnly {
+            network_access: false,
+        };
+        let (policy, notice) =
+            ProxyPolicy::from_sandbox(&read_only, vec!["github.com".to_string()]);
+        assert!(!policy.is_allowed("github.com"));
+        assert!(policy.allowed().is_empty());
+        let notice = notice.expect("the conflict must be announced");
+        assert!(notice.contains("github.com"), "{notice}");
+        assert!(notice.contains("read-only"), "{notice}");
+    }
+
+    #[test]
+    fn an_open_policy_keeps_the_allowlist_and_says_nothing() {
+        let open = SandboxPolicy::workspace_write("/w", Vec::new(), [".git"]);
+        let (policy, notice) = ProxyPolicy::from_sandbox(&open, vec!["github.com".to_string()]);
+        assert!(policy.is_allowed("api.github.com"));
+        assert!(notice.is_none());
+    }
+
+    #[test]
+    fn a_grant_lasts_exactly_as_long_as_its_guard() {
+        // US-004 AC3: the widening does not survive the call.
+        let grants = NetworkGrants::default();
+        assert!(!grants.allows("example.test"));
+        {
+            let _guard = grants.grant("Example.test");
+            assert!(grants.allows("example.test"));
+        }
+        assert!(!grants.allows("example.test"));
+    }
+
+    #[test]
+    fn nested_grants_release_one_at_a_time() {
+        let grants = NetworkGrants::default();
+        let outer = grants.grant("example.test");
+        {
+            let _inner = grants.grant("example.test");
+            assert!(grants.allows("example.test"));
+        }
+        assert!(grants.allows("example.test"), "the outer grant still holds");
+        drop(outer);
+        assert!(!grants.allows("example.test"));
     }
 
     async fn local_upstream() -> String {
@@ -170,7 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_connect_requests_are_rejected() {
-        let handle = spawn(ProxyPolicy::new(vec!["example.com".to_string()]))
+        let handle = spawn(ProxyPolicy::new(vec!["example.com".to_string()]), None)
             .await
             .unwrap();
         let mut s = TcpStream::connect(&handle.addr).await.unwrap();
@@ -192,7 +472,7 @@ mod tests {
         let upstream = local_upstream().await;
         let port = upstream.split(':').nth(1).unwrap().to_string();
         // we allow 127.0.0.1 (resolved locally to the upstream).
-        let handle = spawn(ProxyPolicy::new(vec!["127.0.0.1".to_string()]))
+        let handle = spawn(ProxyPolicy::new(vec!["127.0.0.1".to_string()]), None)
             .await
             .unwrap();
 
@@ -209,5 +489,54 @@ mod tests {
             log.iter().any(|h| h == "evil.exfil.test"),
             "blocage non journalisé: {log:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_refusal_names_the_host_and_the_active_allowlist() {
+        // US-003 AC6: restituted, not merely logged.
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let notice: ProxyNotice = Arc::new(move |message| {
+            if let Ok(mut log) = sink.lock() {
+                log.push(message);
+            }
+        });
+        let handle = spawn(
+            ProxyPolicy::new(vec!["github.com".to_string()]),
+            Some(notice),
+        )
+        .await
+        .unwrap();
+
+        let (_status, body) = connect_through(&handle.addr, "evil-github.com:443").await;
+        assert!(body.contains("evil-github.com"), "{body}");
+        assert!(body.contains("github.com"), "{body}");
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|m| m.contains("evil-github.com") && m.contains("allowed: github.com")),
+            "refus non restitué: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_one_call_grant_opens_then_closes_the_tunnel() {
+        // US-004 AC2/AC3: the escalation opens the host for one call only.
+        let upstream = local_upstream().await;
+        let port = upstream.split(':').nth(1).unwrap().to_string();
+        let handle = spawn(ProxyPolicy::new(Vec::new()), None).await.unwrap();
+        let target = format!("127.0.0.1:{port}");
+
+        let (before, _) = connect_through(&handle.addr, &target).await;
+        assert!(before.contains("403"), "sans grant: {before}");
+        {
+            let _grant = handle.grants.grant("127.0.0.1");
+            let (during, body) = connect_through(&handle.addr, &target).await;
+            assert!(during.contains("200"), "avec grant: {during}");
+            assert!(body.contains("UP-OK"));
+        }
+        let (after, _) = connect_through(&handle.addr, &target).await;
+        assert!(after.contains("403"), "après le grant: {after}");
     }
 }

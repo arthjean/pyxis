@@ -14,10 +14,13 @@ pub mod fs;
 pub mod proxy;
 
 pub use fs::{
-    IgnoreReason, IgnoredRoot, SandboxError, SandboxStatus, WritableRoots, enforce_process,
-    resolve_writable_roots,
+    IgnoreReason, IgnoredRoot, SandboxError, SandboxStatus, WritableRoots, enforce_policy,
+    enforce_process, resolve_writable_roots,
 };
-pub use proxy::{ProxyHandle, ProxyPolicy, spawn as spawn_proxy};
+pub use proxy::{
+    NetworkGrant, NetworkGrants, ProxyHandle, ProxyNotice, ProxyPolicy, describe_allowed,
+    spawn as spawn_proxy,
+};
 
 const SAFE_ENV_KEYS: &[&str] = &[
     "PATH",
