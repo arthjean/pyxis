@@ -17,6 +17,7 @@ pub mod guardrail;
 pub mod message;
 pub mod provider;
 pub mod quota;
+pub mod sandbox;
 pub mod session;
 pub mod tools;
 pub mod transition;
@@ -41,6 +42,7 @@ pub use provider::{
     ToolCallingCapabilities,
 };
 pub use quota::{QuotaSnapshot, QuotaWindow, format_unix_utc};
+pub use sandbox::{SandboxPolicy, WritableRoot, WriteRefusal};
 pub use session::{Session, SessionEntry, SessionError};
 pub use tools::{ToolDispatch, ToolDispatchEvent, ToolEventSink, ToolInvocation, ToolOutcome};
 
