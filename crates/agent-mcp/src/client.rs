@@ -1,22 +1,31 @@
-//! MCP client: connection to a server through the stdio transport (`rmcp`), automatic
-//! `initialize` handshake, tool listing. Wrapping the tools into `DynTool`
-//! (integration into the `agent-tools` registry) will come in Phase 2.
+//! MCP client: connection to a server through the stdio transport (subprocess) or
+//! the Streamable HTTP transport (remote, US-013), automatic `initialize`
+//! handshake, tool listing. Both transports produce the same `McpConnection`: the
+//! rest of the crate never learns which one it is talking to.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use rmcp::service::RunningService;
 use rmcp::transport::TokioChildProcess;
+use rmcp::transport::streamable_http_client::{
+    StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
+};
 use rmcp::{RoleClient, ServiceExt};
 use tokio::process::Command;
 
-use crate::config::McpServerConfig;
+use crate::config::{McpServerConfig, McpTransport};
 use crate::error::McpError;
+use crate::http::StreamableHttpAdapter;
 
 pub type CommandHardener = Arc<dyn Fn(&mut Command) + Send + Sync>;
 
 /// Max delay to establish the connection (spawn + `initialize` handshake).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Same bound for a remote server, but tighter: a network handshake that has not
+/// completed in 10s will not complete (NFR of the PRD). Applies to the TCP/TLS
+/// connection and to the whole `initialize`.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Length cap of a tool description (ARCHITECTURE 6: a server cannot
@@ -54,17 +63,84 @@ impl McpConnection {
     /// Hardened variant: the caller can inject the same env scrub + proxy as the
     /// Bash tools. `cfg.env` stays explicit, but the proxy keys are ignored
     /// to avoid bypasses through `NO_PROXY` or `ALL_PROXY`.
+    ///
+    /// The hardener applies to the stdio transport alone: a remote server is not a
+    /// subprocess, so there is no command to harden.
     pub async fn connect_hardened(
         name: &str,
         cfg: &McpServerConfig,
         harden: Option<&CommandHardener>,
     ) -> Result<Self, McpError> {
-        let mut command = Command::new(&cfg.command);
-        command.args(&cfg.args);
+        match &cfg.transport {
+            McpTransport::Stdio { command, args, env } => {
+                Self::connect_stdio(name, command, args, env, harden).await
+            }
+            McpTransport::Http {
+                url,
+                bearer_token_env_var,
+            } => Self::connect_http(name, url, bearer_token_env_var.as_deref()).await,
+        }
+    }
+
+    /// Remote server over Streamable HTTP. The bearer token is read from the
+    /// environment HERE, by the name the config declares: no readable secret ever
+    /// enters `McpServerConfig`, hence neither the transcript nor the diagnostics
+    /// (US-013 AC3).
+    async fn connect_http(
+        name: &str,
+        url: &str,
+        bearer_token_env_var: Option<&str>,
+    ) -> Result<Self, McpError> {
+        let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
+        if let Some(var) = bearer_token_env_var {
+            let token = std::env::var(var)
+                .ok()
+                .filter(|token| !token.trim().is_empty())
+                .ok_or_else(|| McpError::Connect {
+                    server: name.to_string(),
+                    // The NAME of the variable, never its content.
+                    message: format!("bearer token: environment variable {var} is empty or unset"),
+                })?;
+            config = config.auth_header(token);
+        }
+        let http = reqwest::Client::builder()
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            // Idle connections are not reused: an SSE body that was not drained
+            // stalls the next request on the same connection.
+            .pool_max_idle_per_host(0)
+            .build()
+            .map_err(|e| McpError::Connect {
+                server: name.to_string(),
+                message: format!("http client: {e}"),
+            })?;
+        let transport =
+            StreamableHttpClientTransport::with_client(StreamableHttpAdapter::new(http), config);
+        let service = tokio::time::timeout(HTTP_CONNECT_TIMEOUT, ().serve(transport))
+            .await
+            .map_err(|_| McpError::Connect {
+                server: name.to_string(),
+                message: format!("timeout after {}s", HTTP_CONNECT_TIMEOUT.as_secs()),
+            })?
+            .map_err(|e| McpError::Connect {
+                server: name.to_string(),
+                message: e.to_string(),
+            })?;
+        Ok(Self { service })
+    }
+
+    async fn connect_stdio(
+        name: &str,
+        program: &str,
+        args: &[String],
+        env: &std::collections::BTreeMap<String, String>,
+        harden: Option<&CommandHardener>,
+    ) -> Result<Self, McpError> {
+        let mut command = Command::new(program);
+        command.args(args);
         if let Some(harden) = harden {
             harden(&mut command);
         }
-        for (k, v) in &cfg.env {
+        for (k, v) in env {
             if is_proxy_env_key(k) {
                 continue;
             }

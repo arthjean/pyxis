@@ -180,16 +180,7 @@ mod tests {
 
     fn registry_with(name: &str) -> McpRegistry {
         let mut servers = BTreeMap::new();
-        servers.insert(
-            name.to_string(),
-            McpServerConfig {
-                command: "echo".into(),
-                args: Vec::new(),
-                env: BTreeMap::new(),
-                source: Default::default(),
-                shadows_lower_priority: false,
-            },
-        );
+        servers.insert(name.to_string(), McpServerConfig::stdio("echo", Vec::new()));
         McpRegistry::from_config(McpConfigFile {
             servers,
             skipped: 0,
