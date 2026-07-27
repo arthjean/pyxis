@@ -41,6 +41,9 @@ pub enum Block {
         is_error: bool,
         error_kind: Option<ToolErrorKind>,
     },
+    /// Plan of the current task (US-009). At most one lives in the transcript:
+    /// an update MOVES it to the end instead of stacking a second copy (AC4).
+    Plan(agent_core::PlanView),
     /// Discreet system information (compaction, budget, ...).
     Notice(String),
     /// Error surfaced by the core.
@@ -1161,6 +1164,14 @@ impl AppState {
                     is_error: view.is_error,
                     error_kind: view.error_kind,
                 });
+            }
+            AgentEvent::Plan(view) => {
+                self.finalize_streaming();
+                // AC4: the previous plan leaves the transcript, so the reader
+                // sees ONE plan, in its current state, at the point of the
+                // conversation where it was last updated.
+                self.blocks.retain(|b| !matches!(b, Block::Plan(_)));
+                self.blocks.push(Block::Plan(view.clone()));
             }
             AgentEvent::Compacted(_) => self.blocks.push(Block::Notice("context compacted".into())),
             // Turn accounting (US-017, US-004): no block in the transcript, but
@@ -2319,6 +2330,27 @@ fn quota_line(quota: Option<&agent_core::quota::QuotaSnapshot>) -> String {
         .map(|instant| format!(", resets at {instant}"))
         .unwrap_or_else(|| format!(", reset time {UNAVAILABLE}"));
     format!("{:.0}% used{scope}{reset}", window.used_percent)
+}
+
+/// Wire name of a plan step status (US-009). Single source for the cache
+/// fingerprint and for anything that has to name a status in text.
+pub fn plan_status_label(status: agent_core::PlanStatus) -> &'static str {
+    match status {
+        agent_core::PlanStatus::Pending => "pending",
+        agent_core::PlanStatus::InProgress => "in_progress",
+        agent_core::PlanStatus::Completed => "completed",
+    }
+}
+
+/// Glyph of a plan step: done, in progress, still to do. Deliberately three
+/// distinct shapes rather than colors alone, so the state survives a monochrome
+/// terminal.
+pub fn plan_status_glyph(status: agent_core::PlanStatus) -> &'static str {
+    match status {
+        agent_core::PlanStatus::Completed => "✔",
+        agent_core::PlanStatus::InProgress => "▸",
+        agent_core::PlanStatus::Pending => "□",
+    }
 }
 
 pub fn turn_diff_summary(view: &TurnDiffView) -> String {
@@ -3811,6 +3843,71 @@ mod tests {
         assert_eq!(
             press(&mut s, KeyCode::Enter, KeyModifiers::NONE),
             InputAction::Submit(format!("{a} puis {b}"))
+        );
+    }
+
+    // ───────── US-009: the task plan ─────────
+
+    fn plan_event(steps: &[(&str, agent_core::PlanStatus)]) -> AgentEvent {
+        AgentEvent::Plan(agent_core::PlanView {
+            explanation: None,
+            steps: steps
+                .iter()
+                .map(|(step, status)| agent_core::PlanStep {
+                    step: (*step).to_string(),
+                    status: *status,
+                })
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn a_plan_enters_the_transcript_as_one_block() {
+        let mut s = AppState::new("gpt-5", false);
+        s.apply(&plan_event(&[
+            ("lire", agent_core::PlanStatus::Completed),
+            ("écrire", agent_core::PlanStatus::InProgress),
+        ]));
+        let plans: Vec<&Block> = s
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, Block::Plan(_)))
+            .collect();
+        assert_eq!(plans.len(), 1);
+        match plans[0] {
+            Block::Plan(view) => {
+                assert_eq!(view.steps.len(), 2);
+                assert_eq!(view.steps[1].status, agent_core::PlanStatus::InProgress);
+            }
+            other => unreachable!("expected a plan block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_updated_plan_replaces_the_previous_one() {
+        // US-009 AC4: the display reflects the new state WITHOUT stacking the
+        // old one; the reader sees one plan, and it is the current one.
+        let mut s = AppState::new("gpt-5", false);
+        s.apply(&plan_event(&[("lire", agent_core::PlanStatus::InProgress)]));
+        s.apply(&AgentEvent::Text("j'avance".into()));
+        s.apply(&plan_event(&[
+            ("lire", agent_core::PlanStatus::Completed),
+            ("écrire", agent_core::PlanStatus::InProgress),
+        ]));
+
+        let plans: Vec<&Block> = s
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, Block::Plan(_)))
+            .collect();
+        assert_eq!(plans.len(), 1, "un seul plan doit rester: {:?}", s.blocks);
+        match plans[0] {
+            Block::Plan(view) => assert_eq!(view.steps.len(), 2, "c'est le plan à jour"),
+            other => unreachable!("expected a plan block, got {other:?}"),
+        }
+        assert!(
+            matches!(s.blocks.last(), Some(Block::Plan(_))),
+            "le plan à jour se place au point courant de la conversation"
         );
     }
 }

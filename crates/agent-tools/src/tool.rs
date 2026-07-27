@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use agent_core::event::PlanView;
 use agent_core::sandbox::SandboxPolicy;
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
@@ -148,6 +149,10 @@ pub struct ToolOutput {
     /// The Registry, which owns the approver, is what turns it into an
     /// escalation offer; the tool only states the cause.
     pub denial: Option<SandboxDenial>,
+    /// Structured plan the call published (US-009). Addressed to the CLIENT,
+    /// not to the model: the Registry forwards it as a dispatch event, next to
+    /// the textual result the model reads.
+    pub plan: Option<PlanView>,
 }
 
 impl ToolOutput {
@@ -157,6 +162,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             denial: None,
+            plan: None,
         }
     }
     /// Output marked as a semantic error (the content is kept for the model).
@@ -165,11 +171,17 @@ impl ToolOutput {
             content: content.into(),
             is_error: true,
             denial: None,
+            plan: None,
         }
     }
     /// Attributes the failure to the confinement (US-004 AC1).
     pub fn with_denial(mut self, denial: SandboxDenial) -> Self {
         self.denial = Some(denial);
+        self
+    }
+    /// Publishes a plan alongside the textual result (US-009).
+    pub fn with_plan(mut self, plan: PlanView) -> Self {
+        self.plan = Some(plan);
         self
     }
 }

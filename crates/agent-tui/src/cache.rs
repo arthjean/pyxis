@@ -142,6 +142,15 @@ pub(crate) fn fingerprint(
                 None => call_id.as_str().hash(&mut h),
             }
         }
+        Block::Plan(view) => {
+            7u8.hash(&mut h);
+            view.explanation.hash(&mut h);
+            for step in &view.steps {
+                step.step.hash(&mut h);
+                // The enum has no `Hash`: its wire name is its identity here.
+                crate::state::plan_status_label(step.status).hash(&mut h);
+            }
+        }
         Block::Notice(t) => {
             5u8.hash(&mut h);
             t.hash(&mut h);

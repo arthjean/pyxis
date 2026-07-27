@@ -42,6 +42,10 @@ pub enum AgentEvent {
     /// when the provider served something usable. Purely informational: a client
     /// that ignores it keeps the previous behavior.
     Quota(crate::quota::QuotaSnapshot),
+    /// Task plan published by the model (US-009). Purely informational: a client
+    /// that ignores this variant keeps the previous behavior, and the plan never
+    /// drives the loop.
+    Plan(PlanView),
     /// Permission request (emitted by the tool pipeline, US-013, not by the
     /// core in EP-002; present to pin down the contract).
     PermissionAsk(PermissionReq),
@@ -145,6 +149,33 @@ pub enum FileChange {
     Added,
     Modified,
     Deleted,
+}
+
+/// Plan of the current task (US-009), as the model states it. Pure data: the
+/// core neither validates it (the tool does) nor renders it (the client does).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanView {
+    /// Optional rationale for the update. Absent = the steps speak for themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+    pub steps: Vec<PlanStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanStep {
+    pub step: String,
+    pub status: PlanStatus,
+}
+
+/// The three states of a plan step, taken from Codex (`plan_spec.rs:7`). At most
+/// one step is `InProgress`, an invariant the tool enforces before the event
+/// exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Completed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

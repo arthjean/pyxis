@@ -932,6 +932,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                             Some(ToolDispatchEvent::OutputDelta { id, chunk }) => {
                                                 yield AgentEvent::ToolOutputDelta(ToolOutputDeltaView { id, chunk });
                                             }
+                                            Some(ToolDispatchEvent::Plan(view)) => {
+                                                yield AgentEvent::Plan(view);
+                                            }
                                             None => tool_events_open = false,
                                         }
                                     }
@@ -950,6 +953,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     }
                                     ToolDispatchEvent::OutputDelta { id, chunk } => {
                                         yield AgentEvent::ToolOutputDelta(ToolOutputDeltaView { id, chunk });
+                                    }
+                                    ToolDispatchEvent::Plan(view) => {
+                                        yield AgentEvent::Plan(view);
                                     }
                                 }
                             }

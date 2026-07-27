@@ -19,6 +19,7 @@ pub mod grep;
 pub mod hooks;
 pub mod path;
 pub mod permission;
+pub mod plan;
 pub mod read;
 pub mod registry;
 pub mod shell;
@@ -42,6 +43,7 @@ pub use permission::{
     AutoApprove, AutoDeny, PermCtx, PermissionDecision, PermissionMode, PermissionModeState,
     PermissionRequest, Resolved, resolve_permission,
 };
+pub use plan::UpdatePlan;
 pub use read::Read;
 pub use registry::{Registry, RegistryBuilder};
 pub use shell::ShellChoice;
@@ -66,5 +68,6 @@ pub fn default_registry(
         .register(Write)
         .register(Edit)
         .register(Bash)
+        .register(UpdatePlan)
         .build()
 }

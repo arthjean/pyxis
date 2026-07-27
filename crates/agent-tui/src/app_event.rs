@@ -598,6 +598,42 @@ impl TranscriptMapper {
                 ));
                 updates
             }
+            // US-009: the plan cell the parity surface already models, now fed
+            // by a real event instead of staying unreachable.
+            AgentEvent::Plan(view) => {
+                let mut updates = self.drain_active_streams();
+                updates.push(TranscriptUpdate::new(
+                    TranscriptLifecycle::Completed,
+                    TranscriptItem::new(
+                        Some(self.next_local("plan")),
+                        TranscriptRole::Assistant,
+                        TranscriptItemKind::PlanUpdate,
+                        TranscriptItemStatus::Complete,
+                        TranscriptPayload::PlanUpdate {
+                            explanation: view.explanation.clone(),
+                            steps: view
+                                .steps
+                                .iter()
+                                .map(|step| TranscriptPlanStep {
+                                    step: step.step.clone(),
+                                    status: match step.status {
+                                        agent_core::PlanStatus::Completed => {
+                                            TranscriptPlanStepStatus::Completed
+                                        }
+                                        agent_core::PlanStatus::InProgress => {
+                                            TranscriptPlanStepStatus::InProgress
+                                        }
+                                        agent_core::PlanStatus::Pending => {
+                                            TranscriptPlanStepStatus::Pending
+                                        }
+                                    },
+                                })
+                                .collect(),
+                        },
+                    ),
+                ));
+                updates
+            }
         }
     }
 

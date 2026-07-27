@@ -970,6 +970,36 @@ fn push_block<'a>(
                 }
             }
         }
+        Block::Plan(view) => {
+            // US-009: one line per step, its glyph carrying the state. The step
+            // in progress is the only one at full contrast: a plan is read to
+            // find out where the agent stands.
+            if let Some(explanation) = &view.explanation {
+                push_wrapped(
+                    lines,
+                    vec![Span::styled(explanation.clone(), theme.dim())],
+                    Span::styled(format!("{INDENT}· "), theme.dim()),
+                    Span::styled(format!("{INDENT}  "), theme.dim()),
+                    width,
+                );
+            }
+            for step in &view.steps {
+                let style = match step.status {
+                    agent_core::PlanStatus::InProgress => theme.fg(),
+                    _ => theme.dim(),
+                };
+                push_wrapped(
+                    lines,
+                    vec![Span::styled(step.step.clone(), style)],
+                    Span::styled(
+                        format!("{INDENT}{} ", crate::state::plan_status_glyph(step.status)),
+                        style,
+                    ),
+                    Span::styled(format!("{INDENT}  "), theme.dim()),
+                    width,
+                );
+            }
+        }
         Block::Notice(text) => {
             push_wrapped(
                 lines,

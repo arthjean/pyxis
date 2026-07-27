@@ -4,7 +4,7 @@
 
 use tokio::sync::mpsc;
 
-use crate::event::PermissionReq;
+use crate::event::{PermissionReq, PlanView};
 use crate::message::{ToolCallId, ToolErrorKind};
 
 /// A tool call requested by the model (args already reassembled into valid JSON).
@@ -35,6 +35,9 @@ pub enum ToolDispatchEvent {
         id: ToolCallId,
         chunk: String,
     },
+    /// Structured plan a tool just published (US-009). Travels beside the
+    /// textual result because it is addressed to the client, not to the model.
+    Plan(PlanView),
 }
 
 #[derive(Clone, Default)]
