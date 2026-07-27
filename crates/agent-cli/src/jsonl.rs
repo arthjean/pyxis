@@ -220,6 +220,36 @@ mod tests {
         assert_eq!(value["type"], "end_turn");
     }
 
+    /// US-009 AC3/AC5: the plan is emitted on the JSONL stream exactly like any
+    /// other event, under its own `type`. A consumer that filters on the types
+    /// it knows therefore ignores it without a single behavior change, and the
+    /// schema version does not move: adding a variant changes nothing in how an
+    /// already emitted line reads.
+    #[test]
+    fn the_plan_is_one_more_typed_line_on_the_stream() {
+        let value = line_of(&AgentEvent::Plan(agent_core::PlanView {
+            explanation: Some("cadrage".into()),
+            steps: vec![
+                agent_core::PlanStep {
+                    step: "lire".into(),
+                    status: agent_core::PlanStatus::Completed,
+                },
+                agent_core::PlanStep {
+                    step: "écrire".into(),
+                    status: agent_core::PlanStatus::InProgress,
+                },
+            ],
+        }));
+        assert_eq!(value["schema"], SCHEMA_VERSION);
+        assert_eq!(value["type"], "plan");
+        assert_eq!(value["data"]["explanation"], "cadrage");
+        assert_eq!(value["data"]["steps"][1]["status"], "in_progress");
+
+        // An absent explanation is absent from the line, not a null to handle.
+        let value = line_of(&AgentEvent::Plan(agent_core::PlanView::default()));
+        assert!(value["data"].get("explanation").is_none());
+    }
+
     /// AC5: non-textual content and control characters -> the line stays a
     /// valid, parsable JSON, without a raw byte nor an internal newline.
     #[test]

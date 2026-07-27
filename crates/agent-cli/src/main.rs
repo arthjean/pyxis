@@ -23,12 +23,16 @@ use agent_core::clock::SystemClock;
 use agent_core::guardrail::CostBudget;
 use agent_core::message::{Message, recent_untrusted_content};
 use agent_core::provider::Provider;
+use agent_core::sandbox::SandboxPolicy;
 use agent_core::{AgentContext, CancelToken, Deps, RunConfig};
 use agent_provider::{KEYRING_ACCOUNT, OpenAiChatGptProvider};
 use agent_sandbox::{ProxyPolicy, set_proxy_env};
 use agent_tokenizer::HeuristicCounter;
 use agent_tools::permission::{AutoDeny, PermissionMode, PermissionModeState};
-use agent_tools::{Bash, Edit, Glob, Grep, Read, Registry, Write};
+use agent_tools::{
+    ApplyPatch, Bash, DynTool, Edit, ExecCommand, ExecSessions, Glob, Grep, Read, Registry,
+    UpdatePlan, ViewImage, Write, WriteStdin,
+};
 
 use crate::approver::TuiApprover;
 use crate::interactive::InteractiveConfig;
@@ -39,6 +43,13 @@ const RESUME_TAINT_SCAN_MESSAGES: usize = 8;
 #[derive(Debug)]
 struct Args {
     prompt: Option<String>,
+    /// `-p` / `--print` seen, with or without its inline value (US-020). Kept
+    /// apart from `prompt`, which stays `None` until standard input is resolved.
+    print: bool,
+    /// `--ephemeral` (US-020 AC4): nothing of this run is persisted.
+    ephemeral: bool,
+    /// `--output-last-message <path>` (US-020 AC3).
+    output_last_message: Option<String>,
     resume: Option<String>,
     model: String,
     /// `--model` passed explicitly: distinguishes the compile-time default from a
@@ -153,12 +164,19 @@ where
 {
     let mut args = Args {
         prompt: None,
+        print: false,
+        ephemeral: false,
+        output_last_message: None,
         resume: None,
         model: agent_provider::DEFAULT_MODEL.to_string(),
         model_from_cli: false,
         allow_hosts: Vec::new(),
         yes: false,
         sandbox: true,
+        profile: None,
+        overrides: Vec::new(),
+        permission_mode: None,
+        sandbox_mode: None,
         token_budget: None,
         cost_budget_micro_usd: None,
         input_cost_micro_per_ktok: None,
@@ -171,7 +189,20 @@ where
     while let Some(a) = it.next() {
         match a.as_str() {
             "-h" | "--help" => args.help = true,
-            "-p" | "--print" => args.prompt = Some(next_value(&mut it, a.as_str())?),
+            // US-020 AC1: the value became optional. Without it the prompt is read
+            // from standard input, which is what makes `-p` usable in a pipe.
+            "-p" | "--print" => {
+                args.print = true;
+                if let Some(next) = it.peek()
+                    && !next.starts_with('-')
+                {
+                    args.prompt = it.next();
+                }
+            }
+            "--ephemeral" => args.ephemeral = true,
+            "--output-last-message" => {
+                args.output_last_message = Some(next_value(&mut it, "--output-last-message")?)
+            }
             "--resume" => {
                 args.resume = match it.peek() {
                     Some(next) if !next.starts_with('-') => it.next(),
@@ -263,7 +294,63 @@ where
             }
         }
     }
+    if !args.help {
+        validate_ephemeral(&args)?;
+    }
     Ok(args)
+}
+
+/// US-020 AC6: `--ephemeral` contradicts a resume, and outside the headless mode
+/// it would promise something the interactive commands cannot hold — `/new`,
+/// `/fork` and `/resume` all move a file that would not exist. Refused rather
+/// than silently degraded, and both flags are named.
+fn validate_ephemeral(args: &Args) -> anyhow::Result<()> {
+    if !args.ephemeral {
+        return Ok(());
+    }
+    if args.resume.is_some() {
+        anyhow::bail!("--ephemeral and --resume are incompatible");
+    }
+    if !args.print && args.prompt.is_none() {
+        anyhow::bail!("--ephemeral requires the headless mode (-p / --print)");
+    }
+    Ok(())
+}
+
+/// Resolves the headless prompt (US-020 AC1/AC2/AC5). The ARGUMENT wins over
+/// standard input, which is then not read at all: a `-p` that already carries
+/// its prompt must not drain a pipe the caller left open for something else.
+/// `read_stdin` is injected so the precedence stays testable without a process.
+fn resolve_prompt(
+    print: bool,
+    prompt: Option<String>,
+    read_stdin: impl FnOnce() -> anyhow::Result<Option<String>>,
+) -> anyhow::Result<Option<String>> {
+    if prompt.is_some() || !print {
+        return Ok(prompt);
+    }
+    read_stdin()?
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .map(Some)
+        // AC5: an empty standard input is an error carrying its name, never a
+        // wait for something that will not come.
+        .ok_or_else(|| anyhow::anyhow!("no prompt provided (argument or standard input)"))
+}
+
+/// Standard input as a prompt. `None` when it is a terminal: reading would block
+/// on a human who was never asked to type, which is exactly the indefinite wait
+/// AC5 refuses.
+fn stdin_prompt() -> anyhow::Result<Option<String>> {
+    use std::io::{IsTerminal, Read};
+
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Ok(None);
+    }
+    let mut buf = String::new();
+    stdin.read_to_string(&mut buf)?;
+    Ok(Some(buf))
 }
 
 fn next_value<I>(it: &mut std::iter::Peekable<I>, flag: &str) -> anyhow::Result<String>
@@ -660,11 +747,14 @@ fn enforce_sandbox(
 }
 
 fn main() -> anyhow::Result<()> {
-    let args = parse_args()?;
+    let mut args = parse_args()?;
     if args.help {
         print!("{HELP}");
         return Ok(());
     }
+    // US-020: standard input resolved FIRST, because `args.prompt.is_some()` is
+    // what tells the rest of the startup it is running headless.
+    args.prompt = resolve_prompt(args.print, args.prompt.take(), stdin_prompt)?;
 
     // US-020: diagnostics prepared FIRST. The panic net must cover the whole
     // startup, and its file must exist before Landlock, which cannot grant a write
@@ -766,13 +856,34 @@ fn main() -> anyhow::Result<()> {
         settings::home_dir().as_deref(),
     );
 
+    // Session directory created BEFORE the sandbox (US-001): under `read-only`
+    // nothing in the workspace is writable afterwards, and a Landlock rule needs
+    // a path that already opens. A session Pyxis cannot record is not a session,
+    // so this directory is granted whatever the policy.
+    // US-020 AC4: `--ephemeral` neither creates it nor asks for a write right on
+    // it. Creating the directory "just in case" would already be a trace left in
+    // the workspace, which is the whole thing the flag promises not to do.
+    let sessions_dir = workspace.join(".pyxis").join("sessions");
+    if !args.ephemeral
+        && let Err(err) = std::fs::create_dir_all(&sessions_dir)
+    {
+        eprintln!("[session] {}: {err}", sessions_dir.display());
+    }
+    let session_dirs: &[&std::path::Path] = if args.ephemeral {
+        &[]
+    } else {
+        &[sessions_dir.as_path()]
+    };
+
     // FS sandbox BEFORE the runtime (main thread -> inherited by the workers).
-    let sandbox_enforced = sandbox_enforced_from_args(
+    let policy = sandbox_policy_from_args(&args, &workspace, &config, &writable_roots);
+    let enforced = enforce_sandbox(
         &args,
-        &workspace,
+        &policy,
         settings_path.as_deref(),
         &diagnostics,
         &writable_roots,
+        session_dirs,
     );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1218,7 +1329,9 @@ async fn run(
     // 3. Persistent session: one JSONL file per conversation (timestamped) under
     // <workspace>/.pyxis/sessions/, listable/resumable through `/resume`.
     let sessions_dir = workspace.join(".pyxis").join("sessions");
-    std::fs::create_dir_all(&sessions_dir)?;
+    if !args.ephemeral {
+        std::fs::create_dir_all(&sessions_dir)?;
+    }
     let (current_session, initial_messages) = if let Some(resume_arg) = &args.resume {
         let path = resolve_resume_path(&sessions_dir, resume_arg)?;
         let resumed =
@@ -1228,9 +1341,15 @@ async fn run(
         (interactive::new_session_path(&sessions_dir), Vec::new())
     };
     provider.set_prompt_cache_key(&interactive::prompt_cache_key_for_session(&current_session));
-    let jsonl = agent_session::JsonlSession::create_at(&current_session)
-        .map_err(|e| anyhow::anyhow!("session: {e}"))?;
-    let (shared_session, conversation) = SharedSession::new(jsonl);
+    // US-020 AC4: under `--ephemeral` the file is never opened, so nothing can be
+    // written to it. The identifier keeps naming the run in the summary line.
+    let (shared_session, conversation) = if args.ephemeral {
+        SharedSession::ephemeral()
+    } else {
+        let jsonl = agent_session::JsonlSession::create_at(&current_session)
+            .map_err(|e| anyhow::anyhow!("session: {e}"))?;
+        SharedSession::new(jsonl)
+    };
     if !initial_messages.is_empty() {
         *conversation
             .lock()
@@ -1285,8 +1404,8 @@ async fn run(
     let mcp = Arc::new(std::sync::Mutex::new(agent_mcp::McpRegistry::from_config(
         mcp_config,
     )));
-    let (mcp_tools, mcp_notices) = if headless {
-        (Vec::new(), Vec::new())
+    let mcp_startup = if headless {
+        McpStartup::default()
     } else {
         connect_mcp_at_startup(&mcp, &mcp_harden).await
     };
@@ -1294,44 +1413,95 @@ async fn run(
     // US-017: hooks come from the GLOBAL configuration alone (`settings.rs` drops
     // the key from a workspace file). Without a declaration the registry keeps
     // `NoHooks`: no process, no clone, no added latency.
-    let (hook_notice_tx, hook_notice_rx) = tokio::sync::mpsc::channel::<String>(16);
+    let session_id = current_session
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
     let hooks: Arc<dyn agent_tools::hooks::Hooks> = if config.hooks.is_empty() {
         Arc::new(agent_tools::hooks::NoHooks)
     } else {
-        // A later hook failing is reported to the human, never to the model: in
-        // the TUI as a notice, in headless mode on stderr, where the diagnostics
-        // of this mode already go (stdout stays byte-for-byte identical).
+        // A later hook failing is reported to the human, never to the model.
         let notice: agent_tools::hooks::HookNotice = if headless {
             Arc::new(|message: String| eprintln!("[hook] {message}"))
         } else {
+            let tx = notice_tx.clone();
             Arc::new(move |message: String| {
-                let _ = hook_notice_tx.try_send(message);
+                // Once the TUI is gone (a `SessionEnd` hook runs after it) the
+                // channel is closed: the human still gets the message, on stderr.
+                if let Err(err) = tx.try_send(message) {
+                    eprintln!("[hook] {}", err.into_inner());
+                }
             })
         };
         Arc::new(
             agent_tools::hooks::CommandHooks::new(config.hooks.clone(), &workspace)
                 .with_hardener(Arc::clone(&mcp_harden))
-                .with_notice(notice),
+                .with_notice(notice)
+                .with_session_id(session_id.clone()),
         )
     };
+
+    // US-017 AC2: the session lifecycle gates on its own hooks. `SessionStart`
+    // fires before the first turn and before the TUI takes the terminal, so a
+    // refusal is readable; it stops the session instead of starting one the user
+    // declared they did not want.
+    if let agent_tools::hooks::HookDecision::Deny(reason) = hooks
+        .lifecycle(agent_tools::hooks::Lifecycle::SessionStart {
+            source: if args.resume.is_some() {
+                "resume"
+            } else {
+                "startup"
+            },
+        })
+        .await
+    {
+        anyhow::bail!("hook: {reason}");
+    }
+
+    // US-012: the persistent shell sessions of this run. Kept here so the end of
+    // the run can close them, which is what guarantees no orphan child survives
+    // Pyxis (AC4).
+    let exec_sessions = ExecSessions::new();
 
     let mut builder = Registry::builder(&workspace)
         .mode_state(permission_mode.clone())
         .approver(approver)
         .approvals(approvals.clone())
         .initial_taint_recent(initial_taint_recent)
-        .hooks(hooks)
+        .hooks(Arc::clone(&hooks))
         .command_hardener(harden)
+        // US-011: whether the active model reads images at all. A provider that
+        // does not declare vision makes `view_image` refuse before any read.
+        .vision(provider.capabilities().vision)
+        .exec_sessions(exec_sessions.clone())
+        // US-001/US-002: the perimeter the tools evaluate BEFORE execution, and
+        // whether the kernel really carries it (US-004 classification).
+        .sandbox(sandbox.policy.clone(), sandbox.enforced)
+        .sandbox_observer(Arc::new(ProxyObserver {
+            proxy: proxy.clone(),
+        }))
+        .sandbox_escalator(Arc::new(ProxyEscalator {
+            grants: proxy.grants.clone(),
+        }))
         .register(Read)
         .register(Glob)
         .register(Grep)
         .register(Write)
         .register(Edit)
-        .register(Bash);
-    for tool in mcp_tools {
+        .register(Bash)
+        // EP-003: the four ported families.
+        .register(UpdatePlan)
+        .register(ApplyPatch)
+        .register(ViewImage)
+        .register(ExecCommand)
+        .register(WriteStdin);
+    for tool in mcp_startup.tools {
         builder = builder.register_dyn(tool);
     }
-    let registry = builder.build();
+    // US-016: shared between the loop (which dispatches through `ToolDispatch`) and
+    // the frontend (which stages the tools of a server connected in session and
+    // recomposes the specs at each turn boundary).
+    let registry = Arc::new(builder.build());
     let tool_specs = registry.tool_specs();
     // US-026/US-027: behavioral guidelines of the tools, collected BEFORE
     // `registry` is moved into `Deps`. The base system prompt is now
@@ -1345,145 +1515,218 @@ async fn run(
         session: shared_session.clone(),
         tokenizer: Arc::new(HeuristicCounter),
         clock: Arc::new(SystemClock),
-        tools: Arc::new(registry),
+        tools: Arc::clone(&registry) as Arc<dyn agent_core::tools::ToolDispatch>,
         // US-001: base token never signalled. The interactive loop substitutes a
         // PER-TURN token (`launch_turn`); the headless mode keeps this one.
         cancel: CancelToken::new(),
     };
 
-    // 6. Headless (-p) vs interactive dispatch.
-    if let Some(prompt) = args.prompt {
-        // Headless one-shot: fixed slug (`args.model`) -> template selected once.
-        let base = interactive::with_tool_guidelines(
-            prompt::select_system_prompt(&args.model),
-            &tool_guidelines,
-        );
-        // US-016: a prompt opening on `/<skill>` injects that skill's instructions
-        // for this turn. An unreadable skill fails the run instead of sending a
-        // turn that would only carry its name.
-        let skill_messages = match skills::invocation(&skills, &prompt) {
-            Some(Ok(injection)) => vec![Message::user(injection.block)],
-            Some(Err(err)) => anyhow::bail!("skill: {err}"),
-            None => Vec::new(),
-        };
-        let mut messages = conversation.lock().map(|g| g.clone()).unwrap_or_default();
-        messages.push(Message::user(prompt));
-        let ctx = AgentContext {
-            model: args.model,
-            reasoning_effort: initial_reasoning_effort.clone(),
-            system: Some(interactive::compose_system(&base, goal.as_deref())),
-            messages,
-            tools: tool_specs,
-            config: run_config,
-            context_messages: context_msgs,
-            ephemeral_messages: skill_messages,
-        };
-        let mut events = jsonl::EventWriter::new(args.output_format);
-        // US-018: reference taken BEFORE the turn, on the workspace as it is.
-        // Machine output only: the text format must stay identical to the
-        // character (US-017 AC4), so it has no consumer for this diff
-        // and must not pay for a `git status` per run.
-        let mut diff_tracker = if events.is_json() {
-            Some(agent_tools::turn_diff::TurnDiffTracker::begin(&workspace).await)
-        } else {
-            None
-        };
-        let result =
-            agent_core::run_headless_observed(ctx, deps, |event| events.event(event)).await;
+    // 6. Headless (-p) vs interactive dispatch. Wrapped so that `SessionEnd`
+    // fires on every way out, including the failures each branch bails on.
+    let output_last_message = args.output_last_message.take();
+    let outcome: anyhow::Result<()> = async {
+        if let Some(prompt) = args.prompt {
+            // Headless one-shot: fixed slug (`args.model`) -> template selected once.
+            let base = interactive::with_tool_guidelines(
+                prompt::select_system_prompt(&args.model),
+                &tool_guidelines,
+            );
+            // US-017 AC2: the prompt is submitted to the hooks before it becomes a
+            // turn. A refusal names the reason and no turn starts.
+            if let agent_tools::hooks::HookDecision::Deny(reason) = hooks
+                .lifecycle(agent_tools::hooks::Lifecycle::UserPromptSubmit { prompt: &prompt })
+                .await
+            {
+                anyhow::bail!("hook: {reason}");
+            }
+            // US-016: a prompt opening on `/<skill>` injects that skill's instructions
+            // for this turn. An unreadable skill fails the run instead of sending a
+            // turn that would only carry its name.
+            let skill_messages = match skills::invocation(&skills, &prompt) {
+                Some(Ok(injection)) => vec![Message::user(injection.block)],
+                Some(Err(err)) => anyhow::bail!("skill: {err}"),
+                None => Vec::new(),
+            };
+            let mut messages = conversation.lock().map(|g| g.clone()).unwrap_or_default();
+            messages.push(Message::user(prompt));
+            let ctx = AgentContext {
+                model: args.model,
+                reasoning_effort: initial_reasoning_effort.clone(),
+                system: Some(interactive::compose_system(&base, goal.as_deref())),
+                messages,
+                tools: tool_specs,
+                config: run_config,
+                context_messages: context_msgs,
+                ephemeral_messages: skill_messages,
+            };
+            let mut events = jsonl::EventWriter::new(args.output_format);
+            // US-018: reference taken BEFORE the turn, on the workspace as it is.
+            // Machine output only: the text format must stay identical to the
+            // character (US-017 AC4), so it has no consumer for this diff
+            // and must not pay for a `git status` per run.
+            let mut diff_tracker = if events.is_json() {
+                Some(agent_tools::turn_diff::TurnDiffTracker::begin(&workspace).await)
+            } else {
+                None
+            };
+            let result =
+                agent_core::run_headless_observed(ctx, deps, |event| events.event(event)).await;
+            // US-012 AC4: a one-shot run leaves no shell session behind, whatever
+            // the outcome below (several paths bail from here).
+            exec_sessions.shutdown();
 
-        // Aggregated diff after the end of the turn, hence after the last tool write
-        // (US-018 AC6: including when the turn was interrupted).
-        if let Some(tracker) = diff_tracker.as_mut() {
-            match tracker.turn_diff().await {
-                Ok(diff) if !diff.is_empty() => {
-                    events.event(&agent_core::AgentEvent::TurnDiff(diff))
+            // Aggregated diff after the end of the turn, hence after the last tool write
+            // (US-018 AC6: including when the turn was interrupted).
+            if let Some(tracker) = diff_tracker.as_mut() {
+                match tracker.turn_diff().await {
+                    Ok(diff) if !diff.is_empty() => {
+                        events.event(&agent_core::AgentEvent::TurnDiff(diff))
+                    }
+                    Ok(_) => {}
+                    Err(err) => eprintln!("[diff] {err}"),
                 }
-                Ok(_) => {}
-                Err(err) => eprintln!("[diff] {err}"),
             }
-        }
-        let session_id = current_session
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_default();
-        events.run_summary(&session_id, &result.ended);
+            events.run_summary(&session_id, &result.ended);
 
-        match result.ended {
-            agent_core::HeadlessEnd::Error(e) => anyhow::bail!("{e}"),
-            agent_core::HeadlessEnd::Exhausted(reason) => anyhow::bail!("stopped: {reason:?}"),
-            agent_core::HeadlessEnd::EndTurn => {}
-        }
-        // In JSON mode, the text already lives in the `text` events: writing it
-        // again would inject non-JSON lines into the stream.
-        if !events.is_json() {
-            // In one-shot mode, no goal loop: we simply remove the marker.
-            let text = result
-                .text
-                .replace(interactive::GOAL_DONE_MARKER, "")
-                .trim_end()
-                .to_string();
-            print!("{text}");
-            if !text.ends_with('\n') {
-                println!();
+            // US-017: end of turn. Nothing follows it here, so the hook observes and
+            // a failure of its own is reported, never fatal.
+            if matches!(result.ended, agent_core::HeadlessEnd::EndTurn) {
+                hooks.lifecycle(agent_tools::hooks::Lifecycle::Stop).await;
             }
+
+            // US-020 AC3: the last assistant message alone, raw, at the requested
+            // destination. Written whatever the outcome, because the exit code is
+            // what tells a pipeline whether the run succeeded; the failure of the
+            // WRITE is reported after the outcome, which owns the exit code.
+            let last_message_write = output_last_message.map(|path| {
+                let text = result
+                    .text
+                    .replace(interactive::GOAL_DONE_MARKER, "")
+                    .trim_end()
+                    .to_string();
+                // A destination outside the writable perimeter is refused by the
+                // sandbox, not widened for it: an argument may come from a script
+                // of the repository (same reasoning as `-c`).
+                std::fs::write(&path, text)
+                    .map_err(|e| anyhow::anyhow!("--output-last-message {path}: {e}"))
+            });
+
+            match result.ended {
+                agent_core::HeadlessEnd::Error(e) => anyhow::bail!("{e}"),
+                agent_core::HeadlessEnd::Exhausted(reason) => anyhow::bail!("stopped: {reason:?}"),
+                agent_core::HeadlessEnd::EndTurn => {}
+            }
+            if let Some(written) = last_message_write {
+                written?;
+            }
+            // In JSON mode, the text already lives in the `text` events: writing it
+            // again would inject non-JSON lines into the stream.
+            if !events.is_json() {
+                // In one-shot mode, no goal loop: we simply remove the marker.
+                let text = result
+                    .text
+                    .replace(interactive::GOAL_DONE_MARKER, "")
+                    .trim_end()
+                    .to_string();
+                print!("{text}");
+                if !text.ends_with('\n') {
+                    println!();
+                }
+            }
+        } else {
+            let cfg = InteractiveConfig {
+                model: args.model,
+                reasoning_effort: initial_reasoning_effort,
+                tool_guidelines,
+                context_messages: context_msgs,
+                run_config,
+                truecolor: agent_tui::supports_truecolor(),
+                // Reduced motion: spinner degraded to a pulsing dot (US-044).
+                reduced_motion: std::env::var_os("NO_COLOR").is_some()
+                    || std::env::var_os("PYXIS_REDUCED_MOTION").is_some(),
+                // credential loaded above (otherwise we bail) -> connected.
+                connected: true,
+                skills,
+                goal,
+                hooks: Arc::clone(&hooks),
+                hook_specs: config.hooks.clone(),
+                command_hardener: Arc::clone(&mcp_harden),
+                mcp_notices: mcp_startup.notices,
+                mcp_tool_names: mcp_startup.names,
+                registry: Arc::clone(&registry),
+                permission_mode,
+                approvals,
+                settings_path,
+                workspace: workspace.clone(),
+                sandbox_scope: sandbox_scope_label(&sandbox.policy, sandbox.enforced),
+                // US-005 AC2: computed here, where the layers were resolved. The loop
+                // only filters out the values it changed in session.
+                config_sources: settings::status_sources(&config),
+                profile: config.profile.clone(),
+            };
+            let outcome = interactive::run(
+                deps,
+                conversation,
+                perm_rx,
+                hook_notice_rx,
+                cfg,
+                shared_session,
+                sessions_dir,
+                current_session,
+                mcp,
+            )
+            .await;
+            // US-012 AC4: the session ending closes every shell session and kills
+            // its process tree, on the error path too.
+            exec_sessions.shutdown();
+            outcome?;
         }
-    } else {
-        let cfg = InteractiveConfig {
-            model: args.model,
-            reasoning_effort: initial_reasoning_effort,
-            tool_guidelines,
-            context_messages: context_msgs,
-            run_config,
-            tool_specs,
-            truecolor: agent_tui::supports_truecolor(),
-            // Reduced motion: spinner degraded to a pulsing dot (US-044).
-            reduced_motion: std::env::var_os("NO_COLOR").is_some()
-                || std::env::var_os("PYXIS_REDUCED_MOTION").is_some(),
-            // credential loaded above (otherwise we bail) -> connected.
-            connected: true,
-            skills,
-            goal,
-            command_hardener: Arc::clone(&mcp_harden),
-            mcp_notices,
-            permission_mode,
-            approvals,
-            settings_path,
-            workspace: workspace.clone(),
-            sandbox_scope: sandbox_scope_label(sandbox_enforced, &config.writable_roots),
-        };
-        interactive::run(
-            deps,
-            conversation,
-            perm_rx,
-            hook_notice_rx,
-            cfg,
-            shared_session,
-            sessions_dir,
-            current_session,
-            mcp,
-        )
-        .await?;
+        Ok(())
     }
-    Ok(())
+    .await;
+
+    // US-017: the session is over whatever happened; the hook observes it and
+    // cannot refuse an end that already took place.
+    if hooks.watches(agent_tools::hooks::HookEvent::SessionEnd) {
+        hooks
+            .lifecycle(agent_tools::hooks::Lifecycle::SessionEnd {
+                reason: if outcome.is_ok() { "exit" } else { "error" },
+            })
+            .await;
+    }
+    outcome
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, jsonl, parse_args_from, permission_policy, precedence_u64, resolve_permission_mode,
-        resolve_resume_path, run_config_from_args, settings,
+        Args, SandboxPolicy, jsonl, parse_args_from, permission_policy, precedence_string,
+        precedence_u64, resolve_permission_mode, resolve_prompt, resolve_resume_path,
+        run_config_from_args, sandbox_policy_from_args, sandbox_scope_label, settings,
+        validate_ephemeral,
     };
     use agent_tools::permission::PermissionMode;
+
+    fn argv(raw: &[&str]) -> Vec<String> {
+        raw.iter().map(|s| (*s).to_string()).collect()
+    }
 
     fn args() -> Args {
         Args {
             model: "mock".into(),
             model_from_cli: true,
             prompt: None,
+            print: false,
+            ephemeral: false,
+            output_last_message: None,
             resume: None,
             allow_hosts: Vec::new(),
             yes: false,
             sandbox: true,
+            profile: None,
+            overrides: Vec::new(),
+            permission_mode: None,
+            sandbox_mode: None,
             token_budget: None,
             cost_budget_micro_usd: None,
             input_cost_micro_per_ktok: None,
@@ -1702,12 +1945,15 @@ mod tests {
         assert_eq!(args.prompt.as_deref(), Some("continue"));
     }
 
+    /// US-020 AC1 changed this contract: `-p` no longer requires a value, so a
+    /// flag right after it is parsed as a flag instead of aborting the startup.
+    /// The prompt then comes from standard input, resolved outside the parser.
     #[test]
-    fn parse_args_rejects_missing_print_value() {
-        let err = parse_args_from(vec!["-p".to_string(), "--resume".to_string()])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("-p: missing value"));
+    fn print_does_not_swallow_the_flag_that_follows_it() {
+        let args = parse_args_from(vec!["-p".to_string(), "--resume".to_string()]).unwrap();
+        assert!(args.print);
+        assert_eq!(args.prompt, None);
+        assert_eq!(args.resume.as_deref(), Some(""));
     }
 
     #[test]
@@ -2032,5 +2278,116 @@ mod tests {
         );
         assert_eq!(mode, PermissionMode::BypassPermissions);
         assert!(announced, "un elargissement en headless doit etre annonce");
+    }
+
+    /// US-020 AC1: `-p` no longer demands its value. Without one the mode is
+    /// still headless, and the prompt is left to standard input.
+    #[test]
+    fn print_without_value_is_headless_and_leaves_the_prompt_to_stdin() {
+        let args = parse_args_from(argv(&["-p"])).unwrap();
+        assert!(args.print);
+        assert_eq!(args.prompt, None);
+
+        // A following flag is NOT swallowed as the prompt.
+        let args = parse_args_from(argv(&["-p", "--output-format", "json"])).unwrap();
+        assert!(args.print);
+        assert_eq!(args.prompt, None);
+        assert_eq!(args.output_format, jsonl::OutputFormat::Json);
+
+        // With a value, the old behavior is unchanged.
+        let args = parse_args_from(argv(&["-p", "hello"])).unwrap();
+        assert!(args.print);
+        assert_eq!(args.prompt.as_deref(), Some("hello"));
+    }
+
+    /// US-020 AC2: the argument wins, and standard input is then not read AT ALL
+    /// (the injected reader must never run).
+    #[test]
+    fn an_argument_prompt_wins_over_stdin_which_stays_unread() {
+        let mut read = false;
+        let resolved = resolve_prompt(true, Some("from arg".into()), || {
+            read = true;
+            Ok(Some("from stdin".into()))
+        })
+        .unwrap();
+        assert_eq!(resolved.as_deref(), Some("from arg"));
+        assert!(
+            !read,
+            "l'entrée standard ne doit pas être lue quand l'argument porte le prompt"
+        );
+    }
+
+    /// US-020 AC1: piped, the prompt comes from standard input, trailing newline
+    /// of `echo` included.
+    #[test]
+    fn stdin_becomes_the_prompt_when_the_argument_is_absent() {
+        let resolved = resolve_prompt(true, None, || Ok(Some("  do the thing\n".into()))).unwrap();
+        assert_eq!(resolved.as_deref(), Some("do the thing"));
+    }
+
+    /// US-020 AC5: nothing on either side is a NAMED error, never a wait. Both
+    /// shapes count as nothing: a terminal (`None`) and an empty pipe.
+    #[test]
+    fn no_prompt_at_all_fails_by_name_instead_of_waiting() {
+        for stdin in [None, Some(String::new()), Some("  \n".into())] {
+            let err = resolve_prompt(true, None, || Ok(stdin.clone())).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("no prompt provided (argument or standard input)"),
+                "message: {err}"
+            );
+        }
+        // Without `-p` there is no headless run to feed: interactive mode stays.
+        assert_eq!(resolve_prompt(false, None, || Ok(None)).unwrap(), None);
+    }
+
+    /// US-020 AC6: the two flags contradict each other and the refusal names both.
+    #[test]
+    fn ephemeral_and_resume_are_refused_by_name() {
+        let err = parse_args_from(argv(&["-p", "x", "--ephemeral", "--resume", "latest"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--ephemeral"), "message: {err}");
+        assert!(err.contains("--resume"), "message: {err}");
+    }
+
+    /// US-020: `--ephemeral` promises "no session file", which only the headless
+    /// mode can hold: `/new`, `/fork` and `/resume` all move a file.
+    #[test]
+    fn ephemeral_requires_the_headless_mode() {
+        let err = parse_args_from(argv(&["--ephemeral"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--ephemeral"), "message: {err}");
+        assert!(err.contains("-p"), "message: {err}");
+
+        assert!(parse_args_from(argv(&["-p", "x", "--ephemeral"])).is_ok());
+        // A bare positional argument is already a headless run.
+        assert!(parse_args_from(argv(&["--ephemeral", "do it"])).is_ok());
+        // `--help` still prints instead of failing on an incoherent combination.
+        assert!(parse_args_from(argv(&["--ephemeral", "--help"])).is_ok());
+    }
+
+    /// US-020 AC4/AC6: the validation is on the resolved flags, not on the order
+    /// they were typed in.
+    #[test]
+    fn ephemeral_validation_is_order_independent() {
+        let mut a = args();
+        a.ephemeral = true;
+        a.print = true;
+        assert!(validate_ephemeral(&a).is_ok());
+        a.resume = Some(String::new());
+        assert!(validate_ephemeral(&a).is_err());
+    }
+
+    /// US-020 AC3: the destination is taken as given; no default, no extension.
+    #[test]
+    fn output_last_message_takes_a_path() {
+        let args = parse_args_from(argv(&["-p", "x", "--output-last-message", "out.txt"])).unwrap();
+        assert_eq!(args.output_last_message.as_deref(), Some("out.txt"));
+        let err = parse_args_from(argv(&["-p", "x", "--output-last-message"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--output-last-message"), "message: {err}");
     }
 }
