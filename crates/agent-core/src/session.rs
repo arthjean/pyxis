@@ -36,12 +36,17 @@ pub struct FileSnapshot {
     pub content: String,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SessionError {
     #[error("io: {0}")]
     Io(String),
     #[error("serde: {0}")]
     Serde(String),
+    /// A line in the MIDDLE of the log is unreadable (a truncated trailing line
+    /// is not corruption, it is a crash mid-write). Carries the byte offset so a
+    /// client can name it instead of reporting an opaque failure.
+    #[error("corrupt session line at offset {offset}: {detail}")]
+    Corrupt { offset: u64, detail: String },
 }
 
 #[async_trait::async_trait]
