@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::context::TurnContext;
 use crate::id::{AgentId, EventId, ThreadId, TurnId};
 use crate::lifecycle::TurnState;
 
@@ -22,6 +23,18 @@ pub const THREAD_META_ENTRY: &str = "thread_meta";
 pub const THREAD_EVENT_ENTRY: &str = "thread_event";
 /// Version of the orchestration layer written in the binding line.
 pub const THREAD_RUNTIME_VERSION: u32 = 1;
+
+/// Provenance of a materialized branch (US-010 AC2).
+///
+/// Written in the binding line of the CHILD, never in the parent: that is what
+/// keeps a branch readable after its source is deleted or archived. A fork of a
+/// fork overwrites nothing: each log carries the origin of its own cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkOrigin {
+    pub parent_thread_id: ThreadId,
+    pub fork_turn_id: TurnId,
+    pub fork_event_id: EventId,
+}
 
 /// One durable orchestration event. `seq` is monotonic per thread and starts at
 /// 1: it orders events inside a file without depending on the clock.
@@ -74,6 +87,12 @@ pub enum ThreadEventPayload {
         /// Bounded cause of a terminal state (FR-04, observability NFR).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cause: Option<String>,
+        /// Configuration the turn was committed to. Carried by the transition
+        /// that STARTS the turn and by no other, so a resumed thread can report
+        /// what its last turn ran under without a second event per turn
+        /// (US-009 AC1).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<TurnContext>,
     },
     /// A branch was materialized at a terminal turn boundary (US-010).
     Forked {
@@ -107,14 +126,67 @@ mod tests {
                 from: Some(TurnState::Queued),
                 to: TurnState::Running,
                 cause: None,
+                context: None,
             },
         };
         let line = serde_json::to_string(&event).unwrap();
         assert!(line.contains("\"kind\":\"turn_state_changed\""));
         // Absent options stay out of the durable line.
         assert!(!line.contains("cause"));
+        assert!(!line.contains("context"));
         assert_eq!(serde_json::from_str::<ThreadEvent>(&line).unwrap(), event);
         assert_eq!(event.turn_id(), Some(turn_id));
+    }
+
+    /// The captured configuration survives the file (US-009 AC1), and a log
+    /// written before it existed still replays: the field is optional.
+    #[test]
+    fn a_turn_configuration_round_trips_and_stays_optional() {
+        use crate::context::{TurnContext, TurnLimits};
+
+        let ids = SequentialIds::new();
+        let turn_id = TurnId::generate(&ids);
+        let event = ThreadEvent {
+            event_id: EventId::generate(&ids),
+            thread_id: ThreadId::generate(&ids),
+            seq: 1,
+            at_ms: 0,
+            payload: ThreadEventPayload::TurnStateChanged {
+                turn_id,
+                from: Some(TurnState::Queued),
+                to: TurnState::Running,
+                cause: None,
+                context: Some(TurnContext {
+                    turn_id,
+                    model: "gpt-5.4-codex".into(),
+                    reasoning_effort: Some("high".into()),
+                    permission_mode: "ask".into(),
+                    sandbox: "workspace-write".into(),
+                    workspace: std::path::PathBuf::from("/home/arthur/dev/pyxis"),
+                    limits: TurnLimits {
+                        max_turns: 50,
+                        max_output_tokens: 4096,
+                        max_pending_inputs: 16,
+                    },
+                }),
+            },
+        };
+        let line = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<ThreadEvent>(&line).unwrap(), event);
+
+        let without = r#"{"event_id":"evt_00000000000000000000000000000009",
+            "thread_id":"thr_00000000000000000000000000000008","seq":1,"at_ms":0,
+            "payload":{"kind":"turn_state_changed",
+            "turn_id":"trn_00000000000000000000000000000007","to":"running"}}"#;
+        let older = serde_json::from_str::<ThreadEvent>(without).expect("a v1 line still replays");
+        assert!(matches!(
+            older.payload,
+            ThreadEventPayload::TurnStateChanged {
+                context: None,
+                from: None,
+                ..
+            }
+        ));
     }
 
     #[test]

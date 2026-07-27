@@ -20,6 +20,7 @@ pub mod event;
 pub mod id;
 pub mod inputs;
 pub mod lifecycle;
+pub mod resume;
 pub mod runner;
 pub mod store;
 pub mod thread;
@@ -29,17 +30,19 @@ pub use context::{
     StepSection, StepSnapshot, StepSource, TurnContext, TurnContextSource, TurnLimits,
 };
 pub use event::{
-    THREAD_EVENT_ENTRY, THREAD_META_ENTRY, THREAD_RUNTIME_VERSION, ThreadEvent, ThreadEventPayload,
+    ForkOrigin, THREAD_EVENT_ENTRY, THREAD_META_ENTRY, THREAD_RUNTIME_VERSION, ThreadEvent,
+    ThreadEventPayload,
 };
 pub use id::{
     AgentId, EventId, IdError, IdGenerator, RandomIds, SequentialIds, StepId, ThreadId, TurnId,
 };
 pub use inputs::TurnInputs;
 pub use lifecycle::{LifecycleError, TurnLifecycle, TurnState};
+pub use resume::ResumedThread;
 pub use runner::{RunAgentRunner, TurnOutcome, TurnRequest, TurnRunner};
-pub use store::{MemoryThreadStore, StoreError, ThreadSnapshot, ThreadStore};
+pub use store::{ForkPoint, MemoryThreadStore, StoreError, ThreadSnapshot, ThreadStore};
 pub use thread::{
-    Accepted, COMMAND_MAILBOX, LIVE_EVENT_BUFFER, MAX_PENDING_INPUTS, RuntimeError, RuntimeEvent,
-    RuntimeEventPayload, SHUTDOWN_DEADLINE, STRAGGLER_ABORT_AFTER, Submission, SubmitError,
-    ThreadHandle, ThreadOptions, ThreadStatus, TurnStatus,
+    Accepted, COMMAND_MAILBOX, Fork, ForkError, LIVE_EVENT_BUFFER, MAX_PENDING_INPUTS,
+    RuntimeError, RuntimeEvent, RuntimeEventPayload, SHUTDOWN_DEADLINE, STRAGGLER_ABORT_AFTER,
+    Submission, SubmitError, ThreadHandle, ThreadOptions, ThreadStatus, TurnStatus,
 };

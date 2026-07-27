@@ -28,7 +28,7 @@ use agent_core::CompactKind;
 use agent_core::compaction::is_summary_message;
 use agent_core::message::{ContentBlock, Message, Role};
 use agent_core::session::{FileSnapshot, Session, SessionEntry, SessionError};
-use agent_runtime::event::{THREAD_EVENT_ENTRY, THREAD_META_ENTRY, ThreadEvent};
+use agent_runtime::event::{ForkOrigin, THREAD_EVENT_ENTRY, THREAD_META_ENTRY, ThreadEvent};
 use agent_runtime::id::ThreadId;
 use serde::{Deserialize, Serialize};
 
@@ -60,22 +60,27 @@ fn invalid_session(e: impl std::fmt::Display) -> SessionError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "entry", rename_all = "snake_case")]
 pub(crate) enum ThreadLine {
-    /// Binds the log to a thread. Written once, at creation.
+    /// Binds the log to a thread. Written once at creation, and once more at
+    /// the tail of a materialized branch: the LAST binding of a file is the one
+    /// that owns it, which is what lets a fork copy a prefix verbatim instead of
+    /// rewriting the bytes it inherited (US-010).
     ThreadMeta {
         thread_id: ThreadId,
         runtime_version: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<ForkOrigin>,
     },
     ThreadEvent(ThreadEvent),
 }
 
-enum LogLine {
+pub(crate) enum LogLine {
     Session(SessionEntry),
     Thread(ThreadLine),
 }
 
 /// Reads one JSONL line in either format. The `entry` tag decides, so a v1
 /// entry never goes through the runtime types and vice versa.
-fn parse_log_line(line: &str) -> Result<LogLine, serde_json::Error> {
+pub(crate) fn parse_log_line(line: &str) -> Result<LogLine, serde_json::Error> {
     let value: serde_json::Value = serde_json::from_str(line)?;
     let is_thread_line = value
         .get("entry")
@@ -357,6 +362,10 @@ pub struct ResumedSession {
     /// Thread this log is bound to (EP-001). `None` for a v1 session that has
     /// never been opened by the runtime.
     pub thread_id: Option<ThreadId>,
+    /// Branch this log was cut from (US-010). Read from the SAME binding line as
+    /// `thread_id`, so a copied prefix never lends its provenance to the branch
+    /// that inherited it.
+    pub origin: Option<ForkOrigin>,
     /// Orchestration events replayed in file order (EP-001).
     pub thread_events: Vec<ThreadEvent>,
 }
@@ -469,8 +478,11 @@ fn replay_line(
         Ok(parsed) => {
             match parsed {
                 LogLine::Session(entry) => apply_entry(out, pending_clear, entry)?,
-                LogLine::Thread(ThreadLine::ThreadMeta { thread_id, .. }) => {
+                LogLine::Thread(ThreadLine::ThreadMeta {
+                    thread_id, origin, ..
+                }) => {
                     out.thread_id = Some(thread_id);
+                    out.origin = origin;
                 }
                 LogLine::Thread(ThreadLine::ThreadEvent(event)) => out.thread_events.push(event),
             }

@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use agent_core::message::Message;
 use agent_core::provider::ToolSpec;
 use agent_core::step::{StepContextSource, StepFrame};
+use serde::{Deserialize, Serialize};
 
 use crate::id::{IdGenerator, StepId, TurnId};
 
@@ -33,7 +34,7 @@ pub const MAX_STEP_CONTEXT_BYTES: usize = 64 * 1024;
 
 /// Limits a turn runs under. Constants of the runtime, never configuration
 /// (FR-20).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnLimits {
     pub max_turns: u32,
     pub max_output_tokens: u32,
@@ -47,7 +48,11 @@ pub struct TurnLimits {
 /// does not own permissions or the sandbox. `permission_mode` and `sandbox` are
 /// the labels the authoritative crates expose, kept here so a transcript can be
 /// audited without replaying the tool pipeline.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Durable: it travels with the transition that starts the turn, so a thread
+/// resumed after a restart still knows what its last turn ran under (US-009
+/// AC1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnContext {
     pub turn_id: TurnId,
     pub model: String,

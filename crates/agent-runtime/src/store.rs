@@ -10,10 +10,12 @@
 //! a transition. The runtime owns the `IdGenerator` and the lifecycle; the store
 //! only guarantees that what it accepted survived.
 
+use std::sync::Arc;
+
 use agent_core::message::Message;
 
-use crate::event::ThreadEvent;
-use crate::id::ThreadId;
+use crate::event::{ForkOrigin, ThreadEvent};
+use crate::id::{EventId, ThreadId, TurnId};
 
 /// Named failures of a store. Every variant is a refusal to acknowledge: a
 /// caller that gets one must NOT treat the operation as accepted.
@@ -37,6 +39,34 @@ pub enum StoreError {
     /// threads from sharing a durable log.
     #[error("thread store holds {holds}, got {given}")]
     ThreadMismatch { holds: ThreadId, given: ThreadId },
+    /// A fork named a cut this log does not carry. Refusing is what keeps
+    /// `fork` from materializing an arbitrary prefix (US-010 AC5).
+    #[error("no event {event_id} in this thread log")]
+    NoSuchEvent { event_id: EventId },
+}
+
+/// Where a branch is cut and what it must remember about its source (US-010).
+///
+/// The runtime resolves it against the DURABLE log before calling the store:
+/// `fork_event_id` is always the terminal transition of `fork_turn_id`, so the
+/// materialized prefix ends on a complete turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForkPoint {
+    pub parent_thread_id: ThreadId,
+    pub child_thread_id: ThreadId,
+    pub fork_turn_id: TurnId,
+    pub fork_event_id: EventId,
+}
+
+impl ForkPoint {
+    /// Provenance the child records about this cut.
+    pub fn origin(&self) -> ForkOrigin {
+        ForkOrigin {
+            parent_thread_id: self.parent_thread_id,
+            fork_turn_id: self.fork_turn_id,
+            fork_event_id: self.fork_event_id,
+        }
+    }
 }
 
 /// Durable state rebuilt from a thread log. Carries BOTH formats: the v1
@@ -50,6 +80,8 @@ pub struct ThreadSnapshot {
     pub schema_version: Option<u32>,
     /// True when a partial trailing line (crash mid-write) was truncated.
     pub skipped_partial: bool,
+    /// Branch this log was cut from, when it is one (US-010 AC2).
+    pub origin: Option<ForkOrigin>,
 }
 
 impl ThreadSnapshot {
@@ -80,6 +112,16 @@ pub trait ThreadStore: Send + Sync {
     /// Rebuilds the durable state.
     async fn read(&self) -> Result<ThreadSnapshot, StoreError>;
 
+    /// Materializes the durable prefix up to `at.fork_event_id` INCLUDED as an
+    /// independent log bound to `at.child_thread_id`, and returns it open.
+    ///
+    /// Flushes first, so the copy sees every byte the parent acknowledged. All
+    /// or nothing: a failure publishes no child and leaves the source
+    /// byte-identical, which is what makes a failed `/fork` a no-op rather than
+    /// a half-branch (US-010 AC5). Materialized and not referenced on purpose:
+    /// a child survives the deletion of its parent (AC4).
+    async fn fork(&self, at: &ForkPoint) -> Result<Arc<dyn ThreadStore>, StoreError>;
+
     /// Releases the log. Idempotent.
     async fn close(&self) -> Result<(), StoreError>;
 }
@@ -94,12 +136,26 @@ pub struct MemoryThreadStore {
 struct MemoryState {
     thread_id: Option<ThreadId>,
     events: Vec<ThreadEvent>,
+    origin: Option<ForkOrigin>,
     closed: bool,
 }
 
 impl MemoryThreadStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Branch of another memory store: bound, pre-filled with the copied prefix
+    /// and carrying its provenance.
+    fn branched(thread_id: ThreadId, events: Vec<ThreadEvent>, origin: ForkOrigin) -> Self {
+        Self {
+            state: std::sync::Mutex::new(MemoryState {
+                thread_id: Some(thread_id),
+                events,
+                origin: Some(origin),
+                closed: false,
+            }),
+        }
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, MemoryState>, StoreError> {
@@ -162,7 +218,35 @@ impl ThreadStore for MemoryThreadStore {
             events: state.events.clone(),
             schema_version: None,
             skipped_partial: false,
+            origin: state.origin,
         })
+    }
+
+    async fn fork(&self, at: &ForkPoint) -> Result<Arc<dyn ThreadStore>, StoreError> {
+        let state = self.lock()?;
+        if state.closed {
+            return Err(StoreError::Closed);
+        }
+        if let Some(held) = state.thread_id
+            && held != at.parent_thread_id
+        {
+            return Err(StoreError::ThreadMismatch {
+                holds: held,
+                given: at.parent_thread_id,
+            });
+        }
+        let cut = state
+            .events
+            .iter()
+            .position(|e| e.event_id == at.fork_event_id)
+            .ok_or(StoreError::NoSuchEvent {
+                event_id: at.fork_event_id,
+            })?;
+        Ok(Arc::new(MemoryThreadStore::branched(
+            at.child_thread_id,
+            state.events[..=cut].to_vec(),
+            at.origin(),
+        )))
     }
 
     async fn close(&self) -> Result<(), StoreError> {
@@ -181,7 +265,7 @@ pub mod contract {
     //! be visible from `agent-session`), so it asserts and unwraps like a test.
     #![allow(clippy::expect_used)]
 
-    use super::{StoreError, ThreadStore};
+    use super::{ForkPoint, StoreError, ThreadStore};
     use crate::event::{ThreadEvent, ThreadEventPayload};
     use crate::id::{EventId, IdGenerator, SequentialIds, ThreadId, TurnId};
     use crate::lifecycle::TurnState;
@@ -257,6 +341,7 @@ pub mod contract {
                     from: Some(TurnState::Queued),
                     to: TurnState::Running,
                     cause: None,
+                    context: None,
                 },
             ),
         ];
@@ -296,6 +381,116 @@ pub mod contract {
         assert_eq!(snapshot.thread_id, Some(thread_id));
         assert_eq!(snapshot.events, appended);
     }
+
+    /// Fork contract (US-010), run on a freshly opened empty store. Kept apart
+    /// from [`assert_thread_store_contract`] because that one ends on a closed
+    /// store, and a fork is an operation of a LIVE one.
+    ///
+    /// The caller owns the cleanup of the returned child.
+    pub async fn assert_thread_fork_contract(store: &dyn ThreadStore) {
+        let ids = SequentialIds::starting_at(1_000);
+        let thread_id = ThreadId::generate(&ids);
+        let first_turn = TurnId::generate(&ids);
+        let second_turn = TurnId::generate(&ids);
+        store.create(&thread_id).await.expect("create");
+
+        let mut log = Vec::new();
+        for (seq, payload) in [
+            ThreadEventPayload::ThreadCreated,
+            ThreadEventPayload::InputSubmitted {
+                turn_id: first_turn,
+                client_message_id: None,
+                text: "premier".into(),
+            },
+            ThreadEventPayload::TurnStateChanged {
+                turn_id: first_turn,
+                from: Some(TurnState::Queued),
+                to: TurnState::Completed,
+                cause: None,
+                context: None,
+            },
+            ThreadEventPayload::InputSubmitted {
+                turn_id: second_turn,
+                client_message_id: None,
+                text: "second".into(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let e = event(&ids, thread_id, seq as u64 + 1, payload);
+            store.append(&e).await.expect("append");
+            log.push(e);
+        }
+        // Cut on the terminal of the first turn: everything after it belongs to
+        // the parent alone.
+        let cut = log[2].event_id;
+        let point = ForkPoint {
+            parent_thread_id: thread_id,
+            child_thread_id: ThreadId::generate(&ids),
+            fork_turn_id: first_turn,
+            fork_event_id: cut,
+        };
+
+        // 1. An unknown cut is refused and materializes nothing.
+        let unknown = ForkPoint {
+            fork_event_id: EventId::generate(&ids),
+            ..point
+        };
+        assert!(
+            matches!(
+                store.fork(&unknown).await,
+                Err(StoreError::NoSuchEvent { .. })
+            ),
+            "an unknown fork point must be refused"
+        );
+
+        // 2. The child carries the prefix THROUGH the cut, its own binding and
+        //    its provenance.
+        let child = store.fork(&point).await.expect("fork");
+        let snapshot = child.read().await.expect("read the child");
+        assert_eq!(snapshot.thread_id, Some(point.child_thread_id));
+        assert_eq!(snapshot.origin, Some(point.origin()));
+        assert_eq!(
+            snapshot.events,
+            log[..3],
+            "the child holds the prefix up to the cut, and nothing after it"
+        );
+
+        // 3. Parent and child diverge without cross-writes.
+        let child_event = event(
+            &ids,
+            point.child_thread_id,
+            snapshot.next_seq(),
+            ThreadEventPayload::TurnStateChanged {
+                turn_id: second_turn,
+                from: Some(TurnState::Queued),
+                to: TurnState::Running,
+                cause: None,
+                context: None,
+            },
+        );
+        child
+            .append(&child_event)
+            .await
+            .expect("append to the child");
+        let parent_after = store.read().await.expect("read the parent");
+        assert_eq!(
+            parent_after.events, log,
+            "writing to the child adds nothing to the parent"
+        );
+        assert_eq!(
+            child.read().await.expect("re-read the child").events.len(),
+            4,
+            "the child keeps its own event"
+        );
+        // 4. The child refuses an event addressed to its parent.
+        assert!(matches!(
+            child.append(&log[3]).await,
+            Err(StoreError::ThreadMismatch { .. })
+        ));
+        child.close().await.expect("close the child");
+    }
 }
 
 #[cfg(test)]
@@ -307,6 +502,11 @@ mod tests {
     #[tokio::test]
     async fn memory_adapter_satisfies_the_store_contract() {
         contract::assert_thread_store_contract(&MemoryThreadStore::new()).await;
+    }
+
+    #[tokio::test]
+    async fn memory_adapter_satisfies_the_fork_contract() {
+        contract::assert_thread_fork_contract(&MemoryThreadStore::new()).await;
     }
 
     #[tokio::test]

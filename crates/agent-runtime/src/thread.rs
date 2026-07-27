@@ -11,7 +11,7 @@
 //! Every limit below is a CONSTANT. FR-20 forbids adding a public configuration
 //! key for orchestration in v1.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,8 +29,9 @@ use crate::event::{ThreadEvent, ThreadEventPayload};
 use crate::id::{EventId, IdGenerator, ThreadId, TurnId};
 use crate::inputs::TurnInputs;
 use crate::lifecycle::{TurnLifecycle, TurnState};
+use crate::resume::{self, ResumedThread};
 use crate::runner::{TurnOutcome, TurnRequest, TurnRunner};
-use crate::store::{StoreError, ThreadStore};
+use crate::store::{ForkPoint, StoreError, ThreadSnapshot, ThreadStore};
 
 /// Control mailbox depth. A producer that finds it full is refused, never
 /// blocked (edge case #2).
@@ -120,6 +121,10 @@ pub enum RuntimeEventPayload {
     },
     /// Engine event, forwarded with its canonical content untouched.
     Engine(AgentEvent),
+    /// A branch was materialized from the turn this event is correlated to.
+    Forked {
+        child_thread_id: ThreadId,
+    },
     ShuttingDown,
 }
 
@@ -146,6 +151,48 @@ pub enum SubmitError {
 pub enum RuntimeError {
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+/// A materialized branch (US-010). Carries its provenance AND its open store,
+/// so a client that forks in order to switch to the branch does not have to
+/// guess where the runtime put it.
+pub struct Fork {
+    pub child_thread_id: ThreadId,
+    pub fork_turn_id: TurnId,
+    /// Terminal event of `fork_turn_id`: the exact cut in the parent's log.
+    pub fork_event_id: EventId,
+    /// The parent's `Forked` event, durable before this value is handed back.
+    pub event_id: EventId,
+    pub store: Arc<dyn ThreadStore>,
+}
+
+impl std::fmt::Debug for Fork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Fork")
+            .field("child_thread_id", &self.child_thread_id)
+            .field("fork_turn_id", &self.fork_turn_id)
+            .field("fork_event_id", &self.fork_event_id)
+            .field("event_id", &self.event_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a branch was refused. Every variant leaves the source untouched: no
+/// child file, no event in the parent (US-010 AC5).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ForkError {
+    #[error("a turn is running: interrupt or finish it before forking")]
+    TurnActive { current: TurnStatus },
+    #[error("this thread has no terminal turn to fork from")]
+    NoTerminalTurn,
+    #[error("turn {turn_id} does not belong to this thread")]
+    UnknownTurn { turn_id: TurnId },
+    #[error("turn {turn_id} is not terminal (`{state}`)")]
+    NotTerminal { turn_id: TurnId, state: TurnState },
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Submit(#[from] SubmitError),
 }
 
 /// Everything a thread needs to run. Assembled by the client (CLI wiring in
@@ -177,6 +224,10 @@ enum Command {
         turn_id: Option<TurnId>,
         reply: oneshot::Sender<Result<Option<TurnStatus>, SubmitError>>,
     },
+    Fork {
+        at: Option<TurnId>,
+        reply: oneshot::Sender<Result<Fork, ForkError>>,
+    },
 }
 
 impl Command {
@@ -189,6 +240,9 @@ impl Command {
             }
             Self::Interrupt { reply, .. } => {
                 let _ = reply.send(Err(error));
+            }
+            Self::Fork { reply, .. } => {
+                let _ = reply.send(Err(error.into()));
             }
         }
     }
@@ -218,10 +272,17 @@ pub struct ThreadHandle {
     events: broadcast::Sender<RuntimeEvent>,
     token: CancellationToken,
     actor: Mutex<Option<JoinHandle<()>>>,
+    resumed: ResumedThread,
 }
 
 impl ThreadHandle {
-    /// Opens the durable log, binds it to `thread_id` and starts the actor.
+    /// Opens the durable log, binds it to `thread_id`, replays what it holds and
+    /// starts the actor (US-004, US-009).
+    ///
+    /// A log that already carries turns is RESUMED, not restarted: the last
+    /// state, the current turn, the accepted submissions and the fork
+    /// provenance come back, and a turn a crash left without a terminal is
+    /// closed here, once, before any command is served.
     pub async fn start(options: ThreadOptions) -> Result<Self, RuntimeError> {
         let ThreadOptions {
             thread_id,
@@ -235,16 +296,13 @@ impl ThreadHandle {
 
         store.create(&thread_id).await?;
         let snapshot = store.read().await?;
-        let already_created = snapshot
-            .events
-            .iter()
-            .any(|e| matches!(e.payload, ThreadEventPayload::ThreadCreated));
+        let plan = resume::plan(thread_id, &snapshot);
 
         let token = parent_cancel.child_token();
         let (events, _) = broadcast::channel(LIVE_EVENT_BUFFER);
         let (status_tx, status_rx) = watch::channel(ThreadStatus {
             thread_id,
-            turn: None,
+            turn: plan.resumed.turn,
             pending_inputs: 0,
             pending_steers: 0,
             shutting_down: false,
@@ -263,7 +321,8 @@ impl ThreadHandle {
             tracker: TaskTracker::new(),
             seq: snapshot.next_seq(),
             turn: None,
-            last_turn: None,
+            last_turn: plan.resumed.turn,
+            accepted: plan.resumed.accepted.clone(),
             pending: VecDeque::new(),
             straggler_deadline: None,
             events: events.clone(),
@@ -272,8 +331,41 @@ impl ThreadHandle {
             finished_rx,
             shutting_down: false,
         };
-        if !already_created {
+        if !plan.thread_created {
             actor.commit(ThreadEventPayload::ThreadCreated).await?;
+        }
+
+        let mut resumed = plan.resumed;
+        // US-009 AC2: the transcript was reconciled by `resume::plan` BEFORE the
+        // recovery terminal is written, so the log never claims a turn stopped
+        // cleanly while its tool calls are still unanswered.
+        for (turn_id, from) in plan.unfinished {
+            let cause = resume::recovery_cause(from);
+            actor
+                .commit(ThreadEventPayload::TurnStateChanged {
+                    turn_id,
+                    from: Some(from),
+                    to: TurnState::Interrupted,
+                    cause: Some(cause),
+                    context: None,
+                })
+                .await?;
+            actor.last_turn = Some(TurnStatus {
+                turn_id,
+                state: TurnState::Interrupted,
+            });
+            resumed.recovered.push(turn_id);
+        }
+        if !resumed.recovered.is_empty() {
+            resumed.turn = actor.last_turn;
+            actor.publish_status();
+            tracing::debug!(
+                target: "pyxis::runtime",
+                thread_id = %thread_id,
+                recovered = resumed.recovered.len(),
+                reconciled_calls = resumed.reconciled_calls,
+                "turns closed by resume"
+            );
         }
 
         let join = tokio::spawn(actor.run(command_rx));
@@ -284,11 +376,18 @@ impl ThreadHandle {
             events,
             token,
             actor: Mutex::new(Some(join)),
+            resumed,
         })
     }
 
     pub fn thread_id(&self) -> ThreadId {
         self.thread_id
+    }
+
+    /// What the durable log held when this handle opened it. The transcript a
+    /// client chains its next turn on.
+    pub fn resumed(&self) -> &ResumedThread {
+        &self.resumed
     }
 
     /// Submits an input that opens a turn of its own.
@@ -336,6 +435,18 @@ impl ThreadHandle {
     ) -> Result<Option<TurnStatus>, SubmitError> {
         let (reply, answer) = oneshot::channel();
         self.dispatch(Command::Interrupt { turn_id, reply })?;
+        answer.await.map_err(|_| SubmitError::Stopped)?
+    }
+
+    /// Materializes a branch at a terminal turn boundary (US-010).
+    ///
+    /// `at` names the turn to branch from; `None` takes the last terminal turn.
+    /// Goes through the mailbox like any other operation: the actor is the only
+    /// place that knows whether a turn is running, and a fork of a moving
+    /// transcript would copy a prefix nobody can reason about.
+    pub async fn fork(&self, at: Option<TurnId>) -> Result<Fork, ForkError> {
+        let (reply, answer) = oneshot::channel();
+        self.dispatch(Command::Fork { at, reply })?;
         answer.await.map_err(|_| SubmitError::Stopped)?
     }
 
@@ -392,6 +503,10 @@ struct ThreadActor {
     /// state the turn ended in, so the status keeps showing it until the next
     /// turn starts.
     last_turn: Option<TurnStatus>,
+    /// Submissions already accepted, by client idempotency key. Rebuilt from the
+    /// log at resume, so a retry that crosses a restart is still deduplicated
+    /// (FR-12, edge case #3).
+    accepted: HashMap<String, Accepted>,
     pending: VecDeque<(TurnId, Submission)>,
     /// Armed when a turn is cancelled. Past it, a turn that ignored the signal
     /// is aborted and the actor writes its terminal itself (US-008 AC5).
@@ -401,6 +516,49 @@ struct ThreadActor {
     finished_tx: mpsc::Sender<TurnFinished>,
     finished_rx: mpsc::Receiver<TurnFinished>,
     shutting_down: bool,
+}
+
+/// Resolves the cut a fork asks for against the durable log (US-010).
+///
+/// A boundary is the TERMINAL transition of a turn, and its event identifies the
+/// exact prefix to materialize. Naming a turn that is unknown or still open is
+/// refused rather than approximated to a nearby boundary.
+fn resolve_fork_point(
+    snapshot: &ThreadSnapshot,
+    at: Option<TurnId>,
+) -> Result<(TurnId, EventId), ForkError> {
+    let mut last_state: Option<TurnState> = None;
+    let mut terminal: Option<(TurnId, EventId)> = None;
+    let mut seen = false;
+
+    for event in &snapshot.events {
+        let ThreadEventPayload::TurnStateChanged { turn_id, to, .. } = &event.payload else {
+            if let (Some(target), Some(turn_id)) = (at, event.turn_id())
+                && target == turn_id
+            {
+                seen = true;
+            }
+            continue;
+        };
+        if at.is_some_and(|target| target != *turn_id) {
+            continue;
+        }
+        seen = true;
+        last_state = Some(*to);
+        if to.is_terminal() {
+            terminal = Some((*turn_id, event.event_id));
+        }
+    }
+
+    match (terminal, at) {
+        (Some(point), _) => Ok(point),
+        (None, None) => Err(ForkError::NoTerminalTurn),
+        (None, Some(turn_id)) if !seen => Err(ForkError::UnknownTurn { turn_id }),
+        (None, Some(turn_id)) => Err(ForkError::NotTerminal {
+            turn_id,
+            state: last_state.unwrap_or(TurnState::Queued),
+        }),
+    }
 }
 
 /// Fires at `deadline`, or never when no turn is being force-stopped.
@@ -502,6 +660,10 @@ impl ThreadActor {
                 let outcome = self.on_interrupt(turn_id);
                 let _ = reply.send(outcome);
             }
+            Command::Fork { at, reply } => {
+                let outcome = self.on_fork(at).await;
+                let _ = reply.send(outcome);
+            }
         }
     }
 
@@ -520,6 +682,15 @@ impl ThreadActor {
                 text: submission.text.clone(),
             })
             .await?;
+        if let Some(key) = submission.client_message_id.clone() {
+            self.accepted.insert(
+                key,
+                Accepted {
+                    turn_id,
+                    event_id: event.event_id,
+                },
+            );
+        }
         self.publish(
             event.event_id,
             Some(turn_id),
@@ -530,7 +701,29 @@ impl ThreadActor {
         Ok(event.event_id)
     }
 
+    /// Identifiers a previous acceptance of the same `client_message_id` was
+    /// given, if any.
+    ///
+    /// Checked BEFORE admission, shutdown included: replaying a submission the
+    /// log already carries is not a new operation, so it can neither be refused
+    /// nor executed twice (FR-12).
+    fn already_accepted(&self, submission: &Submission) -> Option<Accepted> {
+        let key = submission.client_message_id.as_ref()?;
+        let prior = self.accepted.get(key).copied();
+        if prior.is_some() {
+            tracing::debug!(
+                target: "pyxis::runtime",
+                thread_id = %self.thread_id,
+                "submission replayed, returning the original identifiers"
+            );
+        }
+        prior
+    }
+
     async fn on_submit(&mut self, submission: Submission) -> Result<Accepted, SubmitError> {
+        if let Some(prior) = self.already_accepted(&submission) {
+            return Ok(prior);
+        }
         if self.shutting_down {
             return Err(SubmitError::ShuttingDown);
         }
@@ -559,6 +752,9 @@ impl ThreadActor {
         submission: Submission,
         expected_turn_id: Option<TurnId>,
     ) -> Result<Accepted, SubmitError> {
+        if let Some(prior) = self.already_accepted(&submission) {
+            return Ok(prior);
+        }
         if self.shutting_down {
             return Err(SubmitError::ShuttingDown);
         }
@@ -635,6 +831,82 @@ impl ThreadActor {
         }))
     }
 
+    /// Cuts a branch at a terminal turn boundary (US-010).
+    ///
+    /// Order matters: refuse, resolve against the DURABLE log, materialize, and
+    /// only then record the fork in the parent. A failure at any step leaves the
+    /// parent exactly as it was.
+    async fn on_fork(&mut self, at: Option<TurnId>) -> Result<Fork, ForkError> {
+        if self.shutting_down {
+            return Err(SubmitError::ShuttingDown.into());
+        }
+        if let Some(running) = self.turn.as_ref() {
+            // Edge case #12: a moving transcript has no boundary to copy.
+            return Err(ForkError::TurnActive {
+                current: TurnStatus {
+                    turn_id: running.lifecycle.turn_id(),
+                    state: running.lifecycle.state(),
+                },
+            });
+        }
+
+        // Read back rather than trust in-memory state: the cut is a byte offset
+        // in the log, so the log is what has to name it.
+        let snapshot = self.store.read().await?;
+        let (fork_turn_id, fork_event_id) = resolve_fork_point(&snapshot, at)?;
+        let child_thread_id = ThreadId::generate(self.ids.as_ref());
+        let point = ForkPoint {
+            parent_thread_id: self.thread_id,
+            child_thread_id,
+            fork_turn_id,
+            fork_event_id,
+        };
+        let store = self.store.fork(&point).await?;
+
+        let event = match self
+            .commit(ThreadEventPayload::Forked {
+                child_thread_id,
+                fork_turn_id,
+                fork_event_id,
+            })
+            .await
+        {
+            Ok(event) => event,
+            Err(err) => {
+                // The branch is on disk and self-describing: it carries its own
+                // origin, so nothing about it is partial. What failed is the
+                // parent's record of it, and naming it here is what keeps it
+                // from becoming an anonymous file.
+                tracing::warn!(
+                    thread_id = %self.thread_id,
+                    child_thread_id = %child_thread_id,
+                    error = %err,
+                    "branch materialized but its parent could not record it"
+                );
+                return Err(err.into());
+            }
+        };
+        self.publish(
+            event.event_id,
+            Some(fork_turn_id),
+            RuntimeEventPayload::Forked { child_thread_id },
+        );
+        tracing::debug!(
+            target: "pyxis::runtime",
+            thread_id = %self.thread_id,
+            child_thread_id = %child_thread_id,
+            fork_turn_id = %fork_turn_id,
+            "branch materialized"
+        );
+        Ok(Fork {
+            child_thread_id,
+            fork_turn_id,
+            fork_event_id,
+            event_id: event.event_id,
+            store,
+        })
+    }
+
     async fn start_turn(&mut self, turn_id: TurnId, submission: Submission) {
         if self.shutting_down {
             return;
@@ -643,6 +915,10 @@ impl ThreadActor {
         let Ok(from) = lifecycle.transition(TurnState::Running) else {
             return;
         };
+        // US-006 AC1: captured ONCE, before the transition that starts the turn
+        // is written, so the log records the configuration the engine actually
+        // received. What the source does afterwards belongs to the next turn.
+        let context = self.turn_contexts.capture(turn_id);
         // US-005 AC1: `running` is durable BEFORE the engine exists, so no
         // provider call can happen for a turn the log never started.
         let event = match self
@@ -651,6 +927,7 @@ impl ThreadActor {
                 from: Some(from),
                 to: TurnState::Running,
                 cause: None,
+                context: Some(context.clone()),
             })
             .await
         {
@@ -672,9 +949,6 @@ impl ThreadActor {
             },
         );
 
-        // US-006 AC1: captured ONCE. What the source does afterwards belongs to
-        // the next turn.
-        let context = self.turn_contexts.capture(turn_id);
         let inputs = Arc::new(TurnInputs::new());
         let (engine_tx, mut engine_rx) = mpsc::channel::<AgentEvent>(LIVE_EVENT_BUFFER);
         let turn_token = self.token.child_token();
@@ -840,6 +1114,7 @@ impl ThreadActor {
                 from: Some(from),
                 to,
                 cause: cause.clone(),
+                context: None,
             })
             .await
         {
@@ -934,5 +1209,110 @@ impl ThreadActor {
         if let Err(err) = self.store.close().await {
             tracing::warn!(thread_id = %self.thread_id, error = %err, "thread store close failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::id::SequentialIds;
+
+    fn log(ids: &dyn IdGenerator, payloads: Vec<ThreadEventPayload>) -> ThreadSnapshot {
+        let thread_id = ThreadId::generate(ids);
+        ThreadSnapshot {
+            thread_id: Some(thread_id),
+            events: payloads
+                .into_iter()
+                .enumerate()
+                .map(|(i, payload)| ThreadEvent {
+                    event_id: EventId::generate(ids),
+                    thread_id,
+                    seq: i as u64 + 1,
+                    at_ms: i as u64,
+                    payload,
+                })
+                .collect(),
+            ..ThreadSnapshot::default()
+        }
+    }
+
+    /// A turn that is queued but not running is unreachable from a live actor
+    /// (a fork is refused before it while a turn is active) and impossible after
+    /// a resume (every open turn is closed there). The refusal is still typed:
+    /// approximating it to the nearest boundary would branch a transcript the
+    /// caller never named.
+    #[test]
+    fn a_fork_at_a_turn_that_never_reached_a_terminal_is_refused() {
+        let ids = SequentialIds::new();
+        let queued = TurnId::generate(&ids);
+        let snapshot = log(
+            &ids,
+            vec![
+                ThreadEventPayload::ThreadCreated,
+                ThreadEventPayload::InputSubmitted {
+                    turn_id: queued,
+                    client_message_id: None,
+                    text: "en attente".into(),
+                },
+                ThreadEventPayload::TurnStateChanged {
+                    turn_id: queued,
+                    from: Some(TurnState::Queued),
+                    to: TurnState::Running,
+                    cause: None,
+                    context: None,
+                },
+            ],
+        );
+        assert!(matches!(
+            resolve_fork_point(&snapshot, Some(queued)),
+            Err(ForkError::NotTerminal {
+                state: TurnState::Running,
+                ..
+            })
+        ));
+        assert!(matches!(
+            resolve_fork_point(&snapshot, None),
+            Err(ForkError::NoTerminalTurn)
+        ));
+    }
+
+    /// Without a target, the LAST terminal wins; with one, its own terminal does.
+    #[test]
+    fn a_fork_point_resolves_to_the_terminal_of_the_named_turn() {
+        let ids = SequentialIds::new();
+        let first = TurnId::generate(&ids);
+        let second = TurnId::generate(&ids);
+        let snapshot = log(
+            &ids,
+            vec![
+                ThreadEventPayload::TurnStateChanged {
+                    turn_id: first,
+                    from: Some(TurnState::Running),
+                    to: TurnState::Completed,
+                    cause: None,
+                    context: None,
+                },
+                ThreadEventPayload::TurnStateChanged {
+                    turn_id: second,
+                    from: Some(TurnState::Running),
+                    to: TurnState::Interrupted,
+                    cause: None,
+                    context: None,
+                },
+            ],
+        );
+        assert_eq!(
+            resolve_fork_point(&snapshot, None).unwrap(),
+            (second, snapshot.events[1].event_id)
+        );
+        assert_eq!(
+            resolve_fork_point(&snapshot, Some(first)).unwrap(),
+            (first, snapshot.events[0].event_id)
+        );
+        // An interrupted turn is a boundary too: it is terminal.
+        assert_eq!(
+            resolve_fork_point(&snapshot, Some(second)).unwrap().0,
+            second
+        );
     }
 }

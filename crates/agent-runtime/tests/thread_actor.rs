@@ -124,6 +124,12 @@ impl ThreadStore for GatedStore {
     async fn read(&self) -> Result<ThreadSnapshot, StoreError> {
         self.inner.read().await
     }
+    async fn fork(
+        &self,
+        at: &agent_runtime::store::ForkPoint,
+    ) -> Result<Arc<dyn ThreadStore>, StoreError> {
+        self.inner.fork(at).await
+    }
     async fn close(&self) -> Result<(), StoreError> {
         self.inner.close().await
     }
