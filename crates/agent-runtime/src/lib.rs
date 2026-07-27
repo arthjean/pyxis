@@ -16,6 +16,7 @@
 pub mod event;
 pub mod id;
 pub mod lifecycle;
+pub mod runner;
 pub mod store;
 
 pub use event::{
@@ -25,4 +26,5 @@ pub use id::{
     AgentId, EventId, IdError, IdGenerator, RandomIds, SequentialIds, StepId, ThreadId, TurnId,
 };
 pub use lifecycle::{LifecycleError, TurnLifecycle, TurnState};
+pub use runner::{RunAgentRunner, TurnOutcome, TurnRequest, TurnRunner};
 pub use store::{MemoryThreadStore, StoreError, ThreadSnapshot, ThreadStore};
