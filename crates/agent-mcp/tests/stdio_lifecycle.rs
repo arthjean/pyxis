@@ -2,7 +2,6 @@
 //! schema preservation and clean shutdown through `cancel`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -55,13 +54,10 @@ async fn stdio_connect_lists_tools_and_cancel_closes_child() {
     let dir = temp_dir("stdio-lifecycle");
     let exe = compile_fixture(&dir);
     let closed = dir.join("closed.txt");
-    let cfg = McpServerConfig {
-        command: exe.to_string_lossy().into_owned(),
-        args: vec![closed.to_string_lossy().into_owned()],
-        env: BTreeMap::new(),
-        source: Default::default(),
-        shadows_lower_priority: false,
-    };
+    let cfg = McpServerConfig::stdio(
+        exe.to_string_lossy().into_owned(),
+        vec![closed.to_string_lossy().into_owned()],
+    );
 
     let conn = McpConnection::connect("fixture", &cfg).await.unwrap();
     let tools = conn.list_tools("fixture").await.unwrap();

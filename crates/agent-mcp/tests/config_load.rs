@@ -42,9 +42,10 @@ fn parses_stdio_server_with_args_and_env() {
     let cfg = McpConfigFile::load(&dir).unwrap();
     assert_eq!(cfg.servers.len(), 1);
     let fs = cfg.servers.get("filesystem").unwrap();
-    assert_eq!(fs.command, "npx");
-    assert_eq!(fs.args.len(), 3);
-    assert_eq!(fs.env.get("FOO").map(String::as_str), Some("bar"));
+    assert_eq!(fs.transport.short_label(), "stdio");
+    assert!(fs.transport.target().starts_with("npx "));
+    assert_eq!(fs.transport.target().split(' ').count(), 4);
+    assert_eq!(fs.env().get("FOO").map(String::as_str), Some("bar"));
     assert_eq!(fs.source.origin, McpConfigOrigin::Workspace);
     assert_eq!(cfg.skipped, 0);
     assert!(cfg.issues.is_empty());
@@ -52,7 +53,7 @@ fn parses_stdio_server_with_args_and_env() {
 }
 
 #[test]
-fn remote_server_without_command_is_skipped_not_fatal() {
+fn a_remote_server_is_loaded_next_to_a_stdio_one() {
     let dir = temp_dir("remote");
     std::fs::write(
         dir.join(".mcp.json"),
@@ -63,14 +64,18 @@ fn remote_server_without_command_is_skipped_not_fatal() {
     )
     .unwrap();
     let cfg = McpConfigFile::load(&dir).unwrap();
-    // The stdio server is kept, the remote one (without `command`) is ignored without an error.
-    assert_eq!(cfg.servers.len(), 1);
-    assert!(cfg.servers.contains_key("stdio-ok"));
-    assert_eq!(cfg.skipped, 1);
-    assert!(matches!(
-        cfg.issues[0].kind,
-        McpConfigIssueKind::UnsupportedTransport
-    ));
+    // US-013: both transports are first-class now.
+    assert_eq!(cfg.servers.len(), 2);
+    assert_eq!(
+        cfg.servers.get("stdio-ok").unwrap().transport.short_label(),
+        "stdio"
+    );
+    assert_eq!(
+        cfg.servers.get("remote").unwrap().transport.short_label(),
+        "http"
+    );
+    assert_eq!(cfg.skipped, 0);
+    assert!(cfg.issues.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -159,20 +164,18 @@ fn load_claude_extracts_user_scope_mcpservers_only() {
     )
     .unwrap();
     let cfg = McpConfigFile::load_claude(&path).unwrap();
-    // user scope only: exa kept, remote (without command) skipped, neon
-    // (project scope) ignored, unrelated keys ignored.
-    assert_eq!(cfg.servers.len(), 1);
+    // user scope only: exa and remote kept, neon (project scope) ignored,
+    // unrelated keys ignored.
+    assert_eq!(cfg.servers.len(), 2);
     assert!(cfg.servers.contains_key("exa"));
+    assert!(cfg.servers.contains_key("remote"));
     assert!(!cfg.servers.contains_key("neon"));
     assert_eq!(
         cfg.servers.get("exa").unwrap().source.origin,
         McpConfigOrigin::ClaudeUser
     );
-    assert_eq!(cfg.skipped, 1);
-    assert!(matches!(
-        cfg.issues[0].kind,
-        McpConfigIssueKind::UnsupportedTransport
-    ));
+    assert_eq!(cfg.skipped, 0);
+    assert!(cfg.issues.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
