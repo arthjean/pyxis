@@ -13,10 +13,16 @@
 //! - No public configuration key. Every v1 limit is a constant (FR-20).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod event;
 pub mod id;
 pub mod lifecycle;
+pub mod store;
 
+pub use event::{
+    THREAD_EVENT_ENTRY, THREAD_META_ENTRY, THREAD_RUNTIME_VERSION, ThreadEvent, ThreadEventPayload,
+};
 pub use id::{
     AgentId, EventId, IdError, IdGenerator, RandomIds, SequentialIds, StepId, ThreadId, TurnId,
 };
 pub use lifecycle::{LifecycleError, TurnLifecycle, TurnState};
+pub use store::{MemoryThreadStore, StoreError, ThreadSnapshot, ThreadStore};
