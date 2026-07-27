@@ -344,14 +344,31 @@ fn run_config_from_args(args: &Args, config: &settings::Config) -> anyhow::Resul
 /// US-005: sandbox scope in one line, as `/status` shows it. Resolved here
 /// because enforcement happens before the interactive loop exists, and the loop
 /// has no way to observe it afterwards.
-fn sandbox_scope_label(enforced: bool, extra_roots: &[std::path::PathBuf]) -> String {
-    if !enforced {
+///
+/// US-001 AC4/AC5: the line always names the policy REALLY in force. A confined
+/// variant the kernel did not apply is shown as what it is, never under the
+/// name that was asked for.
+fn sandbox_scope_label(policy: &SandboxPolicy, enforced: bool) -> String {
+    if !policy.confines_writes() {
         return "off (writes not restricted)".to_string();
     }
-    match extra_roots.len() {
-        0 => "enforced (workspace)".to_string(),
-        1 => "enforced (workspace + 1 extra root)".to_string(),
-        n => format!("enforced (workspace + {n} extra roots)"),
+    if !enforced {
+        return format!(
+            "{} requested, NOT applied (writes not restricted)",
+            policy.id()
+        );
+    }
+    match policy {
+        SandboxPolicy::DangerFullAccess => "off (writes not restricted)".to_string(),
+        SandboxPolicy::ReadOnly { .. } => "enforced (read-only)".to_string(),
+        SandboxPolicy::WorkspaceWrite { writable_roots, .. } => {
+            // The workspace is the first root: the rest is what was added to it.
+            match writable_roots.len().saturating_sub(1) {
+                0 => "enforced (workspace)".to_string(),
+                1 => "enforced (workspace + 1 extra root)".to_string(),
+                n => format!("enforced (workspace + {n} extra roots)"),
+            }
+        }
     }
 }
 
@@ -385,20 +402,112 @@ fn resolve_permission_mode(
     (mode, headless && mode != policy.mode)
 }
 
-fn sandbox_enforced_from_args(
+/// What the confinement resolved to at startup: the policy asked for, and
+/// whether the kernel really carries it. Threaded into the runtime because
+/// enforcement happens before it exists and cannot be observed afterwards.
+struct SandboxSetup {
+    policy: SandboxPolicy,
+    enforced: bool,
+}
+
+/// Reads the network confinement on behalf of the tools (US-004). The glue is
+/// here, in the only crate that knows both `agent-tools` and `agent-sandbox`.
+struct ProxyObserver {
+    proxy: agent_sandbox::ProxyHandle,
+}
+
+impl agent_tools::SandboxObserver for ProxyObserver {
+    fn mark(&self) -> usize {
+        self.proxy.mark()
+    }
+    fn blocked_since(&self, mark: usize) -> Vec<String> {
+        self.proxy.blocked_since(mark)
+    }
+    fn allowed(&self) -> String {
+        agent_sandbox::describe_allowed(&self.proxy.allowed)
+    }
+}
+
+/// Applies an approved one-call widening (US-004).
+///
+/// The network is the ONLY perimeter that widens in place: it lives in the
+/// proxy, which is ours. The filesystem perimeter is a Landlock domain, which
+/// is inherited by every child and irreversible for the process, so no
+/// escalation can lift it and none is offered. Returning `None` there is what
+/// keeps the refusal in place instead of promising a retry that would fail
+/// identically.
+struct ProxyEscalator {
+    grants: agent_sandbox::NetworkGrants,
+}
+
+impl agent_tools::SandboxEscalator for ProxyEscalator {
+    fn can_lift(&self, denial: &agent_tools::SandboxDenial) -> bool {
+        denial.is_escalatable()
+    }
+    fn lift(&self, denial: &agent_tools::SandboxDenial) -> Option<agent_tools::EscalationGuard> {
+        match denial {
+            agent_tools::SandboxDenial::Network { host, .. } => {
+                Some(Box::new(self.grants.grant(host)))
+            }
+            agent_tools::SandboxDenial::Filesystem => None,
+        }
+    }
+}
+
+/// Resolves the policy in force (US-001). `--no-sandbox` is a documented ALIAS
+/// of full access, with no third semantics of its own (US-008 AC5); the named
+/// variants come from `sandbox_mode`, a security key no workspace file can set.
+fn sandbox_policy_from_args(
     args: &Args,
     workspace: &std::path::Path,
+    config: &settings::Config,
+    writable_roots: &agent_sandbox::WritableRoots,
+) -> SandboxPolicy {
+    if !args.sandbox {
+        return SandboxPolicy::DangerFullAccess;
+    }
+    let subpaths = agent_tools::path::PROTECTED_SUBPATHS;
+    let default = || {
+        SandboxPolicy::workspace_write(
+            workspace,
+            writable_roots.granted.clone(),
+            subpaths.iter().map(std::path::PathBuf::from),
+        )
+    };
+    let Some(id) = config.sandbox_mode.as_deref() else {
+        return default();
+    };
+    // `settings.rs` already refused an unknown identifier: reaching the fallback
+    // would mean the two lists diverged, which must degrade to the safe side
+    // rather than to an unconfined session.
+    SandboxPolicy::from_id(id, workspace, writable_roots.granted.clone(), subpaths).unwrap_or_else(
+        || {
+            eprintln!("[sandbox] unknown policy `{id}`, falling back on the default");
+            default()
+        },
+    )
+}
+
+fn enforce_sandbox(
+    args: &Args,
+    policy: &SandboxPolicy,
     settings_path: Option<&std::path::Path>,
     diagnostics: &observability::Diagnostics,
     writable_roots: &agent_sandbox::WritableRoots,
+    agent_state_dirs: &[&std::path::Path],
 ) -> bool {
-    if !args.sandbox {
+    if !policy.confines_writes() {
+        let source = if args.sandbox {
+            "by the `full-access` policy"
+        } else {
+            "by --no-sandbox"
+        };
         if args.yes {
             eprintln!(
-                "[sandbox] disabled by --no-sandbox: --yes may accept edits without filesystem confinement"
+                "[sandbox] disabled {source}: --yes may accept edits without filesystem confinement"
             );
         } else {
-            eprintln!("[sandbox] disabled by --no-sandbox");
+            eprintln!("[sandbox] disabled {source}");
         }
         return false;
     }
@@ -414,12 +523,14 @@ fn sandbox_enforced_from_args(
     // that stay writable, each granted individually.
     let mut writable: Vec<&std::path::Path> = settings_path.into_iter().collect();
     writable.extend(diagnostics.writable_files());
-    match agent_sandbox::enforce_process(workspace, &writable, &writable_roots.as_paths()) {
+    match agent_sandbox::enforce_policy(policy, &writable, agent_state_dirs) {
         Ok(status) => {
-            if let Some(w) = status.warning() {
-                eprintln!("[sandbox] {w}");
+            // US-001 AC5: a degradation names the requested variant AND the one
+            // really applied, never silently keeps the first.
+            if let Some(message) = status.degradation(policy) {
+                eprintln!("[sandbox] {message}");
             }
-            status == agent_sandbox::fs::SandboxStatus::Enforced
+            status.confines()
         }
         Err(e) => {
             if args.yes {
@@ -546,7 +657,7 @@ fn main() -> anyhow::Result<()> {
             settings_path,
             config,
         },
-        sandbox_enforced,
+        SandboxSetup { policy, enforced },
     ))
 }
 
@@ -836,7 +947,7 @@ async fn run(
     mut args: Args,
     workspace: std::path::PathBuf,
     pre: PreSandbox,
-    sandbox_enforced: bool,
+    sandbox: SandboxSetup,
 ) -> anyhow::Result<()> {
     let PreSandbox {
         skills,
@@ -1437,4 +1548,135 @@ mod tests {
         let p = permission_policy(true, true, false);
         assert_eq!(p.mode, agent_tools::permission::PermissionMode::AcceptEdits);
     }
+
+    // ───────────────────────── EP-001 ─────────────────────────
+
+    fn roots(granted: &[&str]) -> agent_sandbox::WritableRoots {
+        agent_sandbox::WritableRoots {
+            granted: granted.iter().map(std::path::PathBuf::from).collect(),
+            ignored: Vec::new(),
+        }
+    }
+
+    /// US-008 AC5: `--no-sandbox` is an ALIAS of full access, with no third
+    /// semantics of its own.
+    #[test]
+    fn no_sandbox_is_an_alias_of_full_access() {
+        let mut a = args();
+        a.sandbox = false;
+        let policy = sandbox_policy_from_args(
+            &a,
+            std::path::Path::new("/work/repo"),
+            &settings::Config::default(),
+            &roots(&[]),
+        );
+        assert_eq!(policy, SandboxPolicy::DangerFullAccess);
+
+        // And it outranks a confined policy from the configuration: a flag the
+        // user typed is never overridden by a file.
+        let config = settings::Config {
+            sandbox_mode: Some("read-only".to_string()),
+            ..settings::Config::default()
+        };
+        let policy =
+            sandbox_policy_from_args(&a, std::path::Path::new("/work/repo"), &config, &roots(&[]));
+        assert_eq!(policy, SandboxPolicy::DangerFullAccess);
+    }
+
+    /// US-001 AC1/AC3: without configuration the perimeter is what it was
+    /// before the policy type existed: the workspace, its extra roots, and the
+    /// deferred-execution subpaths subtracted.
+    #[test]
+    fn the_default_policy_reproduces_the_previous_perimeter() {
+        let policy = sandbox_policy_from_args(
+            &args(),
+            std::path::Path::new("/work/repo"),
+            &settings::Config::default(),
+            &roots(&["/tmp/scratch"]),
+        );
+        let SandboxPolicy::WorkspaceWrite {
+            writable_roots,
+            network_access,
+        } = &policy
+        else {
+            unreachable!("le défaut doit rester workspace-write: {policy:?}");
+        };
+        assert!(
+            network_access,
+            "l'allow-list reste seule maîtresse du réseau"
+        );
+        assert_eq!(writable_roots.len(), 2);
+        assert_eq!(
+            writable_roots[0].root,
+            std::path::PathBuf::from("/work/repo")
+        );
+        assert_eq!(
+            writable_roots[0].read_only_subpaths,
+            agent_tools::path::PROTECTED_SUBPATHS
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect::<Vec<_>>()
+        );
+        // The extra roots carry no subtraction: `.git` only means something
+        // under the workspace.
+        assert!(writable_roots[1].read_only_subpaths.is_empty());
+    }
+
+    #[test]
+    fn a_named_policy_from_the_global_configuration_is_applied() {
+        let config = settings::Config {
+            sandbox_mode: Some("read-only".to_string()),
+            ..settings::Config::default()
+        };
+        let policy = sandbox_policy_from_args(
+            &args(),
+            std::path::Path::new("/work/repo"),
+            &config,
+            &roots(&["/tmp/scratch"]),
+        );
+        assert_eq!(
+            policy,
+            SandboxPolicy::ReadOnly {
+                network_access: false
+            }
+        );
+        // Read-only grants no root, so `writable_roots` has nothing to add.
+        assert!(policy.writable_roots().is_empty());
+    }
+
+    /// US-001 AC4/AC5: the status line always names the policy REALLY in force.
+    #[test]
+    fn the_status_line_names_the_policy_really_in_force() {
+        let full = SandboxPolicy::DangerFullAccess;
+        assert_eq!(
+            sandbox_scope_label(&full, false),
+            "off (writes not restricted)"
+        );
+
+        let ws = SandboxPolicy::workspace_write("/work/repo", Vec::new(), [".git"]);
+        assert_eq!(sandbox_scope_label(&ws, true), "enforced (workspace)");
+        let ws_extra = SandboxPolicy::workspace_write(
+            "/work/repo",
+            vec![std::path::PathBuf::from("/tmp/a")],
+            [".git"],
+        );
+        assert_eq!(
+            sandbox_scope_label(&ws_extra, true),
+            "enforced (workspace + 1 extra root)"
+        );
+
+        let read_only = SandboxPolicy::ReadOnly {
+            network_access: false,
+        };
+        assert_eq!(
+            sandbox_scope_label(&read_only, true),
+            "enforced (read-only)"
+        );
+
+        // Requested but not carried by the kernel: shown as what it is.
+        let degraded = sandbox_scope_label(&read_only, false);
+        assert!(degraded.contains("read-only"), "{degraded}");
+        assert!(degraded.contains("NOT applied"), "{degraded}");
+    }
+
 }
