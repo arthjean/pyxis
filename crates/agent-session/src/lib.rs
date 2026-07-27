@@ -28,6 +28,13 @@ use agent_core::CompactKind;
 use agent_core::compaction::is_summary_message;
 use agent_core::message::{ContentBlock, Message, Role};
 use agent_core::session::{FileSnapshot, Session, SessionEntry, SessionError};
+use agent_runtime::event::{THREAD_EVENT_ENTRY, THREAD_META_ENTRY, ThreadEvent};
+use agent_runtime::id::ThreadId;
+use serde::{Deserialize, Serialize};
+
+pub mod thread_store;
+
+pub use thread_store::JsonlThreadStore;
 
 /// Name of the session file in a working directory.
 pub const SESSION_FILE: &str = "session.jsonl";
@@ -42,6 +49,43 @@ fn serde_err(e: impl std::fmt::Display) -> SessionError {
 
 fn invalid_session(e: impl std::fmt::Display) -> SessionError {
     SessionError::Serde(e.to_string())
+}
+
+/// Lines the thread runtime adds to the SAME file as the v1 transcript (EP-001).
+///
+/// Additive by construction: a v1 reader deserializes them into
+/// `SessionEntry::Unknown` and skips them, which is why `SESSION_SCHEMA_VERSION`
+/// is deliberately NOT bumped. Bumping it would make every new file unreadable
+/// by an older binary, which rejects `schema_version > 1` outright.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "entry", rename_all = "snake_case")]
+pub(crate) enum ThreadLine {
+    /// Binds the log to a thread. Written once, at creation.
+    ThreadMeta {
+        thread_id: ThreadId,
+        runtime_version: u32,
+    },
+    ThreadEvent(ThreadEvent),
+}
+
+enum LogLine {
+    Session(SessionEntry),
+    Thread(ThreadLine),
+}
+
+/// Reads one JSONL line in either format. The `entry` tag decides, so a v1
+/// entry never goes through the runtime types and vice versa.
+fn parse_log_line(line: &str) -> Result<LogLine, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(line)?;
+    let is_thread_line = value
+        .get("entry")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|tag| tag == THREAD_META_ENTRY || tag == THREAD_EVENT_ENTRY);
+    if is_thread_line {
+        serde_json::from_value::<ThreadLine>(value).map(LogLine::Thread)
+    } else {
+        serde_json::from_value::<SessionEntry>(value).map(LogLine::Session)
+    }
 }
 
 fn validate_checkpoint(messages: &[Message]) -> Result<(), SessionError> {
@@ -75,13 +119,29 @@ pub struct JsonlSession {
     state: Mutex<WriterState>,
 }
 
-struct WriterState {
+pub(crate) struct WriterState {
     file: File,
     cursor: usize,
     poisoned: bool,
 }
 
-fn open_prepared(path: &Path) -> Result<(WriterState, bool), SessionError> {
+impl WriterState {
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Forces data AND metadata out. Used before copying a durable prefix.
+    pub(crate) fn sync_all(&mut self) -> Result<(), SessionError> {
+        self.file.sync_all().map_err(io_err)
+    }
+}
+
+/// Opens (creating when needed) a session file, truncates a partial trailing
+/// line and returns the writer, whether the file was empty and the state
+/// replayed from it.
+pub(crate) fn open_prepared(
+    path: &Path,
+) -> Result<(WriterState, bool, ResumedSession), SessionError> {
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -110,13 +170,15 @@ fn open_prepared(path: &Path) -> Result<(WriterState, bool), SessionError> {
     let is_empty = std::fs::metadata(path)
         .map(|m| m.len() == 0)
         .unwrap_or(true);
+    let cursor = resumed.messages.len();
     Ok((
         WriterState {
             file,
-            cursor: resumed.messages.len(),
+            cursor,
             poisoned: false,
         },
         is_empty,
+        resumed,
     ))
 }
 
@@ -128,7 +190,7 @@ fn resume_locked_file(file: &mut File) -> Result<ResumedSession, SessionError> {
     resume_content(&content)
 }
 
-fn write_buf_locked(state: &mut WriterState, buf: &str) -> Result<(), SessionError> {
+pub(crate) fn write_buf_locked(state: &mut WriterState, buf: &str) -> Result<(), SessionError> {
     if state.poisoned {
         return Err(SessionError::Io(
             "session writer poisoned after an append error; reopen the session".into(),
@@ -163,7 +225,7 @@ impl JsonlSession {
     pub fn create_in(dir: &Path) -> Result<Self, SessionError> {
         std::fs::create_dir_all(dir).map_err(io_err)?;
         let path = dir.join(SESSION_FILE);
-        let (state, is_empty) = open_prepared(&path)?;
+        let (state, is_empty, _) = open_prepared(&path)?;
         let session = Self {
             state: Mutex::new(state),
         };
@@ -181,7 +243,7 @@ impl JsonlSession {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(io_err)?;
         }
-        let (state, is_empty) = open_prepared(path)?;
+        let (state, is_empty, _) = open_prepared(path)?;
         let session = Self {
             state: Mutex::new(state),
         };
@@ -200,7 +262,7 @@ impl JsonlSession {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(io_err)?;
         }
-        let (state, is_empty) = open_prepared(path)?;
+        let (state, is_empty, _) = open_prepared(path)?;
         if state.cursor != cursor {
             return Err(invalid_session(format!(
                 "incoherent resume cursor: expected {}, got {cursor}",
@@ -292,6 +354,11 @@ pub struct ResumedSession {
     pub valid_bytes: u64,
     /// True when the read file ended with `\n`.
     pub ended_with_newline: bool,
+    /// Thread this log is bound to (EP-001). `None` for a v1 session that has
+    /// never been opened by the runtime.
+    pub thread_id: Option<ThreadId>,
+    /// Orchestration events replayed in file order (EP-001).
+    pub thread_events: Vec<ThreadEvent>,
 }
 
 /// Resumes the session of a directory (`<dir>/session.jsonl`).
@@ -398,9 +465,15 @@ fn replay_line(
         return Ok(());
     }
 
-    match serde_json::from_str::<SessionEntry>(line) {
-        Ok(entry) => {
-            apply_entry(out, pending_clear, entry)?;
+    match parse_log_line(line) {
+        Ok(parsed) => {
+            match parsed {
+                LogLine::Session(entry) => apply_entry(out, pending_clear, entry)?,
+                LogLine::Thread(ThreadLine::ThreadMeta { thread_id, .. }) => {
+                    out.thread_id = Some(thread_id);
+                }
+                LogLine::Thread(ThreadLine::ThreadEvent(event)) => out.thread_events.push(event),
+            }
             out.valid_bytes = if has_newline {
                 (start + raw_len + 1) as u64
             } else {
@@ -414,7 +487,10 @@ fn replay_line(
                 out.valid_bytes = start as u64;
                 Ok(())
             } else {
-                Err(SessionError::Serde(format!("corrupt line: {e}")))
+                Err(SessionError::Corrupt {
+                    offset: start as u64,
+                    detail: e.to_string(),
+                })
             }
         }
     }

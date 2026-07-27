@@ -11,8 +11,14 @@ workspace = true
 
 [dependencies]
 agent-core.workspace = true
+# EP-001: `agent-session` gains the LOCAL adapter of the orchestration store.
+# The `ThreadStore` trait and the memory adapter stay in `agent-runtime`, which
+# never touches the disk; the dependency therefore runs one way only.
+agent-runtime.workspace = true
 async-trait.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }
