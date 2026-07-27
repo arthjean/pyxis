@@ -2195,6 +2195,30 @@ pub struct SessionFacts<'a> {
     pub session_id: &'a str,
     /// Scope of the active sandbox, as the binary resolved it.
     pub sandbox: &'a str,
+    /// Configuration layer each displayed value comes from (US-005 AC2), keyed by
+    /// the `SOURCE_KEY_*` vocabulary. A key absent from here is at its default
+    /// value, or was changed in session, and no layer describes it any more.
+    pub config_sources: &'a [(&'static str, &'static str)],
+    /// Profile applied to this session (US-006), when one was selected. A profile
+    /// changes four keys at once and is otherwise invisible in the values.
+    pub profile: Option<&'a str>,
+}
+
+/// Keys of `SessionFacts::config_sources`. They are the configuration key names,
+/// so that the producer and this renderer share one vocabulary instead of two
+/// sets of literals.
+pub const SOURCE_KEY_MODEL: &str = "model";
+pub const SOURCE_KEY_REASONING_EFFORT: &str = "reasoning_effort";
+pub const SOURCE_KEY_PERMISSION_MODE: &str = "permission_mode";
+pub const SOURCE_KEY_SANDBOX_MODE: &str = "sandbox_mode";
+
+/// ` (from <layer>)`, or nothing when no layer owns the key.
+fn source_suffix(sources: &[(&'static str, &'static str)], key: &str) -> String {
+    sources
+        .iter()
+        .find(|(owned, _)| *owned == key)
+        .map(|(_, layer)| format!(" (from {layer})"))
+        .unwrap_or_default()
 }
 
 /// Marker for a piece of information the session does not have. Written out
@@ -2227,12 +2251,34 @@ pub fn session_status_report(state: &AppState, facts: SessionFacts<'_>) -> Strin
     } else {
         facts.sandbox
     };
-    format!(
-        "Session status\n  model: {}\n  reasoning effort: {effort}\n  permissions: {}\n  \
-         sandbox: {sandbox}\n  workspace: {workspace}\n  session: {session}",
+    // Built line by line rather than in one format string: each configured line
+    // carries the layer it comes from, and only when a layer owns it.
+    let sources = facts.config_sources;
+    let mut report = String::from("Session status");
+    report.push_str(&format!(
+        "\n  model: {}{}",
         state.model,
+        source_suffix(sources, SOURCE_KEY_MODEL)
+    ));
+    report.push_str(&format!(
+        "\n  reasoning effort: {effort}{}",
+        source_suffix(sources, SOURCE_KEY_REASONING_EFFORT)
+    ));
+    report.push_str(&format!(
+        "\n  permissions: {}{}",
         state.permission_mode_label(),
-    )
+        source_suffix(sources, SOURCE_KEY_PERMISSION_MODE)
+    ));
+    report.push_str(&format!(
+        "\n  sandbox: {sandbox}{}",
+        source_suffix(sources, SOURCE_KEY_SANDBOX_MODE)
+    ));
+    if let Some(profile) = facts.profile {
+        report.push_str(&format!("\n  profile: {profile}"));
+    }
+    report.push_str(&format!("\n  workspace: {workspace}"));
+    report.push_str(&format!("\n  session: {session}"));
+    report
 }
 
 /// US-005: consumption of the session. Same rule as above: everything comes
@@ -3415,6 +3461,8 @@ mod tests {
         let facts = SessionFacts {
             session_id: "20260725-101112.jsonl",
             sandbox: "enforced (workspace)",
+            config_sources: &[],
+            profile: None,
         };
 
         let status = session_status_report(&s, facts);
@@ -3441,6 +3489,40 @@ mod tests {
             usage.contains(&format!("quota: {UNAVAILABLE}")),
             "aucun quota servi: dit explicitement ({usage})"
         );
+    }
+
+    /// US-005 AC2: a value that does not come from a default names its layer, and
+    /// a value nobody declared stays bare. The selected profile gets its own line:
+    /// it changes several keys at once.
+    #[test]
+    fn session_status_names_the_layer_of_each_configured_value() {
+        let mut s = AppState::new("gpt-5.6", true);
+        s.reasoning_effort = Some("high".into());
+        let status = session_status_report(
+            &s,
+            SessionFacts {
+                session_id: "s.jsonl",
+                sandbox: "enforced (read-only)",
+                config_sources: &[
+                    (SOURCE_KEY_MODEL, "command line"),
+                    (SOURCE_KEY_SANDBOX_MODE, "profile"),
+                ],
+                profile: Some("review"),
+            },
+        );
+
+        assert!(
+            status.contains("model: gpt-5.6 (from command line)"),
+            "{status}"
+        );
+        assert!(
+            status.contains("sandbox: enforced (read-only) (from profile)"),
+            "{status}"
+        );
+        assert!(status.contains("profile: review"), "{status}");
+        // Not declared by any layer: no parenthesis invented.
+        assert!(status.contains("reasoning effort: high\n"), "{status}");
+        assert!(!status.contains("permissions: ask (from"), "{status}");
     }
 
     // US-005 AC2: once the data has arrived, consumption, fill and quota are
@@ -3475,6 +3557,8 @@ mod tests {
                 SessionFacts {
                     session_id: "s.jsonl",
                     sandbox: "off (writes not restricted)",
+                    config_sources: &[],
+                    profile: None,
                 }
             )
             .contains("reasoning effort: medium")

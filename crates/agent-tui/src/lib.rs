@@ -74,11 +74,13 @@ pub use render::render_parity;
 pub use state::{
     AppState, Block, COMMANDS, DEFAULT_PERMISSION_MODE_ID, InputAction, McpServerMeta, McpStatus,
     MenuItem, ModelCatalogEntry, ModelMeta, PERMISSION_MODES, PermissionModeMeta, PermissionPrompt,
-    REASONING_EFFORTS, ReasoningEffortMeta, SessionFacts, SessionMeta, Status,
+    REASONING_EFFORTS, ReasoningEffortMeta, SOURCE_KEY_MODEL, SOURCE_KEY_PERMISSION_MODE,
+    SOURCE_KEY_REASONING_EFFORT, SOURCE_KEY_SANDBOX_MODE, SessionFacts, SessionMeta, Status,
     blocks_from_messages, default_reasoning_effort_for_model, model_meta, models,
     normalize_reasoning_effort, normalize_reasoning_effort_for_model, permission_mode_label,
-    permission_mode_meta, prompts_from_messages, reasoning_effort_label, session_status_report,
-    session_usage_report, set_models, supported_reasoning_efforts_for_model, turn_diff_summary,
+    permission_mode_meta, plan_status_glyph, plan_status_label, prompts_from_messages,
+    reasoning_effort_label, session_status_report, session_usage_report, set_models,
+    supported_reasoning_efforts_for_model, turn_diff_summary,
 };
 #[cfg(feature = "codex_tui_parity")]
 pub use streaming::{StreamController, StreamView};

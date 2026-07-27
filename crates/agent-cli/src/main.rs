@@ -47,6 +47,14 @@ struct Args {
     allow_hosts: Vec<String>,
     yes: bool,
     sandbox: bool,
+    /// `--profile <name>` (US-006): selects a `[profiles.<name>]` table.
+    profile: Option<String>,
+    /// `-c key=value` in command-line order (US-007).
+    overrides: Vec<(String, String)>,
+    /// `--permission-mode <mode>` (US-008), already validated.
+    permission_mode: Option<PermissionMode>,
+    /// `--sandbox <mode>` (US-008), already checked against `SandboxPolicy::IDS`.
+    sandbox_mode: Option<String>,
     token_budget: Option<String>,
     cost_budget_micro_usd: Option<String>,
     input_cost_micro_per_ktok: Option<String>,
@@ -72,12 +80,27 @@ const HELP: &str = "\
 Usage: pyxis [options] [prompt]
 
 Options:
-  -p, --print <prompt>                 Mode headless one-shot
+  -p, --print [prompt]                 Mode headless one-shot. Without a value the
+                                        prompt is read from standard input; with
+                                        one, the argument wins and standard input
+                                        is not read at all
+      --output-last-message <path>      Write ONLY the last assistant message
+                                        there, raw. The destination obeys the
+                                        sandbox policy, which no flag widens
+      --ephemeral                       Persist no session file. Headless only,
+                                        and incompatible with --resume
       --resume [latest|<file.jsonl>]    Resume a session
       --model <slug>                    Model to use
       --allow <host>                    Allow a network host
   -y, --yes                             Accept edits in headless mode
       --no-sandbox                      Disable the filesystem sandbox
+      --sandbox <mode>                  workspace-write | read-only | full-access
+      --permission-mode <mode>          ask | accept-edits | auto | full-access |
+                                        read-only
+      --profile <name>                  Apply the [profiles.<name>] table
+  -c, --config <key=value>              Override one configuration key for this
+                                        run. Repeatable; the last occurrence of a
+                                        key wins, and a security key is refused
       --token-budget <n>                Total token budget
       --cost-budget-micro-usd <n>       Total cost budget
       --input-cost-micro-per-ktok <n>   Input price
@@ -87,24 +110,37 @@ Options:
                                         one JSON event per line (docs/EVENT_SCHEMA.md)
   -h, --help                            Show this help
 
-Configuration (TOML), lowest precedence first:
-  ~/.pyxis/settings.toml           Global, user-owned. May set every key.
-  <workspace>/.pyxis/config.toml   Project. `permission_mode`, `writable_roots`
-                                   and `hooks` are ignored there with a warning:
-                                   a workspace-controlled file must never widen a
-                                   security perimeter.
-  Environment variables, then command-line arguments, override both.
+Configuration (TOML), by increasing precedence. `/status` names the layer every
+non-default value comes from.
+  global settings (10)   ~/.pyxis/settings.toml. User-owned, may set every key.
+  profile (15)           The [profiles.<name>] table selected by --profile, or by
+                         the `profile` key of the global file.
+  project config (20)    <workspace>/.pyxis/config.toml. `permission_mode`,
+                         `sandbox_mode`, `writable_roots`, `hooks` and `profile`
+                         are ignored there with a warning: a workspace-controlled
+                         file must never widen a security perimeter.
+  environment (25)       PYXIS_* variables.
+  command line (30)      -c key=value and the flags above. `-c` refuses a security
+                         key: an argument can come from a script of the repository,
+                         so it is no more trustworthy than a workspace file.
 
 Sandbox:
-  Writes are confined to the workspace, plus the temporary directory and any
-  extra roots listed in `writable_roots` of ~/.pyxis/settings.toml.
-  The write and edit tools additionally refuse .git/ (hooks, config, and the
-  worktree pointer file) and .pyxis/ — which holds the project config file —
-  whose contents run or are read later outside the sandbox. That refusal does
-  NOT cover `bash`: Landlock rules are additive, so a write right granted on the
-  workspace cannot be subtracted for a subpath. A `bash` command can therefore
-  still write .pyxis/config.toml; the blast radius is bounded by the project
-  file never being allowed to set a security key.
+  `--sandbox`, or `sandbox_mode` of ~/.pyxis/settings.toml, selects the policy:
+    workspace-write (default)  Writes confined to the workspace, plus the
+                               temporary directory and the extra roots listed
+                               in `writable_roots`.
+    read-only                  Nothing is writable; the network is closed and
+                               any --allow list is ignored.
+    full-access                No confinement. `--no-sandbox` is its alias.
+  Under a confined policy, .git/ (hooks, config, and the worktree pointer file)
+  and .pyxis/ — which holds the project config file — stay read-only, because
+  their contents run or are read later outside the sandbox. That subtraction is
+  evaluated BEFORE execution and covers `bash` too: Landlock rules are additive,
+  so the kernel cannot take back a right it granted on the workspace, and the
+  decision is therefore made at policy level. A command that is not proven
+  side-effect free and NAMES one of those paths is refused, whether or not the
+  write can be demonstrated. A path built at run time stays out of reach of any
+  static analysis; see docs/CURRENT_STATUS.md.
 ";
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -149,6 +185,49 @@ where
             "--allow" => args.allow_hosts.push(next_value(&mut it, "--allow")?),
             "--yes" | "-y" => args.yes = true,
             "--no-sandbox" => args.sandbox = false,
+            // US-008 AC3: an unknown value names what was received AND what is
+            // accepted, and refuses to start rather than falling back on a
+            // perimeter the user did not choose.
+            "--sandbox" => {
+                let raw = next_value(&mut it, "--sandbox")?;
+                if !SandboxPolicy::IDS.contains(&raw.trim()) {
+                    anyhow::bail!(
+                        "--sandbox: unknown value `{raw}` (expected one of: {})",
+                        SandboxPolicy::IDS.join(", ")
+                    );
+                }
+                args.sandbox_mode = Some(raw.trim().to_string());
+            }
+            "--permission-mode" => {
+                let raw = next_value(&mut it, "--permission-mode")?;
+                let mode = settings::permission_mode_from_arg(&raw).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--permission-mode: unknown value `{raw}` (expected one of: {})",
+                        settings::PERMISSION_MODE_IDS.join(", ")
+                    )
+                })?;
+                args.permission_mode = Some(mode);
+            }
+            "--profile" => {
+                let raw = next_value(&mut it, "--profile")?;
+                if raw.trim().is_empty() {
+                    anyhow::bail!("--profile: missing value");
+                }
+                args.profile = Some(raw.trim().to_string());
+            }
+            // US-007: the generic override. Split on the FIRST `=` only, so a
+            // value may itself contain one.
+            "-c" | "--config" => {
+                let raw = next_value(&mut it, "-c")?;
+                let (key, value) = raw
+                    .split_once('=')
+                    .ok_or_else(|| anyhow::anyhow!("-c: expected key=value, got `{raw}`"))?;
+                if key.trim().is_empty() {
+                    anyhow::bail!("-c: expected key=value, got `{raw}`");
+                }
+                args.overrides
+                    .push((key.trim().to_string(), value.to_string()));
+            }
             "--token-budget" => args.token_budget = Some(next_value(&mut it, "--token-budget")?),
             "--cost-budget-micro-usd" => {
                 args.cost_budget_micro_usd = Some(next_value(&mut it, "--cost-budget-micro-usd")?)
@@ -231,66 +310,104 @@ fn parse_positive_u64(raw: &str, name: &str) -> anyhow::Result<u64> {
     Ok(value)
 }
 
-/// Precedence of a numeric setting (US-016 AC1): configuration < environment
-/// variable < argument. The first undefined level is simply
-/// traversed, which makes the chain identical whatever the number of sources
-/// actually filled in. The environment is passed as a parameter rather than read
-/// here: precedence becomes testable without mutating the process environment.
+/// Precedence of a numeric setting above the file layers (US-005): configuration
+/// < environment variable < argument. Returns the value AND the layer that
+/// carries it when one of the two upper levels won, so `/status` can name it;
+/// `None` means the files (or the default) still own the key. The environment is
+/// passed as a parameter rather than read here: precedence becomes testable
+/// without mutating the process environment.
 fn precedence_u64(
     arg: Option<&str>,
     arg_name: &str,
     env: Option<&str>,
     env_name: &str,
     from_config: Option<u64>,
-) -> anyhow::Result<Option<u64>> {
+) -> anyhow::Result<(Option<u64>, Option<settings::ConfigLayer>)> {
     if let Some(raw) = arg {
-        return parse_positive_u64(raw, arg_name).map(Some);
+        return parse_positive_u64(raw, arg_name)
+            .map(|value| (Some(value), Some(settings::ConfigLayer::SessionFlags)));
     }
     match env {
-        Some(raw) if !raw.trim().is_empty() => parse_positive_u64(raw, env_name).map(Some),
-        _ => Ok(from_config),
+        Some(raw) if !raw.trim().is_empty() => parse_positive_u64(raw, env_name)
+            .map(|value| (Some(value), Some(settings::ConfigLayer::Environment))),
+        _ => Ok((from_config, None)),
     }
 }
 
+/// Same chain for a string setting. An empty value is not a definition: it lets
+/// the level below through instead of overwriting it with nothing.
+fn precedence_string(
+    arg: Option<&str>,
+    env: Option<&str>,
+    from_config: Option<String>,
+) -> (Option<String>, Option<settings::ConfigLayer>) {
+    let defined = |raw: &str| {
+        let trimmed = raw.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    if let Some(value) = arg.and_then(defined) {
+        return (Some(value), Some(settings::ConfigLayer::SessionFlags));
+    }
+    if let Some(value) = env.and_then(defined) {
+        return (Some(value), Some(settings::ConfigLayer::Environment));
+    }
+    (from_config, None)
+}
+
+/// Resolves one numeric setting and records which layer won (US-005 AC2).
 fn setting_u64(
     arg: &Option<String>,
     env: &str,
     name: &str,
     from_config: Option<u64>,
+    key: &'static str,
+    sources: &mut settings::Provenance,
 ) -> anyhow::Result<Option<u64>> {
-    precedence_u64(
+    let (value, layer) = precedence_u64(
         arg.as_deref(),
         name,
         std::env::var(env).ok().as_deref(),
         env,
         from_config,
-    )
+    )?;
+    if let Some(layer) = layer {
+        sources.claim(key, layer);
+    }
+    Ok(value)
 }
 
-fn run_config_from_args(args: &Args, config: &settings::Config) -> anyhow::Result<RunConfig> {
+fn run_config_from_args(args: &Args, config: &mut settings::Config) -> anyhow::Result<RunConfig> {
     let token_budget = setting_u64(
         &args.token_budget,
         "PYXIS_TOKEN_BUDGET",
         "--token-budget",
         config.token_budget,
+        settings::TOKEN_BUDGET_KEY,
+        &mut config.sources,
     )?;
     let cost_limit = setting_u64(
         &args.cost_budget_micro_usd,
         "PYXIS_COST_BUDGET_MICRO_USD",
         "--cost-budget-micro-usd",
         config.cost_budget_micro_usd,
+        settings::COST_BUDGET_KEY,
+        &mut config.sources,
     )?;
     let input_price = setting_u64(
         &args.input_cost_micro_per_ktok,
         "PYXIS_INPUT_COST_MICRO_PER_KTOK",
         "--input-cost-micro-per-ktok",
         config.input_cost_micro_per_ktok,
+        settings::INPUT_COST_KEY,
+        &mut config.sources,
     )?;
     let output_price = setting_u64(
         &args.output_cost_micro_per_ktok,
         "PYXIS_OUTPUT_COST_MICRO_PER_KTOK",
         "--output-cost-micro-per-ktok",
         config.output_cost_micro_per_ktok,
+        settings::OUTPUT_COST_KEY,
+        &mut config.sources,
     )?;
 
     let cost_budget = match (cost_limit, input_price, output_price) {
@@ -306,19 +423,16 @@ fn run_config_from_args(args: &Args, config: &settings::Config) -> anyhow::Resul
             "incomplete cost budget: provide --cost-budget-micro-usd, --input-cost-micro-per-ktok, and --output-cost-micro-per-ktok"
         ),
     };
-    let overload_fallback_model = args
-        .overload_fallback_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            std::env::var("PYXIS_OVERLOAD_FALLBACK_MODEL")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        })
-        .or_else(|| config.overload_fallback_model.clone());
+    let (overload_fallback_model, fallback_layer) = precedence_string(
+        args.overload_fallback_model.as_deref(),
+        std::env::var("PYXIS_OVERLOAD_FALLBACK_MODEL")
+            .ok()
+            .as_deref(),
+        config.overload_fallback_model.clone(),
+    );
+    if let Some(layer) = fallback_layer {
+        config.sources.claim(settings::OVERLOAD_FALLBACK_KEY, layer);
+    }
     if let Some(fallback) = &overload_fallback_model
         && prompt::uses_codex_finetuned_prompt(&args.model)
             != prompt::uses_codex_finetuned_prompt(fallback)
@@ -566,13 +680,47 @@ fn main() -> anyhow::Result<()> {
 
     let workspace = std::env::current_dir()?;
 
+    // Configuration resolved BEFORE the sandbox and in BOTH modes (US-016 AC6):
+    // the global file is outside the workspace, hence inaccessible once Landlock
+    // is in place, and the headless mode needs its settings as much as the
+    // interactive one. Reading is not persisting: `-p` never rewrites the file
+    // (see below). Resolved FIRST of everything that can fail, so an unknown
+    // profile (US-006 AC4) or an unusable `-c` value (US-007 AC4) stops the
+    // startup before an OAuth browser or an MCP subprocess is launched.
+    let config = settings::resolve(settings::Request {
+        global: settings::default_settings_path().as_deref(),
+        project: Some(&settings::project_config_path(&workspace)),
+        profile: args.profile.as_deref(),
+        overrides: &args.overrides,
+        flags: settings::Flags {
+            model: args.model_from_cli.then_some(args.model.as_str()),
+            permission_mode: args.permission_mode,
+            // US-008 AC5: `--no-sandbox` is a documented ALIAS of full access.
+            // Expressed as the same key rather than as a separate path, so it has
+            // no second semantics and `/status` names its provenance like any
+            // other value.
+            sandbox_mode: args
+                .sandbox_mode
+                .as_deref()
+                .or((!args.sandbox).then_some("full-access")),
+        },
+    })
+    .map_err(|err| anyhow::anyhow!("config: {err}"))?;
+    for warning in &config.warnings {
+        eprintln!("[config] {warning}");
+    }
+
     // Skills scanned BEFORE the sandbox, like the rest of the out-of-workspace
     // configuration (US-014). Only `name` and `description` are preloaded, as the
     // spec requires; a body is read at invocation time, which the read-only-global
     // Landlock policy still allows.
-    let skills = skills_root()
-        .map(|root| skills::load(&root))
-        .unwrap_or_default();
+    // US-018: two scopes, the user root and the project root. A project skill
+    // masks a user skill of the same name, and its content stays what it already
+    // was: injected text framed as untrusted, never a declared capability.
+    let skills = skills::load_all(
+        skills_root().as_deref(),
+        Some(&project_skills_root(&workspace)),
+    );
     for issue in &skills.issues {
         eprintln!("[skills] {issue}");
     }
@@ -955,18 +1103,16 @@ async fn run(
         context_msgs,
         cred,
         settings_path,
-        config,
+        mut config,
     } = pre;
-    // An explicit `--model` wins; otherwise we take the model of the configuration
-    // (last `/models` choice, or project setting). Resolved BEFORE everything
-    // else: the fallback validation and the initial effort are computed on the
-    // model actually used.
-    if !args.model_from_cli
-        && let Some(model) = config.model.clone()
-    {
+    // The resolved model already accounts for `--model`, which enters the
+    // configuration as the strongest layer (US-005): there is nothing left to
+    // arbitrate here. Resolved BEFORE everything else, because the fallback
+    // validation and the initial effort are computed on the model actually used.
+    if let Some(model) = config.model.clone() {
         args.model = model;
     }
-    let run_config = run_config_from_args(&args, &config)?;
+    let run_config = run_config_from_args(&args, &mut config)?;
     let headless = args.prompt.is_some();
     let initial_reasoning_effort = config
         .reasoning_effort
@@ -1056,12 +1202,19 @@ async fn run(
 
     // 4. Tool registry + approver (TUI in interactive mode, auto in headless).
     let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
-    let policy = permission_policy(headless, args.yes, sandbox_enforced);
+    let policy = permission_policy(headless, args.yes, sandbox.enforced);
     let (initial_permission_mode, announce_override) =
         resolve_permission_mode(config.permission_mode, policy, headless);
     if announce_override {
+        // US-008 AC6: the widening is announced, and it names the layer that
+        // carries it: a flag and a global file do not call for the same reaction.
+        let source = config
+            .sources
+            .layer(settings::PERMISSION_MODE_KEY)
+            .map(settings::ConfigLayer::label)
+            .unwrap_or("configuration");
         eprintln!(
-            "[config] permission mode from configuration: {} (default for -p would be {})",
+            "[config] permission mode from {source}: {} (default for -p would be {})",
             settings::permission_mode_id(initial_permission_mode),
             settings::permission_mode_id(policy.mode)
         );
@@ -1328,31 +1481,51 @@ mod tests {
         assert!(!announced);
     }
 
-    /// US-016 AC1, the four levels that `main` layers: default (no
-    /// source) < configuration < environment < argument.
+    /// US-016 AC1 / US-005: the levels `main` layers above the files, and the
+    /// layer each winning value is attributed to.
     #[test]
     fn precedence_runs_config_then_env_then_argument() {
         let name = "--token-budget";
         let env = "PYXIS_TOKEN_BUDGET";
+        let env_layer = settings::ConfigLayer::Environment;
+        let flag_layer = settings::ConfigLayer::SessionFlags;
 
-        assert_eq!(precedence_u64(None, name, None, env, None).unwrap(), None);
+        assert_eq!(
+            precedence_u64(None, name, None, env, None).unwrap(),
+            (None, None)
+        );
+        // Nothing above the files won: the key keeps the layer they gave it.
         assert_eq!(
             precedence_u64(None, name, None, env, Some(10)).unwrap(),
-            Some(10)
+            (Some(10), None)
         );
         assert_eq!(
             precedence_u64(None, name, Some("20"), env, Some(10)).unwrap(),
-            Some(20)
+            (Some(20), Some(env_layer))
         );
         assert_eq!(
             precedence_u64(Some("30"), name, Some("20"), env, Some(10)).unwrap(),
-            Some(30)
+            (Some(30), Some(flag_layer))
         );
         // An empty variable is not a definition: it lets the configuration
         // through instead of overwriting with a zero.
         assert_eq!(
             precedence_u64(None, name, Some("  "), env, Some(10)).unwrap(),
-            Some(10)
+            (Some(10), None)
+        );
+
+        // Same chain for a string setting.
+        assert_eq!(
+            precedence_string(Some(" flag "), Some("env"), Some("file".into())),
+            (Some("flag".to_string()), Some(flag_layer))
+        );
+        assert_eq!(
+            precedence_string(None, Some(" env "), Some("file".into())),
+            (Some("env".to_string()), Some(env_layer))
+        );
+        assert_eq!(
+            precedence_string(Some(" "), Some(""), Some("file".into())),
+            (Some("file".to_string()), None)
         );
     }
 
@@ -1360,7 +1533,7 @@ mod tests {
     /// configuration really drives the budget passed to the core.
     #[test]
     fn run_config_falls_back_to_the_configuration_file() {
-        let config = settings::Config {
+        let mut config = settings::Config {
             token_budget: Some(4242),
             overload_fallback_model: Some("gpt-5.5".into()),
             ..settings::Config::default()
@@ -1368,7 +1541,7 @@ mod tests {
         let mut args = args();
         args.model = "gpt-5.5".into();
 
-        let cfg = run_config_from_args(&args, &config).unwrap();
+        let cfg = run_config_from_args(&args, &mut config).unwrap();
 
         assert_eq!(cfg.token_budget, Some(4242));
         assert_eq!(cfg.overload_fallback_model.as_deref(), Some("gpt-5.5"));
@@ -1377,14 +1550,14 @@ mod tests {
     /// The argument wins over the configuration, in the expected direction.
     #[test]
     fn cli_argument_overrides_the_configuration_file() {
-        let config = settings::Config {
+        let mut config = settings::Config {
             token_budget: Some(4242),
             ..settings::Config::default()
         };
         let mut args = args();
         args.token_budget = Some("7".into());
 
-        let cfg = run_config_from_args(&args, &config).unwrap();
+        let cfg = run_config_from_args(&args, &mut config).unwrap();
 
         assert_eq!(cfg.token_budget, Some(7));
     }
@@ -1393,7 +1566,7 @@ mod tests {
     fn run_config_reads_token_budget_flag() {
         let mut args = args();
         args.token_budget = Some("1234".into());
-        let cfg = run_config_from_args(&args, &settings::Config::default()).unwrap();
+        let cfg = run_config_from_args(&args, &mut settings::Config::default()).unwrap();
         assert_eq!(cfg.token_budget, Some(1234));
     }
 
@@ -1403,7 +1576,7 @@ mod tests {
         args.cost_budget_micro_usd = Some("10".into());
         args.input_cost_micro_per_ktok = Some("2".into());
         args.output_cost_micro_per_ktok = Some("4".into());
-        let cfg = run_config_from_args(&args, &settings::Config::default()).unwrap();
+        let cfg = run_config_from_args(&args, &mut settings::Config::default()).unwrap();
         let cost = cfg.cost_budget.unwrap();
         assert_eq!(cost.limit_micro_usd, 10);
         assert_eq!(cost.input_micro_per_ktok, 2);
@@ -1414,7 +1587,7 @@ mod tests {
     fn run_config_rejects_incomplete_cost_budget() {
         let mut args = args();
         args.cost_budget_micro_usd = Some("10".into());
-        let err = run_config_from_args(&args, &settings::Config::default())
+        let err = run_config_from_args(&args, &mut settings::Config::default())
             .unwrap_err()
             .to_string();
         assert!(err.contains("incomplete cost budget"));
@@ -1424,7 +1597,7 @@ mod tests {
     fn run_config_rejects_zero_budget() {
         let mut args = args();
         args.token_budget = Some("0".into());
-        let err = run_config_from_args(&args, &settings::Config::default())
+        let err = run_config_from_args(&args, &mut settings::Config::default())
             .unwrap_err()
             .to_string();
         assert!(err.contains("must be > 0"));
@@ -1434,7 +1607,7 @@ mod tests {
     fn run_config_reads_overload_fallback_model() {
         let mut args = args();
         args.overload_fallback_model = Some(" fallback ".into());
-        let cfg = run_config_from_args(&args, &settings::Config::default()).unwrap();
+        let cfg = run_config_from_args(&args, &mut settings::Config::default()).unwrap();
         assert_eq!(cfg.overload_fallback_model.as_deref(), Some("fallback"));
     }
 
@@ -1443,7 +1616,7 @@ mod tests {
         let mut args = args();
         args.model = "gpt-5-codex".into();
         args.overload_fallback_model = Some("gpt-5.5".into());
-        let err = run_config_from_args(&args, &settings::Config::default())
+        let err = run_config_from_args(&args, &mut settings::Config::default())
             .unwrap_err()
             .to_string();
         assert!(err.contains("fallback model is incompatible"));
@@ -1679,4 +1852,137 @@ mod tests {
         assert!(degraded.contains("NOT applied"), "{degraded}");
     }
 
+    // ───────────────────────── EP-002 ─────────────────────────
+
+    /// US-007 / US-008: the flags that drive the configuration layers are read,
+    /// and `-c` splits on the FIRST `=` so a value may contain one.
+    #[test]
+    fn parse_args_reads_the_configuration_flags() {
+        let args = parse_args_from(
+            [
+                "--profile",
+                "review",
+                "--permission-mode",
+                "read-only",
+                "--sandbox",
+                "read-only",
+                "-c",
+                "model=gpt-5.6-sol",
+                "--config",
+                "overload_fallback_model=a=b",
+            ]
+            .map(String::from)
+            .to_vec(),
+        )
+        .unwrap();
+
+        assert_eq!(args.profile.as_deref(), Some("review"));
+        assert_eq!(args.permission_mode, Some(PermissionMode::Plan));
+        assert_eq!(args.sandbox_mode.as_deref(), Some("read-only"));
+        assert_eq!(
+            args.overrides,
+            vec![
+                ("model".to_string(), "gpt-5.6-sol".to_string()),
+                ("overload_fallback_model".to_string(), "a=b".to_string()),
+            ]
+        );
+    }
+
+    /// US-008 AC3: an unknown value on either flag refuses to start, naming the
+    /// value received AND the ones accepted. Never a silent fallback: that would
+    /// run a session under a perimeter the user did not choose.
+    #[test]
+    fn parse_args_refuses_an_unknown_mode_and_names_the_accepted_values() {
+        let err = parse_args_from(vec!["--sandbox".to_string(), "paranoid".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("paranoid"), "{err}");
+        assert!(err.contains("workspace-write"), "{err}");
+
+        let err = parse_args_from(vec!["--permission-mode".to_string(), "yolo".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("yolo"), "{err}");
+        assert!(err.contains("accept-edits"), "{err}");
+
+        let err = parse_args_from(vec!["-c".to_string(), "model".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected key=value"), "{err}");
+
+        let err = parse_args_from(vec!["-c".to_string(), "=value".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected key=value"), "{err}");
+    }
+
+    /// US-008 AC2: the sandbox flag selects the variant of US-001, and it outranks
+    /// the global file because it enters the configuration as the strongest layer.
+    #[test]
+    fn the_sandbox_flag_selects_the_variant_over_the_file() {
+        let dir = std::env::temp_dir().join(format!("pyxis-ep002-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let global = dir.join("settings.toml");
+        std::fs::write(&global, "sandbox_mode = \"read-only\"\n").unwrap();
+
+        let config = settings::resolve(settings::Request {
+            global: Some(&global),
+            flags: settings::Flags {
+                sandbox_mode: Some("workspace-write"),
+                ..settings::Flags::default()
+            },
+            ..settings::Request::default()
+        })
+        .unwrap();
+
+        let policy = sandbox_policy_from_args(
+            &args(),
+            std::path::Path::new("/work/repo"),
+            &config,
+            &roots(&[]),
+        );
+        assert!(
+            matches!(policy, SandboxPolicy::WorkspaceWrite { .. }),
+            "{policy:?}"
+        );
+
+        // AC5: `--no-sandbox` reaches the same key, as an alias of full access.
+        let config = settings::resolve(settings::Request {
+            global: Some(&global),
+            flags: settings::Flags {
+                sandbox_mode: Some("full-access"),
+                ..settings::Flags::default()
+            },
+            ..settings::Request::default()
+        })
+        .unwrap();
+        assert_eq!(config.sandbox_mode.as_deref(), Some("full-access"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// US-008 AC4/AC6: a flag applies in headless mode as in interactive mode, and
+    /// a mode more permissive than the `-p` default is announced.
+    #[test]
+    fn a_permission_flag_applies_in_headless_mode_and_is_announced() {
+        let config = settings::resolve(settings::Request {
+            flags: settings::Flags {
+                permission_mode: Some(PermissionMode::BypassPermissions),
+                ..settings::Flags::default()
+            },
+            ..settings::Request::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            config.sources.layer(settings::PERMISSION_MODE_KEY),
+            Some(settings::ConfigLayer::SessionFlags)
+        );
+        let (mode, announced) = resolve_permission_mode(
+            config.permission_mode,
+            permission_policy(true, false, true),
+            true,
+        );
+        assert_eq!(mode, PermissionMode::BypassPermissions);
+        assert!(announced, "un elargissement en headless doit etre annonce");
+    }
 }
