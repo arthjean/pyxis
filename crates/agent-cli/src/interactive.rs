@@ -7,13 +7,12 @@
 //!   answers (the dialog does NOT freeze the loop: the select keeps rendering
 //!   and reading the keyboard).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::message::{ContentBlock, Message, recent_untrusted_content};
-use agent_core::provider::ToolSpec;
 use agent_core::{AgentContext, AgentEvent, CancelToken, Deps, RunConfig, Session, run_agent};
 use agent_provider::KEYRING_ACCOUNT;
 use agent_tools::PermissionModeState;
@@ -156,7 +155,10 @@ pub struct InteractiveConfig {
     /// into `AgentContext::context_messages` (never persisted).
     pub context_messages: Vec<Message>,
     pub run_config: RunConfig,
-    pub tool_specs: Vec<ToolSpec>,
+    /// Tool registry, shared with the loop that dispatches through it. Held here
+    /// because the exposed set moves in session (US-016): the specs of a turn are
+    /// read from it at the turn boundary, never frozen at startup.
+    pub registry: Arc<agent_tools::Registry>,
     pub truecolor: bool,
     /// Reduced motion (`NO_COLOR` / `PYXIS_REDUCED_MOTION`): spinner degraded to a
     /// pulsing dot rather than animated (US-044).
@@ -175,6 +177,10 @@ pub struct InteractiveConfig {
     /// server left behind the trust gate, tool not exposable. Successes are silent,
     /// the `/mcp` submenu already shows them.
     pub mcp_notices: Vec<String>,
+    /// Model-facing tool names exposed per MCP server (US-016). A disconnect takes
+    /// exactly these names back out, and the union is what keeps a name handed out
+    /// once from ever being handed out twice.
+    pub mcp_tool_names: BTreeMap<String, BTreeSet<String>>,
     /// Mutable permission mode, shared with the tool registry.
     pub permission_mode: PermissionModeState,
     /// Answers remembered this session, shared with the tool registry
@@ -363,12 +369,17 @@ fn launch_turn(
         crate::prompt::select_system_prompt(&cfg.model),
         &cfg.tool_guidelines,
     );
+    // US-016: the turn boundary is HERE, and it is the only place the exposed set
+    // moves. A server connected while the previous turn was running enters the
+    // registry now, so the model can call its tools from this turn on and no turn
+    // ever sees its tool set change under it (AC4).
+    cfg.registry.commit_staged();
     let ctx = AgentContext {
         model: cfg.model.clone(),
         reasoning_effort: cfg.reasoning_effort.clone(),
         system: Some(compose_system(&base, cfg.goal.as_deref())),
         messages: msgs,
-        tools: cfg.tool_specs.clone(),
+        tools: cfg.registry.tool_specs(),
         config: cfg.run_config.clone(),
         // US-028: project context re-injected every turn, never persisted.
         context_messages: cfg.context_messages.clone(),
@@ -599,6 +610,10 @@ async fn event_loop(
     for notice in std::mem::take(&mut cfg.mcp_notices) {
         state.blocks.push(Block::Notice(notice));
     }
+    // US-016: names handed out per server. Taken out of the config because they
+    // change with every connect and disconnect of the session.
+    let mut mcp_tool_names = std::mem::take(&mut cfg.mcp_tool_names);
+    let registry = Arc::clone(&cfg.registry);
     let mut goal_path = goal_path_for_session(&current_session);
     let mut goal_iters_path = goal_iters_path_for_session(&current_session);
     // Prompt history of the WHOLE directory (every conversation).
@@ -1310,7 +1325,15 @@ async fn event_loop(
                                     .push(Block::Notice(format!("Unknown provider: {other}"))),
                             },
                             "/mcp" => {
-                                handle_mcp(arg, &mcp, &mcp_tx, &cfg.command_hardener, &mut state)
+                                handle_mcp(
+                                    arg,
+                                    &mcp,
+                                    &mcp_tx,
+                                    &cfg.command_hardener,
+                                    &registry,
+                                    &mut mcp_tool_names,
+                                    &mut state,
+                                )
                             }
                             "/skills" => state.blocks.push(Block::Notice(
                                 "Choose a skill in the /skills submenu.".into(),
@@ -1482,7 +1505,33 @@ async fn event_loop(
                 if let Some(ev) = ev {
                     match ev {
                         McpEvent::Connected { name, conn, tools } => {
-                            let n = tools.len();
+                            // US-014: the policy of THIS server shapes what is exposed,
+                            // before anything reaches the tool registry.
+                            let policy = mcp_config_for(&mcp, &name)
+                                .map(|cfg| cfg.tools)
+                                .unwrap_or_default();
+                            let (tools, filter_notices) =
+                                agent_mcp::filter_tools(&name, &tools, &policy);
+                            for notice in filter_notices {
+                                state.blocks.push(Block::Notice(notice));
+                            }
+                            // Reconnect: the names this server held are released (and
+                            // staged out) before new ones are handed out, so a name is
+                            // never handed to two tools.
+                            if let Some(previous) = mcp_tool_names.remove(&name) {
+                                registry.stage_removal(previous.into_iter().collect());
+                            }
+                            let mut taken: BTreeSet<String> =
+                                mcp_tool_names.values().flatten().cloned().collect();
+                            let client = conn.client(&name);
+                            let (exposed, skipped) =
+                                agent_mcp::dyn_tools(&name, &tools, &policy, &client, &mut taken);
+                            for skip in skipped {
+                                state.blocks.push(Block::Notice(skip.summary()));
+                            }
+                            let n = exposed.len();
+                            let names: BTreeSet<String> =
+                                exposed.iter().map(|tool| tool.name().to_string()).collect();
                             // Poisoned lock: close the connection instead of silently dropping it.
                             match mcp.lock() {
                                 Ok(mut r) => {
@@ -1493,11 +1542,13 @@ async fn event_loop(
                                             "MCP \"{name}\": connection canceled."
                                         )));
                                     } else {
-                                        // The registry of exposed tools is composed at
-                                        // startup: a mid-session connection changes the
-                                        // lifecycle, not what the model can call.
+                                        // US-016: staged, not registered. The exposed set
+                                        // only moves at a turn boundary, so a turn in
+                                        // flight keeps the tools it was given.
+                                        registry.stage_tools(exposed);
+                                        mcp_tool_names.insert(name.clone(), names);
                                         state.blocks.push(Block::Notice(format!(
-                                            "MCP \"{name}\" connected ({n} tools). Tools are exposed to the model at startup: relaunch Pyxis to use them."
+                                            "MCP \"{name}\" connected ({n} tools), callable from the next turn."
                                         )));
                                     }
                                 }
@@ -1547,11 +1598,14 @@ async fn event_loop(
 
 /// Handles `/mcp [<server> <action>]`. Connections (spawn + handshake) are
 /// started in the background; the result comes back through `mcp_tx` into the loop.
+#[allow(clippy::too_many_arguments)]
 fn handle_mcp(
     arg: &str,
     mcp: &Arc<Mutex<agent_mcp::McpRegistry>>,
     mcp_tx: &mpsc::Sender<McpEvent>,
     command_hardener: &agent_tools::CommandHardener,
+    registry: &agent_tools::Registry,
+    mcp_tool_names: &mut BTreeMap<String, BTreeSet<String>>,
     state: &mut AppState,
 ) {
     if arg == "issues" {
@@ -1608,9 +1662,15 @@ fn handle_mcp(
             match old {
                 Some(old) => {
                     tokio::spawn(async move { old.cancel().await });
-                    state
-                        .blocks
-                        .push(Block::Notice(format!("MCP \"{server}\" disconnected.")));
+                    // US-016 AC2: its tools leave the registry at the next turn
+                    // boundary; a later call then fails as an unknown tool rather
+                    // than reaching a dead connection.
+                    let removed = mcp_tool_names.remove(server).unwrap_or_default();
+                    let count = removed.len();
+                    registry.stage_removal(removed.into_iter().collect());
+                    state.blocks.push(Block::Notice(format!(
+                        "MCP \"{server}\" disconnected ({count} tools withdrawn from the next turn on)."
+                    )));
                 }
                 None => state
                     .blocks
@@ -1662,10 +1722,11 @@ fn start_mcp_connect(
     };
     match begin {
         Ok((cfg_srv, old)) => {
+            // The whole config is compared, not just the command: a transport, an
+            // endpoint or a tool policy swapped between the prompt and the spawn
+            // would make the confirmation meaningless.
             if let Some(expected) = trusted_cfg
-                && (expected.command != cfg_srv.command
-                    || expected.args != cfg_srv.args
-                    || expected.env != cfg_srv.env)
+                && expected != cfg_srv
             {
                 if let Some(old) = old {
                     tokio::spawn(async move { old.cancel().await });
@@ -1775,7 +1836,7 @@ pub(crate) fn mcp_requires_trust(cfg: &agent_mcp::McpServerConfig) -> bool {
 }
 
 fn mcp_sensitive_env_keys(cfg: &agent_mcp::McpServerConfig) -> Vec<&str> {
-    cfg.env
+    cfg.env()
         .keys()
         .map(String::as_str)
         .filter(|key| {
@@ -1799,21 +1860,37 @@ fn mcp_sensitive_env_keys(cfg: &agent_mcp::McpServerConfig) -> Vec<&str> {
 }
 
 fn mcp_trust_notice(server: &str, cfg: &agent_mcp::McpServerConfig, lead: &str) -> String {
-    let args = if cfg.args.is_empty() {
-        "(none)".to_string()
-    } else {
-        cfg.args.join(" ")
-    };
-    let env_keys = if cfg.env.is_empty() {
-        "(none)".to_string()
-    } else {
-        cfg.env.keys().cloned().collect::<Vec<_>>().join(", ")
-    };
-    let sensitive = mcp_sensitive_env_keys(cfg);
-    let sensitive = if sensitive.is_empty() {
-        "(none)".to_string()
-    } else {
-        sensitive.join(", ")
+    let detail = match &cfg.transport {
+        agent_mcp::McpTransport::Stdio { command, args, env } => {
+            let args = if args.is_empty() {
+                "(none)".to_string()
+            } else {
+                args.join(" ")
+            };
+            let env_keys = if env.is_empty() {
+                "(none)".to_string()
+            } else {
+                env.keys().cloned().collect::<Vec<_>>().join(", ")
+            };
+            let sensitive = mcp_sensitive_env_keys(cfg);
+            let sensitive = if sensitive.is_empty() {
+                "(none)".to_string()
+            } else {
+                sensitive.join(", ")
+            };
+            format!(
+                "Command: {command}\nArgs: {args}\nEnv: {env_keys} (values masked)\nSensitive env: {sensitive}"
+            )
+        }
+        agent_mcp::McpTransport::Http {
+            url,
+            bearer_token_env_var,
+        } => {
+            // The NAME of the variable is shown so the user knows which credential
+            // this connection would hand over; its value is never read here.
+            let token = bearer_token_env_var.as_deref().unwrap_or("(none)");
+            format!("Endpoint: {url}\nBearer token from: {token}")
+        }
     };
     let shadow = if cfg.shadows_lower_priority {
         "\nShadowing: hides a lower-priority MCP config."
@@ -1821,9 +1898,9 @@ fn mcp_trust_notice(server: &str, cfg: &agent_mcp::McpServerConfig, lead: &str) 
         ""
     };
     format!(
-        "MCP \"{server}\": {lead}\nSource: {}\nCommand: {}\nArgs: {args}\nEnv: {env_keys} (values masked)\nSensitive env: {sensitive}{shadow}",
+        "MCP \"{server}\": {lead}\nSource: {}\nTransport: {}\n{detail}{shadow}",
         cfg.source.display(),
-        cfg.command
+        cfg.transport.short_label(),
     )
 }
 
@@ -1970,14 +2047,19 @@ mod tests {
     /// gate, so a repository-controlled declaration never earns a spawn on its own.
     #[test]
     fn a_workspace_controlled_server_stays_behind_the_trust_gate() {
-        use agent_mcp::{McpConfigOrigin, McpConfigSource, McpServerConfig};
+        use agent_mcp::{
+            McpConfigOrigin, McpConfigSource, McpServerConfig, McpToolPolicy, McpTransport,
+        };
         use std::collections::BTreeMap;
 
         let server = |origin: McpConfigOrigin, shadows: bool, env: BTreeMap<String, String>| {
             McpServerConfig {
-                command: "srv".into(),
-                args: Vec::new(),
-                env,
+                transport: McpTransport::Stdio {
+                    command: "srv".into(),
+                    args: Vec::new(),
+                    env,
+                },
+                tools: McpToolPolicy::default(),
                 source: McpConfigSource::new(origin, ""),
                 shadows_lower_priority: shadows,
             }
@@ -2009,6 +2091,21 @@ mod tests {
             false,
             env
         )));
+
+        // US-013 AC4: the transport changes nothing. A remote server declared by
+        // the workspace stays behind the same gate, and handing a credential to a
+        // remote endpoint is exactly what must not happen on `cd` alone.
+        let remote = |origin: McpConfigOrigin| McpServerConfig {
+            transport: McpTransport::Http {
+                url: "https://mcp.example.com/mcp".into(),
+                bearer_token_env_var: Some("EXAMPLE_TOKEN".into()),
+            },
+            tools: McpToolPolicy::default(),
+            source: McpConfigSource::new(origin, ""),
+            shadows_lower_priority: false,
+        };
+        assert!(mcp_requires_trust(&remote(McpConfigOrigin::Workspace)));
+        assert!(!mcp_requires_trust(&remote(McpConfigOrigin::ClaudeUser)));
     }
 
     #[test]

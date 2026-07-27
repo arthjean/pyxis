@@ -49,8 +49,15 @@ const CONCURRENCY: usize = 10;
 
 /// Tool registry + execution policy. Built by the CLI/TUI, injected
 /// into the core as `Arc<dyn ToolDispatch>`.
+///
+/// The exposed set is mutable in session (US-016) but only moves at a **turn
+/// boundary**: a change is staged and applied by `commit_staged`, which the
+/// frontend calls before composing the specs of the next turn. A server
+/// connected while a turn runs therefore never changes the set of tools that turn
+/// is dispatching against (AC4).
 pub struct Registry {
-    tools: HashMap<String, Box<dyn DynTool>>,
+    tools: std::sync::RwLock<HashMap<String, Arc<dyn DynTool>>>,
+    staged: std::sync::Mutex<Vec<StagedChange>>,
     mode: PermissionModeState,
     approver: Arc<dyn Approver>,
     approvals: ApprovalMemory,
@@ -60,6 +67,12 @@ pub struct Registry {
     /// `None` = no perimeter can be widened, hence no escalation is offered.
     escalator: Option<Arc<dyn SandboxEscalator>>,
     ctx: ToolCtx,
+}
+
+/// A change to the exposed tool set, waiting for the next turn boundary.
+enum StagedChange {
+    Add(Vec<Arc<dyn DynTool>>),
+    Remove(Vec<String>),
 }
 
 impl Registry {
@@ -101,10 +114,90 @@ impl Registry {
         }
     }
 
+    /// Read access to the exposed set. A poisoned lock is recovered rather than
+    /// propagated: losing the tool registry would end the session, which is a
+    /// worse outcome than reading a map a panicking thread left consistent
+    /// (nothing here is written across an unwind point).
+    fn tools_read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Arc<dyn DynTool>>> {
+        match self.tools.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Stages tools to expose (US-016). They enter the registry at the next
+    /// `commit_staged`, never in the middle of a turn. A name already exposed is
+    /// kept: a tool the model has already been given must not be replaced under it.
+    pub fn stage_tools(&self, tools: Vec<Box<dyn DynTool>>) {
+        if tools.is_empty() {
+            return;
+        }
+        self.stage(StagedChange::Add(
+            tools.into_iter().map(Arc::from).collect(),
+        ));
+    }
+
+    /// Stages the removal of exposed tools (server disconnected in session).
+    pub fn stage_removal(&self, names: Vec<String>) {
+        if names.is_empty() {
+            return;
+        }
+        self.stage(StagedChange::Remove(names));
+    }
+
+    fn stage(&self, change: StagedChange) {
+        let mut staged = match self.staged.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        staged.push(change);
+    }
+
+    /// Applies the staged changes, in the order they were staged. Called at a turn
+    /// boundary, before the specs are composed. Returns whether the exposed set
+    /// changed, so the frontend can say so.
+    pub fn commit_staged(&self) -> bool {
+        let pending: Vec<StagedChange> = {
+            let mut staged = match self.staged.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if staged.is_empty() {
+                return false;
+            }
+            std::mem::take(&mut staged)
+        };
+        let mut tools = match self.tools.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let mut changed = false;
+        for change in pending {
+            match change {
+                StagedChange::Add(added) => {
+                    for tool in added {
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            tools.entry(tool.name().to_string())
+                        {
+                            slot.insert(tool);
+                            changed = true;
+                        }
+                    }
+                }
+                StagedChange::Remove(names) => {
+                    for name in names {
+                        changed |= tools.remove(&name).is_some();
+                    }
+                }
+            }
+        }
+        changed
+    }
+
     /// Specs exposed to the model (capped descriptions), for `AgentContext.tools`.
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         let mut specs: Vec<ToolSpec> = self
-            .tools
+            .tools_read()
             .values()
             .map(|t| {
                 let raw_description = t.description();
@@ -127,11 +220,12 @@ impl Registry {
     /// tool guidelines in declaration order) -> stable and cache-friendly
     /// prompt.
     pub fn behavioral_guidelines(&self) -> Vec<String> {
-        let mut names: Vec<&String> = self.tools.keys().collect();
+        let tools = self.tools_read();
+        let mut names: Vec<&String> = tools.keys().collect();
         names.sort();
         let mut out = Vec::new();
         for n in names {
-            if let Some(t) = self.tools.get(n) {
+            if let Some(t) = tools.get(n) {
                 for g in t.behavioral_guidelines() {
                     out.push((*g).to_string());
                 }
@@ -149,7 +243,9 @@ impl Registry {
     /// `ToolOutcome` correlated by `id`.
     async fn run_one(&self, call: ToolInvocation, events: ToolEventSink) -> ToolOutcome {
         let id = call.id.clone();
-        let Some(tool) = self.tools.get(&call.name) else {
+        // The `Arc` is cloned out of the map so no lock is held across an await:
+        // a tool removed mid-call keeps running to completion on this handle.
+        let Some(tool) = self.tools_read().get(&call.name).cloned() else {
             return err_outcome(
                 id,
                 format!("unknown tool: {}", call.name),
@@ -657,7 +753,7 @@ fn truncate_utf8_prefix(s: &str, max: usize) -> &str {
 /// `Registry` builder. The default `Approver` is `AutoDeny` (fail-closed:
 /// without an explicit counterpart, every confirmation fails).
 pub struct RegistryBuilder {
-    tools: HashMap<String, Box<dyn DynTool>>,
+    tools: HashMap<String, Arc<dyn DynTool>>,
     mode: PermissionModeState,
     approver: Option<Arc<dyn Approver>>,
     approvals: ApprovalMemory,
@@ -745,20 +841,22 @@ impl RegistryBuilder {
     /// Registers a native tool (boxed into a `DynTool`). An already present name keeps
     /// the first registered tool.
     pub fn register<T: crate::tool::Tool + 'static>(mut self, tool: T) -> Self {
-        let dyn_tool = into_dyn(tool);
+        let dyn_tool: Arc<dyn DynTool> = Arc::from(into_dyn(tool));
         self.tools
             .entry(dyn_tool.name().to_string())
             .or_insert(dyn_tool);
         self
     }
-    /// Registers an already boxed `DynTool` (e.g. a future MCP tool).
+    /// Registers an already boxed `DynTool` (e.g. an MCP tool).
     pub fn register_dyn(mut self, tool: Box<dyn DynTool>) -> Self {
+        let tool: Arc<dyn DynTool> = Arc::from(tool);
         self.tools.entry(tool.name().to_string()).or_insert(tool);
         self
     }
     pub fn build(self) -> Registry {
         let registry = Registry {
-            tools: self.tools,
+            tools: std::sync::RwLock::new(self.tools),
+            staged: std::sync::Mutex::new(Vec::new()),
             mode: self.mode,
             approver: self.approver.unwrap_or_else(|| Arc::new(AutoDeny)),
             approvals: self.approvals,

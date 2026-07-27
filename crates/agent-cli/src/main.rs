@@ -897,6 +897,16 @@ fn save_chatgpt_credential(cred: OAuthCredential) -> anyhow::Result<()> {
     }
 }
 
+/// What the startup connection produced: the tools to register, the notices to
+/// show, and the model-facing names exposed per server. The last one is what lets
+/// a session-time disconnect take exactly its own tools back out (US-016).
+#[derive(Default)]
+struct McpStartup {
+    tools: Vec<Box<dyn DynTool>>,
+    notices: Vec<String>,
+    names: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
 /// Per-server bound of the startup connection (spawn + handshake + `tools/list`).
 /// Every server is dialed concurrently, so this is also the ceiling this step adds
 /// to the total launch time (US-012 AC3).
@@ -915,7 +925,7 @@ const MCP_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 async fn connect_mcp_at_startup(
     mcp: &Arc<std::sync::Mutex<agent_mcp::McpRegistry>>,
     harden: &agent_tools::CommandHardener,
-) -> (Vec<Box<dyn agent_tools::DynTool>>, Vec<String>) {
+) -> McpStartup {
     let mut notices: Vec<String> = Vec::new();
     let mut candidates: Vec<String> = Vec::new();
     match mcp.lock() {
@@ -931,14 +941,17 @@ async fn connect_mcp_at_startup(
             }
         }
         Err(_) => {
-            return (
-                Vec::new(),
-                vec!["MCP: registry unavailable at startup.".to_string()],
-            );
+            return McpStartup {
+                notices: vec!["MCP: registry unavailable at startup.".to_string()],
+                ..McpStartup::default()
+            };
         }
     }
     if candidates.is_empty() {
-        return (Vec::new(), notices);
+        return McpStartup {
+            notices,
+            ..McpStartup::default()
+        };
     }
 
     let mut pending = tokio::task::JoinSet::new();
@@ -958,6 +971,9 @@ async fn connect_mcp_at_startup(
             tokio::spawn(async move { old.cancel().await });
         }
         let harden = Arc::clone(harden);
+        // The policy travels with the task: the registry lock is not held while
+        // the connection is in flight.
+        let policy = cfg.tools.clone();
         pending.spawn(async move {
             let attempt = async {
                 let conn =
@@ -971,12 +987,13 @@ async fn connect_mcp_at_startup(
                 }
             };
             // On expiry the future is dropped: the transport `Drop` kills the
-            // subprocess, so a slow server leaves nothing behind.
+            // subprocess (or the HTTP session), so a slow server leaves nothing behind.
             match tokio::time::timeout(MCP_STARTUP_TIMEOUT, attempt).await {
-                Ok(Ok(connected)) => (name, Ok(connected)),
-                Ok(Err(err)) => (name, Err(err.to_string())),
+                Ok(Ok(connected)) => (name, policy, Ok(connected)),
+                Ok(Err(err)) => (name, policy, Err(err.to_string())),
                 Err(_) => (
                     name,
+                    policy,
                     Err(format!(
                         "connection timeout after {}s",
                         MCP_STARTUP_TIMEOUT.as_secs()
@@ -986,13 +1003,13 @@ async fn connect_mcp_at_startup(
         });
     }
 
-    let mut tools: Vec<Box<dyn agent_tools::DynTool>> = Vec::new();
+    let mut startup = McpStartup::default();
     // Shared across every server: uniqueness of the exposed names is a property of
     // the whole set (US-011 AC1).
     let mut taken = std::collections::BTreeSet::new();
     while let Some(joined) = pending.join_next().await {
-        let (name, outcome) = match joined {
-            Ok(pair) => pair,
+        let (name, policy, outcome) = match joined {
+            Ok(triple) => triple,
             Err(err) => {
                 notices.push(format!("MCP: connection task failed: {err}"));
                 continue;
@@ -1011,26 +1028,44 @@ async fn connect_mcp_at_startup(
             }
         };
         let client = conn.client(&name);
-        let (mut exposed, skipped) = agent_mcp::dyn_tools(&name, &listed, &client, &mut taken);
+        // US-014: the policy shapes the exposed surface BEFORE anything reaches the
+        // registry, and the filtered list is what `/mcp` shows.
+        let (listed, filter_notices) = agent_mcp::filter_tools(&name, &listed, &policy);
+        notices.extend(filter_notices);
+        let (mut exposed, skipped) =
+            agent_mcp::dyn_tools(&name, &listed, &policy, &client, &mut taken);
         for skip in skipped {
             notices.push(skip.summary());
         }
-        tools.append(&mut exposed);
-        match mcp.lock() {
-            Ok(mut reg) => {
-                if let Some(orphan) = reg.finish_connect(&name, conn, listed) {
+        // The tools are only registered once the connection is actually held by the
+        // registry: a connection closed on the way would otherwise leave the model
+        // with tools that can no longer reach anything.
+        let held = match mcp.lock() {
+            Ok(mut reg) => match reg.finish_connect(&name, conn, listed) {
+                Some(orphan) => {
                     tokio::spawn(async move { orphan.cancel().await });
+                    false
                 }
-            }
+                None => true,
+            },
             Err(_) => {
                 tokio::spawn(async move { conn.cancel().await });
                 notices.push(format!(
                     "MCP \"{name}\": registry unavailable, connection closed."
                 ));
+                false
             }
+        };
+        if held {
+            startup.names.insert(
+                name.clone(),
+                exposed.iter().map(|tool| tool.name().to_string()).collect(),
+            );
+            startup.tools.append(&mut exposed);
         }
     }
-    (tools, notices)
+    startup.notices = notices;
+    startup
 }
 
 fn run_auth_onboarding() -> anyhow::Result<OAuthCredential> {
