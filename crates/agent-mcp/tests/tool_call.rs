@@ -4,7 +4,7 @@
 //! error, timeout, server death in flight, routing between two servers, taint.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -61,13 +61,12 @@ fn compile_fixture(dir: &Path) -> PathBuf {
 }
 
 fn config(exe: &Path) -> McpServerConfig {
-    McpServerConfig {
-        command: exe.to_string_lossy().into_owned(),
-        args: Vec::new(),
-        env: BTreeMap::new(),
-        source: Default::default(),
-        shadows_lower_priority: false,
-    }
+    McpServerConfig::stdio(exe.to_string_lossy().into_owned(), Vec::new())
+}
+
+/// No filter, no auto-approval: the behavior these tests were written against.
+fn policy() -> agent_mcp::McpToolPolicy {
+    agent_mcp::McpToolPolicy::default()
 }
 
 async fn connect(exe: &Path, name: &str) -> (McpConnection, Vec<McpToolInfo>) {
@@ -116,7 +115,7 @@ async fn mcp_tools_are_registered_and_callable_by_the_model() {
 
     let client = conn.client("fixture");
     let mut taken = BTreeSet::new();
-    let (tools, skipped) = agent_mcp::dyn_tools("fixture", &listed, &client, &mut taken);
+    let (tools, skipped) = agent_mcp::dyn_tools("fixture", &listed, &policy(), &client, &mut taken);
     assert!(skipped.is_empty(), "unexpected skips: {skipped:?}");
     assert_eq!(tools.len(), 4);
 
@@ -239,8 +238,10 @@ async fn two_servers_exposing_the_same_tool_each_get_their_own_call() {
     let mut taken = BTreeSet::new();
     let alpha_client = alpha_conn.client("alpha");
     let beta_client = beta_conn.client("beta");
-    let (alpha_tools, _) = agent_mcp::dyn_tools("alpha", &alpha_listed, &alpha_client, &mut taken);
-    let (beta_tools, _) = agent_mcp::dyn_tools("beta", &beta_listed, &beta_client, &mut taken);
+    let (alpha_tools, _) =
+        agent_mcp::dyn_tools("alpha", &alpha_listed, &policy(), &alpha_client, &mut taken);
+    let (beta_tools, _) =
+        agent_mcp::dyn_tools("beta", &beta_listed, &policy(), &beta_client, &mut taken);
 
     let mut builder = Registry::builder(&dir)
         .mode(PermissionMode::Default)
@@ -283,7 +284,7 @@ async fn an_mcp_result_taints_the_rest_of_the_turn() {
     let (conn, listed) = connect(&exe, "fixture").await;
     let client = conn.client("fixture");
     let mut taken = BTreeSet::new();
-    let (tools, _) = agent_mcp::dyn_tools("fixture", &listed, &client, &mut taken);
+    let (tools, _) = agent_mcp::dyn_tools("fixture", &listed, &policy(), &client, &mut taken);
 
     let approver = Arc::new(RecordingApprover::default());
     let mut builder = Registry::builder(&dir)

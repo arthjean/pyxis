@@ -29,6 +29,7 @@ use serde_json::{Map, Value};
 
 use crate::call::McpClient;
 use crate::client::McpToolInfo;
+use crate::config::{McpApproval, McpToolPolicy};
 
 /// Prefix of every registered MCP tool. Its presence makes a collision with a
 /// native tool impossible.
@@ -56,6 +57,10 @@ pub struct McpTool {
     original_name: String,
     description: String,
     input_schema: Value,
+    /// Approval level resolved from the server policy (US-015). It is a
+    /// *baseline*: the permission mode, the hooks and the taint defense sit above
+    /// it and can only tighten it.
+    approval: McpApproval,
     client: McpClient,
 }
 
@@ -126,11 +131,17 @@ impl DynTool for McpTool {
         }
     }
 
-    /// US-013: a confirmation is always requested. The shell command
-    /// classification (US-007) does not apply here: an MCP call is an opaque
-    /// action on a remote party.
+    /// A confirmation is requested unless the configuration declared this exact
+    /// tool auto-approved (US-015). The shell command classification (US-007) does
+    /// not apply here: an MCP call is an opaque action on a remote party, so the
+    /// only thing that can lower the baseline is an explicit human decision
+    /// written in a file the workspace does not control.
+    ///
+    /// `Allow` is not the final word: `resolve_permission` upgrades it back to a
+    /// confirmation as soon as the turn carries recent untrusted taint, because
+    /// `is_taint_sensitive` is true for every MCP tool (US-015 AC3).
     fn permission(&self, _raw: &Value, _ctx: &PermCtx) -> PermissionDecision {
-        PermissionDecision::Ask
+        baseline_permission(self.approval)
     }
 
     /// No answer is ever remembered for an MCP call: the arguments are free-form,
@@ -159,6 +170,15 @@ impl DynTool for McpTool {
             // the server (`McpError::Call`).
             Err(err) => Err(ToolError::Io(err.to_string())),
         }
+    }
+}
+
+/// Baseline decision of an MCP tool for its configured approval level. Split out
+/// of the trait method so the decision stays testable without a live connection.
+fn baseline_permission(approval: McpApproval) -> PermissionDecision {
+    match approval {
+        McpApproval::Allow => PermissionDecision::Allow,
+        McpApproval::Ask => PermissionDecision::Ask,
     }
 }
 
@@ -191,10 +211,53 @@ pub struct McpToolPlan {
     pub input_schema: Value,
 }
 
-/// Wraps the tools of one connected server as `DynTool`.
+/// Applies the server policy to the listed tools (US-014): the allow-list runs
+/// first, the deny-list second, order taken from Codex. Returns what stays
+/// exposed and the diagnostics for the human.
+///
+/// A filtered-out tool produces NO diagnostic: hiding it is the point. What is
+/// reported is a name the configuration mentions and the server does not expose
+/// (AC3, a typo silently shrinking the surface), and a filter that empties a
+/// server entirely (AC5, which otherwise looks like a broken connection).
+pub fn filter_tools(
+    server: &str,
+    tools: &[McpToolInfo],
+    policy: &McpToolPolicy,
+) -> (Vec<McpToolInfo>, Vec<String>) {
+    if policy.is_default() {
+        return (tools.to_vec(), Vec::new());
+    }
+    let available: BTreeSet<&str> = tools
+        .iter()
+        .map(|tool| tool.original_name.as_str())
+        .collect();
+    let mut notices: Vec<String> = policy
+        .unknown_names(&available)
+        .into_iter()
+        .map(|name| {
+            format!("MCP \"{server}\": listed tool \"{name}\" is not exposed by the server")
+        })
+        .collect();
+    let kept: Vec<McpToolInfo> = tools
+        .iter()
+        .filter(|tool| policy.exposes(&tool.original_name))
+        .cloned()
+        .collect();
+    if kept.is_empty() && !tools.is_empty() {
+        notices.push(format!(
+            "MCP \"{server}\": 0 tool exposed after filtering (server still connected)"
+        ));
+    }
+    (kept, notices)
+}
+
+/// Wraps the tools of one connected server as `DynTool`. `tools` is expected to be
+/// the already filtered list (`filter_tools`); `policy` is read here for the
+/// approval level alone.
 pub fn dyn_tools(
     server: &str,
     tools: &[McpToolInfo],
+    policy: &McpToolPolicy,
     client: &McpClient,
     taken: &mut BTreeSet<String>,
 ) -> (Vec<Box<dyn DynTool>>, Vec<McpToolSkipped>) {
@@ -202,12 +265,14 @@ pub fn dyn_tools(
     let registered = plans
         .into_iter()
         .map(|plan| {
+            let approval = policy.approval_for(&plan.original_name);
             Box::new(McpTool {
                 name: plan.name,
                 server: server.to_string(),
                 original_name: plan.original_name,
                 description: plan.description,
                 input_schema: plan.input_schema,
+                approval,
                 client: client.clone(),
             }) as Box<dyn DynTool>
         })
@@ -704,6 +769,87 @@ mod tests {
         let (plans, _) = plan_tools("files", &[listed], &mut taken);
         assert!(plans[0].description.contains("\"read\""));
         assert!(plans[0].description.contains("\"files\""));
+    }
+
+    #[test]
+    fn the_allow_list_runs_before_the_deny_list_on_the_listed_set() {
+        let listed = [
+            info("read", object_schema()),
+            info("write", object_schema()),
+            info("delete", object_schema()),
+        ];
+        let policy = McpToolPolicy {
+            enabled: Some(BTreeSet::from(["read".into(), "write".into()])),
+            disabled: BTreeSet::from(["write".into()]),
+            ..McpToolPolicy::default()
+        };
+        let (kept, notices) = filter_tools("srv", &listed, &policy);
+        assert_eq!(
+            kept.iter()
+                .map(|tool| tool.original_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read"]
+        );
+        assert!(notices.is_empty(), "{notices:?}");
+    }
+
+    #[test]
+    fn an_unfiltered_server_keeps_every_tool_and_says_nothing() {
+        let listed = [info("read", object_schema())];
+        let (kept, notices) = filter_tools("srv", &listed, &McpToolPolicy::default());
+        assert_eq!(kept.len(), 1);
+        assert!(notices.is_empty());
+    }
+
+    #[test]
+    fn a_listed_name_absent_from_the_server_is_reported_without_failing() {
+        let listed = [info("read", object_schema())];
+        let policy = McpToolPolicy {
+            disabled: BTreeSet::from(["ghost".into()]),
+            ..McpToolPolicy::default()
+        };
+        let (kept, notices) = filter_tools("srv", &listed, &policy);
+        assert_eq!(kept.len(), 1, "the connection is not affected");
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("ghost"), "{}", notices[0]);
+    }
+
+    #[test]
+    fn a_filter_that_empties_a_server_is_reported_not_hidden() {
+        let listed = [info("read", object_schema())];
+        let policy = McpToolPolicy {
+            disabled: BTreeSet::from(["read".into()]),
+            ..McpToolPolicy::default()
+        };
+        let (kept, notices) = filter_tools("srv", &listed, &policy);
+        assert!(kept.is_empty());
+        assert!(
+            notices.iter().any(|n| n.contains("0 tool exposed")),
+            "{notices:?}"
+        );
+    }
+
+    #[test]
+    fn an_auto_approved_tool_still_confirms_under_taint() {
+        use agent_tools::permission::{PermissionMode, Resolved, resolve_permission};
+
+        let allow = baseline_permission(McpApproval::Allow);
+        assert_eq!(allow, PermissionDecision::Allow);
+        assert_eq!(
+            baseline_permission(McpApproval::Ask),
+            PermissionDecision::Ask
+        );
+        // Without taint the configured level is honored.
+        assert_eq!(
+            resolve_permission(PermissionMode::Default, allow, false, true, true, false),
+            Resolved::Allow
+        );
+        // US-015 AC3: recent untrusted taint forces the confirmation back. No MCP
+        // setting can weaken the OWASP LLM01 defense.
+        assert_eq!(
+            resolve_permission(PermissionMode::Default, allow, false, true, true, true),
+            Resolved::Ask
+        );
     }
 
     #[test]
