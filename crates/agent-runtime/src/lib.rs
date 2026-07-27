@@ -6,11 +6,13 @@
 //! cancellation tree and the shutdown.
 //!
 //! Boundaries:
-//! - `run_agent` stays the ONLY model-tools loop. The runtime never
-//!   re-implements retry, compaction or dispatch.
-//! - No disk access here: the local adapter of the orchestration store lives in
-//!   `agent-session`, which depends on this crate and never the other way round.
-//! - No public configuration key. Every v1 limit is a constant (FR-20).
+//! - `run_agent` stays the ONLY model-tools loop. The runtime reaches it through
+//!   [`runner::TurnRunner`] and never re-implements retry, compaction or
+//!   dispatch.
+//! - No disk access here. [`store::ThreadStore`] is a trait; its JSONL adapter
+//!   lives in `agent-session`, its in-memory adapter in [`store`].
+//! - No public configuration key. Every v1 limit is a constant of
+//!   [`thread`] (FR-20).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod event;
@@ -18,6 +20,7 @@ pub mod id;
 pub mod lifecycle;
 pub mod runner;
 pub mod store;
+pub mod thread;
 
 pub use event::{
     THREAD_EVENT_ENTRY, THREAD_META_ENTRY, THREAD_RUNTIME_VERSION, ThreadEvent, ThreadEventPayload,
@@ -28,3 +31,8 @@ pub use id::{
 pub use lifecycle::{LifecycleError, TurnLifecycle, TurnState};
 pub use runner::{RunAgentRunner, TurnOutcome, TurnRequest, TurnRunner};
 pub use store::{MemoryThreadStore, StoreError, ThreadSnapshot, ThreadStore};
+pub use thread::{
+    Accepted, COMMAND_MAILBOX, LIVE_EVENT_BUFFER, MAX_PENDING_INPUTS, RuntimeError, RuntimeEvent,
+    RuntimeEventPayload, SHUTDOWN_DEADLINE, STRAGGLER_ABORT_AFTER, Submission, SubmitError,
+    ThreadHandle, ThreadOptions, ThreadStatus, TurnStatus,
+};
