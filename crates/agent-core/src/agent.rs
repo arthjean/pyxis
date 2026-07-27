@@ -13,7 +13,7 @@ use std::time::Duration;
 use futures_util::{Stream, StreamExt};
 
 use crate::budget::{ContextBudget, estimate_input, estimate_static_input};
-use crate::cancel::Cancellable;
+use crate::cancel::{Cancellable, guard};
 use crate::compaction::{CompactKind, CompactionState, full_compact, microcompact};
 use crate::deps::Deps;
 use crate::error::{AgentError, ProviderFailure};
@@ -578,7 +578,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
 
                     // US-001: opening the stream can block for several seconds
                     // (TLS + first byte); cancellation takes over without waiting.
-                    let opened = match deps.cancel.guard(deps.provider.stream(req)).await {
+                    let opened = match guard(&deps.cancel, deps.provider.stream(req)).await {
                         Cancellable::Cancelled => continue,
                         Cancellable::Completed(opened) => opened,
                     };
@@ -626,16 +626,17 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 // US-001: a backoff can last up to 60 s (bounded
                                 // Retry-After); cancellation cuts the wait short, the stop
                                 // boundary being the loop head.
-                                let _ = deps
-                                    .cancel
-                                    .guard(deps.clock.sleep(transient_retry_delay(
+                                let _ = guard(
+                                    &deps.cancel,
+                                    deps.clock.sleep(transient_retry_delay(
                                         &config,
                                         transient_retries - 1,
                                         class,
                                         &e,
                                         deps.clock.now_ms(),
-                                    )))
-                                    .await;
+                                    )),
+                                )
+                                .await;
                                 continue;
                             }
                             ErrorClass::Auth(AuthError::Expired) => {
@@ -824,16 +825,17 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 // US-001: a backoff can last up to 60 s (bounded
                                 // Retry-After); cancellation cuts the wait short, the stop
                                 // boundary being the loop head.
-                                let _ = deps
-                                    .cancel
-                                    .guard(deps.clock.sleep(transient_retry_delay(
+                                let _ = guard(
+                                    &deps.cancel,
+                                    deps.clock.sleep(transient_retry_delay(
                                         &config,
                                         transient_retries - 1,
                                         class,
                                         &e,
                                         deps.clock.now_ms(),
-                                    )))
-                                    .await;
+                                    )),
+                                )
+                                .await;
                                 continue;
                             }
                             ErrorClass::Auth(AuthError::Expired) => {
@@ -1111,12 +1113,15 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     // US-001: compaction is a full model call; cancellation does not
                     // wait for it. The transcript is not modified until
                     // `full_compact` has handed back control.
-                    let compacted = match deps.cancel.guard(full_compact(
-                        &mut messages,
-                        &model,
-                        deps.provider.as_ref(),
-                        config.max_output_tokens,
-                    ))
+                    let compacted = match guard(
+                        &deps.cancel,
+                        full_compact(
+                            &mut messages,
+                            &model,
+                            deps.provider.as_ref(),
+                            config.max_output_tokens,
+                        ),
+                    )
                     .await
                     {
                         Cancellable::Cancelled => continue,
@@ -1158,12 +1163,15 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                 }
                 Transition::Recover(_) => {
                     // withholding: REACTIVE compaction; confirmed failure -> propagation.
-                    let compacted = match deps.cancel.guard(full_compact(
-                        &mut messages,
-                        &model,
-                        deps.provider.as_ref(),
-                        config.max_output_tokens,
-                    ))
+                    let compacted = match guard(
+                        &deps.cancel,
+                        full_compact(
+                            &mut messages,
+                            &model,
+                            deps.provider.as_ref(),
+                            config.max_output_tokens,
+                        ),
+                    )
                     .await
                     {
                         Cancellable::Cancelled => continue,

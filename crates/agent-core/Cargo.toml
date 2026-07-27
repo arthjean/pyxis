@@ -20,5 +20,9 @@ async-trait.workspace = true
 async-stream.workspace = true
 futures-util.workspace = true
 tokio.workspace = true
+# US-008: `CancellationToken` is THE cancellation signal of the loop. The core
+# holds a single tree with the runtime instead of translating between two
+# mechanisms; no runtime supervision (`TaskTracker`) enters here.
+tokio-util.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

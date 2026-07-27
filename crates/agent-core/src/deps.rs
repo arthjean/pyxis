@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use agent_tokenizer::TokenCounter;
 
-use crate::cancel::CancelToken;
+use crate::cancel::CancellationToken;
 use crate::clock::Clock;
 use crate::provider::Provider;
 use crate::session::Session;
@@ -19,7 +19,11 @@ pub struct Deps {
     pub tokenizer: Arc<dyn TokenCounter>,
     pub clock: Arc<dyn Clock>,
     pub tools: Arc<dyn ToolDispatch>,
-    /// US-001: cooperative cancellation signal. A token never signalled (default)
-    /// leaves the loop behavior strictly unchanged.
-    pub cancel: CancelToken,
+    /// US-001: cooperative cancellation signal. A token never signalled leaves
+    /// the loop behavior strictly unchanged.
+    ///
+    /// US-008: this is a node of the ONE process-wide cancellation tree. Callers
+    /// pass the child token of the turn they are running, never a fresh root:
+    /// a fresh root is an orphan branch that no interruption reaches.
+    pub cancel: CancellationToken,
 }

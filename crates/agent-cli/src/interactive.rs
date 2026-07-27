@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::message::{ContentBlock, Message, recent_untrusted_content};
-use agent_core::{AgentContext, AgentEvent, CancelToken, Deps, RunConfig, Session, run_agent};
+use agent_core::{
+    AgentContext, AgentEvent, CancellationToken, Deps, RunConfig, Session, run_agent,
+};
 use agent_provider::KEYRING_ACCOUNT;
 use agent_tools::PermissionModeState;
 use agent_tui::{
@@ -70,7 +72,7 @@ struct ActiveTurn {
     id: Option<u64>,
     handle: Option<JoinHandle<()>>,
     /// US-001: cancellation signal of the current turn, one per turn.
-    cancel: Option<CancelToken>,
+    cancel: Option<CancellationToken>,
 }
 
 impl ActiveTurn {
@@ -100,7 +102,7 @@ impl ActiveTurn {
         self.id = Some(turn_id);
         // US-001: every turn carries ITS signal, so that a cancellation cannot
         // reach the next turn.
-        let cancel = CancelToken::new();
+        let cancel = CancellationToken::new();
         let mut deps = deps.clone();
         deps.cancel = cancel.clone();
         self.handle = Some(launch_turn(

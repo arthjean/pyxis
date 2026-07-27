@@ -9,7 +9,7 @@
 //! is wrong.
 
 use agent_core::event::AgentEvent;
-use agent_core::{AgentContext, CancelToken, Deps, run_agent};
+use agent_core::{AgentContext, Deps, run_agent};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -114,37 +114,23 @@ where
         cancel: CancellationToken,
     ) -> TurnOutcome {
         let ctx = (self.context)(&request);
-        // The engine keeps its OWN cooperative signal: it is the one that knows
-        // where a safe boundary is. The hierarchical token is bridged onto it
-        // rather than duplicated, so there is a single cancellation tree with a
-        // single translation point (US-008 removes the in-house token once every
-        // caller goes through the runtime).
-        let engine_cancel = CancelToken::new();
+        // US-008 AC1: the turn's token is handed to the engine AS IS. There is no
+        // second signal to bridge anymore, so no branch of the tree can be
+        // cancelled while the other keeps running.
         let mut deps = self.deps.clone();
-        deps.cancel = engine_cancel.clone();
+        deps.cancel = cancel;
 
         let stream = run_agent(ctx, deps);
         futures_util::pin_mut!(stream);
 
         let mut outcome = TurnOutcome::Failed("engine ended without a terminal event".into());
-        let mut bridged = false;
-        loop {
-            tokio::select! {
-                biased;
-                next = stream.next() => {
-                    let Some(event) = next else { break };
-                    if let Some(terminal) = outcome_of(&event) {
-                        outcome = terminal;
-                    }
-                    // A disconnected client must not stop the engine: the loop
-                    // still has to reconcile its transcript and persist.
-                    let _ = events.send(event).await;
-                }
-                () = cancel.cancelled(), if !bridged => {
-                    bridged = true;
-                    engine_cancel.cancel();
-                }
+        while let Some(event) = stream.next().await {
+            if let Some(terminal) = outcome_of(&event) {
+                outcome = terminal;
             }
+            // A disconnected client must not stop the engine: the loop still has
+            // to reconcile its transcript and persist.
+            let _ = events.send(event).await;
         }
         outcome
     }

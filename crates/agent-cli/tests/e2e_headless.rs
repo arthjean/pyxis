@@ -31,7 +31,7 @@ use agent_core::provider::{
     CanonicalRequest, CanonicalResponse, Capabilities, ErrorClass, Provider, ProviderError,
     ProviderKind, StreamEvent,
 };
-use agent_core::{AgentContext, CancelToken, Deps, HeadlessEnd, RunConfig, run_headless};
+use agent_core::{AgentContext, CancellationToken, Deps, HeadlessEnd, RunConfig, run_headless};
 use agent_provider::CodexEventMapper;
 use agent_provider::chatgpt_request::{ResponsesBodyOptions, build_responses_body};
 use agent_session::JsonlSession;
@@ -288,7 +288,7 @@ fn harness_with_hooks(
             tokenizer: Arc::new(HeuristicCounter),
             clock: Arc::new(SystemClock),
             tools: Arc::new(registry),
-            cancel: CancelToken::new(),
+            cancel: CancellationToken::new(),
         },
         provider,
         session_path,

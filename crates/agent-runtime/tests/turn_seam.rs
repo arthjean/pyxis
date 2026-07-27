@@ -21,7 +21,7 @@ use agent_core::provider::{
 };
 use agent_core::session::{FileSnapshot, Session, SessionError};
 use agent_core::tools::{ToolDispatch, ToolEventSink, ToolInvocation, ToolOutcome};
-use agent_core::{AgentContext, CancelToken, Deps, RunConfig};
+use agent_core::{AgentContext, CancellationToken as CoreCancel, Deps, RunConfig};
 use agent_runtime::id::{SequentialIds, TurnId};
 use agent_runtime::runner::{RunAgentRunner, TurnOutcome, TurnRequest, TurnRunner};
 use agent_tokenizer::HeuristicCounter;
@@ -167,7 +167,7 @@ fn deps(provider: Arc<FakeProvider>, store: Arc<FakeStore>) -> Deps {
         tokenizer: Arc::new(HeuristicCounter),
         clock: Arc::new(InstantClock),
         tools: Arc::new(EchoTools),
-        cancel: CancelToken::new(),
+        cancel: CoreCancel::new(),
     }
 }
 

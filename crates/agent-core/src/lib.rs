@@ -29,7 +29,7 @@ pub use agent::{
     run_headless_observed,
 };
 pub use budget::ContextBudget;
-pub use cancel::{CancelToken, Cancellable};
+pub use cancel::{Cancellable, CancellationToken};
 pub use compaction::CompactKind;
 pub use deps::Deps;
 pub use error::{AgentError, ProviderFailure, ProviderFailureKind};
@@ -73,7 +73,9 @@ mod loop_tests {
     };
     use crate::session::{Session, SessionError};
     use crate::tools::{ToolDispatch, ToolEventSink, ToolInvocation, ToolOutcome};
-    use crate::{AgentContext, AgentEvent, CancelToken, Deps, RunConfig, run_agent, run_headless};
+    use crate::{
+        AgentContext, AgentEvent, CancellationToken, Deps, RunConfig, run_agent, run_headless,
+    };
 
     // ───────── test doubles (injected through Deps) ─────────
 
@@ -85,7 +87,7 @@ mod loop_tests {
         StreamThenErr(Vec<StreamEvent>, ProviderError),
         /// US-001: the cancel signal fires while the stream is being consumed,
         /// exactly after the first delivered event.
-        StreamCancelling(Vec<StreamEvent>, crate::CancelToken),
+        StreamCancelling(Vec<StreamEvent>, crate::CancellationToken),
     }
 
     struct MockProvider {
@@ -320,7 +322,7 @@ mod loop_tests {
 
     /// US-001: tools that signal cancellation then NEVER hand back control:
     /// the loop must take control back without waiting for the dispatch.
-    struct HangingTools(crate::CancelToken);
+    struct HangingTools(crate::CancellationToken);
     #[async_trait::async_trait]
     impl ToolDispatch for HangingTools {
         async fn dispatch(
@@ -335,7 +337,7 @@ mod loop_tests {
 
     /// Edge case #2: cancellation lands in the window between the end of the
     /// dispatch and persistence: the REAL results must survive.
-    struct RacingTools(crate::CancelToken);
+    struct RacingTools(crate::CancellationToken);
     #[async_trait::async_trait]
     impl ToolDispatch for RacingTools {
         async fn dispatch(
@@ -362,7 +364,7 @@ mod loop_tests {
     /// before the signal, then termination (real results) or blocking
     /// (abandoned calls).
     struct DelayedCancelTools {
-        cancel: crate::CancelToken,
+        cancel: crate::CancellationToken,
         yields: usize,
         finish: bool,
     }
@@ -454,7 +456,7 @@ mod loop_tests {
             tokenizer: Arc::new(HeuristicCounter),
             clock: Arc::new(NoopClock),
             tools: Arc::new(EchoTools),
-            cancel: crate::CancelToken::new(),
+            cancel: crate::CancellationToken::new(),
         };
         Harness {
             log,
@@ -1559,7 +1561,7 @@ mod loop_tests {
     async fn cancel_before_start_stops_at_the_first_boundary() {
         let h = harness(vec![text_turn("jamais")], false, 100_000);
         let mut deps = h.deps.clone();
-        let cancel = CancelToken::new();
+        let cancel = CancellationToken::new();
         cancel.cancel();
         deps.cancel = cancel;
         let events = drive(AgentContext::new("mock").push(Message::user("hello")), deps).await;
@@ -1578,7 +1580,7 @@ mod loop_tests {
     // boundary; whatever already scrolled by stays in the persisted transcript.
     #[tokio::test]
     async fn cancel_during_stream_stops_emitting_deltas() {
-        let cancel = CancelToken::new();
+        let cancel = CancellationToken::new();
         let h = harness(
             vec![MockTurn::StreamCancelling(
                 vec![
@@ -1624,7 +1626,7 @@ mod loop_tests {
     // per in-flight call, THEN persists.
     #[tokio::test]
     async fn interrupted_dispatch_writes_synthetic_results_before_persisting() {
-        let cancel = CancelToken::new();
+        let cancel = CancellationToken::new();
         let h = harness(vec![tool_turn("c1")], false, 100_000);
         let mut deps = h.deps.clone();
         deps.cancel = cancel.clone();
@@ -1657,7 +1659,7 @@ mod loop_tests {
     // with no duplicate and none forgotten.
     #[tokio::test]
     async fn interrupted_concurrent_dispatch_answers_every_call_once() {
-        let cancel = CancelToken::new();
+        let cancel = CancellationToken::new();
         let h = harness(vec![tool_turn_n(&["c1", "c2"])], false, 100_000);
         let mut deps = h.deps.clone();
         deps.cancel = cancel.clone();
@@ -1685,7 +1687,7 @@ mod loop_tests {
     // -> the REAL result is kept, no synthetic result overwrites it.
     #[tokio::test]
     async fn tool_finished_before_stop_keeps_its_real_result() {
-        let cancel = CancelToken::new();
+        let cancel = CancellationToken::new();
         let h = harness(vec![tool_turn("c1")], false, 100_000);
         let mut deps = h.deps.clone();
         deps.cancel = cancel.clone();
@@ -1714,7 +1716,7 @@ mod loop_tests {
         const IDS: [&str; 3] = ["c1", "c2", "c3"];
         for run in 0..50usize {
             let ids = &IDS[..=(run % 3)];
-            let cancel = CancelToken::new();
+            let cancel = CancellationToken::new();
             let h = harness(vec![tool_turn_n(ids)], false, 100_000);
             let mut deps = h.deps.clone();
             deps.cancel = cancel.clone();
@@ -1748,7 +1750,7 @@ mod loop_tests {
     async fn cancel_after_completion_is_ignored() {
         let h = harness(vec![text_turn("done")], false, 100_000);
         let mut deps = h.deps.clone();
-        let cancel = CancelToken::new();
+        let cancel = CancellationToken::new();
         deps.cancel = cancel.clone();
         let events = drive(AgentContext::new("mock").push(Message::user("hi")), deps).await;
         assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));

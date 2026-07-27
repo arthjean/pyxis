@@ -24,7 +24,7 @@ use agent_core::guardrail::CostBudget;
 use agent_core::message::{Message, recent_untrusted_content};
 use agent_core::provider::Provider;
 use agent_core::sandbox::SandboxPolicy;
-use agent_core::{AgentContext, CancelToken, Deps, RunConfig};
+use agent_core::{AgentContext, CancellationToken, Deps, RunConfig};
 use agent_provider::{KEYRING_ACCOUNT, OpenAiChatGptProvider};
 use agent_sandbox::{ProxyPolicy, set_proxy_env};
 use agent_tokenizer::HeuristicCounter;
@@ -1518,7 +1518,7 @@ async fn run(
         tools: Arc::clone(&registry) as Arc<dyn agent_core::tools::ToolDispatch>,
         // US-001: base token never signalled. The interactive loop substitutes a
         // PER-TURN token (`launch_turn`); the headless mode keeps this one.
-        cancel: CancelToken::new(),
+        cancel: CancellationToken::new(),
     };
 
     // 6. Headless (-p) vs interactive dispatch. Wrapped so that `SessionEnd`
