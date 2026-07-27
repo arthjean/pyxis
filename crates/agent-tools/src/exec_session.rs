@@ -59,19 +59,31 @@ enum SessionStatus {
 /// tool call, so nothing else would (AC4).
 struct Session {
     pid: Option<u32>,
+    child: Option<tokio::process::Child>,
     stdin: Option<tokio::process::ChildStdin>,
     buffer: Arc<Mutex<Vec<u8>>>,
-    status: Arc<Mutex<SessionStatus>>,
+    status: SessionStatus,
     last_activity: Instant,
     command: String,
 }
 
 impl Session {
-    fn status(&self) -> SessionStatus {
+    fn status(&mut self) -> SessionStatus {
+        if self.status == SessionStatus::Running {
+            let observed = self.child.as_mut().map(tokio::process::Child::try_wait);
+            match observed {
+                Some(Ok(Some(exit))) => {
+                    self.status = SessionStatus::Exited(exit.code());
+                    self.child = None;
+                }
+                Some(Err(_)) => {
+                    self.status = SessionStatus::Exited(None);
+                    self.child = None;
+                }
+                Some(Ok(None)) | None => {}
+            }
+        }
         self.status
-            .lock()
-            .map(|s| *s)
-            .unwrap_or(SessionStatus::Running)
     }
 
     /// Drains what the process produced since the last read.
@@ -90,6 +102,15 @@ impl Drop for Session {
         // the end of the program must not leave an orphan behind.
         if let Some(pid) = self.pid {
             kill_group_blocking(pid);
+        }
+        if let Some(child) = self.child.as_mut() {
+            // Reap the direct child here instead of leaving it to Tokio's
+            // scheduler. Drop can run on the runtime's only thread, where an
+            // async waiter would remain parked and expose a zombie as alive.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 }
@@ -321,24 +342,15 @@ impl Tool for ExecCommand {
         let mut child = spawn_session(&shell, &input.command, ctx)?;
         let pid = child.id();
         let buffer = Arc::new(Mutex::new(Vec::new()));
-        let status = Arc::new(Mutex::new(SessionStatus::Running));
         let stdin = child.stdin.take();
         pump(child.stdout.take(), Arc::clone(&buffer));
         pump(child.stderr.take(), Arc::clone(&buffer));
-        {
-            let status = Arc::clone(&status);
-            tokio::spawn(async move {
-                let code = child.wait().await.ok().and_then(|s| s.code());
-                if let Ok(mut slot) = status.lock() {
-                    *slot = SessionStatus::Exited(code);
-                }
-            });
-        }
         let session = Session {
             pid,
+            child: Some(child),
             stdin,
             buffer: Arc::clone(&buffer),
-            status: Arc::clone(&status),
+            status: SessionStatus::Running,
             last_activity: Instant::now(),
             command: input.command.clone(),
         };
