@@ -98,7 +98,7 @@ Shipped today:
 - **Execution sandbox**: Landlock confines writes to the workspace on Linux (the agent *and* its `bash` subprocesses); a local proxy gates cooperative outbound HTTP(S) subprocess traffic via `--allow <host>`.
 - **Persistent sessions**: one append-only JSONL file per conversation under `.pyxis/sessions/`, with `/resume` to reopen a past session and a workspace-wide prompt history.
 - **`/goal` completion loop**: set a session objective and Pyxis re-runs the agentic loop until it emits a done marker (capped at 25 iterations), persisted in a `.pyxis/goal` sidecar so it survives restarts.
-- **MCP tools (stdio)**: load servers from `.mcp.json` or your existing `~/.claude.json`, connect them at startup, and let the model call their tools as `mcp__<server>__<tool>`. Every MCP result is untrusted content, every MCP call asks for confirmation by default, and a server declared by the workspace stays behind an explicit `/mcp <server> trust`. An unavailable server never blocks the session: its tools are simply absent. Lifecycle and config diagnostics live in the `/mcp` submenu.
+- **MCP tools (stdio and remote HTTP)**: load servers from `.mcp.json` or your existing `~/.claude.json`, connect them at startup, and let the model call their tools as `mcp__<server>__<tool>`. A remote server is declared with `"type": "http"` and a `url` (https, or plain http on a loopback host only); its bearer token is named through `bearerTokenEnvVar` and read from the environment at connect time, so no secret ever sits in the config, the logs or the transcript. Per server, `enabledTools` then `disabledTools` shrink what the model sees, and `toolsApproval` can auto-approve a named tool. Every MCP result is untrusted content, every MCP call asks for confirmation by default, no approval setting survives recent untrusted content in the turn, and a server declared by the workspace stays behind an explicit `/mcp <server> trust` and can never auto-approve anything. An unavailable server never blocks the session: its tools are simply absent. Connecting or disconnecting a server in session changes what the model can call from the next turn on. Lifecycle and config diagnostics live in the `/mcp` submenu.
 - **Agent Skills (open spec)**: a `~/.agents/skills/<name>/SKILL.md` installed for another agent works as is. Names and descriptions are exposed to the model; `/<name>` injects that skill's instructions for the turn, framed as user-level content. An invalid skill is dropped with a trace instead of failing the startup.
 - **Hooks with a veto**: declare `[[hooks]]` in `~/.pyxis/settings.toml` and your own command decides, on the Claude Code contract (JSON event on stdin, `hookSpecificOutput.permissionDecision` on stdout, exit code 2 blocks). A hook can only tighten: `deny` outranks even `--yes`, `ask` forces a confirmation in any mode, and any failure (missing binary, 5 s timeout, unreadable output) denies. A repository cannot declare one.
 - **Diagnosable crashes**: a panic restores the terminal *before* saying anything, appends a dated report to `~/.pyxis/logs/panic.log`, and tells you where to look. `PYXIS_LOG=debug` (or `trace`) writes a structured `tracing` log of the run next to it; unset, nothing is installed and nothing is emitted. Message and tool-input content only ever appears at `trace`.
@@ -141,7 +141,7 @@ The founding invariant: **`agent-core` depends on neither the TUI nor the provid
 | `agent-core` | Agent loop, transition state machine, canonical message/transcript types (headless) |
 | `agent-provider` | `Provider` trait + adapters (reqwest + SSE), canonical `StreamEvent`, error taxonomy |
 | `agent-tools` | Tool registry, fail-closed trait, concurrent/serial dispatch, permissions, taint |
-| `agent-mcp` | `rmcp`-based MCP client (stdio), config loading, server registry, MCP tools as `DynTool` |
+| `agent-mcp` | `rmcp`-based MCP client (stdio + Streamable HTTP), config loading, server registry, per-server tool policy, MCP tools as `DynTool` |
 | `agent-tui` | Ratatui + crossterm frontend, decoupled from the core via channels |
 | `agent-session` | Append-only JSONL persistence, resume, compaction boundaries |
 | `agent-sandbox` | Landlock FS confinement + local network allow-list proxy |
@@ -202,6 +202,7 @@ The filesystem sandbox needs a Linux kernel with Landlock (5.13+, ABI improvemen
 pyxis                          # interactive TUI in the current directory
 pyxis -p "<prompt>"            # headless one-shot, prints the answer and exits
 pyxis "<prompt>"               # bare prompt is treated as -p
+echo "<prompt>" | pyxis -p     # prompt read from standard input
 ```
 
 ### Flags
@@ -212,7 +213,14 @@ pyxis "<prompt>"               # bare prompt is treated as -p
 | `--allow <host>` | Add a host to the network allow-list for tool subprocesses (repeatable). |
 | `--resume [id.jsonl\|latest]` | Reopen the latest or named session before entering the TUI, or continue it with `-p`. |
 | `--yes`, `-y` | Auto-approve tool actions (headless / trusted automation). |
-| `--no-sandbox` | Disable Landlock FS confinement (writes are no longer confined to the workspace). |
+| `--sandbox <mode>` | `workspace-write` (default), `read-only` or `full-access`. |
+| `--no-sandbox` | Alias of `--sandbox full-access` (writes are no longer confined to the workspace). |
+| `--permission-mode <mode>` | `ask`, `accept-edits`, `auto`, `full-access` or `read-only`. |
+| `--profile <name>` | Apply the `[profiles.<name>]` table of the settings file. |
+| `-c <key=value>` | Override one configuration key for this run (repeatable, last wins). A security key is refused. |
+| `-p`, `--print [prompt]` | Headless one-shot. Without a value the prompt is read from standard input; with one, the argument wins and standard input is left alone. |
+| `--output-last-message <path>` | Write only the last assistant message there, raw. The destination obeys the sandbox policy, which no flag widens. |
+| `--ephemeral` | Persist no session file. Headless only, and incompatible with `--resume`. |
 
 ### Slash commands (interactive)
 
@@ -224,8 +232,13 @@ pyxis "<prompt>"               # bare prompt is treated as -p
 | `/skills` | Invoke a skill from `~/.agents/skills` (injects its instructions) |
 | `/providers` | Inspect / configure the auth provider |
 | `/mcp` | Manage MCP server connections |
+| `/hooks` | List the declared hooks with their event and matcher |
+| `/init` | Write an `AGENTS.md` from a real repository inspection (`/init force` to rewrite an existing one) |
 | `/resume` | Reopen a past conversation |
+| `/fork` | Duplicate this session and continue in the copy |
+| `/copy` | Copy the last answer to the clipboard |
 | `/new`, `/clear` | Start fresh (clear the context) |
+| `/logout` | Delete the local credential (the ChatGPT session is not revoked server-side) |
 | `/quit` | Exit |
 
 ### Models
@@ -251,6 +264,18 @@ Pyxis reads and writes a few well-known paths:
 
 These paths outside the workspace (skills, MCP config, keyring) are read **before** the Landlock sandbox is applied, since they would be unreachable afterward.
 
+Configuration is resolved by named layers, each carrying an explicit precedence. `/status` shows which layer every non-default value comes from:
+
+| Layer | Precedence | Source |
+|------|-----------|--------|
+| global settings | 10 | `~/.pyxis/settings.toml`, may set every key |
+| profile | 15 | the `[profiles.<name>]` table selected by `--profile` or by the `profile` key |
+| project config | 20 | `<workspace>/.pyxis/config.toml` |
+| environment | 25 | `PYXIS_*` variables |
+| command line | 30 | `-c key=value` and the flags above |
+
+`permission_mode`, `sandbox_mode`, `writable_roots`, `hooks` and `profile` are security keys: the project file is refused on them with a warning, and so is `-c`, since an argument can come from a script of the repository. `--permission-mode` and `--sandbox` are the documented way to choose a perimeter for one session.
+
 ## Sandbox and security
 
 - **Filesystem**: Landlock confines every write to the workspace, kernel-level, inherited by `bash` subprocesses (the FS sandbox is applied on the main thread before the Tokio runtime is built, so workers inherit it).
@@ -265,7 +290,7 @@ These paths outside the workspace (skills, MCP config, keyring) are read **befor
 The MVP target was deliberately narrow: **make Pyxis excellent with one model channel (the ChatGPT subscription) and dogfood it daily**, rather than ship six empty provider columns. The multi-provider architecture is the invariant; adapters land incrementally.
 
 - **Now (shipped)**: agentic loop, tool suite + Linux FS sandbox, sessions + resume, `/goal`, MCP tools in the model loop, monochrome TUI, ChatGPT subscription provider.
-- **Next**: more provider adapters behind the existing `Provider` trait, mid-session MCP tool registration, per-server MCP OAuth, richer TUI (plan trees, hunk review).
+- **Next**: more provider adapters behind the existing `Provider` trait, per-server MCP OAuth, richer TUI (plan trees, hunk review).
 - **Later**: vector memory (`sqlite-vec`), sub-agents, macOS Seatbelt hardening, VCR provider tests in CI.
 
 Phases and the de-risking spikes live in [`docs/ROADMAP.md`](docs/ROADMAP.md).
