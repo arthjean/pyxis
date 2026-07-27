@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use agent_core::clock::Clock;
 use agent_core::event::AgentEvent;
+use agent_runtime::context::{FixedTurnContext, TurnContext, TurnLimits};
 use agent_runtime::event::{ThreadEvent, ThreadEventPayload};
-use agent_runtime::id::{RandomIds, ThreadId};
+use agent_runtime::id::{RandomIds, ThreadId, TurnId};
 use agent_runtime::lifecycle::TurnState;
 use agent_runtime::runner::{TurnOutcome, TurnRequest, TurnRunner};
 use agent_runtime::store::{MemoryThreadStore, StoreError, ThreadSnapshot, ThreadStore};
@@ -130,6 +131,22 @@ impl ThreadStore for GatedStore {
 
 // ───────── helpers ─────────
 
+pub fn turn_context(turn_id: TurnId) -> TurnContext {
+    TurnContext {
+        turn_id,
+        model: "test-model".into(),
+        reasoning_effort: None,
+        permission_mode: "ask".into(),
+        sandbox: "workspace-write".into(),
+        workspace: std::path::PathBuf::from("/tmp/pyxis-test"),
+        limits: TurnLimits {
+            max_turns: 50,
+            max_output_tokens: 4096,
+            max_pending_inputs: MAX_PENDING_INPUTS,
+        },
+    }
+}
+
 async fn start(
     store: Arc<dyn ThreadStore>,
     runner: Arc<dyn TurnRunner>,
@@ -140,6 +157,9 @@ async fn start(
         thread_id,
         store,
         runner,
+        turn_contexts: Arc::new(FixedTurnContext::new(turn_context(TurnId::generate(
+            &RandomIds,
+        )))),
         ids: Arc::new(RandomIds),
         clock: Arc::new(FixedClock),
         parent_cancel: root.clone(),

@@ -15,19 +15,26 @@
 //!   [`thread`] (FR-20).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod context;
 pub mod event;
 pub mod id;
+pub mod inputs;
 pub mod lifecycle;
 pub mod runner;
 pub mod store;
 pub mod thread;
 
+pub use context::{
+    FixedTurnContext, MAX_SECTION_BYTES, MAX_STEP_CONTEXT_BYTES, StepContext, StepContexts,
+    StepSection, StepSnapshot, StepSource, TurnContext, TurnContextSource, TurnLimits,
+};
 pub use event::{
     THREAD_EVENT_ENTRY, THREAD_META_ENTRY, THREAD_RUNTIME_VERSION, ThreadEvent, ThreadEventPayload,
 };
 pub use id::{
     AgentId, EventId, IdError, IdGenerator, RandomIds, SequentialIds, StepId, ThreadId, TurnId,
 };
+pub use inputs::TurnInputs;
 pub use lifecycle::{LifecycleError, TurnLifecycle, TurnState};
 pub use runner::{RunAgentRunner, TurnOutcome, TurnRequest, TurnRunner};
 pub use store::{MemoryThreadStore, StoreError, ThreadSnapshot, ThreadStore};

@@ -22,7 +22,9 @@ use agent_core::provider::{
 use agent_core::session::{FileSnapshot, Session, SessionError};
 use agent_core::tools::{ToolDispatch, ToolEventSink, ToolInvocation, ToolOutcome};
 use agent_core::{AgentContext, CancellationToken as CoreCancel, Deps, RunConfig};
+use agent_runtime::context::{TurnContext, TurnLimits};
 use agent_runtime::id::{SequentialIds, TurnId};
+use agent_runtime::inputs::TurnInputs;
 use agent_runtime::runner::{RunAgentRunner, TurnOutcome, TurnRequest, TurnRunner};
 use agent_tokenizer::HeuristicCounter;
 use futures_util::StreamExt;
@@ -197,6 +199,28 @@ fn turn_id() -> TurnId {
     TurnId::generate(&SequentialIds::new())
 }
 
+fn request(text: &str) -> TurnRequest {
+    let turn_id = turn_id();
+    TurnRequest {
+        turn_id,
+        text: text.into(),
+        context: TurnContext {
+            turn_id,
+            model: "test-model".into(),
+            reasoning_effort: None,
+            permission_mode: "ask".into(),
+            sandbox: "workspace-write".into(),
+            workspace: std::path::PathBuf::from("/tmp/pyxis-test"),
+            limits: TurnLimits {
+                max_turns: 50,
+                max_output_tokens: 4096,
+                max_pending_inputs: 16,
+            },
+        },
+        inputs: Arc::new(TurnInputs::new()),
+    }
+}
+
 async fn collect(mut rx: mpsc::Receiver<AgentEvent>) -> Vec<AgentEvent> {
     let mut out = Vec::new();
     while let Some(event) = rx.recv().await {
@@ -258,14 +282,7 @@ async fn engine_events_cross_the_seam_without_reimplementing_retry_or_dispatch()
     let (tx, rx) = mpsc::channel(64);
     let observer = tokio::spawn(collect(rx));
     let outcome = runner
-        .run_turn(
-            TurnRequest {
-                turn_id: turn_id(),
-                text: "salut".into(),
-            },
-            tx,
-            CancellationToken::new(),
-        )
+        .run_turn(request("salut"), tx, CancellationToken::new())
         .await;
     let events = observer.await.unwrap();
 
@@ -342,14 +359,7 @@ async fn the_hierarchical_token_interrupts_the_engine_through_the_seam() {
 
     let outcome = tokio::time::timeout(
         Duration::from_secs(5),
-        runner.run_turn(
-            TurnRequest {
-                turn_id: turn_id(),
-                text: "salut".into(),
-            },
-            tx,
-            turn_token,
-        ),
+        runner.run_turn(request("salut"), tx, turn_token),
     )
     .await
     .expect("a cancelled turn must reach its terminal quickly");

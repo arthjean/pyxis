@@ -8,21 +8,33 @@
 //! to grow a loop of its own, US-001's escape hatch applies and the architecture
 //! is wrong.
 
+use std::sync::Arc;
+
 use agent_core::event::AgentEvent;
+use agent_core::input::InputQueue;
 use agent_core::{AgentContext, Deps, run_agent};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::context::TurnContext;
 use crate::id::TurnId;
+use crate::inputs::TurnInputs;
 use crate::lifecycle::TurnState;
 
 /// What the runtime hands to the engine for one turn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct TurnRequest {
     pub turn_id: TurnId,
     /// User input that opened the turn.
     pub text: String,
+    /// Configuration this turn is committed to until its terminal state
+    /// (US-006). A context factory reads it instead of re-reading live settings,
+    /// which is what keeps a mid-turn change from splitting the turn in two.
+    pub context: TurnContext,
+    /// Steering inputs accepted for THIS turn (US-007). Owned by the actor,
+    /// consumed by the engine at its safe points.
+    pub inputs: Arc<TurnInputs>,
 }
 
 /// How a turn ended, as reported by the engine.
@@ -76,8 +88,11 @@ pub trait TurnRunner: Send + Sync {
 
 /// Production runner: drives `agent_core::run_agent`.
 ///
-/// The context factory is what lets US-006 refresh model, tools and project
-/// context per turn without the runtime knowing how a request is built.
+/// The context factory builds the `AgentContext` of a turn from its
+/// [`TurnContext`], and is where a client attaches its own
+/// `agent_core::StepContextSource` (US-006). The runner itself only wires what
+/// belongs to the runtime contract: the turn's cancellation node and its
+/// steering queue.
 pub struct RunAgentRunner<F> {
     deps: Deps,
     context: F,
@@ -113,7 +128,12 @@ where
         events: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
     ) -> TurnOutcome {
-        let ctx = (self.context)(&request);
+        let mut ctx = (self.context)(&request);
+        // US-007: the queue the actor fills is the queue the engine drains. The
+        // runner wires it rather than the factory, so no client can forget it and
+        // silently turn every steer into a post-turn message.
+        ctx.inputs = Some(Arc::clone(&request.inputs) as Arc<dyn InputQueue>);
+
         // US-008 AC1: the turn's token is handed to the engine AS IS. There is no
         // second signal to bridge anymore, so no branch of the tree can be
         // cancelled while the other keeps running.
