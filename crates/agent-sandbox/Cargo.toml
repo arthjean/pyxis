@@ -12,6 +12,9 @@ workspace = true
 # Execution sandbox (US-020): kernel-level FS confinement (Landlock) + allow-list
 # network proxy. Linux-first; explicit degradation elsewhere (AC3).
 [dependencies]
+# The confinement POLICY is pure data owned by `agent-core` (ADR-3): this crate
+# applies it, `agent-tools` evaluates it. Neither one owns it.
+agent-core.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "process", "rt"] }
 thiserror.workspace = true
 

@@ -13,6 +13,11 @@ workspace = true
 rmcp = { workspace = true }
 # `process` (spawn of the stdio server) on top of the workspace tokio features.
 tokio = { workspace = true, features = ["process"] }
+# US-013: the remote transport. `stream` exposes `bytes_stream()`, which the SSE
+# decoder consumes.
+reqwest = { workspace = true, features = ["stream"] }
+sse-stream = { workspace = true }
+futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

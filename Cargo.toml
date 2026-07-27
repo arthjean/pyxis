@@ -85,9 +85,17 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # workspace version, but reserved for `[dev-dependencies]`, never in the
 # graph of the distributed `pyxis` binary.
 insta = "1"
-# MCP (ARCHITECTURE 6): official Rust SDK. stdio client only at first
-# (transport-child-process); SSE/HTTP + OAuth = Phase 2.
-rmcp = { version = "1.7.0", default-features = false, features = ["client", "transport-child-process"] }
+# MCP (ARCHITECTURE 6): official Rust SDK. stdio (transport-child-process) and
+# remote Streamable HTTP (US-013). The `-reqwest` variant of the HTTP transport is
+# NOT enabled on purpose: it pins reqwest 0.13 while the workspace is on 0.12,
+# which would duplicate the whole HTTP/TLS stack. `agent-mcp` implements the
+# `StreamableHttpClient` trait over the workspace client instead. Per-server OAuth
+# stays deferred.
+rmcp = { version = "1.7.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client"] }
+# SSE frame decoding of the Streamable HTTP transport. Same crate (and same 0.2
+# line) as the one `rmcp` decodes with: the `Sse` type crosses the trait boundary,
+# so a second version would not type-check.
+sse-stream = "0.2"
 # internal crates
 agent-tokenizer = { path = "crates/agent-tokenizer" }
 agent-mcp = { path = "crates/agent-mcp" }

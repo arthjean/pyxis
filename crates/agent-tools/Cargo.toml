@@ -26,6 +26,9 @@ walkdir.workspace = true
 # aggregated turn diff (US-018): diff engine already present in the workspace,
 # used here to produce the unified text. No new dependency.
 similar.workspace = true
+# `view_image` (US-011): the provider wire format for an image block is base64.
+# Already in the workspace graph (agent-auth), no new dependency.
+base64.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
