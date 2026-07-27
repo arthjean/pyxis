@@ -31,6 +31,35 @@ pub fn messages(workspace: &Path, date: &str) -> Vec<Message> {
     out
 }
 
+/// Full project context injected per turn: AGENTS.md, then the skill catalog,
+/// then the environment block. The catalog is inserted BEFORE the environment,
+/// which is the volatile part, so the stable prefix stays cacheable. Shared by
+/// the startup composition and by the `/init` refresh (US-019 AC1): both must
+/// produce the same block order, or a refresh would break the cached prefix.
+pub fn project_messages(
+    workspace: &Path,
+    date: &str,
+    skills: &crate::skills::Catalog,
+) -> Vec<Message> {
+    let mut out = messages(workspace, date);
+    if let Some(block) = crate::skills::catalog_block(&skills.skills) {
+        let before_environment = out.len().saturating_sub(1);
+        out.insert(before_environment, Message::user(block));
+    }
+    out
+}
+
+/// Name of the instruction file already present at the root of `workspace`, if
+/// any (US-019 AC2). `symlink_metadata` and not `exists`: a dangling symlink
+/// still counts as a file that is there, and `/init` must not overwrite it
+/// without being told to.
+pub fn instructions_file(workspace: &Path) -> Option<&'static str> {
+    CANDIDATES
+        .iter()
+        .copied()
+        .find(|name| workspace.join(name).symlink_metadata().is_ok())
+}
+
 /// Discovers and concatenates the AGENTS.md from `start` up to the directory containing
 /// `.git` (included). Output order parent -> cwd (the closest last -> wins
 /// on reading), priority to the closest one within budget. `None` when nothing is found.
@@ -255,6 +284,45 @@ mod tests {
         assert!(
             block.contains(&format!("<shell>{}</shell>", shell.label)),
             "bloc: {block}"
+        );
+    }
+
+    /// US-019 AC2: what `/init` must not overwrite. `CLAUDE.md` counts, and so
+    /// does a file that only exists as a symlink.
+    #[test]
+    fn instructions_file_names_what_is_already_there() {
+        let ws = tmp("instructions");
+        assert_eq!(instructions_file(&ws), None);
+        std::fs::write(ws.join("CLAUDE.md"), "x").unwrap();
+        assert_eq!(instructions_file(&ws), Some("CLAUDE.md"));
+        // AGENTS.md has priority in `CANDIDATES`, hence in the answer too.
+        std::fs::write(ws.join("AGENTS.md"), "x").unwrap();
+        assert_eq!(instructions_file(&ws), Some("AGENTS.md"));
+    }
+
+    /// US-019 AC1: the block order of the refresh is the startup order, because
+    /// both go through `project_messages`. The catalog sits BEFORE the volatile
+    /// environment block, which is what keeps the prefix cacheable.
+    #[test]
+    fn project_messages_keeps_the_environment_block_last() {
+        let ws = tmp("project");
+        let catalog = crate::skills::Catalog::default();
+
+        // Startup: no instruction file yet, only the environment block.
+        let before = project_messages(&ws, "2026-07-27", &catalog);
+        assert_eq!(before.len(), 1);
+
+        // What a `/init` turn does, then what the refresh reads back.
+        std::fs::write(ws.join("AGENTS.md"), "Use bun, never npm.").unwrap();
+        let after = project_messages(&ws, "2026-07-27", &catalog);
+        assert!(after[0].text().contains("Use bun, never npm."));
+        assert!(
+            after
+                .last()
+                .map(|m| m.text())
+                .unwrap_or_default()
+                .contains("<environment>"),
+            "le bloc environnement reste en dernier"
         );
     }
 

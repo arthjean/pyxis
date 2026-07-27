@@ -200,6 +200,35 @@ pub struct InteractiveConfig {
     /// (US-005). Resolved there because enforcement happens before this loop
     /// exists.
     pub sandbox_scope: String,
+    /// Configuration layer each displayed value comes from (US-005 AC2), in the
+    /// `agent_tui::SOURCE_KEY_*` vocabulary.
+    pub config_sources: Vec<(&'static str, &'static str)>,
+    /// Profile applied to this session (US-006), shown by `/status`.
+    pub profile: Option<String>,
+}
+
+/// US-005 AC2: provenance is stated only for the values still as the
+/// configuration resolved them. A layer that no longer explains the displayed
+/// value would be worse than no layer at all: it would be a wrong answer to
+/// "where does this come from?".
+fn config_sources_still_valid(
+    cfg: &InteractiveConfig,
+    resolved_model: &str,
+    resolved_effort: &Option<String>,
+    resolved_permission_mode: agent_tools::permission::PermissionMode,
+) -> Vec<(&'static str, &'static str)> {
+    let mut sources = cfg.config_sources.clone();
+    let mut drop_key = |key: &str| sources.retain(|(owned, _)| *owned != key);
+    if cfg.model != resolved_model {
+        drop_key(agent_tui::SOURCE_KEY_MODEL);
+    }
+    if cfg.reasoning_effort != *resolved_effort {
+        drop_key(agent_tui::SOURCE_KEY_REASONING_EFFORT);
+    }
+    if cfg.permission_mode.get() != resolved_permission_mode {
+        drop_key(agent_tui::SOURCE_KEY_PERMISSION_MODE);
+    }
+    sources
 }
 
 /// US-006: one line per modified file, in the same scope as the aggregated turn
@@ -341,6 +370,193 @@ pub(crate) fn read_goal(path: &Path) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Instruction block injected by `/init` (US-019 AC1). Ephemeral for the turn,
+/// like a skill body: the transcript keeps the `/init` the user typed, which is
+/// what says afterwards where the file came from. It asks for a REAL inspection
+/// because an AGENTS.md written from the model's priors would describe a
+/// plausible repository rather than this one.
+const INIT_PROMPT: &str = "\
+Bootstrap the contributor instructions of this repository.
+
+1. Inspect the repository for real: list the root, read the build manifests, \
+locate the sources, the tests and the CI configuration, and read enough of them \
+to describe what is actually there.
+2. Write `AGENTS.md` at the root of the workspace with only what a new \
+contributor cannot guess: the build, test and lint commands that really work \
+here, the layout of the code, the conventions the existing code follows, and \
+the invariants that must not be broken.
+3. Keep it short and factual. Never state a command you have not seen declared \
+somewhere in the repository, and do not restate what the file tree already says.
+
+Write the file with your file-writing tool, then answer with a one-line summary \
+of what you put in it.";
+
+/// What `/init` does about an instruction file that is already there (AC2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitDecision {
+    /// Nothing to protect: the bootstrap turn starts.
+    Bootstrap,
+    /// A file exists and `force` was not typed: the command refuses and names it.
+    Confirm(&'static str),
+    /// A file exists and the user confirmed by typing `/init force`.
+    Overwrite(&'static str),
+}
+
+/// `/init` never overwrites an instruction file on its own: the confirmation is
+/// the explicit `force` argument, decided BEFORE the turn starts. Leaving the
+/// guard to the permission pipeline would not do, because `accept-edits` and
+/// `auto` approve a write without asking anyone.
+fn init_decision(workspace: &Path, arg: &str) -> InitDecision {
+    let forced = arg.trim() == "force";
+    match crate::context::instructions_file(workspace) {
+        Some(name) if forced => InitDecision::Overwrite(name),
+        Some(name) => InitDecision::Confirm(name),
+        None => InitDecision::Bootstrap,
+    }
+}
+
+/// Clipboard helpers tried in order (`/copy`, US-019 AC4). Declared as an argv
+/// and not as a command line: nothing is re-interpreted by a shell between this
+/// table and the process. The first one present on the machine wins.
+#[cfg(target_os = "macos")]
+const CLIPBOARD_HELPERS: &[(&str, &[&str])] = &[("pbcopy", &[])];
+#[cfg(not(target_os = "macos"))]
+const CLIPBOARD_HELPERS: &[(&str, &[&str])] = &[
+    ("wl-copy", &[]),
+    ("xclip", &["-selection", "clipboard"]),
+    ("xsel", &["--clipboard", "--input"]),
+];
+
+/// Raw text of the last assistant answer, as it was streamed (US-019 AC4): no
+/// rendering, no markup added, and the goal marker removed like the headless
+/// output does. `None` when no answer has been displayed yet.
+fn last_assistant_text(state: &AppState) -> Option<String> {
+    state.blocks.iter().rev().find_map(|block| match block {
+        Block::Assistant { text, .. } => {
+            Some(text.replace(GOAL_DONE_MARKER, "").trim_end().to_string())
+        }
+        _ => None,
+    })
+}
+
+/// Names the clipboard failure instead of letting `/copy` claim a copy that did
+/// not happen (AC4). Lists what was tried, because "no clipboard" almost always
+/// means "the helper for this session type is not installed".
+fn clipboard_failure(errors: &[String]) -> String {
+    let tried = CLIPBOARD_HELPERS
+        .iter()
+        .map(|(program, _)| *program)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("no usable clipboard helper (tried: {tried}) — {}", {
+        if errors.is_empty() {
+            "none of them is installed".to_string()
+        } else {
+            errors.join("; ")
+        }
+    })
+}
+
+/// Ceiling on a clipboard helper. They all fork into the background, so the
+/// foreground process returns at once; a helper that does not is a hang of the
+/// WHOLE interface, since this runs inside the event loop.
+const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Writes `text` to the system clipboard and returns the helper that took it.
+async fn copy_to_clipboard(text: &str) -> Result<&'static str, String> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut errors: Vec<String> = Vec::new();
+    for (program, args) in CLIPBOARD_HELPERS {
+        let mut child = match tokio::process::Command::new(program)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            // Not installed on this machine: try the next one, and keep the
+            // reason in case none of them works.
+            Err(err) => {
+                errors.push(format!("{program}: {err}"));
+                continue;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(err) = stdin.write_all(text.as_bytes()).await {
+                errors.push(format!("{program}: {err}"));
+                let _ = child.kill().await;
+                continue;
+            }
+            // Dropped BEFORE the wait: the helper reads until EOF.
+            drop(stdin);
+        }
+        match tokio::time::timeout(CLIPBOARD_TIMEOUT, child.wait()).await {
+            Ok(Ok(status)) if status.success() => return Ok(program),
+            Ok(Ok(status)) => errors.push(format!("{program}: {status}")),
+            Ok(Err(err)) => errors.push(format!("{program}: {err}")),
+            Err(_) => {
+                errors.push(format!(
+                    "{program}: no answer after {}s",
+                    CLIPBOARD_TIMEOUT.as_secs()
+                ));
+                let _ = child.kill().await;
+            }
+        }
+    }
+    Err(clipboard_failure(&errors))
+}
+
+/// What `/logout` can promise and what it cannot (US-019 AC5). Nothing here
+/// reaches OpenAI: the credential is deleted locally, so the ChatGPT session
+/// itself stays open until the user revokes it from their account.
+const LOGOUT_SERVER_NOTE: &str = "The ChatGPT session is NOT revoked server-side: \
+     only the local credential is deleted. Revoke it from your OpenAI account to \
+     close it everywhere.";
+
+/// Local sign-out, shared by `/logout` and `/providers subscription codex
+/// disconnect` so the two cannot drift apart. Keyring first: if the provider
+/// forgot the credential while the stored one survived, the next start would
+/// silently reconnect.
+async fn sign_out(deps: &Deps) -> Result<(), String> {
+    agent_auth::store::delete(KEYRING_ACCOUNT).map_err(|err| format!("keyring: {err}"))?;
+    deps.provider
+        .disconnect_auth()
+        .await
+        .map_err(|err| format!("provider: {err}"))
+}
+
+/// `/hooks`: what is declared, on which event, with which matcher (US-019 AC6).
+/// The argv is shown as declared, since a hook is an argv and not a command line.
+fn hooks_report(specs: &[agent_tools::hooks::HookSpec]) -> String {
+    if specs.is_empty() {
+        return "No hook declared. `hooks` is a global settings key: a workspace file \
+                cannot declare one."
+            .to_string();
+    }
+    let mut lines = vec![format!("{} hook(s) declared:", specs.len())];
+    for spec in specs {
+        let argv = std::iter::once(spec.command.as_str())
+            .chain(spec.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+        // `*` = every tool, `-` = this event watches the session and names no
+        // tool at all. Showing `*` on a lifecycle event would read as "all
+        // tools", which is not the same statement.
+        let matcher = match spec.matcher.as_deref() {
+            Some(tool) => tool,
+            None if spec.event.is_tool_scoped() => "*",
+            None => "-",
+        };
+        lines.push(format!(
+            "  {:<16} matcher={matcher:<10} {argv}",
+            spec.event.name(),
+        ));
+    }
+    lines.join("\n")
 }
 
 /// Builds the turn context (up-to-date conversation + message) and launches
@@ -595,6 +811,13 @@ async fn event_loop(
     mut current_session: PathBuf,
     mcp: Arc<Mutex<agent_mcp::McpRegistry>>,
 ) -> anyhow::Result<()> {
+    // US-005 AC2: the values as the CONFIGURATION resolved them. `/models`,
+    // `/effort` and `/permissions` change them in session, and a layer name would
+    // then describe a value that is no longer the one displayed.
+    let resolved_model = cfg.model.clone();
+    let resolved_effort = cfg.reasoning_effort.clone();
+    let resolved_permission_mode = cfg.permission_mode.get();
+
     let mut state = AppState::new(cfg.model.clone(), cfg.truecolor);
     state.set_permission_mode(permission_mode_id(cfg.permission_mode.get()));
     state.workspace = std::env::current_dir()
@@ -691,6 +914,10 @@ async fn event_loop(
     } else {
         0
     };
+    // US-019: set by `/init`, consumed when the turn it started ends. The project
+    // context is read once, before the turn; only a re-read makes a file written
+    // DURING that turn count for the next one.
+    let mut refresh_context = false;
     let mut pending_resp: Option<oneshot::Sender<agent_tools::permission::ApprovalResponse>> = None;
     // US-019: a hook running after a tool call reports its failures here. The
     // branch closes for good once the emitter is gone (no hook declared, or
@@ -1063,12 +1290,63 @@ async fn event_loop(
                                     running = true;
                                 }
                             },
-                            // resume / new / clear during a turn: we wait (the
-                            // persistence file is being written by the stream).
-                            "/resume" | "/new" | "/clear" if running => {
+                            // resume / new / clear / fork during a turn: we wait
+                            // (the persistence file is being written by the stream).
+                            "/resume" | "/new" | "/clear" | "/fork" if running => {
                                 state.blocks.push(Block::Notice(
                                     "Wait for the current turn to finish.".into(),
                                 ));
+                            }
+                            // US-019: forking writes the CURRENT transcript into a new
+                            // file and keeps working there. The original file is closed
+                            // by `switch_file` and stays on disk exactly as it was: the
+                            // fork appends nothing to it.
+                            "/fork" => {
+                                let msgs =
+                                    conversation.lock().map(|g| g.clone()).unwrap_or_default();
+                                let path = new_session_path(&sessions_dir);
+                                if let Err(e) = session.switch_file(&path, 0) {
+                                    state.blocks.push(Block::Error(format!("fork: {e}")));
+                                } else {
+                                    current_session = path;
+                                    goal_path = goal_path_for_session(&current_session);
+                                    goal_iters_path =
+                                        goal_iters_path_for_session(&current_session);
+                                    deps.provider.set_prompt_cache_key(
+                                        &prompt_cache_key_for_session(&current_session),
+                                    );
+                                    // The copy starts from the current state, goal
+                                    // included: a fork that dropped it would not be
+                                    // the same session.
+                                    if let Some(goal) = cfg.goal.clone() {
+                                        if let Err(e) = std::fs::write(&goal_path, &goal) {
+                                            state
+                                                .blocks
+                                                .push(Block::Error(format!("fork: goal: {e}")));
+                                        }
+                                        if let Err(e) =
+                                            write_goal_iters(&goal_iters_path, goal_iters)
+                                        {
+                                            state
+                                                .blocks
+                                                .push(Block::Error(format!("fork: goal: {e}")));
+                                        }
+                                    }
+                                    // Writes the whole transcript into the fresh file:
+                                    // the cursor was reset to 0 by `switch_file`, so
+                                    // `sync` replays everything instead of a delta.
+                                    if let Err(e) = session.sync(&msgs).await {
+                                        state.blocks.push(Block::Error(format!("fork: {e}")));
+                                    } else {
+                                        state.blocks.push(Block::Notice(format!(
+                                            "Session forked ({} messages). The original stays \
+                                             on disk untouched.",
+                                            msgs.len()
+                                        )));
+                                    }
+                                    state.sessions =
+                                        load_sessions(&sessions_dir, &current_session);
+                                }
                             }
                             "/resume" => {
                                 let path = match crate::resolve_resume_path(&sessions_dir, arg) {
@@ -1200,12 +1478,20 @@ async fn event_loop(
                                     .file_name()
                                     .map(|name| name.to_string_lossy().to_string())
                                     .unwrap_or_default();
+                                let sources = config_sources_still_valid(
+                                    &cfg,
+                                    &resolved_model,
+                                    &resolved_effort,
+                                    resolved_permission_mode,
+                                );
                                 state.blocks.push(Block::Notice(
                                     agent_tui::session_status_report(
                                         &state,
                                         agent_tui::SessionFacts {
                                             session_id: &session_id,
                                             sandbox: &cfg.sandbox_scope,
+                                            config_sources: &sources,
+                                            profile: cfg.profile.as_deref(),
                                         },
                                     ),
                                 ));
@@ -1250,6 +1536,87 @@ async fn event_loop(
                                     }
                                 }
                             }
+                            // US-019: the last answer as it was streamed, no
+                            // rendering applied. A clipboard that refuses is an
+                            // error block, never a silent "copied".
+                            "/copy" => match last_assistant_text(&state) {
+                                None => state
+                                    .blocks
+                                    .push(Block::Notice("No answer to copy yet.".into())),
+                                Some(text) if text.is_empty() => state
+                                    .blocks
+                                    .push(Block::Notice("The last answer is empty.".into())),
+                                Some(text) => match copy_to_clipboard(&text).await {
+                                    Ok(helper) => state.blocks.push(Block::Notice(format!(
+                                        "Last answer copied with {helper} ({} characters).",
+                                        text.chars().count()
+                                    ))),
+                                    Err(e) => {
+                                        state.blocks.push(Block::Error(format!("copy: {e}")))
+                                    }
+                                },
+                            },
+                            // US-019: hooks are declared in the GLOBAL settings only,
+                            // so this list is also the answer to "can this repository
+                            // run something behind my back?".
+                            "/hooks" => state
+                                .blocks
+                                .push(Block::Notice(hooks_report(&cfg.hook_specs))),
+                            "/logout" if !state.provider_connected => state
+                                .blocks
+                                .push(Block::Notice("Already signed out.".into())),
+                            "/logout" => match sign_out(&deps).await {
+                                Ok(()) => {
+                                    state.provider_connected = false;
+                                    state.blocks.push(Block::Notice(format!(
+                                        "Signed out: local credential deleted. \
+                                         {LOGOUT_SERVER_NOTE}"
+                                    )));
+                                }
+                                Err(e) => {
+                                    state.blocks.push(Block::Error(format!("logout: {e}")))
+                                }
+                            },
+                            "/init" if running => state.blocks.push(Block::Notice(
+                                "Wait for the current turn to finish.".into(),
+                            )),
+                            "/init" => match init_decision(&cfg.workspace, arg) {
+                                InitDecision::Confirm(name) => {
+                                    state.blocks.push(Block::Notice(format!(
+                                        "{name} already exists at the workspace root. Run \
+                                         `/init force` to have it rewritten."
+                                    )));
+                                }
+                                decision => {
+                                    if let InitDecision::Overwrite(name) = decision {
+                                        state.blocks.push(Block::Notice(format!(
+                                            "Rewriting {name} (confirmed by `force`)."
+                                        )));
+                                    }
+                                    // The transcript keeps `/init`; the instructions
+                                    // travel as an ephemeral block, exactly like a
+                                    // skill body.
+                                    state.push_user(cmd);
+                                    #[cfg(feature = "codex_tui_parity")]
+                                    parity_surface.apply_update(
+                                        parity_mapper.map_user_message(cmd.to_string()),
+                                    );
+                                    active_turn.start(
+                                        &conversation,
+                                        &cfg,
+                                        &deps,
+                                        &agent_tx,
+                                        cmd,
+                                        true,
+                                        Some(INIT_PROMPT.to_string()),
+                                    );
+                                    running = true;
+                                    // AC1: the project context was read before this
+                                    // turn wrote the file, so it is re-read when the
+                                    // turn ends, no restart involved.
+                                    refresh_context = true;
+                                }
+                            },
                             "/compact" if running => state.blocks.push(Block::Notice(
                                 "A turn is in progress.".into(),
                             )),
@@ -1312,23 +1679,22 @@ async fn event_loop(
                                         ));
                                     }
                                 }
+                                // US-019: same sign-out path as `/logout`, so the two
+                                // surfaces cannot promise different things.
                                 "subscription codex disconnect" => {
                                     if state.provider_connected {
-                                        if let Err(e) = agent_auth::store::delete(KEYRING_ACCOUNT) {
-                                            state
-                                                .blocks
-                                                .push(Block::Error(format!("disconnect: {e}")));
-                                        } else if let Err(e) = deps.provider.disconnect_auth().await {
-                                            state.blocks.push(Block::Error(format!(
-                                                "provider disconnect: {e}"
-                                            )));
-                                        } else {
+                                        match sign_out(&deps).await {
+                                            Ok(()) => {
                                                 state.provider_connected = false;
-                                                state.blocks.push(Block::Notice(
-                                                    "Disconnected from Codex (credential removed). \
-                                                     Log in again before the next model call."
-                                                        .into(),
-                                                ));
+                                                state.blocks.push(Block::Notice(format!(
+                                                    "Disconnected from Codex (credential \
+                                                     removed). Log in again before the next \
+                                                     model call. {LOGOUT_SERVER_NOTE}"
+                                                )));
+                                            }
+                                            Err(e) => state
+                                                .blocks
+                                                .push(Block::Error(format!("disconnect: {e}"))),
                                         }
                                     } else {
                                         state
@@ -1435,6 +1801,26 @@ async fn event_loop(
                     }
                     if stop {
                         active_turn.finish();
+                        // US-019 AC1: re-read BEFORE any continuation turn is
+                        // launched below, so the goal loop sees the fresh context too.
+                        if std::mem::take(&mut refresh_context) {
+                            cfg.context_messages = crate::context::project_messages(
+                                &cfg.workspace,
+                                &crate::context::today_utc(),
+                                &cfg.skills,
+                            );
+                            state.blocks.push(Block::Notice(
+                                match crate::context::instructions_file(&cfg.workspace) {
+                                    Some(name) => format!(
+                                        "{name} is part of the project context from the next \
+                                         turn on."
+                                    ),
+                                    None => "No instruction file written: the project context \
+                                             is unchanged."
+                                        .to_string(),
+                                },
+                            ));
+                        }
                         // Goal loop: on a "clean" EndTurn with an active
                         // goal, we re-prompt as long as the completion marker is
                         // not emitted (the model does not decide alone to stop).
@@ -2063,9 +2449,10 @@ pub(crate) fn new_session_path(dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        GOAL_DONE_MARKER, approvals_report, compose_system, count_encrypted_reasoning,
-        mcp_requires_trust, scrub_encrypted_reasoning, session_path_from_arg, take_goal_done,
-        workspace_file_mentions,
+        CLIPBOARD_HELPERS, GOAL_DONE_MARKER, INIT_PROMPT, InitDecision, LOGOUT_SERVER_NOTE,
+        approvals_report, clipboard_failure, compose_system, count_encrypted_reasoning,
+        hooks_report, init_decision, last_assistant_text, mcp_requires_trust,
+        scrub_encrypted_reasoning, session_path_from_arg, take_goal_done, workspace_file_mentions,
     };
     use agent_core::message::{ContentBlock, Message};
     use agent_tui::{AppState, Block};
@@ -2255,6 +2642,152 @@ mod tests {
         assert!(session_path_from_arg(sessions, "/tmp/123.jsonl").is_none());
         assert!(session_path_from_arg(sessions, "nested/123.jsonl").is_none());
         assert!(session_path_from_arg(sessions, "123.txt").is_none());
+    }
+
+    fn tmp_workspace(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pyxis-us019-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// US-019 AC1/AC2: with nothing to protect the bootstrap turn starts; with an
+    /// instruction file already there it does NOT, and the file is named.
+    #[test]
+    fn init_refuses_to_overwrite_without_an_explicit_force() {
+        let ws = tmp_workspace("init");
+        assert_eq!(init_decision(&ws, ""), InitDecision::Bootstrap);
+        assert_eq!(init_decision(&ws, "force"), InitDecision::Bootstrap);
+
+        std::fs::write(ws.join("AGENTS.md"), "rules").unwrap();
+        assert_eq!(init_decision(&ws, ""), InitDecision::Confirm("AGENTS.md"));
+        // Anything that is not the confirmation keeps refusing.
+        assert_eq!(
+            init_decision(&ws, "yes"),
+            InitDecision::Confirm("AGENTS.md")
+        );
+        assert_eq!(
+            init_decision(&ws, " force "),
+            InitDecision::Overwrite("AGENTS.md")
+        );
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    /// US-019 AC2: the tolerated `CLAUDE.md` fallback is protected the same way,
+    /// and so is a dangling symlink, which `exists()` would have declared absent.
+    #[test]
+    fn init_protects_every_instruction_file_shape() {
+        let ws = tmp_workspace("init-shapes");
+        std::fs::write(ws.join("CLAUDE.md"), "rules").unwrap();
+        assert_eq!(init_decision(&ws, ""), InitDecision::Confirm("CLAUDE.md"));
+        let _ = std::fs::remove_dir_all(&ws);
+
+        #[cfg(unix)]
+        {
+            let ws = tmp_workspace("init-dangling");
+            std::os::unix::fs::symlink(ws.join("gone.md"), ws.join("AGENTS.md")).unwrap();
+            assert_eq!(init_decision(&ws, ""), InitDecision::Confirm("AGENTS.md"));
+            let _ = std::fs::remove_dir_all(&ws);
+        }
+    }
+
+    /// US-019 AC4: the LAST answer, raw, with the goal marker removed like the
+    /// headless output does. Nothing to copy is not an empty copy.
+    #[test]
+    fn copy_takes_the_last_answer_raw() {
+        let mut state = AppState::new("gpt-5", false);
+        assert_eq!(last_assistant_text(&state), None);
+
+        state.blocks.push(Block::Assistant {
+            text: "first".into(),
+            streaming: false,
+        });
+        state.blocks.push(Block::Assistant {
+            text: format!("**bold** answer\n{GOAL_DONE_MARKER}\n"),
+            streaming: false,
+        });
+        state.blocks.push(Block::Notice("a notice".into()));
+        assert_eq!(
+            last_assistant_text(&state).as_deref(),
+            Some("**bold** answer"),
+            "markup kept as streamed, marker removed"
+        );
+    }
+
+    /// US-019 AC4: a clipboard that cannot be reached is NAMED. The message says
+    /// what was tried, otherwise "no clipboard" is unactionable.
+    #[test]
+    fn a_clipboard_failure_names_what_was_tried() {
+        let message = clipboard_failure(&[]);
+        for (program, _) in CLIPBOARD_HELPERS {
+            assert!(message.contains(program), "message: {message}");
+        }
+        let detailed = clipboard_failure(&["wl-copy: exit 1".to_string()]);
+        assert!(detailed.contains("wl-copy: exit 1"), "message: {detailed}");
+    }
+
+    /// US-019 AC1: what the bootstrap turn asks for. Pinned because the ONLY
+    /// thing that makes the written `AGENTS.md` describe THIS repository rather
+    /// than a plausible one is that the prompt demands a real inspection.
+    #[test]
+    fn the_init_prompt_demands_an_inspection_and_names_the_file() {
+        assert!(INIT_PROMPT.contains("AGENTS.md"), "{INIT_PROMPT}");
+        assert!(INIT_PROMPT.contains("for real"), "{INIT_PROMPT}");
+        assert!(
+            INIT_PROMPT.contains("Never state a command you have not seen declared"),
+            "{INIT_PROMPT}"
+        );
+    }
+
+    /// US-019 AC5: signing out deletes a LOCAL credential and nothing else. The
+    /// sentence saying so is pinned, because dropping it would leave the user
+    /// believing the ChatGPT session is closed when it is not.
+    #[test]
+    fn the_sign_out_message_states_the_absence_of_server_revocation() {
+        assert!(LOGOUT_SERVER_NOTE.contains("NOT revoked server-side"));
+        assert!(LOGOUT_SERVER_NOTE.contains("local credential"));
+        assert!(LOGOUT_SERVER_NOTE.contains("OpenAI account"));
+    }
+
+    /// US-019 AC6: every declared hook is listed with its event and its matcher.
+    /// A lifecycle hook names no tool, and that is shown as `*` rather than left
+    /// blank, which would read as an unknown.
+    #[test]
+    fn hooks_are_listed_with_event_and_matcher() {
+        use agent_tools::hooks::{HookEvent, HookSpec};
+
+        assert!(hooks_report(&[]).contains("No hook declared"));
+
+        let report = hooks_report(&[
+            HookSpec {
+                event: HookEvent::PreToolUse,
+                matcher: Some("Bash".into()),
+                command: "guard".into(),
+                args: vec!["--strict".into()],
+            },
+            HookSpec {
+                event: HookEvent::SessionStart,
+                matcher: None,
+                command: "notify".into(),
+                args: Vec::new(),
+            },
+        ]);
+        assert!(report.contains("2 hook(s) declared"), "{report}");
+        assert!(report.contains("PreToolUse"), "{report}");
+        assert!(report.contains("matcher=Bash"), "{report}");
+        assert!(report.contains("guard --strict"), "{report}");
+        assert!(report.contains("SessionStart"), "{report}");
+        // A lifecycle event names no tool: `-`, not `*` which would read as
+        // "every tool".
+        assert!(report.contains("matcher=-"), "{report}");
+
+        let every_tool = hooks_report(&[HookSpec {
+            event: HookEvent::PostToolUse,
+            matcher: None,
+            command: "audit".into(),
+            args: Vec::new(),
+        }]);
+        assert!(every_tool.contains("matcher=*"), "{every_tool}");
     }
 
     #[test]

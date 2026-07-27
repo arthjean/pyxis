@@ -21,7 +21,7 @@ expression: "harness::frame(\"command_menu\", &s, W, H)"
   /goal         Set a goal and work until it is done
   /providers    Configure the authentication provider
   /mcp          Inspect MCP servers
-  1-8/17 · ↑↓ navigate · enter run · tab complete · esc cancel
+  1-8/22 · ↑↓ navigate · enter run · tab complete · esc cancel
 ────────────────────────────────────────────────────────────────────────────────
 › /
 ────────────────────────────────────────────────────────────────────────────────

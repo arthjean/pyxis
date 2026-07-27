@@ -75,16 +75,29 @@ pub const COMMANDS: &[(&str, &str, bool)] = &[
     ("/mcp", "Inspect MCP servers", true),
     ("/resume", "Resume a past conversation", true),
     (
+        "/fork",
+        "Duplicate this session and continue in the copy",
+        false,
+    ),
+    (
         "/approvals",
         "List the answers remembered this session (clear to forget)",
         false,
     ),
     ("/status", "Show the session configuration", false),
     ("/usage", "Show token consumption and quota", false),
+    ("/hooks", "List the declared hooks", false),
     ("/diff", "Show the current workspace changes", false),
+    ("/copy", "Copy the last answer to the clipboard", false),
+    (
+        "/init",
+        "Write an AGENTS.md from a repository inspection",
+        false,
+    ),
     ("/compact", "Compact the context now", false),
     ("/new", "Start a new session and clear context", false),
     ("/clear", "Clear context and start fresh", false),
+    ("/logout", "Sign out and delete the local credential", false),
     ("/quit", "Quit Pyxis", false),
 ];
 
@@ -2748,6 +2761,27 @@ mod tests {
         // Enter on the placeholder dispatches nothing.
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(action, InputAction::None);
+    }
+
+    /// US-019: the five commands of the epic are in the single source, and each
+    /// executes on Enter rather than opening a submenu (`force` and `clear` are
+    /// typed, not picked).
+    #[test]
+    fn the_session_commands_of_us019_are_declared_and_directly_executable() {
+        for name in ["/init", "/fork", "/copy", "/logout", "/hooks"] {
+            let entry = COMMANDS.iter().find(|(id, _, _)| *id == name);
+            assert!(entry.is_some(), "{name} absente de COMMANDS");
+            if let Some((_, description, takes_arg)) = entry {
+                assert!(!description.is_empty(), "{name} sans description");
+                assert!(!takes_arg, "{name} ne doit pas ouvrir de sous-menu");
+            }
+        }
+        // `/copy` must not steal the `/c` prefix from `/compact` and `/clear`.
+        let mut s = AppState::new("gpt-5", false);
+        s.set_input("/co".into());
+        let ids: Vec<_> = s.menu_items().into_iter().map(|it| it.id).collect();
+        assert!(ids.contains(&"/compact".to_string()), "{ids:?}");
+        assert!(ids.contains(&"/copy".to_string()), "{ids:?}");
     }
 
     #[test]
