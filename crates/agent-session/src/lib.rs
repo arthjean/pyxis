@@ -530,6 +530,22 @@ fn scan_session(path: &Path) -> Result<SessionScan, SessionError> {
             continue;
         }
         match serde_json::from_str::<SessionEntry>(parsed) {
+            // A binding line is `Unknown` to a v1 reader, and the listing is
+            // exactly where it matters: it is the only place a branch declares
+            // its parent (US-011). Re-parsed here rather than in the hot path,
+            // so a session that carries none pays nothing.
+            Ok(SessionEntry::Unknown) => {
+                if let Ok(ThreadLine::ThreadMeta {
+                    thread_id, origin, ..
+                }) = serde_json::from_str::<ThreadLine>(parsed)
+                {
+                    // Last binding wins, as at resume: a materialized branch
+                    // inherits the binding of its source before declaring its
+                    // own.
+                    scan.thread_id = Some(thread_id);
+                    scan.origin = origin;
+                }
+            }
             Ok(entry) => apply_scan_entry(&mut scan, &mut pending_clear, entry)?,
             Err(_) if !has_newline => break,
             Err(e) => return Err(SessionError::Serde(format!("corrupt line: {e}"))),
@@ -543,6 +559,8 @@ struct SessionScan {
     message_count: usize,
     summary: Option<String>,
     prompts: Vec<String>,
+    thread_id: Option<ThreadId>,
+    origin: Option<ForkOrigin>,
 }
 
 fn apply_scan_entry(
@@ -609,6 +627,20 @@ pub struct SessionInfo {
     pub summary: String,
     pub message_count: usize,
     pub modified: SystemTime,
+    /// Thread this session is bound to. `None` for a v1 session the runtime
+    /// never opened.
+    pub thread_id: Option<ThreadId>,
+    /// Branch this session was cut from (US-011). Present makes it a branch,
+    /// and names both its parent and the turn it was cut at, without opening
+    /// the thread.
+    pub origin: Option<ForkOrigin>,
+}
+
+impl SessionInfo {
+    /// True when this session is a branch of another one.
+    pub fn is_branch(&self) -> bool {
+        self.origin.is_some()
+    }
 }
 
 /// Lists the resumable sessions of a directory (`*.jsonl`), sorted from the most
@@ -648,6 +680,8 @@ pub fn list_sessions(dir: &Path, exclude: Option<&Path>) -> Vec<SessionInfo> {
             summary: scan.summary.unwrap_or_default(),
             message_count: scan.message_count,
             modified,
+            thread_id: scan.thread_id,
+            origin: scan.origin,
         });
     }
     out.sort_by(|a, b| b.modified.cmp(&a.modified).then_with(|| a.id.cmp(&b.id)));
@@ -1069,6 +1103,96 @@ mod tests {
         assert_eq!(list[0].summary, "session B");
         assert_eq!(list[0].message_count, 2);
         drop(a);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// US-011: a branch is inspectable FROM THE LISTING. Nothing here opens a
+    /// thread or reads a transcript: the parent and the cut point come from the
+    /// branch's own binding line, which is why they survive the deletion of the
+    /// source.
+    #[tokio::test]
+    async fn a_listed_branch_names_its_parent_and_its_fork_point() {
+        use agent_runtime::id::{EventId, SequentialIds, ThreadId, TurnId};
+        use agent_runtime::lifecycle::TurnState;
+        use agent_runtime::store::{ForkPoint, ThreadStore};
+
+        let dir = tmp("list-branch");
+        std::fs::create_dir_all(&dir).unwrap();
+        let parent_path = dir.join("parent.jsonl");
+
+        let ids = SequentialIds::new();
+        let parent_thread_id = ThreadId::generate(&ids);
+        let child_thread_id = ThreadId::generate(&ids);
+        let fork_turn_id = TurnId::generate(&ids);
+
+        let store = JsonlThreadStore::open(&parent_path).unwrap();
+        store.create(&parent_thread_id).await.unwrap();
+        // A listed session needs a transcript; the branch inherits it.
+        std::fs::write(
+            &parent_path,
+            format!(
+                "{}{}\n",
+                std::fs::read_to_string(&parent_path).unwrap(),
+                serde_json::to_string(&SessionEntry::Message(Message::user("la question")))
+                    .unwrap()
+            ),
+        )
+        .unwrap();
+        let cut = agent_runtime::event::ThreadEvent {
+            event_id: EventId::generate(&ids),
+            thread_id: parent_thread_id,
+            seq: 1,
+            at_ms: 1,
+            payload: agent_runtime::event::ThreadEventPayload::TurnStateChanged {
+                turn_id: fork_turn_id,
+                from: Some(TurnState::Running),
+                to: TurnState::Completed,
+                cause: None,
+                context: None,
+            },
+        };
+        store.append(&cut).await.unwrap();
+        let point = ForkPoint {
+            parent_thread_id,
+            child_thread_id,
+            fork_turn_id,
+            fork_event_id: cut.event_id,
+        };
+        let branch = store.fork(&point).await.unwrap();
+        branch.close().await.unwrap();
+        store.close().await.unwrap();
+
+        let listed = list_sessions(&dir, None);
+        let parent = listed
+            .iter()
+            .find(|s| s.id == "parent.jsonl")
+            .expect("the source is listed");
+        assert_eq!(parent.thread_id, Some(parent_thread_id));
+        assert!(!parent.is_branch(), "the source is not a branch");
+
+        let child = listed
+            .iter()
+            .find(|s| s.id == format!("{child_thread_id}.jsonl"))
+            .expect("the branch is listed");
+        assert_eq!(child.thread_id, Some(child_thread_id));
+        assert!(child.is_branch());
+        assert_eq!(child.origin, Some(point.origin()));
+        assert_eq!(
+            child.origin.map(|o| o.parent_thread_id),
+            Some(parent_thread_id)
+        );
+        assert_eq!(child.origin.map(|o| o.fork_turn_id), Some(fork_turn_id));
+        assert_eq!(child.message_count, parent.message_count);
+
+        // The relation is read from the branch alone: deleting the source
+        // changes nothing about what the listing can say.
+        std::fs::remove_file(&parent_path).unwrap();
+        let after = list_sessions(&dir, None);
+        let child = after
+            .iter()
+            .find(|s| s.id == format!("{child_thread_id}.jsonl"))
+            .expect("the branch outlives its source in the listing");
+        assert_eq!(child.origin, Some(point.origin()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
