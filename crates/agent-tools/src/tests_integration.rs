@@ -1822,12 +1822,30 @@ async fn plan_mode_blocks_mutations() {
     assert_eq!(ws.read("f.txt"), "abc", "Plan should not mutate anything");
 }
 
+/// EP-003 success metric: the tools exposed to the model. Six predate the epic,
+/// the four ported families add five tools (`exec_command` and `write_stdin`
+/// being one family split in two, as Codex does).
 #[tokio::test]
-async fn default_registry_exposes_six_tool_specs() {
+async fn default_registry_exposes_every_native_tool_spec() {
     let reg = crate::default_registry("/tmp", PermissionMode::Default, allow_approver());
     let specs = reg.tool_specs();
     let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, ["bash", "edit", "glob", "grep", "read", "write"]);
+    assert_eq!(
+        names,
+        [
+            "apply_patch",
+            "bash",
+            "edit",
+            "exec_command",
+            "glob",
+            "grep",
+            "read",
+            "update_plan",
+            "view_image",
+            "write",
+            "write_stdin",
+        ]
+    );
     assert!(specs.iter().all(|s| !s.description.is_empty()));
     for spec in specs {
         spec.validate().unwrap();
@@ -2228,92 +2246,715 @@ async fn a_refused_call_triggers_no_post_hook() {
     assert!(hooks.post_calls.lock().unwrap().is_empty());
 }
 
-// ══════════════════════════ US-020: trace structurée ══════════════════════════
+// ══════════════════════════ EP-001 ══════════════════════════
 
-/// Collects the trace of one dispatch at a given level, on the current thread
-/// only: the process-wide subscriber belongs to the binary (FR-15).
-async fn traced_dispatch(level: tracing::Level, calls: Vec<ToolInvocation>) -> String {
-    let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let sink = Arc::clone(&buffer);
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_ansi(false)
-        .with_writer(move || SharedBuffer(Arc::clone(&sink)))
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+/// Tool that fails as if the confinement refused it, then succeeds once the
+/// perimeter is widened. The "widening" is a shared counter the escalator
+/// raises and the guard lowers: the same shape a real one-call grant has.
+struct SandboxProbe {
+    denial: crate::sandbox::SandboxDenial,
+    widened: Arc<AtomicUsize>,
+    calls: Arc<AtomicUsize>,
+}
 
+#[async_trait]
+impl Tool for SandboxProbe {
+    type Input = serde_json::Value;
+    fn name(&self) -> &str {
+        "confined"
+    }
+    fn description(&self) -> String {
+        "confined".into()
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+    fn permission(&self, _i: &Self::Input, _c: &PermCtx) -> PermissionDecision {
+        PermissionDecision::Allow
+    }
+    async fn call(&self, _i: Self::Input, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.widened.load(Ordering::SeqCst) > 0 {
+            Ok(ToolOutput::text("ran under the widened perimeter"))
+        } else {
+            Ok(ToolOutput::error("blocked").with_denial(self.denial.clone()))
+        }
+    }
+}
+
+struct WideningGuard(Arc<AtomicUsize>);
+
+impl Drop for WideningGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn network_denial() -> crate::sandbox::SandboxDenial {
+    crate::sandbox::SandboxDenial::Network {
+        host: "api.example.test".to_string(),
+        allowed: "none".to_string(),
+    }
+}
+
+/// Escalator that really widens, and records what it was asked to lift.
+struct WideningEscalator {
+    widened: Arc<AtomicUsize>,
+    seen: Arc<Mutex<Vec<crate::sandbox::SandboxDenial>>>,
+}
+
+impl crate::sandbox::SandboxEscalator for WideningEscalator {
+    fn can_lift(&self, denial: &crate::sandbox::SandboxDenial) -> bool {
+        denial.is_escalatable()
+    }
+    fn lift(
+        &self,
+        denial: &crate::sandbox::SandboxDenial,
+    ) -> Option<crate::sandbox::EscalationGuard> {
+        self.seen.lock().unwrap().push(denial.clone());
+        self.widened.fetch_add(1, Ordering::SeqCst);
+        Some(Box::new(WideningGuard(Arc::clone(&self.widened))))
+    }
+}
+
+fn widening_escalator(
+    widened: Arc<AtomicUsize>,
+    seen: Arc<Mutex<Vec<crate::sandbox::SandboxDenial>>>,
+) -> Arc<dyn crate::sandbox::SandboxEscalator> {
+    Arc::new(WideningEscalator { widened, seen })
+}
+
+/// Escalator that can lift nothing: proves that a cause outside its reach is
+/// never turned into a question (US-004 AC6).
+struct PowerlessEscalator;
+
+impl crate::sandbox::SandboxEscalator for PowerlessEscalator {
+    fn can_lift(&self, _denial: &crate::sandbox::SandboxDenial) -> bool {
+        false
+    }
+    fn lift(
+        &self,
+        _denial: &crate::sandbox::SandboxDenial,
+    ) -> Option<crate::sandbox::EscalationGuard> {
+        None
+    }
+}
+
+// US-002 AC2/AC3: the hole `docs/CURRENT_STATUS.md` documented is closed, and it
+// is closed BEFORE the command runs, not by observing its damage afterwards.
+#[tokio::test]
+async fn bash_cannot_write_into_a_protected_subpath() {
+    let ws = TempWs::new("bash-protected");
+    std::fs::create_dir_all(ws.path().join(".git/hooks")).unwrap();
+    std::fs::create_dir_all(ws.path().join(".pyxis")).unwrap();
+    let reg = Registry::builder(ws.path())
+        .mode(PermissionMode::BypassPermissions)
+        .approver(allow_approver())
+        .register(Bash)
+        .build();
+
+    for (command, victim) in [
+        ("echo evil > .git/hooks/pre-commit", ".git/hooks/pre-commit"),
+        ("echo evil > .pyxis/config.toml", ".pyxis/config.toml"),
+    ] {
+        let out = reg
+            .dispatch(vec![call(
+                "b",
+                "bash",
+                serde_json::json!({ "command": command }),
+            )])
+            .await;
+        let outcome = by_id(&out, "b");
+        assert!(outcome.is_error, "{command} doit échouer: {outcome:?}");
+        assert!(
+            outcome.content.contains("protected path"),
+            "{command}: {}",
+            outcome.content
+        );
+        assert_eq!(
+            outcome.error_kind,
+            Some(ToolErrorKind::Validation),
+            "le refus précède la permission, donc c'est une validation"
+        );
+        assert!(
+            !ws.path().join(victim).exists(),
+            "{victim} ne doit pas avoir été écrit"
+        );
+    }
+}
+
+// US-004 AC1/AC2/AC3: a confinement failure is named, offered for escalation,
+// and the widening dies with the call.
+#[tokio::test]
+async fn a_sandbox_denial_is_escalated_for_one_call_only() {
+    let widened = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (approver, asks) = RecordingApprover::new(true);
+    let reg = Registry::builder("/tmp")
+        .approver(approver)
+        .sandbox_escalator(widening_escalator(Arc::clone(&widened), Arc::clone(&seen)))
+        .register(SandboxProbe {
+            denial: network_denial(),
+            widened: Arc::clone(&widened),
+            calls: Arc::clone(&calls),
+        })
+        .build();
+
+    let out = reg
+        .dispatch(vec![call("a", "confined", serde_json::json!({}))])
+        .await;
+
+    let outcome = by_id(&out, "a");
+    assert!(
+        !outcome.is_error,
+        "la réexécution escaladée doit réussir: {outcome:?}"
+    );
+    assert_eq!(outcome.content, "ran under the widened perimeter");
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "un seul réessai");
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        &[network_denial()],
+        "l'escalade porte sur la cause identifiée"
+    );
+    // AC3: the widening does not survive the call.
+    assert_eq!(widened.load(Ordering::SeqCst), 0);
+    // AC3/AC4: never rememberable, so it can never become a session policy.
+    let asks = asks.lock().unwrap();
+    assert_eq!(asks.len(), 1);
+    assert!(!asks[0].memoizable);
+    assert!(asks[0].reason.contains("api.example.test"));
+}
+
+// US-004 AC4: the most permissive mode does not make it automatic.
+#[tokio::test]
+async fn escalation_stays_an_explicit_decision_under_bypass_permissions() {
+    let widened = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (approver, asks) = RecordingApprover::new(false);
+    let reg = Registry::builder("/tmp")
+        .mode(PermissionMode::BypassPermissions)
+        .approver(approver)
+        .sandbox_escalator(widening_escalator(Arc::clone(&widened), seen))
+        .register(SandboxProbe {
+            denial: network_denial(),
+            widened: Arc::clone(&widened),
+            calls: Arc::clone(&calls),
+        })
+        .build();
+
+    let out = reg
+        .dispatch(vec![call("a", "confined", serde_json::json!({}))])
+        .await;
+
+    // The question WAS asked even under Bypass, and the refusal stands.
+    assert_eq!(asks.lock().unwrap().len(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "aucun réessai sans accord");
+    let outcome = by_id(&out, "a");
+    assert!(outcome.is_error);
+    assert_eq!(widened.load(Ordering::SeqCst), 0);
+}
+
+// US-004 AC5: recent untrusted taint forces the confirmation whatever the mode.
+#[tokio::test]
+async fn escalation_is_taint_forced_when_the_turn_read_untrusted_content() {
+    let widened = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (approver, asks) = RecordingApprover::new(false);
     let reg = Registry::builder("/tmp")
         .mode(PermissionMode::DontAsk)
-        .approver(allow_approver())
-        .register(Probe::new("p", true, true))
+        .approver(approver)
+        .initial_taint_recent(true)
+        .sandbox_escalator(widening_escalator(Arc::clone(&widened), seen))
+        .register(SandboxProbe {
+            denial: network_denial(),
+            widened,
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
         .build();
-    let _ = reg.dispatch(calls).await;
 
-    let bytes = buffer.lock().unwrap().clone();
-    String::from_utf8_lossy(&bytes).into_owned()
+    let _ = reg
+        .dispatch(vec![call("a", "confined", serde_json::json!({}))])
+        .await;
+
+    let asks = asks.lock().unwrap();
+    let escalation = asks.last().expect("une escalade a été proposée");
+    assert!(
+        escalation.taint_forced,
+        "l'escalade sous taint doit être forcée: {escalation:?}"
+    );
+    assert!(!escalation.memoizable);
 }
 
-struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for SharedBuffer {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self.0.lock() {
-            Ok(mut sink) => sink.extend_from_slice(buf),
-            Err(poisoned) => poisoned.into_inner().extend_from_slice(buf),
-        }
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-/// US-020 AC3: the crate emits structured events, collected by whoever installs a
-/// subscriber.
+// US-004 AC6: fail-closed on the doubt. A cause nobody can lift, or no
+// escalator at all, keeps the original failure and asks nothing.
 #[tokio::test]
-async fn the_dispatch_emits_a_structured_decision() {
-    let trace = traced_dispatch(
-        tracing::Level::DEBUG,
-        vec![call("a", "p", serde_json::json!({"secret": "hunter2"}))],
+async fn a_cause_that_cannot_be_lifted_is_never_offered() {
+    for escalator in [
+        // The kernel FS perimeter: named, never escalatable.
+        None,
+        // An escalator that cannot lift this particular cause.
+        Some(Arc::new(PowerlessEscalator) as Arc<dyn crate::sandbox::SandboxEscalator>),
+    ] {
+        let widened = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (approver, asks) = RecordingApprover::new(true);
+        let denial = if escalator.is_some() {
+            network_denial()
+        } else {
+            crate::sandbox::SandboxDenial::Filesystem
+        };
+        let mut builder = Registry::builder("/tmp")
+            .approver(approver)
+            .register(SandboxProbe {
+                denial,
+                widened: Arc::clone(&widened),
+                calls: Arc::clone(&calls),
+            });
+        if let Some(escalator) = escalator {
+            builder = builder.sandbox_escalator(escalator);
+        }
+        let reg = builder.build();
+
+        let out = reg
+            .dispatch(vec![call("a", "confined", serde_json::json!({}))])
+            .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "aucun réessai");
+        assert!(by_id(&out, "a").is_error);
+        assert_eq!(widened.load(Ordering::SeqCst), 0);
+        assert!(
+            asks.lock().unwrap().is_empty(),
+            "aucune question ne doit être posée sur une cause non levable"
+        );
+    }
+}
+
+// ══════════════════════════ EP-003 ══════════════════════════
+// The four ported tool families, checked THROUGH the pipeline: what a tool
+// promises alone matters less than what the registry actually lets through.
+
+/// Runs a batch and returns the outcomes plus every dispatch event, so a test
+/// can assert on what the client receives, not only on what the model reads.
+async fn dispatch_capturing(
+    reg: &Registry,
+    calls: Vec<ToolInvocation>,
+) -> (Vec<ToolOutcome>, Vec<agent_core::tools::ToolDispatchEvent>) {
+    use agent_core::tools::{ToolDispatch, ToolEventSink};
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let outcomes = ToolDispatch::dispatch(reg, calls, ToolEventSink::new(tx)).await;
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    (outcomes, events)
+}
+
+// US-009 AC3: a valid plan reaches the client as an event, beside the textual
+// acknowledgement the model gets.
+#[tokio::test]
+async fn a_valid_plan_reaches_the_client_as_an_event() {
+    let ws = TempWs::new("plan-event");
+    let reg = Registry::builder(ws.path())
+        .mode(PermissionMode::Default)
+        .approver(Arc::new(crate::permission::AutoDeny))
+        .register(crate::UpdatePlan)
+        .build();
+
+    let (out, events) = dispatch_capturing(
+        &reg,
+        vec![call(
+            "p",
+            "update_plan",
+            serde_json::json!({
+                "explanation": "cadrage",
+                "plan": [
+                    { "step": "lire", "status": "completed" },
+                    { "step": "écrire", "status": "in_progress" }
+                ]
+            }),
+        )],
     )
     .await;
 
-    assert!(trace.contains("tool permission resolved"), "{trace}");
-    assert!(trace.contains("pyxis::tools"), "{trace}");
-    assert!(trace.contains("tool=p"), "{trace}");
-    assert!(trace.contains("resolved=Allow"), "{trace}");
-}
-
-/// US-020 AC6: the arguments of a call are content. They appear at the highest
-/// verbosity, and nowhere below it.
-#[tokio::test]
-async fn call_content_appears_only_at_the_highest_verbosity() {
-    let input = serde_json::json!({"secret": "hunter2"});
-
-    let debug = traced_dispatch(tracing::Level::DEBUG, vec![call("a", "p", input.clone())]).await;
+    assert!(!by_id(&out, "p").is_error, "{:?}", by_id(&out, "p"));
     assert!(
-        !debug.contains("hunter2"),
-        "le contenu ne doit pas fuiter en debug: {debug}"
+        !by_id(&out, "p").untrusted,
+        "un plan écrit par le modèle n'est pas du contenu externe"
     );
-
-    let full = traced_dispatch(tracing::Level::TRACE, vec![call("a", "p", input)]).await;
-    assert!(full.contains("hunter2"), "attendu au niveau trace: {full}");
+    let plan = events
+        .iter()
+        .find_map(|e| match e {
+            agent_core::tools::ToolDispatchEvent::Plan(view) => Some(view),
+            _ => None,
+        })
+        .expect("le plan doit voyager comme événement de dispatch");
+    assert_eq!(plan.steps.len(), 2);
+    assert_eq!(plan.explanation.as_deref(), Some("cadrage"));
+    assert_eq!(plan.steps[1].status, agent_core::PlanStatus::InProgress);
 }
 
-/// US-020 AC4: without a subscriber, an emission produces nothing. Proven by
-/// running the same dispatch outside any collection and observing that the tools
-/// keep working, at the same cost as before the instrumentation.
+// US-009 AC2: two steps in progress -> refusal returned to the model, and the
+// REST of the batch runs. The turn is not broken by a malformed plan.
 #[tokio::test]
-async fn without_a_subscriber_the_dispatch_is_unchanged() {
+async fn two_steps_in_progress_are_refused_without_breaking_the_batch() {
+    let ws = TempWs::new("plan-invalid");
+    ws.write("a.txt", "content\n");
+    let reg = Registry::builder(ws.path())
+        .mode(PermissionMode::Default)
+        .approver(Arc::new(crate::permission::AutoDeny))
+        .register(crate::UpdatePlan)
+        .register(Read)
+        .build();
+
+    let (out, events) = dispatch_capturing(
+        &reg,
+        vec![
+            call(
+                "p",
+                "update_plan",
+                serde_json::json!({
+                    "explanation": null,
+                    "plan": [
+                        { "step": "un", "status": "in_progress" },
+                        { "step": "deux", "status": "in_progress" }
+                    ]
+                }),
+            ),
+            call(
+                "r",
+                "read",
+                serde_json::json!({ "path": "a.txt", "offset": null, "limit": null }),
+            ),
+        ],
+    )
+    .await;
+
+    let refused = by_id(&out, "p");
+    assert!(refused.is_error);
+    assert_eq!(refused.error_kind, Some(ToolErrorKind::Validation));
+    assert!(
+        refused.content.contains("at most one step"),
+        "la contrainte doit être nommée au modèle: {}",
+        refused.content
+    );
+    assert!(
+        !by_id(&out, "r").is_error,
+        "le reste du lot doit survivre au plan invalide"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, agent_core::tools::ToolDispatchEvent::Plan(_))),
+        "aucun plan ne doit être publié quand il est refusé"
+    );
+}
+
+// US-010 AC2: a patch whose SECOND hunk no longer matches leaves the first file
+// untouched. All-or-nothing is the property that makes a retry safe.
+#[tokio::test]
+async fn a_stale_hunk_leaves_every_file_untouched() {
+    let ws = TempWs::new("patch-atomic");
+    ws.write("first.txt", "alpha\nbeta\n");
+    ws.write("second.txt", "gamma\n");
+    let reg = Registry::builder(ws.path())
+        .mode(PermissionMode::BypassPermissions)
+        .approver(allow_approver())
+        .register(crate::ApplyPatch)
+        .build();
+
+    let patch = "*** Begin Patch\n\
+         *** Update File: first.txt\n\
+         @@\n\
+         -beta\n\
+         +BETA\n\
+         *** Update File: second.txt\n\
+         @@\n\
+         -absent\n\
+         +NEW\n\
+         *** End Patch\n";
+    let out = reg
+        .dispatch(vec![call(
+            "p",
+            "apply_patch",
+            serde_json::json!({ "input": patch }),
+        )])
+        .await;
+
+    let outcome = by_id(&out, "p");
+    assert!(outcome.is_error, "un contexte périmé doit échouer");
+    assert!(
+        outcome.content.contains("stale"),
+        "la raison doit être rendue au modèle: {}",
+        outcome.content
+    );
+    assert_eq!(
+        ws.read("first.txt"),
+        "alpha\nbeta\n",
+        "aucune modification partielle: le premier fichier reste intact"
+    );
+    assert_eq!(ws.read("second.txt"), "gamma\n");
+}
+
+// US-010 AC1: a well-formed patch applies, creates and deletes.
+#[tokio::test]
+async fn a_well_formed_patch_updates_adds_and_deletes() {
+    let ws = TempWs::new("patch-apply");
+    ws.write("keep.txt", "one\ntwo\nthree\n");
+    ws.write("gone.txt", "obsolete\n");
+    let reg = Registry::builder(ws.path())
+        .mode(PermissionMode::BypassPermissions)
+        .approver(allow_approver())
+        .register(crate::ApplyPatch)
+        .build();
+
+    // Built line by line: a Rust string continuation would eat the leading
+    // space of a context line, which is exactly what the grammar reads.
+    let patch = [
+        "*** Begin Patch",
+        "*** Update File: keep.txt",
+        "@@",
+        " one",
+        "-two",
+        "+TWO",
+        " three",
+        "*** Add File: fresh.txt",
+        "+created",
+        "*** Delete File: gone.txt",
+        "*** End Patch",
+        "",
+    ]
+    .join("\n");
+    let out = reg
+        .dispatch(vec![call(
+            "p",
+            "apply_patch",
+            serde_json::json!({ "input": patch }),
+        )])
+        .await;
+
+    let outcome = by_id(&out, "p");
+    assert!(!outcome.is_error, "{}", outcome.content);
+    assert_eq!(ws.read("keep.txt"), "one\nTWO\nthree\n");
+    assert_eq!(ws.read("fresh.txt"), "created\n");
+    assert!(!ws.path().join("gone.txt").exists());
+}
+
+// US-010 AC3: a patch aiming at a protected subpath is refused BEFORE the
+// permission decision, hence under the most permissive mode too.
+#[tokio::test]
+async fn a_patch_into_a_protected_subpath_is_refused_before_permission() {
+    let ws = TempWs::new("patch-protected");
+    std::fs::create_dir_all(ws.path().join(".git/hooks")).unwrap();
+    let reg = Registry::builder(ws.path())
+        .mode(PermissionMode::BypassPermissions)
+        .approver(allow_approver())
+        .register(crate::ApplyPatch)
+        .build();
+
+    let patch = "*** Begin Patch\n\
+         *** Add File: .git/hooks/pre-commit\n\
+         +#!/bin/sh\n\
+         +echo pwned\n\
+         *** End Patch\n";
+    let out = reg
+        .dispatch(vec![call(
+            "p",
+            "apply_patch",
+            serde_json::json!({ "input": patch }),
+        )])
+        .await;
+
+    let outcome = by_id(&out, "p");
+    assert!(outcome.is_error);
+    assert_eq!(
+        outcome.error_kind,
+        Some(ToolErrorKind::Validation),
+        "le refus précède la permission, donc c'est une validation"
+    );
+    assert!(!ws.path().join(".git/hooks/pre-commit").exists());
+}
+
+// US-011 AC1: the image enters the outcome as a block, ready for the transcript.
+#[tokio::test]
+async fn view_image_carries_the_image_into_the_outcome() {
+    let ws = TempWs::new("image-ok");
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    png.extend_from_slice(b"payload");
+    std::fs::write(ws.path().join("shot.png"), &png).unwrap();
+    let reg = Registry::builder(ws.path())
+        .mode(PermissionMode::Default)
+        .approver(Arc::new(crate::permission::AutoDeny))
+        .vision(true)
+        .register(crate::ViewImage)
+        .build();
+
+    let out = reg
+        .dispatch(vec![call(
+            "i",
+            "view_image",
+            serde_json::json!({ "path": "shot.png" }),
+        )])
+        .await;
+
+    let outcome = by_id(&out, "i");
+    assert!(!outcome.is_error, "{}", outcome.content);
+    assert_eq!(outcome.images.len(), 1);
+    assert_eq!(outcome.images[0].media_type, "image/png");
+    assert!(
+        outcome.untrusted,
+        "une image du dépôt est du contenu externe (OWASP LLM01)"
+    );
+}
+
+// US-011 AC2/AC3: no vision declared -> refused before any read; outside the
+// workspace -> refused by the shared guardrail.
+#[tokio::test]
+async fn view_image_is_refused_without_vision_and_outside_the_workspace() {
+    let ws = TempWs::new("image-refus");
+    let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    png.extend_from_slice(b"payload");
+    std::fs::write(ws.path().join("shot.png"), &png).unwrap();
+
+    let blind = Registry::builder(ws.path())
+        .mode(PermissionMode::BypassPermissions)
+        .approver(allow_approver())
+        .register(crate::ViewImage)
+        .build();
+    let out = blind
+        .dispatch(vec![call(
+            "i",
+            "view_image",
+            serde_json::json!({ "path": "shot.png" }),
+        )])
+        .await;
+    let outcome = by_id(&out, "i");
+    assert!(outcome.is_error);
+    assert_eq!(outcome.error_kind, Some(ToolErrorKind::Validation));
+    assert!(outcome.images.is_empty(), "rien ne doit être envoyé");
+
+    let seeing = Registry::builder(ws.path())
+        .mode(PermissionMode::BypassPermissions)
+        .approver(allow_approver())
+        .vision(true)
+        .register(crate::ViewImage)
+        .build();
+    let out = seeing
+        .dispatch(vec![call(
+            "i",
+            "view_image",
+            serde_json::json!({ "path": "../outside.png" }),
+        )])
+        .await;
+    assert!(by_id(&out, "i").is_error, "hors périmètre = refus");
+    assert!(by_id(&out, "i").images.is_empty());
+}
+
+// US-012 AC5: a session inherits the perimeter. Naming a protected subpath is
+// refused for `exec_command` exactly as it is for `bash`, and for `write_stdin`
+// too: otherwise opening a shell then typing the command would be the way around.
+#[tokio::test]
+async fn a_shell_session_inherits_the_protected_subpaths() {
+    let ws = TempWs::new("session-protected");
+    std::fs::create_dir_all(ws.path().join(".git/hooks")).unwrap();
+    let reg = Registry::builder(ws.path())
+        .mode(PermissionMode::BypassPermissions)
+        .approver(allow_approver())
+        .register(crate::ExecCommand)
+        .register(crate::WriteStdin)
+        .build();
+
+    for (id, name, input) in [
+        (
+            "e",
+            "exec_command",
+            serde_json::json!({ "command": "echo evil > .git/hooks/pre-commit", "timeout_ms": 100 }),
+        ),
+        (
+            "w",
+            "write_stdin",
+            serde_json::json!({ "session_id": 1, "input": "echo evil > .git/hooks/pre-commit\n", "timeout_ms": 100 }),
+        ),
+    ] {
+        let out = reg.dispatch(vec![call(id, name, input)]).await;
+        let outcome = by_id(&out, id);
+        assert!(outcome.is_error, "{name} doit échouer: {outcome:?}");
+        assert_eq!(
+            outcome.error_kind,
+            Some(ToolErrorKind::Validation),
+            "{name}: le refus précède la permission"
+        );
+    }
+    assert!(!ws.path().join(".git/hooks/pre-commit").exists());
+}
+
+// ══════════════════════════ EP-004 ══════════════════════════
+
+/// US-016 AC1/AC2/AC4: the exposed set moves at a turn boundary and nowhere else.
+/// Staging is what a mid-session `/mcp connect` does; `commit_staged` is what the
+/// frontend calls before composing the next turn.
+#[tokio::test]
+async fn a_staged_tool_appears_only_after_the_turn_boundary() {
     let reg = Registry::builder("/tmp")
-        .mode(PermissionMode::DontAsk)
         .approver(allow_approver())
         .register(Probe::new("p", true, true))
         .build();
+    reg.stage_tools(vec![crate::tool::into_dyn(Probe::new("late", true, true))]);
+
+    // Still in the turn: neither in the specs, nor callable.
+    assert!(!reg.tool_specs().iter().any(|s| s.name == "late"));
+    let out = reg
+        .dispatch(vec![call("a", "late", serde_json::json!({}))])
+        .await;
+    assert!(out[0].is_error);
+    assert_eq!(out[0].error_kind, Some(ToolErrorKind::UnknownTool));
+
+    // Turn boundary.
+    assert!(reg.commit_staged(), "the exposed set changed");
+    assert!(reg.tool_specs().iter().any(|s| s.name == "late"));
+    let out = reg
+        .dispatch(vec![call("b", "late", serde_json::json!({}))])
+        .await;
+    assert!(!out[0].is_error, "{:?}", out[0]);
+
+    // A disconnection follows the same rule, and the later call fails cleanly.
+    reg.stage_removal(vec!["late".to_string()]);
+    assert!(
+        !reg.dispatch(vec![call("c", "late", serde_json::json!({}))])
+            .await[0]
+            .is_error
+    );
+    assert!(reg.commit_staged());
+    let out = reg
+        .dispatch(vec![call("d", "late", serde_json::json!({}))])
+        .await;
+    assert!(out[0].is_error);
+    assert_eq!(out[0].error_kind, Some(ToolErrorKind::UnknownTool));
+    assert!(!reg.commit_staged(), "nothing left to apply");
+}
+
+/// US-016 AC3: a staged name that collides with an already exposed tool never
+/// replaces it. The model was given that name with the first tool's schema.
+#[tokio::test]
+async fn a_staged_name_never_replaces_an_exposed_tool() {
+    let exposed = Probe::new("p", true, true);
+    let exposed_ran = Arc::clone(&exposed.ran);
+    let collider = Probe::new("p", true, true);
+    let collider_ran = Arc::clone(&collider.ran);
+
+    let reg = Registry::builder("/tmp")
+        .approver(allow_approver())
+        .register(exposed)
+        .build();
+    reg.stage_tools(vec![crate::tool::into_dyn(collider)]);
+    assert!(!reg.commit_staged(), "a collision changes nothing");
 
     let out = reg
         .dispatch(vec![call("a", "p", serde_json::json!({}))])
         .await;
-
-    assert_eq!(by_id(&out, "a").content, "p ok");
+    assert!(!out[0].is_error);
+    assert_eq!(exposed_ran.load(Ordering::SeqCst), 1);
+    assert_eq!(collider_ran.load(Ordering::SeqCst), 0);
+    assert_eq!(reg.tool_specs().iter().filter(|s| s.name == "p").count(), 1);
 }

@@ -29,6 +29,7 @@ use crate::permission::{
     ApprovalKey, ApprovalMemo, ApprovalMemory, Approver, AutoDeny, PermCtx, PermissionMode,
     PermissionModeState, PermissionRequest, Resolved, resolve_permission,
 };
+use crate::sandbox::{SandboxDenial, SandboxEscalator};
 use crate::taint::TaintTracker;
 use crate::tool::{DynTool, ToolCtx, into_dyn};
 
@@ -39,6 +40,10 @@ const TAINT_NOT_MEMOIZABLE: &str = "untrusted content was read in this turn";
 /// Reason shown when a hook is what forces the confirmation (US-018 AC2): a
 /// remembered answer would silence that hook for the rest of the session.
 const HOOK_NOT_MEMOIZABLE: &str = "the confirmation comes from a hook";
+/// A sandbox escalation is never rememberable (US-004 AC3/AC4): remembering it
+/// would turn a one-call widening into a session-wide policy change, which is
+/// exactly what the story forbids.
+const ESCALATION_NOT_MEMOIZABLE: &str = "a sandbox escalation covers one call only";
 /// Concurrency cap of the read-only batch (ARCHITECTURE 4.2).
 const CONCURRENCY: usize = 10;
 
@@ -51,6 +56,9 @@ pub struct Registry {
     approvals: ApprovalMemory,
     taint: TaintTracker,
     hooks: Arc<dyn Hooks>,
+    /// Turns an approved sandbox escalation into an actual widening (US-004).
+    /// `None` = no perimeter can be widened, hence no escalation is offered.
+    escalator: Option<Arc<dyn SandboxEscalator>>,
     ctx: ToolCtx,
 }
 
@@ -64,6 +72,7 @@ impl Registry {
             taint_window: crate::taint::DEFAULT_WINDOW,
             initial_taint_recent: false,
             hooks: None,
+            escalator: None,
             ctx: ToolCtx::new(workspace),
         }
     }
@@ -319,6 +328,11 @@ impl Registry {
             })
         });
         let untrusted = tool.returns_untrusted();
+        // The retry of an escalation (US-004) needs the input again. Cloned only
+        // when a perimeter can actually be widened: without an escalator, no
+        // offer is possible and nothing is copied.
+        let retry_input = self.escalator.as_ref().map(|_| call.input.clone());
+        let mut denial: Option<SandboxDenial> = None;
         let outcome =
             match tokio::time::timeout(tool.timeout(&ctx), tool.invoke(call.input, &ctx)).await {
                 Err(_elapsed) => {
@@ -326,7 +340,7 @@ impl Registry {
                         self.taint.mark();
                     }
                     err_outcome_tainted(
-                        id,
+                        id.clone(),
                         ToolError::Timeout.to_string(),
                         untrusted,
                         ToolErrorKind::Timeout,
@@ -336,22 +350,37 @@ impl Registry {
                     if untrusted {
                         self.taint.mark();
                     }
-                    err_outcome_tainted(id, e.to_string(), untrusted, e.kind())
+                    err_outcome_tainted(id.clone(), e.to_string(), untrusted, e.kind())
                 }
                 Ok(Ok(out)) => {
                     // 5. taint: an untrusted output just entered the context.
                     if untrusted {
                         self.taint.mark();
                     }
-                    ToolOutcome {
-                        id,
-                        content: out.content,
-                        is_error: out.is_error,
-                        untrusted,
-                        error_kind: out.is_error.then_some(ToolErrorKind::Semantic),
+                    denial = out.denial;
+                    // US-009: the plan is addressed to the client, so it travels
+                    // on the event channel, correlated to nothing but this turn.
+                    if let Some(plan) = out.plan {
+                        events.emit(ToolDispatchEvent::Plan(plan));
                     }
+                    outcome_from(id.clone(), out.content, out.is_error, untrusted, out.images)
                 }
             };
+
+        // 5bis. US-004: a failure the sandbox caused, and that a perimeter can
+        // actually lift, becomes an explicit offer to re-run this ONE call.
+        let outcome = match (denial, retry_input) {
+            (Some(denial), Some(input))
+                if self
+                    .escalator
+                    .as_ref()
+                    .is_some_and(|escalator| escalator.can_lift(&denial)) =>
+            {
+                self.escalate(tool.as_ref(), &denial, input, outcome, &ctx, &events)
+                    .await
+            }
+            _ => outcome,
+        };
 
         // 6. hooks PostToolUse (4.3): only after a call that actually ran. The
         // outcome is already decided and is passed by reference: a later hook
@@ -371,8 +400,98 @@ impl Registry {
         outcome
     }
 
+    /// Offers, then applies, a one-call widening of the confinement (US-004).
+    ///
+    /// Deliberately OUTSIDE `resolve_permission`: the question is asked directly,
+    /// so no permission mode short-circuits it and the escalation is never
+    /// automatic, not even under `BypassPermissions` (AC4). It is never
+    /// rememberable either, and the widening lives exactly as long as the guard
+    /// (AC3). A refusal, an absent escalator, or a cause the escalator cannot
+    /// lift all keep the original failure: fail-closed on the doubt (AC6).
+    async fn escalate(
+        &self,
+        tool: &dyn DynTool,
+        denial: &SandboxDenial,
+        input: serde_json::Value,
+        original: ToolOutcome,
+        ctx: &ToolCtx,
+        events: &ToolEventSink,
+    ) -> ToolOutcome {
+        let untrusted = tool.returns_untrusted();
+        let Some(escalator) = self.escalator.as_ref() else {
+            return original;
+        };
+        let id = original.id.clone();
+        let mode = self.mode();
+        // AC5: recent taint forces the confirmation whatever the mode. Here it
+        // also denies any automatic approver, which is the fail-closed side of
+        // the same rule.
+        let taint_forced = self.taint.is_recent() && tool.is_taint_sensitive();
+        let req = PermissionRequest {
+            call_id: id.clone(),
+            tool: tool.name().to_string(),
+            reason: denial.escalation_reason(),
+            taint_forced,
+            mode: format!("{mode:?}"),
+            input_summary: summarize(&input),
+            input: input.clone(),
+            memoizable: false,
+            memo_refused: Some(ESCALATION_NOT_MEMOIZABLE.to_string()),
+        };
+        events.emit(ToolDispatchEvent::PermissionAsk(PermissionReq {
+            call_id: id.clone(),
+            tool: req.tool.clone(),
+            reason: req.reason.clone(),
+            taint_forced: req.taint_forced,
+            input_summary: req.input_summary.clone(),
+            input: req.input.clone(),
+            mode: req.mode.clone(),
+        }));
+        if !self.approver.approve(&req).await.allow {
+            return original;
+        }
+        // The guard IS the widening: it lives on the stack for the duration of
+        // the retry and revokes on drop, so no path can leak it into the session.
+        let Some(_grant) = escalator.lift(denial) else {
+            return original;
+        };
+        tracing::debug!(
+            target: "pyxis::tools",
+            tool = %req.tool,
+            "sandbox escalation granted for one call"
+        );
+        match tokio::time::timeout(tool.timeout(ctx), tool.invoke(input, ctx)).await {
+            Err(_elapsed) => {
+                if untrusted {
+                    self.taint.mark();
+                }
+                err_outcome_tainted(
+                    id,
+                    ToolError::Timeout.to_string(),
+                    untrusted,
+                    ToolErrorKind::Timeout,
+                )
+            }
+            Ok(Err(e)) => {
+                if untrusted {
+                    self.taint.mark();
+                }
+                err_outcome_tainted(id, e.to_string(), untrusted, e.kind())
+            }
+            Ok(Ok(out)) => {
+                if untrusted {
+                    self.taint.mark();
+                }
+                if let Some(plan) = out.plan {
+                    events.emit(ToolDispatchEvent::Plan(plan));
+                }
+                outcome_from(id, out.content, out.is_error, untrusted, out.images)
+            }
+        }
+    }
+
     fn can_run_parallel_without_permission(&self, call: &ToolInvocation) -> bool {
-        let Some(tool) = self.tools.get(&call.name) else {
+        let Some(tool) = self.tools_read().get(&call.name).cloned() else {
             return false;
         };
         if !(tool.is_concurrency_safe() && tool.is_read_only() && !tool.is_taint_sensitive()) {
@@ -472,12 +591,26 @@ fn err_outcome(
     error_kind: ToolErrorKind,
 ) -> ToolOutcome {
     // Pipeline error (refusal/unknown/parse): in-house content, not tainted.
+    ToolOutcome::new(id, msg, true, false, Some(error_kind))
+}
+
+/// Outcome of a call that ran to completion, error or not.
+fn outcome_from(
+    id: agent_core::message::ToolCallId,
+    content: String,
+    is_error: bool,
+    untrusted: bool,
+    images: Vec<agent_core::tools::ToolImage>,
+) -> ToolOutcome {
     ToolOutcome {
-        id,
-        content: msg,
-        is_error: true,
-        untrusted: false,
-        error_kind: Some(error_kind),
+        images,
+        ..ToolOutcome::new(
+            id,
+            content,
+            is_error,
+            untrusted,
+            is_error.then_some(ToolErrorKind::Semantic),
+        )
     }
 }
 
@@ -487,13 +620,7 @@ fn err_outcome_tainted(
     untrusted: bool,
     error_kind: ToolErrorKind,
 ) -> ToolOutcome {
-    ToolOutcome {
-        id,
-        content: msg,
-        is_error: true,
-        untrusted,
-        error_kind: Some(error_kind),
-    }
+    ToolOutcome::new(id, msg, true, untrusted, Some(error_kind))
 }
 
 fn ask_reason(taint_forced: bool, hook: Option<&str>) -> String {
@@ -537,6 +664,7 @@ pub struct RegistryBuilder {
     taint_window: u64,
     initial_taint_recent: bool,
     hooks: Option<Arc<dyn Hooks>>,
+    escalator: Option<Arc<dyn SandboxEscalator>>,
     ctx: ToolCtx,
 }
 
@@ -583,6 +711,37 @@ impl RegistryBuilder {
         self.ctx.harden = Some(harden);
         self
     }
+    /// Does the active model read images (US-011)? Read from the provider
+    /// capabilities by agent-cli.
+    pub fn vision(mut self, vision: bool) -> Self {
+        self.ctx.vision = vision;
+        self
+    }
+    /// Persistent shell sessions of the run (US-012), owned by agent-cli so the
+    /// end of the run can close them.
+    pub fn exec_sessions(mut self, sessions: crate::exec_session::ExecSessions) -> Self {
+        self.ctx.sessions = sessions;
+        self
+    }
+    /// Confinement perimeter in force for the session (US-001), and whether the
+    /// kernel really carries it (US-004 classification).
+    pub fn sandbox(mut self, policy: agent_core::sandbox::SandboxPolicy, enforced: bool) -> Self {
+        self.ctx.sandbox = policy;
+        self.ctx.sandbox_enforced = enforced;
+        self
+    }
+    /// What the confinement blocked during a call (US-004), injected by
+    /// agent-cli over the network proxy.
+    pub fn sandbox_observer(mut self, observer: Arc<dyn crate::sandbox::SandboxObserver>) -> Self {
+        self.ctx.sandbox_observer = Some(observer);
+        self
+    }
+    /// Applies an approved one-call widening (US-004). Without it no escalation
+    /// is ever offered: a perimeter nobody can widen must not be advertised.
+    pub fn sandbox_escalator(mut self, escalator: Arc<dyn SandboxEscalator>) -> Self {
+        self.escalator = Some(escalator);
+        self
+    }
     /// Registers a native tool (boxed into a `DynTool`). An already present name keeps
     /// the first registered tool.
     pub fn register<T: crate::tool::Tool + 'static>(mut self, tool: T) -> Self {
@@ -605,6 +764,7 @@ impl RegistryBuilder {
             approvals: self.approvals,
             taint: TaintTracker::new(self.taint_window),
             hooks: self.hooks.unwrap_or_else(|| Arc::new(NoHooks)),
+            escalator: self.escalator,
             ctx: self.ctx,
         };
         registry.seed_taint(self.initial_taint_recent);
