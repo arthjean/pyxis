@@ -17,6 +17,7 @@ pub mod error;
 pub mod glob;
 pub mod grep;
 pub mod hooks;
+pub mod patch;
 pub mod path;
 pub mod permission;
 pub mod plan;
@@ -38,6 +39,7 @@ pub use error::{ToolError, ValidationError};
 pub use glob::Glob;
 pub use grep::Grep;
 pub use hooks::{CommandHooks, HookDecision, HookEvent, HookSpec, Hooks, NoHooks};
+pub use patch::ApplyPatch;
 pub use permission::{
     ApprovalEntry, ApprovalKey, ApprovalMemo, ApprovalMemory, ApprovalResponse, Approver,
     AutoApprove, AutoDeny, PermCtx, PermissionDecision, PermissionMode, PermissionModeState,
@@ -69,5 +71,6 @@ pub fn default_registry(
         .register(Edit)
         .register(Bash)
         .register(UpdatePlan)
+        .register(ApplyPatch)
         .build()
 }
