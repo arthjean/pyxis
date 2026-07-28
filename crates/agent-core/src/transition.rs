@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use crate::compaction::CompactKind;
 use crate::error::{AgentError, ProviderFailure};
-use crate::message::{ContentBlock, Message, Role, ToolCallId};
+use crate::message::{ContentBlock, Message, Role, ToolCallFormat, ToolCallId};
 use crate::provider::{StopReason, StreamEvent};
 use crate::tools::ToolInvocation;
 use agent_tokenizer::TokenCounter;
@@ -149,11 +149,13 @@ pub fn post_stream_transition(acc: &Accumulator) -> Transition {
 struct PartialCall {
     name: String,
     args: String,
+    format: ToolCallFormat,
 }
 
 struct CompletedCall {
     name: String,
     input: serde_json::Value,
+    format: ToolCallFormat,
 }
 
 /// Accumulates `StreamEvent`s (except `Usage`, handled by the budget) into a
@@ -181,7 +183,7 @@ impl Accumulator {
         match ev {
             StreamEvent::TextDelta { text } => self.text.push_str(&text),
             StreamEvent::ReasoningDelta { text } => self.reasoning.push_str(&text),
-            StreamEvent::ToolCallStart { id, name } => {
+            StreamEvent::ToolCallStart { id, name, format } => {
                 if id.trim().is_empty() {
                     return Err(contract_error("tool call id is empty"));
                 }
@@ -196,13 +198,14 @@ impl Accumulator {
                     PartialCall {
                         name,
                         args: String::new(),
+                        format,
                     },
                 );
                 self.order.push(id);
             }
-            StreamEvent::ToolCallDelta { id, args_json } => {
+            StreamEvent::ToolCallDelta { id, input_delta } => {
                 if let Some(p) = self.open.get_mut(&id) {
-                    p.args.push_str(&args_json);
+                    p.args.push_str(&input_delta);
                 } else {
                     return Err(contract_error(format!(
                         "tool call delta without start: {id}"
@@ -217,12 +220,18 @@ impl Accumulator {
                 let Some(partial) = self.open.remove(&id) else {
                     return Err(contract_error(format!("tool call end without start: {id}")));
                 };
-                let input = parse_tool_args(&id, &partial.args)?;
+                let input = match partial.format {
+                    ToolCallFormat::Json => parse_tool_args(&id, &partial.args)?,
+                    // Freeform input is the model's text verbatim: parsing it
+                    // as JSON would corrupt a patch or a script.
+                    ToolCallFormat::Text => serde_json::Value::String(partial.args),
+                };
                 self.completed.insert(
                     id,
                     CompletedCall {
                         name: partial.name,
                         input,
+                        format: partial.format,
                     },
                 );
             }
@@ -257,6 +266,7 @@ impl Accumulator {
                     id: id.clone(),
                     name: p.name.clone(),
                     input: p.input.clone(),
+                    format: p.format,
                 })
             })
             .collect()
@@ -289,6 +299,7 @@ impl Accumulator {
                     id: id.clone(),
                     name: p.name.clone(),
                     input: p.input.clone(),
+                    format: p.format,
                 });
             }
         }
@@ -384,13 +395,10 @@ mod tests {
         assert!(matches!(post_stream_transition(&end), Transition::EndTurn));
 
         let tools = acc_with(vec![
-            StreamEvent::ToolCallStart {
-                id: "c1".into(),
-                name: "bash".into(),
-            },
+            StreamEvent::tool_call_start("c1", "bash"),
             StreamEvent::ToolCallDelta {
                 id: "c1".into(),
-                args_json: "{\"cmd\":\"ls\"}".into(),
+                input_delta: "{\"cmd\":\"ls\"}".into(),
             },
             StreamEvent::ToolCallEnd { id: "c1".into() },
             StreamEvent::Done {
@@ -427,13 +435,10 @@ mod tests {
     fn maxtokens_mid_toolcall_recovers_not_drops() {
         // truncated mid tool_call -> Recover (withholding), not a silent EndTurn
         let a = acc_with(vec![
-            StreamEvent::ToolCallStart {
-                id: "c1".into(),
-                name: "bash".into(),
-            },
+            StreamEvent::tool_call_start("c1", "bash"),
             StreamEvent::ToolCallDelta {
                 id: "c1".into(),
-                args_json: "{\"cm".into(),
+                input_delta: "{\"cm".into(),
             },
             StreamEvent::Done {
                 stop: StopReason::MaxTokens,
@@ -484,13 +489,10 @@ mod tests {
                 id: "rs_1".into(),
                 encrypted_content: "ENC".into(),
             },
-            StreamEvent::ToolCallStart {
-                id: "c1".into(),
-                name: "bash".into(),
-            },
+            StreamEvent::tool_call_start("c1", "bash"),
             StreamEvent::ToolCallDelta {
                 id: "c1".into(),
-                args_json: "{}".into(),
+                input_delta: "{}".into(),
             },
             StreamEvent::ToolCallEnd { id: "c1".into() },
             StreamEvent::Done {
@@ -515,13 +517,10 @@ mod tests {
     fn assistant_message_carries_text_and_tooluse() {
         let a = acc_with(vec![
             StreamEvent::TextDelta { text: "ok".into() },
-            StreamEvent::ToolCallStart {
-                id: "c1".into(),
-                name: "bash".into(),
-            },
+            StreamEvent::tool_call_start("c1", "bash"),
             StreamEvent::ToolCallDelta {
                 id: "c1".into(),
-                args_json: "{}".into(),
+                input_delta: "{}".into(),
             },
             StreamEvent::ToolCallEnd { id: "c1".into() },
             StreamEvent::Done {
@@ -543,13 +542,10 @@ mod tests {
                 id: "rs_1".into(),
                 encrypted_content: "ENC".into(),
             },
-            StreamEvent::ToolCallStart {
-                id: "c1".into(),
-                name: "bash".into(),
-            },
+            StreamEvent::tool_call_start("c1", "bash"),
             StreamEvent::ToolCallDelta {
                 id: "c1".into(),
-                args_json: "{\"cmd\":\"ls\"}".into(),
+                input_delta: "{\"cmd\":\"ls\"}".into(),
             },
             StreamEvent::ToolCallEnd { id: "c1".into() },
             StreamEvent::Done {
@@ -568,7 +564,7 @@ mod tests {
         let err = a
             .push(StreamEvent::ToolCallDelta {
                 id: "c1".into(),
-                args_json: "{}".into(),
+                input_delta: "{}".into(),
             })
             .unwrap_err();
         assert!(matches!(err, AgentError::Provider(_)));
@@ -577,19 +573,115 @@ mod tests {
     #[test]
     fn accumulator_rejects_invalid_json_at_tool_end() {
         let mut a = Accumulator::new();
-        a.push(StreamEvent::ToolCallStart {
-            id: "c1".into(),
-            name: "bash".into(),
-        })
-        .unwrap();
+        a.push(StreamEvent::tool_call_start("c1", "bash")).unwrap();
         a.push(StreamEvent::ToolCallDelta {
             id: "c1".into(),
-            args_json: "{\"cmd\"".into(),
+            input_delta: "{\"cmd\"".into(),
         })
         .unwrap();
         let err = a
             .push(StreamEvent::ToolCallEnd { id: "c1".into() })
             .unwrap_err();
         assert!(matches!(err, AgentError::Provider(_)));
+    }
+
+    /// A freeform call carries text the model wrote: it must survive
+    /// byte-for-byte, including text that merely looks like broken JSON.
+    #[test]
+    fn freeform_call_accumulates_text_without_json_parsing() {
+        let source = "// @exec: cell\nconst x = {unbalanced;";
+        let mut a = Accumulator::new();
+        a.push(StreamEvent::custom_tool_call_start("c1", "exec"))
+            .unwrap();
+        for chunk in ["// @exec: cell\n", "const x = {unbalanced;"] {
+            a.push(StreamEvent::ToolCallDelta {
+                id: "c1".into(),
+                input_delta: chunk.into(),
+            })
+            .unwrap();
+        }
+        a.push(StreamEvent::ToolCallEnd { id: "c1".into() })
+            .unwrap();
+        a.push(StreamEvent::Done {
+            stop: StopReason::ToolUse,
+        })
+        .unwrap();
+
+        let calls = a.tool_calls();
+        assert_eq!(calls.len(), 1, "exactly one terminal call");
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[0].name, "exec");
+        assert_eq!(calls[0].format, ToolCallFormat::Text);
+        assert_eq!(calls[0].text_input(), Some(source));
+
+        let message = a.to_assistant_message();
+        let ContentBlock::ToolUse {
+            id,
+            name,
+            input,
+            format,
+        } = message
+            .content
+            .iter()
+            .find(|block| matches!(block, ContentBlock::ToolUse { .. }))
+            .expect("tool use block")
+        else {
+            unreachable!()
+        };
+        assert_eq!((id.as_str(), name.as_str()), ("c1", "exec"));
+        assert_eq!(*format, ToolCallFormat::Text);
+        assert_eq!(input.as_str(), Some(source));
+        assert!(matches!(
+            post_stream_transition(&a),
+            Transition::RunTools(_)
+        ));
+    }
+
+    #[test]
+    fn a_freeform_call_without_input_stays_an_empty_string_not_an_object() {
+        let mut a = Accumulator::new();
+        a.push(StreamEvent::custom_tool_call_start("c1", "exec"))
+            .unwrap();
+        a.push(StreamEvent::ToolCallEnd { id: "c1".into() })
+            .unwrap();
+        assert_eq!(a.tool_calls()[0].text_input(), Some(""));
+        // The JSON path keeps its historical empty-object default.
+        let mut json = Accumulator::new();
+        json.push(StreamEvent::tool_call_start("c2", "bash"))
+            .unwrap();
+        json.push(StreamEvent::ToolCallEnd { id: "c2".into() })
+            .unwrap();
+        assert_eq!(json.tool_calls()[0].input, serde_json::json!({}));
+    }
+
+    #[test]
+    fn contract_violations_reject_freeform_calls_the_same_way() {
+        let mut a = Accumulator::new();
+        assert!(
+            a.push(StreamEvent::custom_tool_call_start("c1", " "))
+                .is_err(),
+            "a call without a name is not dispatchable"
+        );
+        let mut a = Accumulator::new();
+        a.push(StreamEvent::custom_tool_call_start("c1", "exec"))
+            .unwrap();
+        assert!(
+            a.push(StreamEvent::custom_tool_call_start("c1", "exec"))
+                .is_err(),
+            "duplicate call id"
+        );
+        assert!(
+            a.push(StreamEvent::ToolCallDelta {
+                id: "ghost".into(),
+                input_delta: "x".into(),
+            })
+            .is_err(),
+            "delta before start"
+        );
+        assert!(
+            a.push(StreamEvent::ToolCallEnd { id: "ghost".into() })
+                .is_err(),
+            "end before start"
+        );
     }
 }

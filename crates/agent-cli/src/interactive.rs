@@ -2963,11 +2963,7 @@ mod tests {
                 id: "rs_1".into(),
                 encrypted_content: "ENC".into(),
             },
-            ContentBlock::ToolUse {
-                id: "c1".into(),
-                name: "bash".into(),
-                input: serde_json::json!({}),
-            },
+            ContentBlock::tool_use("c1", "bash", serde_json::json!({})),
         ])];
         assert_eq!(count_encrypted_reasoning(&messages), 1);
         assert_eq!(scrub_encrypted_reasoning(&mut messages), 1);

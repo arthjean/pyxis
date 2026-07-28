@@ -633,13 +633,10 @@ pub fn done_end_turn() -> StreamEvent {
 
 pub fn tool_call(id: &str, name: &str) -> Vec<StreamEvent> {
     vec![
-        StreamEvent::ToolCallStart {
-            id: id.into(),
-            name: name.into(),
-        },
+        StreamEvent::tool_call_start(id, name),
         StreamEvent::ToolCallDelta {
             id: id.into(),
-            args_json: "{}".into(),
+            input_delta: "{}".into(),
         },
         StreamEvent::ToolCallEnd { id: id.into() },
         StreamEvent::Done {

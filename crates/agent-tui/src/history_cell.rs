@@ -3349,7 +3349,9 @@ pub fn cells_from_messages(messages: &[Message]) -> Vec<HistoryCellKind> {
                             cells
                                 .push(HistoryCellKind::Reasoning(ReasoningCell::new(text.clone())));
                         }
-                        ContentBlock::ToolUse { id, name, input } => {
+                        ContentBlock::ToolUse {
+                            id, name, input, ..
+                        } => {
                             if let Some(mapping) = tool_exec_mapping_from_tool(name, input) {
                                 cells.push(HistoryCellKind::Exec(ExecCell::command_with_id(
                                     Some(TranscriptItemId::derived("exec", id)),
@@ -5812,11 +5814,7 @@ mod tests {
                 ContentBlock::Text {
                     text: "voici".into(),
                 },
-                ContentBlock::ToolUse {
-                    id: "c1".into(),
-                    name: "read".into(),
-                    input: serde_json::json!({ "path": "a.rs" }),
-                },
+                ContentBlock::tool_use("c1", "read", serde_json::json!({ "path": "a.rs" })),
             ]),
             Message::tool_result("orphan", "contenu", false),
         ];
@@ -5847,11 +5845,11 @@ mod tests {
     #[test]
     fn replay_strips_padded_read_line_numbers() {
         let messages = vec![
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "c1".into(),
-                name: "read".into(),
-                input: serde_json::json!({ "path": "a.rs" }),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "c1",
+                "read",
+                serde_json::json!({ "path": "a.rs" }),
+            )]),
             Message::tool_result("c1", "     1\tfn main() {}\n     2\t", false),
         ];
 
@@ -5865,11 +5863,11 @@ mod tests {
     #[test]
     fn replay_pairs_bash_tool_use_with_exec_result() {
         let messages = vec![
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "bash-1".into(),
-                name: "bash".into(),
-                input: serde_json::json!({ "command": "echo ok" }),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "bash-1",
+                "bash",
+                serde_json::json!({ "command": "echo ok" }),
+            )]),
             Message::tool_result("bash-1", "ok", false),
         ];
 

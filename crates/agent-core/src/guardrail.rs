@@ -235,11 +235,7 @@ mod tests {
 
     #[test]
     fn batch_signature_is_order_independent_and_distinct() {
-        let inv = |name: &str, input: serde_json::Value| ToolInvocation {
-            id: "x".into(),
-            name: name.into(),
-            input,
-        };
+        let inv = |name: &str, input: serde_json::Value| ToolInvocation::json("x", name, input);
         let s1 = batch_signature(&[
             inv("read", serde_json::json!({"path": "a"})),
             inv("bash", serde_json::json!({"cmd": "ls"})),

@@ -11,7 +11,7 @@ use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-use crate::message::{Message, ToolCallId};
+use crate::message::{Message, ToolCallFormat, ToolCallId};
 use crate::model::{ModelRuntimeError, ResolvedModelRuntime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,7 +30,8 @@ pub enum ProviderKind {
 
 /// The only streaming vocabulary the core knows (PROVIDERS section 2). Every
 /// adapter must produce THIS sequence. At `ToolCallEnd`, concatenating the
-/// `ToolCallDelta.args_json` of a same id MUST yield valid JSON.
+/// `ToolCallDelta.input_delta` of a same id MUST yield valid JSON for a `Json`
+/// call, and is taken as-is for a `Text` one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum StreamEvent {
@@ -43,10 +44,14 @@ pub enum StreamEvent {
     ToolCallStart {
         id: ToolCallId,
         name: String,
+        /// Fixed at the start: a call cannot change format mid-stream, and the
+        /// accumulator refuses a delta that contradicts it.
+        #[serde(default)]
+        format: ToolCallFormat,
     },
     ToolCallDelta {
         id: ToolCallId,
-        args_json: String,
+        input_delta: String,
     },
     ToolCallEnd {
         id: ToolCallId,
@@ -75,6 +80,26 @@ pub enum StreamEvent {
     Quota {
         snapshot: crate::quota::QuotaSnapshot,
     },
+}
+
+impl StreamEvent {
+    /// Start of a call whose arguments are JSON.
+    pub fn tool_call_start(id: impl Into<ToolCallId>, name: impl Into<String>) -> Self {
+        Self::ToolCallStart {
+            id: id.into(),
+            name: name.into(),
+            format: ToolCallFormat::Json,
+        }
+    }
+
+    /// Start of a freeform call whose input is text.
+    pub fn custom_tool_call_start(id: impl Into<ToolCallId>, name: impl Into<String>) -> Self {
+        Self::ToolCallStart {
+            id: id.into(),
+            name: name.into(),
+            format: ToolCallFormat::Text,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

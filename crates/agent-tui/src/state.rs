@@ -544,7 +544,10 @@ pub fn blocks_from_messages(messages: &[Message]) -> Vec<Block> {
                     });
                 }
                 for b in &m.content {
-                    if let ContentBlock::ToolUse { id, name, input } = b {
+                    if let ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } = b
+                    {
                         blocks.push(Block::ToolCall {
                             id: id.clone(),
                             name: name.clone(),
@@ -3195,11 +3198,7 @@ mod tests {
                 ContentBlock::Text {
                     text: "voici".into(),
                 },
-                ContentBlock::ToolUse {
-                    id: "c1".into(),
-                    name: "read".into(),
-                    input: serde_json::json!({ "path": "a.rs" }),
-                },
+                ContentBlock::tool_use("c1", "read", serde_json::json!({ "path": "a.rs" })),
             ]),
             Message::tool_result("c1", "contenu", false),
         ];

@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::event::{PermissionReq, PlanView};
-use crate::message::{ToolCallId, ToolErrorKind};
+use crate::message::{ToolCallFormat, ToolCallId, ToolErrorKind};
 use crate::provider::ToolSpec;
 
 /// Absolute ceiling for one model-visible tool result, independently of the
@@ -70,7 +70,30 @@ pub struct ToolExecution {
 pub struct ToolInvocation {
     pub id: ToolCallId,
     pub name: String,
+    /// JSON arguments for a `Json` call, the raw text for a `Text` one.
     pub input: serde_json::Value,
+    /// Carried to dispatch so a freeform call is never re-read as JSON.
+    pub format: ToolCallFormat,
+}
+
+impl ToolInvocation {
+    pub fn json(
+        id: impl Into<ToolCallId>,
+        name: impl Into<String>,
+        input: serde_json::Value,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            input,
+            format: ToolCallFormat::Json,
+        }
+    }
+
+    /// Text input of a freeform call, as the model emitted it.
+    pub fn text_input(&self) -> Option<&str> {
+        self.format.is_text().then(|| self.input.as_str()).flatten()
+    }
 }
 
 /// Authoritative result of one tool call. The model payload, canonical

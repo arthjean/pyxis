@@ -23,10 +23,10 @@
 //! orphan result discarded) and NEVER rewrites the `.jsonl` on disk. The
 //! repaired anomalies are traced under `PYXIS_DEBUG_TRANSCRIPT`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use agent_core::message::{
-    ContentBlock, INTERRUPTED_TOOL_RESULT, Message, Role, unanswered_tool_calls,
+    ContentBlock, INTERRUPTED_TOOL_RESULT, Message, Role, ToolCallFormat, unanswered_tool_calls,
 };
 use agent_core::model::ResponsesDialect;
 use agent_core::provider::{CanonicalRequest, GrammarSyntax, ToolKind, ToolSpec};
@@ -147,11 +147,13 @@ fn build_input(messages: &[Message], lite: bool) -> Vec<Value> {
     // both sets leave the building strictly unchanged.
     let unanswered = unanswered_tool_calls(messages);
     let orphan_calls: HashSet<&str> = unanswered.iter().map(String::as_str).collect();
-    let known_calls: HashSet<&str> = messages
+    // The format of each call is carried along: a result must be emitted with
+    // the item type its call used, otherwise the backend rejects the pair.
+    let known_calls: HashMap<&str, ToolCallFormat> = messages
         .iter()
         .flat_map(|m| m.content.iter())
         .filter_map(|b| match b {
-            ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+            ContentBlock::ToolUse { id, format, .. } => Some((id.as_str(), *format)),
             _ => None,
         })
         .collect();
@@ -258,29 +260,40 @@ fn assistant_items(blocks: &[ContentBlock], orphan_calls: &HashSet<&str>, input:
             id,
             name,
             input: args,
+            format,
         } = b
         {
-            input.push(json!({
-                "type": "function_call",
-                "call_id": id,
-                "name": name,
-                // arguments is a JSON STRING in the Responses API.
-                "arguments": args.to_string(),
-            }));
+            input.push(match format {
+                ToolCallFormat::Json => json!({
+                    "type": "function_call",
+                    "call_id": id,
+                    "name": name,
+                    // arguments is a JSON STRING in the Responses API.
+                    "arguments": args.to_string(),
+                }),
+                // A freeform call travels as text: serializing the JSON value
+                // would re-quote and escape the model's own input.
+                ToolCallFormat::Text => json!({
+                    "type": "custom_tool_call",
+                    "call_id": id,
+                    "name": name,
+                    "input": call_input_text(args),
+                }),
+            });
         }
     }
     // US-003: repair AFTER the calls of the message, never between two of
     // them. The synthetic result is our own text -> emitted raw, without an
     // untrusted envelope.
     for b in blocks {
-        if let ContentBlock::ToolUse { id, .. } = b
+        if let ContentBlock::ToolUse { id, format, .. } = b
             && orphan_calls.contains(id.as_str())
         {
             trace_transcript_anomaly(&format!(
                 "tool call {id} has no result: synthetic interrupted output emitted"
             ));
             input.push(json!({
-                "type": "function_call_output",
+                "type": output_item_type(*format),
                 "call_id": id,
                 "output": INTERRUPTED_TOOL_RESULT,
             }));
@@ -288,8 +301,13 @@ fn assistant_items(blocks: &[ContentBlock], orphan_calls: &HashSet<&str>, input:
     }
 }
 
-/// `tool_result` blocks (Tool role) -> `function_call_output` items.
-fn tool_result_items(blocks: &[ContentBlock], known_calls: &HashSet<&str>, input: &mut Vec<Value>) {
+/// `tool_result` blocks (Tool role) -> `function_call_output` or
+/// `custom_tool_call_output`, matching the format of the call they answer.
+fn tool_result_items(
+    blocks: &[ContentBlock],
+    known_calls: &HashMap<&str, ToolCallFormat>,
+    input: &mut Vec<Value>,
+) {
     for b in blocks {
         if let ContentBlock::ToolResult {
             tool_use_id,
@@ -302,23 +320,42 @@ fn tool_result_items(blocks: &[ContentBlock], known_calls: &HashSet<&str>, input
         {
             // US-003: a result without a matching call is refused by the
             // backend just like a call without a result. It is discarded.
-            if !known_calls.contains(tool_use_id.as_str()) {
+            let Some(format) = known_calls.get(tool_use_id.as_str()).copied() else {
                 trace_transcript_anomaly(&format!(
                     "tool result {tool_use_id} has no matching call: dropped"
                 ));
                 continue;
-            }
+            };
             let output = if *untrusted {
                 untrusted_tool_output_payload(content, *is_error, error_kind.as_ref())
             } else {
                 content.clone()
             };
             input.push(json!({
-                "type": "function_call_output",
+                "type": output_item_type(format),
                 "call_id": tool_use_id,
                 "output": output,
             }));
         }
+    }
+}
+
+/// Result item type matching a call format. `custom_tool_call_output` shares
+/// the output encoding of `function_call_output`, only the type differs.
+fn output_item_type(format: ToolCallFormat) -> &'static str {
+    match format {
+        ToolCallFormat::Json => "function_call_output",
+        ToolCallFormat::Text => "custom_tool_call_output",
+    }
+}
+
+/// Text of a freeform call. The accumulator stores it as a JSON string; a
+/// transcript written by an older or foreign writer may hold something else,
+/// and re-serializing it is better than losing the call.
+fn call_input_text(input: &Value) -> String {
+    match input.as_str() {
+        Some(text) => text.to_string(),
+        None => input.to_string(),
     }
 }
 
@@ -547,11 +584,7 @@ mod tests {
             ContentBlock::Text {
                 text: "calling".into(),
             },
-            ContentBlock::ToolUse {
-                id: "call_42".into(),
-                name: "bash".into(),
-                input: json!({ "cmd": "ls" }),
-            },
+            ContentBlock::tool_use("call_42", "bash", json!({ "cmd": "ls" })),
         ]);
         let tool = Message::tool_result("call_42", "files...", false);
         let body = request_body(&req(vec![assistant, tool], vec![], None));
@@ -692,11 +725,7 @@ mod tests {
                 id: "rs_1".into(),
                 encrypted_content: "ENC".into(),
             },
-            ContentBlock::ToolUse {
-                id: "c1".into(),
-                name: "bash".into(),
-                input: json!({}),
-            },
+            ContentBlock::tool_use("c1", "bash", json!({})),
         ]);
         let body = request_body(&req(vec![assistant], vec![], None));
         let input = body["input"].as_array().unwrap();
@@ -731,11 +760,7 @@ mod tests {
     }
 
     fn tool_use(id: &str) -> ContentBlock {
-        ContentBlock::ToolUse {
-            id: id.into(),
-            name: "bash".into(),
-            input: json!({ "cmd": "ls" }),
-        }
+        ContentBlock::tool_use(id, "bash", json!({ "cmd": "ls" }))
     }
 
     fn item_types(body: &Value) -> Vec<String> {
@@ -860,11 +885,7 @@ mod tests {
     fn assistant_text_and_calls_order() {
         // text first (message), then function_call, like Pi.
         let assistant = Message::assistant(vec![
-            ContentBlock::ToolUse {
-                id: "c1".into(),
-                name: "a".into(),
-                input: json!({}),
-            },
+            ContentBlock::tool_use("c1", "a", json!({})),
             ContentBlock::Text {
                 text: "after".into(),
             },
@@ -930,5 +951,65 @@ mod tests {
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["strict"], true);
         assert_eq!(body["tools"][1]["type"], "custom");
+    }
+
+    #[test]
+    fn custom_tool_call_and_its_output_round_trip_on_the_same_call_id() {
+        let source = "// @exec: cell\nconst x = {1};";
+        let assistant = Message::assistant(vec![ContentBlock::custom_tool_use(
+            "call_c", "exec", source,
+        )]);
+        let result = Message::tool_result_with_trust("call_c", "1", false, false);
+        let body = request_body(&req(vec![assistant, result], vec![], None));
+        assert_eq!(
+            body["input"],
+            json!([
+                { "type": "custom_tool_call", "call_id": "call_c", "name": "exec", "input": source },
+                { "type": "custom_tool_call_output", "call_id": "call_c", "output": "1" },
+            ]),
+            "text input travels verbatim and the output keeps its call_id"
+        );
+    }
+
+    #[test]
+    fn an_orphan_custom_call_is_repaired_with_a_custom_output() {
+        let assistant = Message::assistant(vec![ContentBlock::custom_tool_use(
+            "call_c", "exec", "loop()",
+        )]);
+        let body = request_body(&req(vec![Message::user("go"), assistant], vec![], None));
+        assert_eq!(
+            item_types(&body),
+            vec!["message", "custom_tool_call", "custom_tool_call_output"]
+        );
+        assert_eq!(body["input"][2]["call_id"], "call_c");
+        assert_eq!(body["input"][2]["output"], INTERRUPTED_TOOL_RESULT);
+    }
+
+    #[test]
+    fn mixed_transcripts_pair_each_result_with_the_type_of_its_call() {
+        let assistant = Message::assistant(vec![
+            tool_use("call_f"),
+            ContentBlock::custom_tool_use("call_c", "exec", "run()"),
+        ]);
+        let body = request_body(&req(
+            vec![
+                assistant,
+                Message::tool_result_with_trust("call_f", "files", false, false),
+                Message::tool_result_with_trust("call_c", "done", false, false),
+            ],
+            vec![],
+            None,
+        ));
+        assert_eq!(
+            item_types(&body),
+            vec![
+                "function_call",
+                "custom_tool_call",
+                "function_call_output",
+                "custom_tool_call_output"
+            ]
+        );
+        assert_eq!(body["input"][2]["call_id"], "call_f");
+        assert_eq!(body["input"][3]["call_id"], "call_c");
     }
 }

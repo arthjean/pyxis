@@ -2194,11 +2194,11 @@ mod tests {
         let mut state = AppState::new("gpt-5", true);
         state.open_transcript_overlay();
         let messages = vec![
-            agent_core::Message::assistant(vec![agent_core::ContentBlock::ToolUse {
-                id: "read-1".into(),
-                name: "read".into(),
-                input: serde_json::json!({ "path": "README.md" }),
-            }]),
+            agent_core::Message::assistant(vec![agent_core::ContentBlock::tool_use(
+                "read-1",
+                "read",
+                serde_json::json!({ "path": "README.md" }),
+            )]),
             agent_core::Message::tool_result(
                 "read-1",
                 (1..=18)

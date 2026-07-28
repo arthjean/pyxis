@@ -105,11 +105,11 @@ async fn crash_repair_crash_is_idempotent_across_1000_deterministic_replays() {
             ],
             &ids,
         );
-        *log.messages.lock().unwrap() = vec![Message::assistant(vec![ContentBlock::ToolUse {
-            id: "orphan".into(),
-            name: "bash".into(),
-            input: serde_json::json!({}),
-        }])];
+        *log.messages.lock().unwrap() = vec![Message::assistant(vec![ContentBlock::tool_use(
+            "orphan",
+            "bash",
+            serde_json::json!({}),
+        )])];
 
         let first = ThreadHandle::start(ThreadOptions {
             ids: Arc::new(SequentialIds::starting_at(seed + 8)),
@@ -394,11 +394,11 @@ async fn a_turn_left_open_by_a_crash_is_recovered_once_after_reconciliation() {
     // The transcript a crash left behind: a tool call nobody answered.
     *log.messages.lock().unwrap() = vec![
         Message::user("lance l'outil"),
-        Message::assistant(vec![ContentBlock::ToolUse {
-            id: "call-1".into(),
-            name: "bash".into(),
-            input: serde_json::json!({}),
-        }]),
+        Message::assistant(vec![ContentBlock::tool_use(
+            "call-1",
+            "bash",
+            serde_json::json!({}),
+        )]),
     ];
 
     let handle = open(&log, thread_id, echo_runner(1)).await;
@@ -523,11 +523,11 @@ async fn recovery_is_all_or_nothing_across_failures_before_and_after_the_commit(
                 },
             ],
         );
-        *log.messages.lock().unwrap() = vec![Message::assistant(vec![ContentBlock::ToolUse {
-            id: "orphan".into(),
-            name: "bash".into(),
-            input: serde_json::json!({}),
-        }])];
+        *log.messages.lock().unwrap() = vec![Message::assistant(vec![ContentBlock::tool_use(
+            "orphan",
+            "bash",
+            serde_json::json!({}),
+        )])];
 
         let point = if after_touch {
             FailurePoint::after_touch(

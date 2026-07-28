@@ -912,11 +912,7 @@ mod tests {
                 id: "rs_1".into(),
                 encrypted_content: "ENC_SECRET".into(),
             },
-            ContentBlock::ToolUse {
-                id: "c1".into(),
-                name: "bash".into(),
-                input: serde_json::json!({}),
-            },
+            ContentBlock::tool_use("c1", "bash", serde_json::json!({})),
         ]);
         s.sync(&[assistant]).await.unwrap();
         drop(s);
@@ -948,11 +944,7 @@ mod tests {
                 id: "rs_1".into(),
                 encrypted_content: "ENC_SECRET".into(),
             },
-            ContentBlock::ToolUse {
-                id: "c1".into(),
-                name: "bash".into(),
-                input: serde_json::json!({}),
-            },
+            ContentBlock::tool_use("c1", "bash", serde_json::json!({})),
         ]);
         s.checkpoint(CompactKind::Auto, &[summary("[summary]"), assistant])
             .await
@@ -1421,11 +1413,7 @@ mod tests {
                 id: "rs_1".into(),
                 encrypted_content: "ENC".into(),
             },
-            ContentBlock::ToolUse {
-                id: "c1".into(),
-                name: "bash".into(),
-                input: serde_json::json!({}),
-            },
+            ContentBlock::tool_use("c1", "bash", serde_json::json!({})),
         ]);
         s.sync(&[assistant]).await.unwrap();
         s.redact_encrypted_reasoning().await.unwrap();

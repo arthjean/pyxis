@@ -99,11 +99,7 @@ impl Approver for RecordingApprover {
 }
 
 fn call(id: &str, name: &str, input: serde_json::Value) -> ToolInvocation {
-    ToolInvocation {
-        id: id.to_string(),
-        name: name.to_string(),
-        input,
-    }
+    ToolInvocation::json(id, name, input)
 }
 
 #[tokio::test]

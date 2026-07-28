@@ -352,16 +352,8 @@ mod tests {
 
         let mut messages = vec![
             Message::assistant(vec![
-                ContentBlock::ToolUse {
-                    id: "answered".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({}),
-                },
-                ContentBlock::ToolUse {
-                    id: "orphan".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({}),
-                },
+                ContentBlock::tool_use("answered", "bash", serde_json::json!({})),
+                ContentBlock::tool_use("orphan", "bash", serde_json::json!({})),
             ]),
             Message::tool_result_with_trust("answered", "ok", false, true),
         ];

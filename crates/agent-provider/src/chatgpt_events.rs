@@ -1,12 +1,13 @@
 //! Mapping of the SSE events of the Responses API (ChatGPT/Codex backend) into the
 //! canonical `StreamEvent` vocabulary (PROVIDERS 2). Stateful: tracks the
 //! active function call and accumulates its arguments to guarantee the invariant
-//! "`args_json` complete & valid at `ToolCallEnd`".
+//! "`input_delta` complete & valid at `ToolCallEnd`".
 //!
 //! Event types transcribed verbatim from Pi (`openai-responses-shared.ts` +
 //! `openai-codex-responses.ts`). The irrelevant events (created, part.added,
 //! content_part.added, ...) are silently ignored, like Pi.
 
+use agent_core::message::ToolCallFormat;
 use agent_core::provider::{ProviderError, StopReason, StreamEvent, TokenUsage};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -14,7 +15,16 @@ use std::collections::HashMap;
 struct ActiveCall {
     call_id: String,
     args: String,
+    format: ToolCallFormat,
 }
+
+/// Responses output item types this mapper knowingly handles: projected here
+/// (`function_call`, `custom_tool_call`, `reasoning`) or carried by their own
+/// delta events (`message`). The conformance suite reads it so an item the
+/// wire starts sending, and that we silently ignore, fails a test instead of
+/// disappearing from the stream.
+pub const MAPPED_OUTPUT_ITEM_TYPES: &[&str] =
+    &["message", "reasoning", "function_call", "custom_tool_call"];
 
 /// Stateful mapper for one response stream. Reinstantiated on every turn.
 #[derive(Default)]
@@ -72,6 +82,12 @@ impl CodexEventMapper {
                     v.get("delta").and_then(Value::as_str),
                 ) && let Some(active) = self.active.get_mut(&key)
                 {
+                    if active.format != ToolCallFormat::Json {
+                        return Err(ProviderError::Decode(format!(
+                            "function arguments delta on custom tool call {}",
+                            active.call_id
+                        )));
+                    }
                     active.args.push_str(delta);
                 }
                 Ok(Vec::new())
@@ -84,6 +100,33 @@ impl CodexEventMapper {
                 ) && let Some(active) = self.active.get_mut(&key)
                 {
                     active.args = args.to_string();
+                }
+                Ok(Vec::new())
+            }
+            // Freeform input arrives as text fragments on its own event name.
+            "response.custom_tool_call_input.delta" => {
+                if let (Some(key), Some(delta)) = (
+                    self.event_item_key(&v, "custom_tool_call_input.delta")?,
+                    v.get("delta").and_then(Value::as_str),
+                ) && let Some(active) = self.active.get_mut(&key)
+                {
+                    if active.format != ToolCallFormat::Text {
+                        return Err(ProviderError::Decode(format!(
+                            "custom tool input delta on function call {}",
+                            active.call_id
+                        )));
+                    }
+                    active.args.push_str(delta);
+                }
+                Ok(Vec::new())
+            }
+            "response.custom_tool_call_input.done" => {
+                if let (Some(key), Some(input)) = (
+                    self.event_item_key(&v, "custom_tool_call_input.done")?,
+                    v.get("input").and_then(Value::as_str),
+                ) && let Some(active) = self.active.get_mut(&key)
+                {
+                    active.args = input.to_string();
                 }
                 Ok(Vec::new())
             }
@@ -103,9 +146,9 @@ impl CodexEventMapper {
             Some(i) => i,
             None => return Vec::new(),
         };
-        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        let Some(format) = call_format(item) else {
             return Vec::new();
-        }
+        };
         let call_id = item
             .get("call_id")
             .and_then(Value::as_str)
@@ -116,12 +159,8 @@ impl CodexEventMapper {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        // arguments often "" at opening time; we accumulate what follows.
-        let args = item
-            .get("arguments")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+        // Input is often "" at opening time; we accumulate what follows.
+        let args = initial_call_input(item, format).to_string();
         let item_id = item_id(item).unwrap_or(call_id.as_str()).to_string();
         if let Some(index) = v.get("output_index").and_then(Value::as_u64) {
             self.output_index_to_item.insert(index, item_id.clone());
@@ -133,9 +172,14 @@ impl CodexEventMapper {
             ActiveCall {
                 call_id: call_id.clone(),
                 args,
+                format,
             },
         );
-        vec![StreamEvent::ToolCallStart { id: call_id, name }]
+        vec![StreamEvent::ToolCallStart {
+            id: call_id,
+            name,
+            format,
+        }]
     }
 
     fn on_item_done(&mut self, v: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
@@ -167,20 +211,26 @@ impl CodexEventMapper {
                 encrypted_content: enc.to_string(),
             }]);
         }
-        if item_type != Some("function_call") {
+        let Some(item) = v.get("item") else {
             return Ok(Vec::new());
-        }
-        // final arguments: item.done takes priority, otherwise the accumulated ones.
-        let item_args = v
-            .get("item")
-            .and_then(|i| i.get("arguments"))
-            .and_then(Value::as_str);
+        };
+        let Some(format) = call_format(item) else {
+            return Ok(Vec::new());
+        };
+        // The terminal item is authoritative over every delta that preceded it.
+        let item_args = terminal_call_input(item, format);
         let Some(key) = self.event_item_key(v, "output_item.done")? else {
-            return self.reconstruct_done_function_call(v);
+            return self.reconstruct_done_call(item, format);
         };
         let Some(active) = self.active.remove(&key) else {
-            return self.reconstruct_done_function_call(v);
+            return self.reconstruct_done_call(item, format);
         };
+        if active.format != format {
+            return Err(ProviderError::Decode(format!(
+                "tool call {} changed format mid-stream",
+                active.call_id
+            )));
+        }
         if self.last_active_item.as_deref() == Some(key.as_str()) {
             self.last_active_item = None;
         }
@@ -189,26 +239,25 @@ impl CodexEventMapper {
             _ => active.args,
         };
         let mut out = Vec::new();
-        // A single ToolCallDelta carrying everything -> JSON invariant guaranteed.
+        // A single ToolCallDelta carrying everything: valid JSON for a
+        // function, the exact text for a freeform call, and no duplicate.
         if !args.is_empty() {
             out.push(StreamEvent::ToolCallDelta {
                 id: active.call_id.clone(),
-                args_json: args,
+                input_delta: args,
             });
         }
         out.push(StreamEvent::ToolCallEnd { id: active.call_id });
         Ok(out)
     }
 
-    fn reconstruct_done_function_call(
+    /// Terminal item for a call whose opening was never observed. The item
+    /// alone must carry an id and a name, otherwise nothing is dispatchable.
+    fn reconstruct_done_call(
         &mut self,
-        v: &Value,
+        item: &Value,
+        format: ToolCallFormat,
     ) -> Result<Vec<StreamEvent>, ProviderError> {
-        let Some(item) = v.get("item") else {
-            return Err(ProviderError::Decode(
-                "function_call done without active call or item".to_string(),
-            ));
-        };
         let call_id = item
             .get("call_id")
             .and_then(Value::as_str)
@@ -216,22 +265,20 @@ impl CodexEventMapper {
         let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
         if call_id.trim().is_empty() || name.trim().is_empty() {
             return Err(ProviderError::Decode(
-                "function_call done without active call id or name".to_string(),
+                "tool call done without active call id or name".to_string(),
             ));
         }
-        let args = item
-            .get("arguments")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let args = terminal_call_input(item, format).unwrap_or_default();
         self.saw_tool_call = true;
         let mut out = vec![StreamEvent::ToolCallStart {
             id: call_id.to_string(),
             name: name.to_string(),
+            format,
         }];
         if !args.is_empty() {
             out.push(StreamEvent::ToolCallDelta {
                 id: call_id.to_string(),
-                args_json: args.to_string(),
+                input_delta: args.to_string(),
             });
         }
         out.push(StreamEvent::ToolCallEnd {
@@ -375,6 +422,30 @@ fn delta_event(v: &Value, ctor: impl Fn(String) -> StreamEvent) -> Vec<StreamEve
 
 fn item_id(item: &Value) -> Option<&str> {
     item.get("id").and_then(Value::as_str)
+}
+
+/// Call format of an output item, `None` when the item is not a tool call.
+fn call_format(item: &Value) -> Option<ToolCallFormat> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => Some(ToolCallFormat::Json),
+        Some("custom_tool_call") => Some(ToolCallFormat::Text),
+        _ => None,
+    }
+}
+
+/// Input carried by an opening item: `arguments` for a function call,
+/// `input` for a custom one. Never mixed, so a freeform payload can never be
+/// read back as JSON arguments.
+fn initial_call_input(item: &Value, format: ToolCallFormat) -> &str {
+    terminal_call_input(item, format).unwrap_or_default()
+}
+
+fn terminal_call_input(item: &Value, format: ToolCallFormat) -> Option<&str> {
+    let field = match format {
+        ToolCallFormat::Json => "arguments",
+        ToolCallFormat::Text => "input",
+    };
+    item.get(field).and_then(Value::as_str)
 }
 
 /// `response.usage` -> `TokenUsage`. `input_tokens` includes the cached ones (we keep the
@@ -601,10 +672,7 @@ mod tests {
             r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":50,"output_tokens":12}}}"#,
         ]);
 
-        assert!(ev.contains(&StreamEvent::ToolCallStart {
-            id: "call_7".into(),
-            name: "bash".into()
-        }));
+        assert!(ev.contains(&StreamEvent::tool_call_start("call_7", "bash")));
         assert!(ev.contains(&StreamEvent::ToolCallEnd {
             id: "call_7".into()
         }));
@@ -616,12 +684,12 @@ mod tests {
             })
         );
 
-        // invariant: concatenated args_json = valid JSON.
+        // invariant: concatenated input_delta = valid JSON.
         let args: String = ev
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::ToolCallDelta { id, args_json } if id == "call_7" => {
-                    Some(args_json.clone())
+                StreamEvent::ToolCallDelta { id, input_delta } if id == "call_7" => {
+                    Some(input_delta.clone())
                 }
                 _ => None,
             })
@@ -647,8 +715,8 @@ mod tests {
         let args_for = |call_id: &str| -> String {
             ev.iter()
                 .filter_map(|e| match e {
-                    StreamEvent::ToolCallDelta { id, args_json } if id == call_id => {
-                        Some(args_json.clone())
+                    StreamEvent::ToolCallDelta { id, input_delta } if id == call_id => {
+                        Some(input_delta.clone())
                     }
                     _ => None,
                 })
@@ -715,8 +783,8 @@ mod tests {
         assert!(ev.iter().any(|e| {
             matches!(
                 e,
-                StreamEvent::ToolCallDelta { id, args_json }
-                if id == "call_b" && args_json == "{\"path\":\"b.txt\"}"
+                StreamEvent::ToolCallDelta { id, input_delta }
+                if id == "call_b" && input_delta == "{\"path\":\"b.txt\"}"
             )
         }));
     }
@@ -731,7 +799,7 @@ mod tests {
         let args: String = ev
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::ToolCallDelta { args_json, .. } => Some(args_json.clone()),
+                StreamEvent::ToolCallDelta { input_delta, .. } => Some(input_delta.clone()),
                 _ => None,
             })
             .collect();
@@ -747,14 +815,14 @@ mod tests {
         assert!(ev.iter().any(|e| {
             matches!(
                 e,
-                StreamEvent::ToolCallStart { id, name } if id == "c1" && name == "read"
+                StreamEvent::ToolCallStart { id, name, .. } if id == "c1" && name == "read"
             )
         }));
         assert!(ev.iter().any(|e| {
             matches!(
                 e,
-                StreamEvent::ToolCallDelta { id, args_json }
-                if id == "c1" && args_json == "{\"path\":\"Cargo.toml\"}"
+                StreamEvent::ToolCallDelta { id, input_delta }
+                if id == "c1" && input_delta == "{\"path\":\"Cargo.toml\"}"
             )
         }));
         assert_eq!(
@@ -880,5 +948,166 @@ mod tests {
         ));
         // empty line -> no-op.
         assert!(m.ingest("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn fragmented_custom_tool_call_yields_one_terminal_call_with_text_input() {
+        let ev = ingest_all(&[
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","call_id":"call_1","id":"ctc_1","name":"exec","input":""}}"#,
+            r#"{"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","call_id":"call_1","delta":"// @exec: cell\n"}"#,
+            r#"{"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","call_id":"call_1","delta":"const x = 1;"}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_1","id":"ctc_1","name":"exec","input":"// @exec: cell\nconst x = 1;"}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+        ]);
+        assert_eq!(
+            ev,
+            vec![
+                StreamEvent::custom_tool_call_start("call_1", "exec"),
+                StreamEvent::ToolCallDelta {
+                    id: "call_1".into(),
+                    input_delta: "// @exec: cell\nconst x = 1;".into(),
+                },
+                StreamEvent::ToolCallEnd {
+                    id: "call_1".into()
+                },
+                StreamEvent::Done {
+                    stop: StopReason::ToolUse
+                },
+            ]
+        );
+    }
+
+    /// Duplicated deltas then an authoritative terminal item: the terminal
+    /// input wins and nothing is emitted twice.
+    #[test]
+    fn duplicate_deltas_lose_against_the_terminal_item() {
+        let ev = ingest_all(&[
+            r#"{"type":"response.output_item.added","item":{"type":"custom_tool_call","call_id":"call_1","id":"ctc_1","name":"exec","input":""}}"#,
+            r#"{"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","delta":"print(1)"}"#,
+            r#"{"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","delta":"print(1)"}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_1","id":"ctc_1","name":"exec","input":"print(1)"}}"#,
+        ]);
+        let deltas: Vec<&str> = ev
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCallDelta { input_delta, .. } => Some(input_delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, ["print(1)"], "terminal item is authoritative");
+        assert_eq!(
+            ev.iter()
+                .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+                .count(),
+            1,
+            "one dispatch, not two"
+        );
+    }
+
+    #[test]
+    fn custom_tool_call_done_without_added_is_reconstructed() {
+        let ev = ingest_all(&[
+            r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"*** Begin Patch"}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+        ]);
+        assert_eq!(
+            ev.first(),
+            Some(&StreamEvent::custom_tool_call_start("c1", "apply_patch"))
+        );
+        assert!(ev.contains(&StreamEvent::ToolCallDelta {
+            id: "c1".into(),
+            input_delta: "*** Begin Patch".into(),
+        }));
+    }
+
+    #[test]
+    fn impossible_custom_streams_fail_closed_without_dispatch() {
+        // Terminal item without a name: nothing is dispatchable.
+        let mut m = CodexEventMapper::new();
+        assert!(matches!(
+            m.ingest(
+                r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"c1","input":"x"}}"#,
+            )
+            .unwrap_err(),
+            ProviderError::Decode(_)
+        ));
+
+        // A custom delta addressed to a function call would silently corrupt
+        // its JSON arguments, and the reverse would corrupt freeform text.
+        let mut m = CodexEventMapper::new();
+        m.ingest(
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_a","id":"fc_a","name":"read","arguments":""}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            m.ingest(
+                r#"{"type":"response.custom_tool_call_input.delta","item_id":"fc_a","delta":"raw"}"#,
+            )
+            .unwrap_err(),
+            ProviderError::Decode(_)
+        ));
+
+        let mut m = CodexEventMapper::new();
+        m.ingest(
+            r#"{"type":"response.output_item.added","item":{"type":"custom_tool_call","call_id":"call_c","id":"ctc_a","name":"exec","input":""}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            m.ingest(
+                r#"{"type":"response.function_call_arguments.delta","item_id":"ctc_a","delta":"{}"}"#,
+            )
+            .unwrap_err(),
+            ProviderError::Decode(_)
+        ));
+
+        // Format flip between the opening and the terminal item.
+        let mut m = CodexEventMapper::new();
+        m.ingest(
+            r#"{"type":"response.output_item.added","item":{"type":"custom_tool_call","call_id":"c2","id":"ctc_2","name":"exec","input":""}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            m.ingest(
+                r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c2","id":"ctc_2","name":"exec","arguments":"{}"}}"#,
+            )
+            .unwrap_err(),
+            ProviderError::Decode(_)
+        ));
+
+        // Invalid UTF-8 escape inside the payload: rejected at decode, so no
+        // call is ever built from it.
+        let mut m = CodexEventMapper::new();
+        assert!(matches!(
+            m.ingest(
+                "{\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"c3\",\"name\":\"exec\",\"input\":\"\\ud800\"}}",
+            )
+            .unwrap_err(),
+            ProviderError::Decode(_)
+        ));
+    }
+
+    #[test]
+    fn function_and_custom_calls_interleave_without_crosstalk() {
+        let ev = ingest_all(&[
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_f","id":"fc_1","name":"read","arguments":""}}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"custom_tool_call","call_id":"call_c","id":"ctc_1","name":"exec","input":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"path\":\"a.txt\"}"}"#,
+            r#"{"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","delta":"await tools.read()"}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_f","id":"fc_1","name":"read","arguments":"{\"path\":\"a.txt\"}"}}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_c","id":"ctc_1","name":"exec","input":"await tools.read()"}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+        ]);
+        let payload = |call: &str| -> Option<String> {
+            ev.iter().find_map(|event| match event {
+                StreamEvent::ToolCallDelta { id, input_delta } if id == call => {
+                    Some(input_delta.clone())
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(payload("call_f").as_deref(), Some(r#"{"path":"a.txt"}"#));
+        assert_eq!(payload("call_c").as_deref(), Some("await tools.read()"));
+        assert!(ev.contains(&StreamEvent::tool_call_start("call_f", "read")));
+        assert!(ev.contains(&StreamEvent::custom_tool_call_start("call_c", "exec")));
     }
 }

@@ -54,11 +54,7 @@ impl Tool for Probe {
 }
 
 fn call(id: &str, input: serde_json::Value) -> ToolInvocation {
-    ToolInvocation {
-        id: id.into(),
-        name: "p".into(),
-        input,
-    }
+    ToolInvocation::json(id, "p", input)
 }
 
 fn registry() -> Registry {

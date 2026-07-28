@@ -65,6 +65,27 @@ pub enum ToolErrorKind {
     Semantic,
 }
 
+/// How a tool call carries its input. Provider-neutral: a `Text` call is what
+/// the Responses API happens to call a custom tool call, but the core only
+/// knows "this input is text, not JSON arguments".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallFormat {
+    #[default]
+    Json,
+    Text,
+}
+
+impl ToolCallFormat {
+    pub const fn is_json(&self) -> bool {
+        matches!(self, Self::Json)
+    }
+
+    pub const fn is_text(&self) -> bool {
+        matches!(self, Self::Text)
+    }
+}
+
 const fn default_untrusted() -> bool {
     true
 }
@@ -96,7 +117,12 @@ pub enum ContentBlock {
     ToolUse {
         id: ToolCallId,
         name: String,
+        /// JSON arguments for a `Json` call, the raw text for a `Text` one.
         input: serde_json::Value,
+        /// Absent from JSONL written before freeform tools existed, which is
+        /// exactly the `Json` case: the field is additive and read tolerantly.
+        #[serde(default, skip_serializing_if = "ToolCallFormat::is_json")]
+        format: ToolCallFormat,
     },
     ToolResult {
         tool_use_id: ToolCallId,
@@ -304,6 +330,35 @@ impl Message {
 }
 
 impl ContentBlock {
+    /// Call whose arguments are JSON validated against a tool schema.
+    pub fn tool_use(
+        id: impl Into<ToolCallId>,
+        name: impl Into<String>,
+        input: serde_json::Value,
+    ) -> Self {
+        Self::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input,
+            format: ToolCallFormat::Json,
+        }
+    }
+
+    /// Call whose input is raw text (freeform tool). The text is stored as a
+    /// JSON string so one transcript shape carries both formats.
+    pub fn custom_tool_use(
+        id: impl Into<ToolCallId>,
+        name: impl Into<String>,
+        input: impl Into<String>,
+    ) -> Self {
+        Self::ToolUse {
+            id: id.into(),
+            name: name.into(),
+            input: serde_json::Value::String(input.into()),
+            format: ToolCallFormat::Text,
+        }
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             ContentBlock::Text { .. } => "text",
@@ -411,24 +466,16 @@ mod tests {
     fn unanswered_tool_calls_reports_each_pending_call_once_in_order() {
         let messages = vec![
             Message::assistant(vec![
-                ContentBlock::ToolUse {
-                    id: "c1".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({}),
-                },
-                ContentBlock::ToolUse {
-                    id: "c2".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({}),
-                },
+                ContentBlock::tool_use("c1", "bash", serde_json::json!({})),
+                ContentBlock::tool_use("c2", "bash", serde_json::json!({})),
             ]),
             Message::tool_result("c2", "done", false),
             // Defensive repetition of the same call: a single result must follow.
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "c1".into(),
-                name: "bash".into(),
-                input: serde_json::json!({}),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "c1",
+                "bash",
+                serde_json::json!({}),
+            )]),
         ];
         assert_eq!(unanswered_tool_calls(&messages), vec!["c1".to_string()]);
     }
@@ -437,11 +484,11 @@ mod tests {
     fn unanswered_tool_calls_is_empty_on_a_healthy_transcript() {
         let messages = vec![
             Message::user("go"),
-            Message::assistant(vec![ContentBlock::ToolUse {
-                id: "c1".into(),
-                name: "bash".into(),
-                input: serde_json::json!({}),
-            }]),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "c1",
+                "bash",
+                serde_json::json!({}),
+            )]),
             Message::tool_result("c1", "out", false),
         ];
         assert!(unanswered_tool_calls(&messages).is_empty());

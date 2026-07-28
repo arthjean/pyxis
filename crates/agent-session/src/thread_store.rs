@@ -633,11 +633,11 @@ mod tests {
             payload: ThreadEventPayload::ThreadCreated,
         };
         store.append(&created).await.unwrap();
-        let orphan = Message::assistant(vec![ContentBlock::ToolUse {
-            id: "call-recovery".into(),
-            name: "bash".into(),
-            input: serde_json::json!({}),
-        }]);
+        let orphan = Message::assistant(vec![ContentBlock::tool_use(
+            "call-recovery",
+            "bash",
+            serde_json::json!({}),
+        )]);
         Session::sync(&store, std::slice::from_ref(&orphan))
             .await
             .unwrap();

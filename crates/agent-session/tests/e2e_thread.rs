@@ -464,11 +464,11 @@ async fn a_turn_left_open_by_a_crash_is_closed_once_at_resume() {
         store
             .sync(&[
                 Message::user("tour interrompu par un crash"),
-                Message::assistant(vec![ContentBlock::ToolUse {
-                    id: "call_orphelin".into(),
-                    name: "bash".into(),
-                    input: serde_json::json!({}),
-                }]),
+                Message::assistant(vec![ContentBlock::tool_use(
+                    "call_orphelin",
+                    "bash",
+                    serde_json::json!({}),
+                )]),
             ])
             .await
             .expect("the transcript is written");

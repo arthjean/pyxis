@@ -272,13 +272,10 @@ async fn engine_events_cross_the_seam_without_reimplementing_retry_or_dispatch()
             ),
             // 2. a tool call -> the ENGINE dispatches through the injected pipeline.
             Scripted::Stream(vec![
-                StreamEvent::ToolCallStart {
-                    id: "call-1".into(),
-                    name: "echo".into(),
-                },
+                StreamEvent::tool_call_start("call-1", "echo"),
                 StreamEvent::ToolCallDelta {
                     id: "call-1".into(),
-                    args_json: "{}".into(),
+                    input_delta: "{}".into(),
                 },
                 StreamEvent::ToolCallEnd {
                     id: "call-1".into(),

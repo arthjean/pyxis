@@ -574,13 +574,10 @@ mod loop_tests {
 
     fn tool_turn(id: &str) -> MockTurn {
         MockTurn::Stream(vec![
-            StreamEvent::ToolCallStart {
-                id: id.into(),
-                name: "bash".into(),
-            },
+            StreamEvent::tool_call_start(id, "bash"),
             StreamEvent::ToolCallDelta {
                 id: id.into(),
-                args_json: "{\"cmd\":\"ls\"}".into(),
+                input_delta: "{\"cmd\":\"ls\"}".into(),
             },
             StreamEvent::ToolCallEnd { id: id.into() },
             StreamEvent::Done {
@@ -592,10 +589,7 @@ mod loop_tests {
     fn tool_turn_n(ids: &[&str]) -> MockTurn {
         let mut events = Vec::new();
         for id in ids {
-            events.push(StreamEvent::ToolCallStart {
-                id: (*id).into(),
-                name: "bash".into(),
-            });
+            events.push(StreamEvent::tool_call_start(*id, "bash"));
             events.push(StreamEvent::ToolCallEnd { id: (*id).into() });
         }
         events.push(StreamEvent::Done {
@@ -1747,13 +1741,10 @@ mod loop_tests {
         let h = harness(
             vec![
                 MockTurn::Stream(vec![
-                    StreamEvent::ToolCallStart {
-                        id: "c1".into(),
-                        name: "bash".into(),
-                    },
+                    StreamEvent::tool_call_start("c1", "bash"),
                     StreamEvent::ToolCallDelta {
                         id: "c1".into(),
-                        args_json: "{\"cm".into(),
+                        input_delta: "{\"cm".into(),
                     },
                     StreamEvent::Done {
                         stop: StopReason::MaxTokens,
@@ -1792,13 +1783,10 @@ mod loop_tests {
                     output: 5,
                 },
             },
-            StreamEvent::ToolCallStart {
-                id: "c1".into(),
-                name: "bash".into(),
-            },
+            StreamEvent::tool_call_start("c1", "bash"),
             StreamEvent::ToolCallDelta {
                 id: "c1".into(),
-                args_json: "{}".into(),
+                input_delta: "{}".into(),
             },
             StreamEvent::ToolCallEnd { id: "c1".into() },
             StreamEvent::Done {
@@ -1979,13 +1967,10 @@ mod loop_tests {
             StreamEvent::Usage {
                 usage: TokenUsage { input, output },
             },
-            StreamEvent::ToolCallStart {
-                id: id.into(),
-                name: "bash".into(),
-            },
+            StreamEvent::tool_call_start(id, "bash"),
             StreamEvent::ToolCallDelta {
                 id: id.into(),
-                args_json: "{\"cmd\":\"ls\"}".into(),
+                input_delta: "{\"cmd\":\"ls\"}".into(),
             },
             StreamEvent::ToolCallEnd { id: id.into() },
             StreamEvent::Done {
@@ -2036,13 +2021,10 @@ mod loop_tests {
     async fn loop_guardrail_does_not_false_positive_on_distinct_calls() {
         let distinct = |id: &str, cmd: &str| {
             MockTurn::Stream(vec![
-                StreamEvent::ToolCallStart {
-                    id: id.into(),
-                    name: "bash".into(),
-                },
+                StreamEvent::tool_call_start(id, "bash"),
                 StreamEvent::ToolCallDelta {
                     id: id.into(),
-                    args_json: format!("{{\"cmd\":\"{cmd}\"}}"),
+                    input_delta: format!("{{\"cmd\":\"{cmd}\"}}"),
                 },
                 StreamEvent::ToolCallEnd { id: id.into() },
                 StreamEvent::Done {

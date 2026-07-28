@@ -139,11 +139,7 @@ impl Approver for ScopedApprover {
 }
 
 fn call(id: &str, name: &str, input: serde_json::Value) -> ToolInvocation {
-    ToolInvocation {
-        id: id.into(),
-        name: name.into(),
-        input,
-    }
+    ToolInvocation::json(id, name, input)
 }
 
 fn by_id<'a>(outcomes: &'a [ToolOutcome], id: &str) -> &'a ToolOutcome {
