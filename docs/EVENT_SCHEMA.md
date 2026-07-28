@@ -71,6 +71,12 @@ contrat que consomme aussi la TUI.
 | `interrupted` | — | Le tour a été interrompu ; le transcript est déjà réconcilié. |
 | `exhausted` | détail | Arrêt déterministe : budget, plafond de tours, boucle d'outils. |
 | `error` | détail | Erreur d'agent. Émise **avant** la sortie du processus. |
+| `thread_store_failed` | `{operation, detail, thread_id, event_id?}` | Le journal durable est devenu inutilisable. Signal live additif : son `event_id` corrèle la ligne mais ne prétend pas que la faute a été persistée par le writer défaillant. Il est omis si le client reconstruit la faute depuis le dernier statut après une perte d'événements live. |
+
+`thread_store_failed` vient du runtime, pas d'`AgentEvent`. Il termine le run
+avec `run_summary.data.end = "error"` et un `exit_code` non nul. `operation`
+nomme la frontière (`create`, `append`, `commit_recovery`, `flush`, `read`,
+`fork` ou `close`) sans inclure le contenu du prompt.
 
 ### `model_turn`
 
