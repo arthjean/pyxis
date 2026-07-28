@@ -62,6 +62,9 @@ pub enum ExhaustReason {
 pub enum Transition {
     /// The model finished without tool_use -> hand back control.
     EndTurn,
+    /// Assistant output is committed, then the model is sampled again without a
+    /// fabricated user message.
+    Continue,
     /// The model asks for tools -> run them then loop back.
     RunTools(Vec<ToolInvocation>),
     /// Compaction (proactive auto, or reactive) before the next call.
@@ -127,9 +130,16 @@ pub fn post_stream_transition(acc: &Accumulator) -> Transition {
         Some(StopReason::MaxTokens) => Transition::Exhausted(ExhaustReason::MaxOutputTokens {
             visible_output: acc.has_visible_output(),
         }),
+        Some(StopReason::ContentFilter) => Transition::Fail(AgentError::Provider(
+            ProviderFailure::contract("model output blocked by content filter"),
+        )),
+        Some(StopReason::IncompleteUnknown) => Transition::Fail(AgentError::Provider(
+            ProviderFailure::contract("model response incomplete for an unknown reason"),
+        )),
         Some(StopReason::Refusal) => Transition::Fail(AgentError::Provider(
             ProviderFailure::contract("model refusal"),
         )),
+        Some(StopReason::Continue) => Transition::Continue,
         Some(StopReason::EndTurn | StopReason::StopSequence) => Transition::EndTurn,
     }
 }

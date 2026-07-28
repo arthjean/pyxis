@@ -31,6 +31,16 @@ impl ContextBudget {
     /// Fallible variant for the runtime wiring: an unusable window is a
     /// config/provider error, not a budget with zeroed thresholds.
     pub fn try_for_model(max_context: u32, output_reserve: u32) -> Result<Self, String> {
+        Self::try_for_model_with_auto_limit(max_context, output_reserve, None)
+    }
+
+    /// Builds from the effective descriptor. The explicit threshold is shared
+    /// by every budget decision in the turn.
+    pub fn try_for_model_with_auto_limit(
+        max_context: u32,
+        output_reserve: u32,
+        auto_compact_token_limit: Option<u32>,
+    ) -> Result<Self, String> {
         if max_context == 0 {
             return Err("max_context provider nul".to_string());
         }
@@ -42,7 +52,18 @@ impl ContextBudget {
                 "max_output_tokens ({output_reserve}) must be lower than context ({max_context})"
             ));
         }
-        Ok(Self::for_model(max_context, output_reserve))
+        let mut budget = Self::for_model(max_context, output_reserve);
+        if let Some(limit) = auto_compact_token_limit {
+            if limit == 0 || limit > max_context {
+                return Err(format!(
+                    "auto_compact_token_limit ({limit}) must be within context ({max_context})"
+                ));
+            }
+            let usable_limit = limit.saturating_sub(output_reserve);
+            budget.auto_threshold = usable_limit;
+            budget.micro_threshold = budget.micro_threshold.min(usable_limit);
+        }
+        Ok(budget)
     }
 
     /// Builds the budget from the model window. Thresholds: micro at 70%,
@@ -209,6 +230,22 @@ mod tests {
         assert_eq!(b.auto_threshold(), 640);
         assert!(!b.should_microcompact());
         assert!(!b.should_autocompact());
+    }
+
+    #[test]
+    fn descriptor_auto_compact_limit_controls_every_threshold_check() {
+        let mut b = ContextBudget::try_for_model_with_auto_limit(100_000, 4_000, Some(80_000))
+            .expect("valid descriptor geometry");
+        assert_eq!(b.auto_threshold(), 76_000);
+        b.observe_estimated(75_999);
+        assert!(!b.should_autocompact());
+        assert!(!b.would_autocompact(75_999));
+        b.observe_usage(TokenUsage {
+            input: 76_000,
+            output: 1,
+        });
+        assert!(b.should_autocompact());
+        assert!(b.would_autocompact(76_000));
     }
 
     #[test]

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use crate::message::{Message, ToolCallId};
+use crate::model::{ModelRuntimeError, ResolvedModelRuntime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,8 +88,11 @@ impl TokenUsage {
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     EndTurn,
+    Continue,
     ToolUse,
     MaxTokens,
+    ContentFilter,
+    IncompleteUnknown,
     StopSequence,
     Refusal,
 }
@@ -292,6 +296,8 @@ pub enum ToolSpecValidationError {
 pub struct CanonicalRequest {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_runtime: Option<ResolvedModelRuntime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     pub system: Option<String>,
     pub messages: Vec<Message>,
@@ -306,6 +312,40 @@ impl CanonicalRequest {
         }
         if self.max_output_tokens == 0 {
             return Err(CanonicalRequestValidationError::ZeroMaxOutputTokens);
+        }
+        if let Some(runtime) = &self.model_runtime {
+            runtime.validate().map_err(|error| {
+                CanonicalRequestValidationError::InvalidModelRuntime {
+                    detail: error.to_string(),
+                }
+            })?;
+            if runtime.slug != self.model {
+                return Err(CanonicalRequestValidationError::InvalidModelRuntime {
+                    detail: "runtime slug does not match request model".into(),
+                });
+            }
+            if runtime.max_output_tokens != self.max_output_tokens {
+                return Err(CanonicalRequestValidationError::InvalidModelRuntime {
+                    detail: "runtime output limit does not match request".into(),
+                });
+            }
+            if runtime.reasoning_effort != self.reasoning_effort {
+                return Err(CanonicalRequestValidationError::InvalidModelRuntime {
+                    detail: "runtime reasoning effort does not match request".into(),
+                });
+            }
+            if !runtime.accepts_images()
+                && self.messages.iter().any(|message| {
+                    message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, crate::message::ContentBlock::Image { .. }))
+                })
+            {
+                return Err(CanonicalRequestValidationError::UnsupportedImageModality {
+                    model: runtime.slug.clone(),
+                });
+            }
         }
         for (index, message) in self.messages.iter().enumerate() {
             message.validate().map_err(|source| {
@@ -337,6 +377,10 @@ pub enum CanonicalRequestValidationError {
     EmptyModel,
     #[error("max_output_tokens must be greater than zero")]
     ZeroMaxOutputTokens,
+    #[error("invalid model runtime: {detail}")]
+    InvalidModelRuntime { detail: String },
+    #[error("model {model} does not accept image input")]
+    UnsupportedImageModality { model: String },
     #[error("message {index} is invalid: {detail}")]
     InvalidMessage { index: usize, detail: String },
     #[error("tool spec is invalid: {0}")]
@@ -430,6 +474,27 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// Resolves the immutable model contract before a turn is started.
+    fn resolve_model_runtime(
+        &self,
+        model: &str,
+        reasoning_effort: Option<&str>,
+        max_output_tokens: u32,
+        max_retries: u32,
+        backoff_base_ms: u64,
+    ) -> Result<ResolvedModelRuntime, ModelRuntimeError> {
+        let _ = (
+            reasoning_effort,
+            max_output_tokens,
+            max_retries,
+            backoff_base_ms,
+        );
+        Err(ModelRuntimeError::Incompatible {
+            slug: model.to_string(),
+            reason: "provider does not expose a model runtime resolver".into(),
+        })
+    }
+
     /// Hot path: canonical event stream.
     async fn stream(
         &self,
@@ -465,6 +530,40 @@ pub trait Provider: Send + Sync {
 mod tests {
     use super::*;
     use crate::message::{ContentBlock, Message, Role};
+    use crate::model::{
+        InputModality, ModelRetryPolicy, ModelRuntimeSource, ModelToolMode, ResponsesDialect,
+        TruncationMode, TruncationPolicy,
+    };
+
+    fn text_only_runtime() -> ResolvedModelRuntime {
+        ResolvedModelRuntime {
+            slug: "text-model".into(),
+            source: ModelRuntimeSource::Embedded {
+                version: "test".into(),
+            },
+            instructions: "test".into(),
+            fingerprint: "a".repeat(64),
+            context_window: 10_000,
+            auto_compact_token_limit: 8_000,
+            input_modalities: vec![InputModality::Text],
+            reasoning_effort: None,
+            supports_verbosity: false,
+            verbosity: None,
+            supports_parallel_tool_calls: false,
+            responses_dialect: ResponsesDialect::Standard,
+            tool_mode: ModelToolMode::Direct,
+            truncation: TruncationPolicy {
+                mode: TruncationMode::Tokens,
+                limit: 1_000,
+            },
+            retry: ModelRetryPolicy {
+                max_retries: 1,
+                backoff_base_ms: 50,
+            },
+            max_output_tokens: 100,
+            comp_hash: None,
+        }
+    }
 
     #[test]
     fn context_error_detection() {
@@ -502,6 +601,7 @@ mod tests {
         };
         let req = CanonicalRequest {
             model: "gpt".into(),
+            model_runtime: None,
             reasoning_effort: None,
             system: None,
             messages: vec![invalid_message],
@@ -515,6 +615,7 @@ mod tests {
 
         let req = CanonicalRequest {
             model: "gpt".into(),
+            model_runtime: None,
             reasoning_effort: None,
             system: None,
             messages: vec![Message::user("ok")],
@@ -538,9 +639,33 @@ mod tests {
     }
 
     #[test]
+    fn canonical_request_rejects_images_before_serialization_for_text_only_runtime() {
+        let req = CanonicalRequest {
+            model: "text-model".into(),
+            model_runtime: Some(text_only_runtime()),
+            reasoning_effort: None,
+            system: Some("test".into()),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "AA==".into(),
+                }],
+            }],
+            tools: Vec::new(),
+            max_output_tokens: 100,
+        };
+        assert!(matches!(
+            req.validate(),
+            Err(CanonicalRequestValidationError::UnsupportedImageModality { .. })
+        ));
+    }
+
+    #[test]
     fn canonical_request_rejects_non_strict_tool_schemas_and_duplicate_names() {
         let req = CanonicalRequest {
             model: "gpt".into(),
+            model_runtime: None,
             reasoning_effort: None,
             system: None,
             messages: vec![Message::user("ok")],
@@ -574,6 +699,7 @@ mod tests {
         };
         let req = CanonicalRequest {
             model: "gpt".into(),
+            model_runtime: None,
             reasoning_effort: None,
             system: None,
             messages: vec![Message::user("ok")],

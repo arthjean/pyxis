@@ -101,6 +101,9 @@ pub struct ModelTurnView {
     /// relating one to the other is a presentation decision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
+    /// Descriptor threshold that drives proactive compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<u32>,
     /// Local estimate of the same input, produced only when the calibration
     /// probe is enabled (`RunConfig::usage_probe`). Exists to be compared to
     /// `context_tokens`; `None` in the nominal case.

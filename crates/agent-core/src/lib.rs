@@ -16,6 +16,7 @@ pub mod event;
 pub mod guardrail;
 pub mod input;
 pub mod message;
+pub mod model;
 pub mod provider;
 pub mod quota;
 pub mod sandbox;
@@ -572,6 +573,72 @@ mod loop_tests {
             last.text().contains("final answer"),
             "the last persisted message should be the final answer: {synced:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn continuation_commits_assistant_and_resamples_without_user_input() {
+        let first = MockTurn::Stream(vec![
+            StreamEvent::TextDelta {
+                text: "working".into(),
+            },
+            StreamEvent::Done {
+                stop: StopReason::Continue,
+            },
+        ]);
+        let h = harness(vec![first, text_turn("finished")], false, 100_000);
+        let ctx = AgentContext::new("mock").push(Message::user("task"));
+        let events = drive(ctx, h.deps).await;
+        assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ModelTurn(_)))
+                .count(),
+            2
+        );
+        let requests = h.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1]
+                .iter()
+                .filter(|message| message.role == crate::message::Role::User)
+                .count(),
+            1,
+            "continuation must not fabricate a user input"
+        );
+        assert!(
+            requests[1]
+                .iter()
+                .any(|message| message.role == crate::message::Role::Assistant
+                    && message.text().contains("working"))
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_continuations_exhaust_the_model_turn_budget() {
+        let continuation = || {
+            MockTurn::Stream(vec![
+                StreamEvent::TextDelta {
+                    text: "still working".into(),
+                },
+                StreamEvent::Done {
+                    stop: StopReason::Continue,
+                },
+            ])
+        };
+        let h = harness(vec![continuation(), continuation()], false, 100_000);
+        let ctx = AgentContext::new("mock")
+            .push(Message::user("task"))
+            .with_config(RunConfig {
+                max_turns: 2,
+                ..RunConfig::default()
+            });
+        let events = drive(ctx, h.deps).await;
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Exhausted(ExhaustReason::MaxTurns(2)))
+        ));
+        assert_eq!(h.requests.lock().unwrap().len(), 2);
     }
 
     // US-028: context messages (AGENTS.md + env) are prefixed to EVERY

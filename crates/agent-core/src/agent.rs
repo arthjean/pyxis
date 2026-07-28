@@ -23,6 +23,7 @@ use crate::input::InputQueue;
 use crate::message::{
     INTERRUPTED_TOOL_RESULT, Message, ToolCallId, ToolErrorKind, unanswered_tool_calls,
 };
+use crate::model::ResolvedModelRuntime;
 use crate::provider::{
     AuthError, CanonicalRequest, ErrorClass, ProviderError, StreamEvent, TokenUsage, ToolSpec,
 };
@@ -79,6 +80,8 @@ impl Default for RunConfig {
 /// Context of an agent run (model, system, transcript, tools).
 pub struct AgentContext {
     pub model: String,
+    /// Immutable model contract captured before the turn starts.
+    pub model_runtime: Option<ResolvedModelRuntime>,
     pub reasoning_effort: Option<String>,
     pub system: Option<String>,
     pub messages: Vec<Message>,
@@ -105,6 +108,7 @@ impl AgentContext {
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
+            model_runtime: None,
             reasoning_effort: None,
             system: None,
             messages: Vec::new(),
@@ -157,8 +161,10 @@ async fn steer_ready(inputs: &Option<Arc<dyn InputQueue>>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_request(
     model: &str,
+    model_runtime: &Option<ResolvedModelRuntime>,
     reasoning_effort: &Option<String>,
     system: &Option<String>,
     context_messages: &[Message],
@@ -177,6 +183,7 @@ fn make_request(
     all.extend_from_slice(ephemeral_messages);
     CanonicalRequest {
         model: model.to_string(),
+        model_runtime: model_runtime.clone(),
         reasoning_effort: reasoning_effort.clone(),
         system: system.clone(),
         messages: all,
@@ -401,20 +408,44 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
     async_stream::stream! {
         let AgentContext {
             mut model,
-            reasoning_effort,
+            model_runtime,
+            mut reasoning_effort,
             system,
             mut messages,
             mut tools,
-            config,
+            mut config,
             mut context_messages,
             ephemeral_messages,
             step_source,
             inputs,
         } = ctx;
 
+        if let Some(runtime) = &model_runtime {
+            if let Err(error) = runtime.validate() {
+                yield AgentEvent::Error(AgentError::InvalidRequest(error.to_string()));
+                return;
+            }
+            model = runtime.slug.clone();
+            reasoning_effort = runtime.reasoning_effort.clone();
+            config.max_output_tokens = runtime.max_output_tokens;
+            config.max_retries = runtime.retry.max_retries;
+            config.backoff_base_ms = runtime.retry.backoff_base_ms;
+            config.overload_fallback_model = None;
+        }
+
         // ContextBudget computed for the active model (recomputed on overload fallback).
-        let max_context = deps.provider.max_context_for_model(&model);
-        let mut budget = match ContextBudget::try_for_model(max_context, config.max_output_tokens) {
+        let max_context = model_runtime
+            .as_ref()
+            .map(|runtime| runtime.context_window)
+            .unwrap_or_else(|| deps.provider.max_context_for_model(&model));
+        let auto_compact_token_limit = model_runtime
+            .as_ref()
+            .map(|runtime| runtime.auto_compact_token_limit);
+        let mut budget = match ContextBudget::try_for_model_with_auto_limit(
+            max_context,
+            config.max_output_tokens,
+            auto_compact_token_limit,
+        ) {
             Ok(budget) => budget,
             Err(e) => {
                 yield AgentEvent::Error(AgentError::InvalidRequest(e));
@@ -563,6 +594,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     budget.begin_turn();
                     let req = make_request(
                         &model,
+                        &model_runtime,
                         &reasoning_effort,
                         &system,
                         &context_messages,
@@ -911,13 +943,21 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         // US-002: real occupancy of the window, absent when the
                         // provider reported nothing (never reported as zero).
                         context_tokens: last_usage.map(|usage| usage.input),
-                        context_window: deps.provider.context_window_for_model(&model),
+                        context_window: model_runtime
+                            .as_ref()
+                            .map(|runtime| runtime.context_window)
+                            .or_else(|| deps.provider.context_window_for_model(&model)),
+                        auto_compact_token_limit: model_runtime
+                            .as_ref()
+                            .map(|runtime| runtime.auto_compact_token_limit),
                         estimated_context_tokens: estimated_input,
                     });
 
                     let transition = post_stream_transition(&acc);
-                    let commits_assistant =
-                        matches!(transition, Transition::EndTurn | Transition::RunTools(_));
+                    let commits_assistant = matches!(
+                        transition,
+                        Transition::EndTurn | Transition::Continue | Transition::RunTools(_)
+                    );
                     if commits_assistant && !acc.is_empty() {
                         messages.push(acc.to_assistant_message());
                     } else if acc.has_visible_output() {
@@ -932,8 +972,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
             }
             };
 
-            // EXHAUSTIVE match over the 6 variants (AC1), checked at compile time.
+            // Exhaustive match over every transition, checked at compile time.
             match transition {
+                Transition::Continue => {}
                 Transition::EndTurn => {
                     // US-024: persistence of the LAST assistant turn. The final
                     // assistant message (acc.to_assistant_message) was just pushed,

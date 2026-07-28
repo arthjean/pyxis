@@ -160,6 +160,7 @@ pub async fn full_compact(
 
     let req = CanonicalRequest {
         model: model.to_string(),
+        model_runtime: None,
         reasoning_effort: None,
         system: Some(SUMMARY_SYSTEM.to_string()),
         messages: to_summarize,
@@ -179,7 +180,11 @@ pub async fn full_compact(
                 "summary truncated by max_tokens".to_string(),
             ));
         }
-        StopReason::ToolUse | StopReason::Refusal => {
+        StopReason::Continue
+        | StopReason::ToolUse
+        | StopReason::ContentFilter
+        | StopReason::IncompleteUnknown
+        | StopReason::Refusal => {
             return Err(AgentError::Compaction(format!(
                 "incomplete summary received from provider: {:?}",
                 resp.stop
