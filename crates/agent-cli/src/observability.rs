@@ -406,6 +406,91 @@ mod tests {
         assert!(!agent_tui::is_active());
     }
 
+    /// Every source file of a crate, recursively.
+    fn rust_sources(root: &Path) -> Vec<(PathBuf, String)> {
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                found.extend(rust_sources(&path));
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs")
+                && let Ok(content) = std::fs::read_to_string(&path)
+            {
+                found.push((path, content));
+            }
+        }
+        found
+    }
+
+    /// Confidentiality NFR / US-019 AC4: a trace at `error`, `warn`, `info` or
+    /// `debug` carries identifiers and durations, never content. Content is
+    /// allowed at `trace` alone.
+    ///
+    /// Checked mechanically because the failure mode is a one-line addition
+    /// nobody reviews twice: a `text = %submission.text` added to an existing
+    /// span leaks a whole prompt into a file the user is told is safe to share.
+    #[test]
+    fn no_trace_below_the_trace_level_carries_content() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let roots = [
+            manifest.join("src"),
+            manifest.join("..").join("agent-runtime").join("src"),
+        ];
+        // Field names that would carry a prompt, a tool result or a message.
+        const BANNED: &[&str] = &[
+            "prompt =",
+            "prompt=",
+            "text =",
+            "text=",
+            "content =",
+            "content=",
+            ".text()",
+            "submission.text",
+            "message =",
+            "message=",
+        ];
+        let mut offenders: Vec<String> = Vec::new();
+        let mut inspected = 0usize;
+        for (path, source) in roots.iter().flat_map(|root| rust_sources(root)) {
+            for level in ["error!", "warn!", "info!", "debug!"] {
+                let needle = format!("tracing::{level}");
+                let mut from = 0usize;
+                while let Some(found) = source[from..].find(&needle) {
+                    let start = from + found;
+                    // The macro invocation ends at the first `);` that closes
+                    // it. Good enough: these call sites are one statement each.
+                    let end = source[start..]
+                        .find(");")
+                        .map_or(source.len(), |offset| start + offset);
+                    let call = &source[start..end];
+                    inspected += 1;
+                    for banned in BANNED {
+                        if call.contains(banned) {
+                            offenders.push(format!(
+                                "{}: tracing::{level} carries `{banned}`",
+                                path.display()
+                            ));
+                        }
+                    }
+                    from = end.max(start + needle.len());
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "content must stay out of the traces a user is told to share:\n{}",
+            offenders.join("\n")
+        );
+        // A scan that found nothing to scan proves nothing.
+        assert!(
+            inspected >= 10,
+            "only {inspected} trace call sites were inspected: the scan is not reaching the sources"
+        );
+    }
+
     /// Without a home directory nothing is prepared, and the startup goes on.
     #[test]
     fn a_missing_home_is_not_fatal() {
