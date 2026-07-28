@@ -520,6 +520,20 @@ impl ToolDispatchSnapshot {
     pub fn specs(&self) -> &[ToolSpec] {
         &self.specs
     }
+
+    /// Same generation and same captured dispatcher, another visible catalog.
+    ///
+    /// Code Mode is what needs this: the model sees `exec` and `wait` while the
+    /// nested calls dispatch against the full set. Both views share ONE
+    /// dispatcher, so a tool hidden from the model still meets the same taint,
+    /// hooks, permissions and cancellation it would meet directly.
+    pub fn with_specs(&self, specs: Vec<ToolSpec>) -> Self {
+        Self {
+            generation: self.generation,
+            specs,
+            dispatcher: Arc::clone(&self.dispatcher),
+        }
+    }
 }
 
 impl fmt::Debug for ToolDispatchSnapshot {

@@ -1,0 +1,26 @@
+[package]
+name = "agent-code-mode"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Code Mode session protocol (EP-002). Deliberately engine-free: no `v8` here,
+# so the cell state machine (`exec`/`wait`/`terminate`/`shutdown`) is testable
+# without a JavaScript engine and the V8 cost stays in `agent-code-mode-v8`.
+# Depends on `agent-core` for the canonical tool algebra (`ToolSpec`) rather
+# than growing a second vocabulary for the same thing.
+[dependencies]
+agent-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
