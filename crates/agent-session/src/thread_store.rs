@@ -14,7 +14,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use agent_core::session::{SessionEntry, SessionError};
+use agent_core::compaction::CompactKind;
+use agent_core::message::Message;
+use agent_core::session::{FileSnapshot, Session, SessionEntry, SessionError};
 use agent_runtime::event::{THREAD_RUNTIME_VERSION, ThreadEvent};
 use agent_runtime::id::{EventId, ID_BYTES, ThreadId};
 use agent_runtime::store::{ForkPoint, StoreError, ThreadSnapshot, ThreadStore};
@@ -23,7 +25,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     LogLine, SESSION_SCHEMA_VERSION, ThreadLine, WriterState, open_prepared, parse_log_line,
-    resume_file, write_buf_locked,
+    redact_encrypted_reasoning, resume_file, validate_checkpoint, write_buf_locked,
+    write_entry_locked,
 };
 
 fn map_session_error(err: SessionError) -> StoreError {
@@ -31,6 +34,14 @@ fn map_session_error(err: SessionError) -> StoreError {
         SessionError::Io(detail) => StoreError::Io(detail),
         SessionError::Serde(detail) => StoreError::Serde(detail),
         SessionError::Corrupt { offset, detail } => StoreError::Corrupt { offset, detail },
+    }
+}
+
+fn map_store_error(err: StoreError) -> SessionError {
+    match err {
+        StoreError::Serde(detail) => SessionError::Serde(detail),
+        StoreError::Corrupt { offset, detail } => SessionError::Corrupt { offset, detail },
+        other => SessionError::Io(other.to_string()),
     }
 }
 
@@ -173,6 +184,17 @@ fn prefix_through_event(content: &str, event_id: EventId) -> Option<usize> {
     None
 }
 
+/// Where the branch cut from `parent` lands.
+///
+/// Public because a client that forks in order to SWITCH to the branch needs to
+/// name the file, and deriving that name twice is how the two sides drift apart.
+pub fn branch_path(parent: &Path, child: ThreadId) -> PathBuf {
+    parent
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("{child}.jsonl"))
+}
+
 /// Writes the branch file aside and moves it into place (US-010 AC5).
 ///
 /// Staged then renamed: a failure mid-copy leaves no readable child, and the
@@ -192,7 +214,7 @@ fn materialize(parent: &Path, at: &ForkPoint) -> Result<PathBuf, StoreError> {
     .map_err(|e| StoreError::Serde(e.to_string()))?;
 
     let dir = parent.parent().unwrap_or_else(|| Path::new("."));
-    let child = dir.join(format!("{}.jsonl", at.child_thread_id));
+    let child = branch_path(parent, at.child_thread_id);
     if child.exists() {
         return Err(StoreError::Io(format!(
             "branch file {} already exists",
@@ -334,6 +356,74 @@ impl ThreadStore for JsonlThreadStore {
         // Dropping the writer releases the file lock. Idempotent.
         self.lock()?.writer = None;
         Ok(())
+    }
+}
+
+/// Transcript side of the SAME log.
+///
+/// The PRD leaves the choice open between adapting `Session` and replacing it;
+/// this is the adapter. It matters for one concrete reason: a session file is
+/// opened under an exclusive lock, so a `JsonlSession` and a `JsonlThreadStore`
+/// pointed at the same path would fight over it. There is one handle, one
+/// cursor and one writer, and the ordering of a message relative to a turn
+/// transition is therefore the ordering the log shows.
+#[async_trait::async_trait]
+impl Session for JsonlThreadStore {
+    async fn sync(&self, messages: &[Message]) -> Result<(), SessionError> {
+        let mut state = self.lock().map_err(map_store_error)?;
+        let Some(writer) = state.writer.as_mut() else {
+            return Err(SessionError::Io("thread store is closed".into()));
+        };
+        // Delta only, exactly like `JsonlSession`: the engine hands the FULL
+        // transcript on every turn, and rewriting it would grow the log
+        // quadratically.
+        let start = writer.cursor.min(messages.len());
+        for (offset, message) in messages[start..].iter().enumerate() {
+            let mut persisted = message.clone();
+            redact_encrypted_reasoning(std::slice::from_mut(&mut persisted));
+            write_entry_locked(writer, &SessionEntry::Message(persisted))?;
+            writer.cursor = start + offset + 1;
+        }
+        Ok(())
+    }
+
+    async fn checkpoint(
+        &self,
+        kind: CompactKind,
+        messages: &[Message],
+    ) -> Result<(), SessionError> {
+        validate_checkpoint(messages)?;
+        let mut state = self.lock().map_err(map_store_error)?;
+        let Some(writer) = state.writer.as_mut() else {
+            return Err(SessionError::Io("thread store is closed".into()));
+        };
+        let mut persisted = messages.to_vec();
+        redact_encrypted_reasoning(&mut persisted);
+        write_entry_locked(
+            writer,
+            &SessionEntry::CompactCheckpoint {
+                kind,
+                messages: persisted,
+            },
+        )?;
+        writer.cursor = messages.len();
+        Ok(())
+    }
+
+    async fn redact_encrypted_reasoning(&self) -> Result<(), SessionError> {
+        let mut state = self.lock().map_err(map_store_error)?;
+        let Some(writer) = state.writer.as_mut() else {
+            return Err(SessionError::Io("thread store is closed".into()));
+        };
+        write_entry_locked(writer, &SessionEntry::EncryptedReasoningRedacted)
+    }
+
+    async fn record_file_snapshot(&self, snapshot: FileSnapshot) -> Result<(), SessionError> {
+        let mut state = self.lock().map_err(map_store_error)?;
+        let Some(writer) = state.writer.as_mut() else {
+            return Err(SessionError::Io("thread store is closed".into()));
+        };
+        write_entry_locked(writer, &SessionEntry::FileHistorySnapshot(snapshot))
     }
 }
 
@@ -708,6 +798,57 @@ mod tests {
         assert!(
             matches!(&err, StoreError::Corrupt { offset: at, .. } if *at == offset),
             "expected Corrupt at offset {offset}, got {err:?}"
+        );
+        cleanup(&path);
+    }
+
+    /// The adapter is what lets the engine and the thread actor share one file.
+    /// Two properties matter: the messages land in the same log as the
+    /// transitions, and `sync` still writes only the delta.
+    #[tokio::test]
+    async fn the_session_adapter_writes_the_transcript_into_the_thread_log() {
+        let path = tmp("session-adapter");
+        let ids = SequentialIds::new();
+        let thread_id = ThreadId::generate(&ids);
+        let store = JsonlThreadStore::open(&path).unwrap();
+        store.create(&thread_id).await.unwrap();
+
+        let mut messages = vec![Message::user("un")];
+        Session::sync(&store, &messages).await.unwrap();
+        store.append(&event(&ids, thread_id, 1)).await.unwrap();
+        messages.push(Message::assistant_text("deux"));
+        Session::sync(&store, &messages).await.unwrap();
+        // Replaying the same transcript writes nothing: the cursor is shared.
+        Session::sync(&store, &messages).await.unwrap();
+
+        let snapshot = store.read().await.unwrap();
+        assert_eq!(snapshot.thread_id, Some(thread_id));
+        assert_eq!(
+            snapshot
+                .messages
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>(),
+            vec!["un".to_string(), "deux".to_string()]
+        );
+        assert_eq!(
+            snapshot.events.len(),
+            1,
+            "the transition is in the same log"
+        );
+        cleanup(&path);
+    }
+
+    /// A second handle on the same session file is refused by the file lock.
+    /// That refusal is the reason the adapter above exists rather than a
+    /// `JsonlSession` living next to the store.
+    #[test]
+    fn a_second_writer_on_the_same_log_is_refused() {
+        let path = tmp("single-writer");
+        let _store = JsonlThreadStore::open(&path).unwrap();
+        assert!(
+            crate::JsonlSession::create_at(&path).is_err(),
+            "two writers on one session file would interleave without a shared cursor"
         );
         cleanup(&path);
     }

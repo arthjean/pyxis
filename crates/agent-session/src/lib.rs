@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod thread_store;
 
-pub use thread_store::JsonlThreadStore;
+pub use thread_store::{JsonlThreadStore, branch_path};
 
 /// Name of the session file in a working directory.
 pub const SESSION_FILE: &str = "session.jsonl";
@@ -93,7 +93,7 @@ pub(crate) fn parse_log_line(line: &str) -> Result<LogLine, serde_json::Error> {
     }
 }
 
-fn validate_checkpoint(messages: &[Message]) -> Result<(), SessionError> {
+pub(crate) fn validate_checkpoint(messages: &[Message]) -> Result<(), SessionError> {
     if messages.is_empty() {
         return Err(invalid_session("empty compaction checkpoint"));
     }
@@ -110,7 +110,7 @@ fn validate_checkpoint(messages: &[Message]) -> Result<(), SessionError> {
     Ok(())
 }
 
-fn redact_encrypted_reasoning(messages: &mut [Message]) {
+pub(crate) fn redact_encrypted_reasoning(messages: &mut [Message]) {
     for message in messages {
         message
             .content
@@ -220,7 +220,10 @@ pub(crate) fn write_buf_locked(state: &mut WriterState, buf: &str) -> Result<(),
     Ok(())
 }
 
-fn write_entry_locked(state: &mut WriterState, entry: &SessionEntry) -> Result<(), SessionError> {
+pub(crate) fn write_entry_locked(
+    state: &mut WriterState,
+    entry: &SessionEntry,
+) -> Result<(), SessionError> {
     let line = format!("{}\n", serde_json::to_string(entry).map_err(serde_err)?);
     write_buf_locked(state, &line)
 }
