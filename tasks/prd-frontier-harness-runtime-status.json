@@ -25,10 +25,10 @@
     {
       "id": "EP-003",
       "title": "Plan d'outils et feedback autoritatif",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 3,
-      "stories_done": 0
+      "stories_done": 3
     },
     {
       "id": "EP-004",
@@ -159,44 +159,44 @@
       "id": "US-009",
       "title": "Lier exposition et dispatch dans StepToolPlan",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-002"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-28T13:31:44+02:00",
+      "completed_at": "2026-07-28T14:00:21+02:00",
+      "reviewed_at": "2026-07-28T14:00:21+02:00"
     },
     {
       "id": "US-010",
       "title": "Introduire ModelToolResult",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "M",
       "blocked_by": [
         "US-009"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-28T13:31:44+02:00",
+      "completed_at": "2026-07-28T14:00:21+02:00",
+      "reviewed_at": "2026-07-28T14:00:21+02:00"
     },
     {
       "id": "US-011",
       "title": "Borner le feedback par tokens et préserver les terminaux d'exécution",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "L",
       "blocked_by": [
         "US-002",
         "US-010"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-28T13:31:44+02:00",
+      "completed_at": "2026-07-28T14:00:21+02:00",
+      "reviewed_at": "2026-07-28T14:00:21+02:00"
     },
     {
       "id": "US-012",
