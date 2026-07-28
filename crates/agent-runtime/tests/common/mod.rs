@@ -318,6 +318,7 @@ pub fn turn_context(turn_id: TurnId) -> TurnContext {
         turn_id,
         model: "test-model".into(),
         reasoning_effort: None,
+        model_runtime_fingerprint: None,
         permission_mode: "ask".into(),
         sandbox: "workspace-write".into(),
         workspace: std::path::PathBuf::from("/tmp/pyxis-test"),

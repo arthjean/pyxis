@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use agent_core::event::AgentEvent;
 use agent_core::input::InputQueue;
+use agent_core::model::ResolvedModelRuntime;
 use agent_core::{AgentContext, Deps, run_agent};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
@@ -32,6 +33,8 @@ pub struct TurnRequest {
     /// (US-006). A context factory reads it instead of re-reading live settings,
     /// which is what keeps a mid-turn change from splitting the turn in two.
     pub context: TurnContext,
+    /// In-memory body referenced by `context.model_runtime_fingerprint`.
+    pub model_runtime: Option<ResolvedModelRuntime>,
     /// Steering inputs accepted for THIS turn (US-007). Owned by the actor,
     /// consumed by the engine at its safe points.
     pub inputs: Arc<TurnInputs>,

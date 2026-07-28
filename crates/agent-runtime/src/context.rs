@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use agent_core::message::Message;
+use agent_core::model::ResolvedModelRuntime;
 use agent_core::provider::ToolSpec;
 use agent_core::step::{StepContextSource, StepFrame};
 use serde::{Deserialize, Serialize};
@@ -57,11 +58,25 @@ pub struct TurnContext {
     pub turn_id: TurnId,
     pub model: String,
     pub reasoning_effort: Option<String>,
+    /// Durable reference to the descriptor stored once in
+    /// `ModelRuntimeResolved`. Legacy turns have no reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_runtime_fingerprint: Option<String>,
     pub permission_mode: String,
     pub sandbox: String,
     pub workspace: PathBuf,
     pub limits: TurnLimits,
 }
+
+#[derive(Debug, Clone)]
+pub struct CapturedTurnContext {
+    pub context: TurnContext,
+    pub model_runtime: Option<ResolvedModelRuntime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct TurnContextError(pub String);
 
 /// Captures the turn configuration ONCE, when the turn starts.
 ///
@@ -69,7 +84,7 @@ pub struct TurnContext {
 /// the turn already running, which is why the actor calls this exactly once per
 /// turn and hands the result to the engine.
 pub trait TurnContextSource: Send + Sync {
-    fn capture(&self, turn_id: TurnId) -> TurnContext;
+    fn capture(&self, turn_id: TurnId) -> Result<CapturedTurnContext, TurnContextError>;
 }
 
 /// Hands the SAME configuration to every turn, with only the `TurnId`
@@ -79,12 +94,24 @@ pub trait TurnContextSource: Send + Sync {
 /// template while a turn runs and that turn keeps the capture it started with.
 pub struct FixedTurnContext {
     template: Mutex<TurnContext>,
+    model_runtime: Mutex<Option<ResolvedModelRuntime>>,
 }
 
 impl FixedTurnContext {
     pub fn new(template: TurnContext) -> Self {
         Self {
             template: Mutex::new(template),
+            model_runtime: Mutex::new(None),
+        }
+    }
+
+    pub fn with_model_runtime(mut template: TurnContext, runtime: ResolvedModelRuntime) -> Self {
+        template.model = runtime.slug.clone();
+        template.reasoning_effort = runtime.reasoning_effort.clone();
+        template.model_runtime_fingerprint = Some(runtime.fingerprint.clone());
+        Self {
+            template: Mutex::new(template),
+            model_runtime: Mutex::new(Some(runtime)),
         }
     }
 
@@ -94,18 +121,29 @@ impl FixedTurnContext {
             .template
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = template;
+        *self
+            .model_runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
 impl TurnContextSource for FixedTurnContext {
-    fn capture(&self, turn_id: TurnId) -> TurnContext {
+    fn capture(&self, turn_id: TurnId) -> Result<CapturedTurnContext, TurnContextError> {
         let mut context = self
             .template
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         context.turn_id = turn_id;
-        context
+        Ok(CapturedTurnContext {
+            context,
+            model_runtime: self
+                .model_runtime
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        })
     }
 }
 

@@ -11,7 +11,7 @@
 //! Every limit below is a CONSTANT. FR-20 forbids adding a public configuration
 //! key for orchestration in v1.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -47,6 +47,7 @@ pub const MAX_PENDING_INPUTS: usize = 16;
 pub const STRAGGLER_ABORT_AFTER: Duration = Duration::from_secs(2);
 /// Hard ceiling for a full shutdown, aborts and drain included.
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
+const MAX_TURN_FAILURE_CAUSE_CHARS: usize = 500;
 
 /// A client input.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -236,7 +237,7 @@ enum Command {
     /// Persists an orchestration event on behalf of something running outside
     /// the actor (EP-004). The actor stays the single writer of its log.
     Record {
-        payload: ThreadEventPayload,
+        payload: Box<ThreadEventPayload>,
         reply: oneshot::Sender<Result<EventId, SubmitError>>,
     },
 }
@@ -283,7 +284,10 @@ impl AgentJournal for MailboxJournal {
             return Err(SubmitError::Stopped);
         };
         let (reply, answer) = oneshot::channel();
-        match commands.try_send(Command::Record { payload, reply }) {
+        match commands.try_send(Command::Record {
+            payload: Box::new(payload),
+            reply,
+        }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => return Err(SubmitError::QueueFull),
             Err(mpsc::error::TrySendError::Closed(_)) => return Err(SubmitError::Stopped),
@@ -369,6 +373,16 @@ impl ThreadHandle {
             turn: None,
             last_turn: plan.resumed.turn,
             accepted: plan.resumed.accepted.clone(),
+            resolved_runtimes: snapshot
+                .events
+                .iter()
+                .filter_map(|event| match &event.payload {
+                    ThreadEventPayload::ModelRuntimeResolved { fingerprint, .. } => {
+                        Some(fingerprint.clone())
+                    }
+                    _ => None,
+                })
+                .collect(),
             pending: VecDeque::new(),
             straggler_deadline: None,
             events: events.clone(),
@@ -586,6 +600,8 @@ struct ThreadActor {
     /// log at resume, so a retry that crosses a restart is still deduplicated
     /// (FR-12, edge case #3).
     accepted: HashMap<String, Accepted>,
+    /// Descriptor bodies already present in the durable log.
+    resolved_runtimes: HashSet<String>,
     pending: VecDeque<(TurnId, Submission)>,
     /// Armed when a turn is cancelled. Past it, a turn that ignored the signal
     /// is aborted and the actor writes its terminal itself (US-008 AC5).
@@ -745,7 +761,7 @@ impl ThreadActor {
             }
             Command::Record { payload, reply } => {
                 let outcome = self
-                    .commit(payload)
+                    .commit(*payload)
                     .await
                     .map(|event| event.event_id)
                     .map_err(SubmitError::from);
@@ -998,14 +1014,114 @@ impl ThreadActor {
         if self.shutting_down {
             return;
         }
+        // US-006 AC1: captured ONCE, before the transition that starts the turn
+        // is written, so the log records the configuration the engine actually
+        // received. What the source does afterwards belongs to the next turn.
+        let captured = match self.turn_contexts.capture(turn_id).and_then(|captured| {
+            if let Some(runtime) = &captured.model_runtime {
+                runtime
+                    .validate()
+                    .map_err(|error| crate::context::TurnContextError(error.to_string()))?;
+                if captured.context.model != runtime.slug {
+                    return Err(crate::context::TurnContextError(
+                        "captured model does not match resolved runtime".into(),
+                    ));
+                }
+                if captured.context.reasoning_effort != runtime.reasoning_effort {
+                    return Err(crate::context::TurnContextError(
+                        "captured reasoning effort does not match resolved runtime".into(),
+                    ));
+                }
+                if captured.context.limits.max_output_tokens != runtime.max_output_tokens {
+                    return Err(crate::context::TurnContextError(
+                        "captured output limit does not match resolved runtime".into(),
+                    ));
+                }
+                if captured.context.model_runtime_fingerprint.as_deref()
+                    != Some(runtime.fingerprint.as_str())
+                {
+                    return Err(crate::context::TurnContextError(
+                        "captured fingerprint does not match resolved runtime".into(),
+                    ));
+                }
+            } else if captured.context.model_runtime_fingerprint.is_some() {
+                return Err(crate::context::TurnContextError(
+                    "captured fingerprint has no resolved runtime".into(),
+                ));
+            }
+            Ok(captured)
+        }) {
+            Ok(captured) => captured,
+            Err(error) => {
+                let cause = format!("model runtime refused: {error}")
+                    .chars()
+                    .take(MAX_TURN_FAILURE_CAUSE_CHARS)
+                    .collect::<String>();
+                match self
+                    .commit(ThreadEventPayload::TurnStateChanged {
+                        turn_id,
+                        from: Some(TurnState::Queued),
+                        to: TurnState::Failed,
+                        cause: Some(cause.clone()),
+                        context: None,
+                    })
+                    .await
+                {
+                    Ok(event) => {
+                        self.last_turn = Some(TurnStatus {
+                            turn_id,
+                            state: TurnState::Failed,
+                        });
+                        self.publish(
+                            event.event_id,
+                            Some(turn_id),
+                            RuntimeEventPayload::TurnStateChanged {
+                                from: Some(TurnState::Queued),
+                                to: TurnState::Failed,
+                                cause: Some(cause),
+                            },
+                        );
+                    }
+                    Err(store_error) => {
+                        tracing::warn!(
+                            thread_id = %self.thread_id,
+                            turn_id = %turn_id,
+                            error = %store_error,
+                            "model runtime refusal could not be persisted"
+                        );
+                    }
+                }
+                self.publish_status();
+                return;
+            }
+        };
+        let context = captured.context;
+        let model_runtime = captured.model_runtime;
+        if let Some(runtime) = &model_runtime
+            && !self.resolved_runtimes.contains(&runtime.fingerprint)
+        {
+            let fingerprint = runtime.fingerprint.clone();
+            if let Err(error) = self
+                .commit(ThreadEventPayload::ModelRuntimeResolved {
+                    fingerprint: fingerprint.clone(),
+                    runtime: runtime.clone(),
+                })
+                .await
+            {
+                tracing::warn!(
+                    thread_id = %self.thread_id,
+                    turn_id = %turn_id,
+                    error = %error,
+                    "model runtime descriptor not persisted"
+                );
+                return;
+            }
+            self.resolved_runtimes.insert(fingerprint);
+        }
         let mut lifecycle = TurnLifecycle::queued(turn_id);
         let Ok(from) = lifecycle.transition(TurnState::Running) else {
             return;
         };
-        // US-006 AC1: captured ONCE, before the transition that starts the turn
-        // is written, so the log records the configuration the engine actually
-        // received. What the source does afterwards belongs to the next turn.
-        let context = self.turn_contexts.capture(turn_id);
         // US-005 AC1: `running` is durable BEFORE the engine exists, so no
         // provider call can happen for a turn the log never started.
         let event = match self
@@ -1048,6 +1164,7 @@ impl ThreadActor {
             turn_id,
             text: submission.text,
             context,
+            model_runtime,
             inputs: Arc::clone(&inputs),
         };
 

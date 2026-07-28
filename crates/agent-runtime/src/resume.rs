@@ -84,6 +84,7 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
     for event in &snapshot.events {
         match &event.payload {
             ThreadEventPayload::ThreadCreated => thread_created = true,
+            ThreadEventPayload::ModelRuntimeResolved { .. } => {}
             ThreadEventPayload::InputSubmitted {
                 turn_id,
                 client_message_id,

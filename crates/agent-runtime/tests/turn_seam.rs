@@ -208,6 +208,7 @@ fn request(text: &str) -> TurnRequest {
             turn_id,
             model: "test-model".into(),
             reasoning_effort: None,
+            model_runtime_fingerprint: None,
             permission_mode: "ask".into(),
             sandbox: "workspace-write".into(),
             workspace: std::path::PathBuf::from("/tmp/pyxis-test"),
@@ -217,6 +218,7 @@ fn request(text: &str) -> TurnRequest {
                 max_pending_inputs: 16,
             },
         },
+        model_runtime: None,
         inputs: Arc::new(TurnInputs::new()),
     }
 }

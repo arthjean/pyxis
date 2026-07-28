@@ -11,6 +11,7 @@
 //! NOT bumped (bumping it would make new files unreadable by older binaries,
 //! which reject `schema_version > 1`).
 
+use agent_core::model::ResolvedModelRuntime;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentAuthority, AgentState};
@@ -60,6 +61,7 @@ impl ThreadEvent {
                 ..
             } => Some(*turn_id),
             ThreadEventPayload::ThreadCreated
+            | ThreadEventPayload::ModelRuntimeResolved { .. }
             | ThreadEventPayload::AgentLinked { .. }
             | ThreadEventPayload::AgentStateChanged { .. } => None,
         }
@@ -71,6 +73,12 @@ impl ThreadEvent {
 pub enum ThreadEventPayload {
     /// First event of a thread. Never emitted twice for the same log.
     ThreadCreated,
+    /// Effective descriptor, written once per fingerprint. Turn contexts carry
+    /// only the stable reference.
+    ModelRuntimeResolved {
+        fingerprint: String,
+        runtime: ResolvedModelRuntime,
+    },
     /// A client input was accepted. Durable BEFORE the acknowledgement, so a
     /// client holding a `TurnId` knows the input survived a crash.
     InputSubmitted {
@@ -179,6 +187,7 @@ mod tests {
                     turn_id,
                     model: "gpt-5.4-codex".into(),
                     reasoning_effort: Some("high".into()),
+                    model_runtime_fingerprint: None,
                     permission_mode: "ask".into(),
                     sandbox: "workspace-write".into(),
                     workspace: std::path::PathBuf::from("/home/arthur/dev/pyxis"),

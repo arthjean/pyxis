@@ -8,7 +8,11 @@ use std::time::{Duration, Instant};
 
 use agent_core::clock::Clock;
 use agent_core::event::AgentEvent;
-use agent_runtime::context::{FixedTurnContext, TurnContext, TurnLimits};
+use agent_core::model::{
+    InputModality, ModelRetryPolicy, ModelRuntimeSource, ModelToolMode, ResolvedModelRuntime,
+    ResponsesDialect, TruncationMode, TruncationPolicy,
+};
+use agent_runtime::context::{FixedTurnContext, TurnContext, TurnContextSource, TurnLimits};
 use agent_runtime::event::{ThreadEvent, ThreadEventPayload};
 use agent_runtime::id::{RandomIds, ThreadId, TurnId};
 use agent_runtime::lifecycle::TurnState;
@@ -142,6 +146,7 @@ pub fn turn_context(turn_id: TurnId) -> TurnContext {
         turn_id,
         model: "test-model".into(),
         reasoning_effort: None,
+        model_runtime_fingerprint: None,
         permission_mode: "ask".into(),
         sandbox: "workspace-write".into(),
         workspace: std::path::PathBuf::from("/tmp/pyxis-test"),
@@ -157,15 +162,24 @@ async fn start(
     store: Arc<dyn ThreadStore>,
     runner: Arc<dyn TurnRunner>,
 ) -> (Arc<ThreadHandle>, ThreadId, CancellationToken) {
+    let contexts = Arc::new(FixedTurnContext::new(turn_context(TurnId::generate(
+        &RandomIds,
+    )))) as Arc<dyn TurnContextSource>;
+    start_with_contexts(store, runner, contexts).await
+}
+
+async fn start_with_contexts(
+    store: Arc<dyn ThreadStore>,
+    runner: Arc<dyn TurnRunner>,
+    turn_contexts: Arc<dyn TurnContextSource>,
+) -> (Arc<ThreadHandle>, ThreadId, CancellationToken) {
     let thread_id = ThreadId::generate(&RandomIds);
     let root = CancellationToken::new();
     let handle = ThreadHandle::start(ThreadOptions {
         thread_id,
         store,
         runner,
-        turn_contexts: Arc::new(FixedTurnContext::new(turn_context(TurnId::generate(
-            &RandomIds,
-        )))),
+        turn_contexts,
         ids: Arc::new(RandomIds),
         clock: Arc::new(FixedClock),
         parent_cancel: root.clone(),
@@ -174,6 +188,36 @@ async fn start(
     .await
     .expect("the thread starts");
     (Arc::new(handle), thread_id, root)
+}
+
+fn resolved_runtime() -> ResolvedModelRuntime {
+    ResolvedModelRuntime {
+        slug: "test-model".into(),
+        source: ModelRuntimeSource::Embedded {
+            version: "test".into(),
+        },
+        instructions: "runtime instructions".into(),
+        fingerprint: "a".repeat(64),
+        context_window: 100_000,
+        auto_compact_token_limit: 80_000,
+        input_modalities: vec![InputModality::Text],
+        reasoning_effort: Some("high".into()),
+        supports_verbosity: true,
+        verbosity: Some("low".into()),
+        supports_parallel_tool_calls: true,
+        responses_dialect: ResponsesDialect::Standard,
+        tool_mode: ModelToolMode::Direct,
+        truncation: TruncationPolicy {
+            mode: TruncationMode::Tokens,
+            limit: 2_000,
+        },
+        retry: ModelRetryPolicy {
+            max_retries: 3,
+            backoff_base_ms: 50,
+        },
+        max_output_tokens: 4096,
+        comp_hash: Some("test-hash".into()),
+    }
 }
 
 fn states(snapshot: &ThreadSnapshot) -> Vec<TurnState> {
@@ -199,6 +243,130 @@ async fn wait_for(mut check: impl FnMut() -> bool, what: &str) {
 }
 
 // ───────── tests ─────────
+
+#[tokio::test]
+async fn a_runtime_descriptor_is_persisted_once_and_turns_reference_it() {
+    let store = Arc::new(MemoryThreadStore::new());
+    let (runner, started) = ScriptedRunner::new(Behavior::CompleteNow);
+    let runtime = resolved_runtime();
+    let contexts = Arc::new(FixedTurnContext::with_model_runtime(
+        turn_context(TurnId::generate(&RandomIds)),
+        runtime.clone(),
+    )) as Arc<dyn TurnContextSource>;
+    let (handle, _, _root) =
+        start_with_contexts(Arc::clone(&store) as Arc<dyn ThreadStore>, runner, contexts).await;
+
+    handle.submit(Submission::new("one")).await.unwrap();
+    wait_for(
+        || {
+            started.lock().unwrap().len() == 1
+                && handle
+                    .status()
+                    .turn
+                    .is_some_and(|turn| turn.state == TurnState::Completed)
+        },
+        "first terminal",
+    )
+    .await;
+    handle.submit(Submission::new("two")).await.unwrap();
+    wait_for(
+        || {
+            started.lock().unwrap().len() == 2
+                && handle
+                    .status()
+                    .turn
+                    .is_some_and(|turn| turn.state == TurnState::Completed)
+        },
+        "second terminal",
+    )
+    .await;
+
+    let snapshot = store.read().await.unwrap();
+    let descriptors: Vec<_> = snapshot
+        .events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            ThreadEventPayload::ModelRuntimeResolved {
+                fingerprint,
+                runtime,
+            } => Some((fingerprint, runtime)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(descriptors, [(&runtime.fingerprint, &runtime)]);
+    let contexts: Vec<_> = snapshot
+        .events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            ThreadEventPayload::TurnStateChanged {
+                context: Some(context),
+                ..
+            } => Some(context),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(contexts.len(), 2);
+    assert!(contexts.iter().all(|context| {
+        context.model_runtime_fingerprint.as_deref() == Some(runtime.fingerprint.as_str())
+    }));
+    let requests = started.lock().unwrap();
+    assert!(requests.iter().all(|request| {
+        request
+            .model_runtime
+            .as_ref()
+            .map(|runtime| runtime.fingerprint.as_str())
+            == Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    }));
+    drop(requests);
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_invalid_runtime_fails_before_the_turn_runner_starts() {
+    let store = Arc::new(MemoryThreadStore::new());
+    let (runner, started) = ScriptedRunner::new(Behavior::CompleteNow);
+    let mut runtime = resolved_runtime();
+    runtime.instructions = "x".repeat(agent_core::model::MAX_MODEL_INSTRUCTIONS_BYTES + 1);
+    let contexts = Arc::new(FixedTurnContext::with_model_runtime(
+        turn_context(TurnId::generate(&RandomIds)),
+        runtime,
+    )) as Arc<dyn TurnContextSource>;
+    let (handle, _, _root) =
+        start_with_contexts(Arc::clone(&store) as Arc<dyn ThreadStore>, runner, contexts).await;
+
+    handle.submit(Submission::new("must fail")).await.unwrap();
+    wait_for(
+        || {
+            handle
+                .status()
+                .turn
+                .is_some_and(|turn| turn.state == TurnState::Failed)
+        },
+        "runtime refusal",
+    )
+    .await;
+
+    assert!(started.lock().unwrap().is_empty());
+    let snapshot = store.read().await.unwrap();
+    assert_eq!(states(&snapshot), [TurnState::Failed]);
+    assert!(snapshot.events.iter().all(|event| !matches!(
+        &event.payload,
+        ThreadEventPayload::ModelRuntimeResolved { .. }
+    )));
+    let cause = snapshot
+        .events
+        .iter()
+        .find_map(|event| match &event.payload {
+            ThreadEventPayload::TurnStateChanged {
+                cause: Some(cause), ..
+            } => Some(cause),
+            _ => None,
+        });
+    assert!(cause.is_some_and(|cause| {
+        cause.contains("instructions exceed") && cause.chars().count() <= 500
+    }));
+    handle.shutdown().await;
+}
 
 /// EP-001 definition of done: create, submit, observe, close, rebuild.
 #[tokio::test]

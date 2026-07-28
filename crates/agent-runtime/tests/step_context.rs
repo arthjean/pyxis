@@ -224,7 +224,11 @@ async fn a_turn_keeps_the_context_it_was_captured_with() {
     wait_for_terminal(&harness.handle).await;
 
     // The frozen capture carries the turn that asked for it.
-    let first = harness.contexts.capture(accepted.turn_id);
+    let first = harness
+        .contexts
+        .capture(accepted.turn_id)
+        .expect("context captures")
+        .context;
     assert_eq!(first.turn_id, accepted.turn_id);
     assert_eq!(first.model, "test-model");
 

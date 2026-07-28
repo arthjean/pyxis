@@ -33,8 +33,9 @@ pub use agent::{
     MAX_ACTIVE_AGENTS, MAX_AGENT_DEPTH, MAX_AGENTS_PER_ROOT,
 };
 pub use context::{
-    FixedTurnContext, MAX_SECTION_BYTES, MAX_STEP_CONTEXT_BYTES, StepContext, StepContexts,
-    StepSection, StepSnapshot, StepSource, TurnContext, TurnContextSource, TurnLimits,
+    CapturedTurnContext, FixedTurnContext, MAX_SECTION_BYTES, MAX_STEP_CONTEXT_BYTES, StepContext,
+    StepContexts, StepSection, StepSnapshot, StepSource, TurnContext, TurnContextError,
+    TurnContextSource, TurnLimits,
 };
 pub use event::{
     ForkOrigin, THREAD_EVENT_ENTRY, THREAD_META_ENTRY, THREAD_RUNTIME_VERSION, ThreadEvent,
