@@ -1,0 +1,26 @@
+[package]
+name = "agent-parity"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Baseline verifier (EP-001/US-001). Reads the read-only Codex clone pinned at
+# the baseline commit and derives ONE deterministic contract matrix. No runtime
+# dependency: nothing in the Pyxis binary may import this crate, and this crate
+# imports no Pyxis crate either. `git` is invoked read-only through
+# `std::process::Command` so no git library enters the workspace graph.
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[[bin]]
+name = "agent-parity"
+path = "src/main.rs"
