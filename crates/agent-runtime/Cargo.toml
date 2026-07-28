@@ -22,6 +22,9 @@ hex.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# EP-004: identifies a sub-agent diff without carrying it into the parent's
+# context. Already in the workspace graph (agent-session), no new dependency.
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

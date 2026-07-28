@@ -18,6 +18,7 @@
 pub mod agent;
 pub mod context;
 pub mod event;
+pub mod handoff;
 pub mod id;
 pub mod inputs;
 pub mod lifecycle;
@@ -38,6 +39,7 @@ pub use event::{
     ForkOrigin, THREAD_EVENT_ENTRY, THREAD_META_ENTRY, THREAD_RUNTIME_VERSION, ThreadEvent,
     ThreadEventPayload,
 };
+pub use handoff::{AgentHandoff, HandoffDraft, MAX_HANDOFF_SUMMARY, UNTRUSTED_BANNER};
 pub use id::{
     AgentId, EventId, IdError, IdGenerator, RandomIds, SequentialIds, StepId, ThreadId, TurnId,
 };
