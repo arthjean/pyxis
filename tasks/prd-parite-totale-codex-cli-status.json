@@ -3,16 +3,16 @@
     "file": "tasks/prd-parite-totale-codex-cli.md",
     "title": "Parité comportementale totale avec Codex CLI",
     "created_at": "2026-07-28",
-    "status": "READY"
+    "status": "IN_PROGRESS"
   },
   "epics": [
     {
       "id": "EP-001",
       "title": "Contrat provider et baseline de parité",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 4,
-      "stories_done": 0
+      "stories_done": 4
     },
     {
       "id": "EP-002",
@@ -60,54 +60,54 @@
       "id": "US-001",
       "title": "Figer la matrice contractuelle Codex",
       "epic": "EP-001",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [],
-      "started_at": null,
-      "completed_at": null,
+      "started_at": "2026-07-28",
+      "completed_at": "2026-07-28",
       "reviewed_at": null
     },
     {
       "id": "US-002",
       "title": "Généraliser l'algèbre des outils",
       "epic": "EP-001",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-001"
       ],
-      "started_at": null,
-      "completed_at": null,
+      "started_at": "2026-07-28",
+      "completed_at": "2026-07-28",
       "reviewed_at": null
     },
     {
       "id": "US-003",
       "title": "Supporter le cycle custom_tool_call",
       "epic": "EP-001",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-002"
       ],
-      "started_at": null,
-      "completed_at": null,
+      "started_at": "2026-07-28",
+      "completed_at": "2026-07-28",
       "reviewed_at": null
     },
     {
       "id": "US-004",
       "title": "Installer les fixtures de conformité provider",
       "epic": "EP-001",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-003"
       ],
-      "started_at": null,
-      "completed_at": null,
+      "started_at": "2026-07-28",
+      "completed_at": "2026-07-28",
       "reviewed_at": null
     },
     {
