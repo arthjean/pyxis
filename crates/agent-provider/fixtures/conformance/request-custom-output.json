@@ -1,0 +1,100 @@
+{
+  "name": "custom call and its output round-trip beside a function call",
+  "note": "EP-001/US-003 AC2: the output payload references the right call_id and each result carries the item type of the call it answers.",
+  "request": {
+    "canonical": {
+      "model": "gpt-5.6-sol",
+      "system": "runtime prompt",
+      "messages": [
+        { "role": "user", "content": [{ "type": "text", "text": "go" }] },
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "tool_use",
+              "id": "call_f",
+              "name": "read",
+              "input": { "path": "a.txt" }
+            },
+            {
+              "type": "tool_use",
+              "id": "call_c",
+              "name": "exec",
+              "format": "text",
+              "input": "// @exec: cell\nconst n = await tools.read({path: \"a.txt\"});"
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": [
+            {
+              "type": "tool_result",
+              "tool_use_id": "call_f",
+              "content": "contenu",
+              "untrusted": false
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": [
+            {
+              "type": "tool_result",
+              "tool_use_id": "call_c",
+              "content": "7",
+              "untrusted": false
+            }
+          ]
+        }
+      ],
+      "tools": [],
+      "max_output_tokens": 4096
+    },
+    "options": {
+      "reasoning_effort": null,
+      "include_encrypted_reasoning": false,
+      "parallel_tool_calls": true,
+      "text_verbosity": "low",
+      "dialect": "standard"
+    },
+    "body": {
+      "model": "gpt-5.6-sol",
+      "store": false,
+      "stream": true,
+      "tool_choice": "auto",
+      "parallel_tool_calls": true,
+      "text": { "verbosity": "low" },
+      "instructions": "runtime prompt",
+      "input": [
+        {
+          "type": "message",
+          "role": "user",
+          "content": [{ "type": "input_text", "text": "go" }]
+        },
+        {
+          "type": "function_call",
+          "call_id": "call_f",
+          "name": "read",
+          "arguments": "{\"path\":\"a.txt\"}"
+        },
+        {
+          "type": "custom_tool_call",
+          "call_id": "call_c",
+          "name": "exec",
+          "input": "// @exec: cell\nconst n = await tools.read({path: \"a.txt\"});"
+        },
+        {
+          "type": "function_call_output",
+          "call_id": "call_f",
+          "output": "contenu"
+        },
+        {
+          "type": "custom_tool_call_output",
+          "call_id": "call_c",
+          "output": "7"
+        }
+      ]
+    }
+  }
+}

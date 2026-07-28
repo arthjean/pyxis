@@ -1,0 +1,64 @@
+{
+  "name": "function tools keep the historical flat wire",
+  "note": "EP-001/US-002 AC1: name, description and JSON schema of a function tool are unchanged by the tool algebra.",
+  "request": {
+    "canonical": {
+      "model": "gpt-5.5",
+      "system": "Tu es Pyxis.",
+      "messages": [
+        { "role": "user", "content": [{ "type": "text", "text": "go" }] }
+      ],
+      "tools": [
+        {
+          "name": "read",
+          "description": "reads a file",
+          "kind": "function",
+          "input_schema": {
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"],
+            "additionalProperties": false
+          }
+        }
+      ],
+      "max_output_tokens": 4096
+    },
+    "options": {
+      "reasoning_effort": null,
+      "include_encrypted_reasoning": false,
+      "parallel_tool_calls": true,
+      "text_verbosity": "low",
+      "dialect": "standard"
+    },
+    "body": {
+      "model": "gpt-5.5",
+      "store": false,
+      "stream": true,
+      "tool_choice": "auto",
+      "parallel_tool_calls": true,
+      "text": { "verbosity": "low" },
+      "instructions": "Tu es Pyxis.",
+      "input": [
+        {
+          "type": "message",
+          "role": "user",
+          "content": [{ "type": "input_text", "text": "go" }]
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "name": "read",
+          "description": "reads a file",
+          "strict": true,
+          "parameters": {
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"],
+            "additionalProperties": false
+          }
+        }
+      ]
+    }
+  }
+}

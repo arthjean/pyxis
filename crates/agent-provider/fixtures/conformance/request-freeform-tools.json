@@ -1,0 +1,80 @@
+{
+  "name": "freeform tool on the Responses Lite dialect",
+  "note": "EP-001/US-002 AC2: a freeform tool keeps its text format and its optional grammar, and gains no input_schema.",
+  "request": {
+    "canonical": {
+      "model": "gpt-5.6-sol",
+      "system": "runtime prompt",
+      "messages": [
+        { "role": "user", "content": [{ "type": "text", "text": "compte les fichiers" }] }
+      ],
+      "tools": [
+        {
+          "name": "exec",
+          "description": "run javascript in the code mode session",
+          "kind": "freeform",
+          "grammar": {
+            "syntax": "lark",
+            "definition": "start: pragma_source | plain_source"
+          }
+        },
+        {
+          "name": "notes",
+          "description": "free text scratchpad",
+          "kind": "freeform"
+        }
+      ],
+      "max_output_tokens": 4096
+    },
+    "options": {
+      "reasoning_effort": "high",
+      "include_encrypted_reasoning": false,
+      "parallel_tool_calls": true,
+      "text_verbosity": "low",
+      "dialect": "lite"
+    },
+    "body": {
+      "model": "gpt-5.6-sol",
+      "store": false,
+      "stream": true,
+      "tool_choice": "auto",
+      "parallel_tool_calls": false,
+      "text": { "verbosity": "low" },
+      "reasoning": { "effort": "high", "summary": "auto", "context": "all_turns" },
+      "input": [
+        {
+          "type": "additional_tools",
+          "role": "developer",
+          "tools": [
+            {
+              "type": "custom",
+              "name": "exec",
+              "description": "run javascript in the code mode session",
+              "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": "start: pragma_source | plain_source"
+              }
+            },
+            {
+              "type": "custom",
+              "name": "notes",
+              "description": "free text scratchpad",
+              "format": { "type": "text" }
+            }
+          ]
+        },
+        {
+          "type": "message",
+          "role": "developer",
+          "content": [{ "type": "input_text", "text": "runtime prompt" }]
+        },
+        {
+          "type": "message",
+          "role": "user",
+          "content": [{ "type": "input_text", "text": "compte les fichiers" }]
+        }
+      ]
+    }
+  }
+}

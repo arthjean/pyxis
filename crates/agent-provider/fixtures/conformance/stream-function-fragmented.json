@@ -1,0 +1,21 @@
+{
+  "name": "fragmented function call",
+  "note": "Baseline regression guard: the historical function path still yields one delta carrying valid JSON.",
+  "stream": {
+    "events": [
+      { "type": "response.output_item.added", "output_index": 0, "item": { "type": "function_call", "call_id": "call_f", "id": "fc_1", "name": "read", "arguments": "" } },
+      { "type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "{\"path\":\"" },
+      { "type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "a.txt\"}" },
+      { "type": "response.function_call_arguments.done", "item_id": "fc_1", "arguments": "{\"path\":\"a.txt\"}" },
+      { "type": "response.output_item.done", "item": { "type": "function_call", "call_id": "call_f", "id": "fc_1", "name": "read", "arguments": "{\"path\":\"a.txt\"}" } },
+      { "type": "response.completed", "response": { "status": "completed", "usage": { "input_tokens": 120, "output_tokens": 8 } } }
+    ],
+    "expected": [
+      { "type": "tool_call_start", "data": { "id": "call_f", "name": "read", "format": "json" } },
+      { "type": "tool_call_delta", "data": { "id": "call_f", "input_delta": "{\"path\":\"a.txt\"}" } },
+      { "type": "tool_call_end", "data": { "id": "call_f" } },
+      { "type": "usage", "data": { "usage": { "input": 120, "output": 8 } } },
+      { "type": "done", "data": { "stop": "tool_use" } }
+    ]
+  }
+}

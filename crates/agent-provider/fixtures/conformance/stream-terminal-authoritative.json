@@ -1,0 +1,25 @@
+{
+  "name": "terminal item contradicts the deltas",
+  "note": "EP-001/US-004 AC2: the terminal result wins over intermediate deltas, and nothing is emitted twice.",
+  "stream": {
+    "events": [
+      { "type": "response.output_item.added", "output_index": 0, "item": { "type": "custom_tool_call", "call_id": "call_c", "id": "ctc_1", "name": "exec", "input": "" } },
+      { "type": "response.custom_tool_call_input.delta", "item_id": "ctc_1", "delta": "partial(" },
+      { "type": "response.custom_tool_call_input.delta", "item_id": "ctc_1", "delta": "partial(" },
+      { "type": "response.output_item.done", "item": { "type": "custom_tool_call", "call_id": "call_c", "id": "ctc_1", "name": "exec", "input": "final()" } },
+      { "type": "response.output_item.added", "output_index": 1, "item": { "type": "function_call", "call_id": "call_f", "id": "fc_1", "name": "read", "arguments": "" } },
+      { "type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "{\"path\":\"stale\"}" },
+      { "type": "response.output_item.done", "item": { "type": "function_call", "call_id": "call_f", "id": "fc_1", "name": "read", "arguments": "{\"path\":\"fresh\"}" } },
+      { "type": "response.completed", "response": { "status": "completed" } }
+    ],
+    "expected": [
+      { "type": "tool_call_start", "data": { "id": "call_c", "name": "exec", "format": "text" } },
+      { "type": "tool_call_delta", "data": { "id": "call_c", "input_delta": "final()" } },
+      { "type": "tool_call_end", "data": { "id": "call_c" } },
+      { "type": "tool_call_start", "data": { "id": "call_f", "name": "read", "format": "json" } },
+      { "type": "tool_call_delta", "data": { "id": "call_f", "input_delta": "{\"path\":\"fresh\"}" } },
+      { "type": "tool_call_end", "data": { "id": "call_f" } },
+      { "type": "done", "data": { "stop": "tool_use" } }
+    ]
+  }
+}
