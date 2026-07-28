@@ -122,14 +122,14 @@ La boucle est une **state machine dont les transitions sont un enum exhaustif v�
 
 L'API consommateur est un **stream** via `async-stream` : `run_agent` renvoie un `Stream<Item = AgentEvent>` que le frontend (ou le mode `-p`) consomme. Le cœur ne « pousse » rien vers un terminal — il yield des événements.
 
-> **Deux types d'événements, ne pas confondre.** `StreamEvent` (défini dans `agent-provider`, cf. [`docs/PROVIDERS.md`](./PROVIDERS.md)) circule **provider → core** : ce sont les fragments bruts normalisés du stream modèle (`TextDelta`, `ToolCallDelta`, `Usage`, `Done`, …). `AgentEvent` (défini dans `agent-core`, cf. §10.1) circule **core → clients** : c'est le contrat de présentation consommé par `agent-tui` et le mode `-p`. `agent-core` **consomme** les `StreamEvent`, les accumule, et **traduit** le résultat décisionnel en `AgentEvent`. Ce sont deux frontières distinctes ; aucune n'expose d'ANSI.
+> **Deux types d'événements, ne pas confondre.** `StreamEvent` (contrat défini dans `agent-core`, produit par les adapters de `agent-provider`, cf. [`docs/PROVIDERS.md`](./PROVIDERS.md)) circule **provider → core** : ce sont les fragments bruts normalisés du stream modèle (`TextDelta`, `ToolCallDelta`, `Usage`, `Done`, …). `AgentEvent` (défini dans `agent-core`, cf. §10.1) circule **core → clients** : c'est le contrat de présentation consommé par `agent-tui` et le mode `-p`. `agent-core` **consomme** les `StreamEvent`, les accumule, et **traduit** le résultat décisionnel en `AgentEvent`. Ce sont deux frontières distinctes ; aucune n'expose d'ANSI.
 
 ### 3.2 Patterns repris de Claude Code
 
 | Pattern | Description | Pourquoi |
 |---|---|---|
 | **transcript-before-response** | Le message est persisté dans le transcript JSONL **avant** l'appel API (`sync_data`). | Crash pendant le stream = pas de perte ; resume cohérent. |
-| **withholding** | Un `Option<PendingError>` retient **uniquement** une erreur PTL / max-tokens (contexte plein, troncature) **jusqu'à échec confirmé** du recovery (compaction réactive). On ne propage l'erreur que si la récupération échoue vraiment. | Évite de tuer une session récupérable par compaction. **Distinct du retry transverse** (529/Retryable), qui relève du backoff provider, pas du `PendingError`. |
+| **withholding** | Un `Option<PendingError>` retient **uniquement** une erreur PTL / max-tokens (contexte plein, troncature) **jusqu'à échec confirmé** du recovery (compaction réactive). On ne propage l'erreur que si la récupération échoue vraiment. | Évite de tuer une session récupérable par compaction. **Distinct du retry transverse** (529/Retryable), piloté par `run_agent`, pas par `PendingError`. |
 | **injectable deps** | Provider, clock, tokenizer, sandbox, tools passés en paramètres (traits, struct `Deps`). | Boucle testable sans API réelle. |
 | **ContextBudget unifié** | Calculé **une seule fois par modèle**, source unique de vérité pour compaction, troncature, alerte de fenêtre. | Pas de divergence entre deux estimateurs. |
 | **circuit breaker autocompact** | Coupe après N échecs d'autocompact consécutifs au lieu de boucler. | Anti error-loop. |
@@ -137,7 +137,7 @@ L'API consommateur est un **stream** via `async-stream` : `run_agent` renvoie un
 **Précision withholding ↔ retry (point d'incohérence corrigé).** Deux mécanismes ne doivent jamais être mélangés :
 
 - **Withholding** retient une erreur de **contexte** (PTL, max-tokens, `413`) dans `PendingError`, tente une **compaction réactive** (§5), et ne propage qu'en cas d'échec du recovery.
-- **Le retry transverse** gère les erreurs **transitoires** (`Retryable`, `Overloaded`/`529`, `RateLimited`/`429`) via backoff exponentiel + jitter, dans la couche provider (cf. [`docs/PROVIDERS.md`](./PROVIDERS.md) §retry). Ces erreurs **ne passent jamais** par `PendingError`.
+- **Le retry transverse** gère les erreurs **transitoires** (`Retryable`, `Overloaded`/`529`, `RateLimited`/`429`) via un budget d'attempts, backoff exponentiel, jitter et `Retry-After` dans l'unique boucle `run_agent` (cf. [`docs/PROVIDERS.md`](./PROVIDERS.md) §retry). L'adapter classifie, mais ne rouvre pas le provider. Ces erreurs **ne passent jamais** par `PendingError`.
 
 ### 3.3 Comptage de tokens et fallback local
 
@@ -145,13 +145,15 @@ L'API consommateur est un **stream** via `async-stream` : `run_agent` renvoie un
 
 ### 3.4 Taxonomie d'erreurs canonique — `ErrorClass`
 
-Le type d'erreur classifiée est **`ErrorClass`** (nom canonique, partout dans le code et la doc — jamais `ErrClass`). Il aligne `agent-core` et `agent-provider`. Cinq variantes (cf. [`docs/PROVIDERS.md`](./PROVIDERS.md), source de vérité de la taxonomie) :
+Le type d'erreur classifiée est **`ErrorClass`** (nom canonique, partout dans le code et la doc). Il aligne `agent-core` et `agent-provider`. Sept variantes (cf. [`docs/PROVIDERS.md`](./PROVIDERS.md), source de vérité de la taxonomie) :
 
 ```rust
 enum ErrorClass {
     Retryable,            // transitoire générique → backoff + jitter
-    Overloaded,           // 529 → backoff agressif, fallback modèle après 3×529
+    Overloaded(u16),      // 529 → fallback modèle si configuré, sinon backoff agressif
     RateLimited,          // 429 → honore Retry-After
+    ContextLimit,         // compaction réactive puis réouverture dans le même budget
+    ReasoningReplayRejected, // une reprise sans replay, dans le même budget
     Auth(AuthError),      // 401/credential → cf. AuthError ci-dessous
     InvalidRequest,       // 4xx non récupérable → propagation immédiate
 }
@@ -160,16 +162,19 @@ enum AuthError {
     Expired,              // token expiré → refresh OAuth puis retry
     ThirdPartyBlocked,    // "This credential is only authorized for use with Claude Code…"
     Invalid,              // credential invalide → propagation
+    ReconnectRequired,    // refresh absent, refusé ou déjà consommé
 }
 ```
 
 `classify_error(&e) -> ErrorClass` est implémenté dans chaque adapter provider. Routage de la boucle :
 
 - `Retryable | Overloaded | RateLimited` → **retry transverse** (backoff, jitter, `Retry-After`, fallback modèle). Jamais retenu dans `PendingError`.
-- `Auth(Expired)` → refresh OAuth via `agent-auth`, puis retry.
-- `Auth(ThirdPartyBlocked | Invalid)` → propagation (erreur fatale d'auth).
+- `ContextLimit` → withholding et compaction réactive, mais toute réouverture consomme le même budget d'attempts.
+- `ReasoningReplayRejected` → une seule réouverture sans replay, qui consomme l'attempt suivant.
+- `Auth(Expired)` → au plus un refresh OAuth cancellation-guarded par sampling, puis réouverture avec les headers reconstruits.
+- `Auth(ThirdPartyBlocked | Invalid | ReconnectRequired)` → propagation (erreur fatale d'auth).
 - `InvalidRequest` → propagation immédiate.
-- Erreur de **contexte** (PTL / max-tokens / `413`) → **pas** une variante `ErrorClass` transitoire : elle alimente le **withholding** (`PendingError`) et déclenche la compaction réactive.
+- Erreur de **contexte** (PTL / max-tokens / `413`) → `ContextLimit`, qui alimente le **withholding** (`PendingError`) et déclenche la compaction réactive sans contourner le budget d'attempts.
 
 ### 3.5 Pseudo-Rust
 
@@ -223,17 +228,26 @@ fn run_agent(mut ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     Ok(StreamEvent::Usage(u))           => budget.update_budget(u),
                     Ok(StreamEvent::Done)               => break,
                     Err(e) => {
-                        // classify_error → ErrorClass (5 variantes, cf. §3.4).
+                        // classify_error → ErrorClass (7 variantes, cf. §3.4).
                         match deps.provider.classify_error(&e) {
                             // Transitoires : RETRY TRANSVERSE (backoff/jitter), PAS de withholding.
                             ErrorClass::Retryable
                             | ErrorClass::Overloaded
                             | ErrorClass::RateLimited => {
-                                deps.backoff.wait_for(&e).await; // honore Retry-After, jitter, 3×529 → fallback
+                                yield retry_scheduled(ids, ordinal, delay, fingerprints);
+                                cancel.guard(clock.sleep(delay)).await;
                                 break; // on reboucle avec le même contexte
                             }
+                            ErrorClass::ReasoningReplayRejected => {
+                                disable_replay_once();
+                                break;
+                            }
+                            ErrorClass::ContextLimit => {
+                                compact_then_reopen_within_budget();
+                                break;
+                            }
                             ErrorClass::Auth(AuthError::Expired) => {
-                                deps.auth.refresh().await;
+                                refresh_once_under_cancel().await;
                                 break; // retry après refresh
                             }
                             ErrorClass::Auth(_) | ErrorClass::InvalidRequest => {
@@ -612,7 +626,7 @@ Tant que Phase 2 n'est pas ouverte, la mémoire vectorielle est **explicitement 
 6. transcript persisté **avant** l'appel API.
 7. La compaction se cassera sur tout provider sans `Usage` fiable si le fallback `agent-tokenizer` n'est pas branché : `update_budget` lit le `Usage` du stream **sinon** compte en local.
 8. **Withholding ≠ retry.** Seules les erreurs de contexte (PTL / max-tokens / `413`) alimentent `PendingError` et la compaction réactive ; les transitoires (`Retryable` / `Overloaded` / `RateLimited`) sont absorbées par le backoff transverse et n'entrent jamais dans `PendingError`.
-9. Le type d'erreur classifiée est **`ErrorClass`** (5 variantes), nommé identiquement dans tout le code et toute la doc — jamais `ErrClass`.
+9. Le type d'erreur classifiée est **`ErrorClass`** (7 variantes), nommé identiquement dans tout le code et toute la doc.
 10. `run_agent` est le **seul** moteur modèle-outils. `agent-runtime` l'atteint par `TurnRunner` et ne réimplémente jamais retry, compaction ni dispatch. Le jour où le seam a besoin d'une boucle à lui, l'architecture est fausse (ADR-12, §7bis).
 11. Un tour produit **exactement un** état terminal, persisté avant d'être publié, et une seconde transition terminale est refusée par une erreur typée.
 12. Une opération acceptée est **durable avant son acquittement**, et une resoumission portant un `client_message_id` déjà accepté rend les identifiants d'origine sans rien réexécuter.

@@ -135,13 +135,15 @@ Deux enums d'événements coexistent dans le système, **distincts par design** 
 
 ### 2.2 Taxonomie d'erreurs canonique (`ErrorClass`)
 
-`ErrorClass` est le type **canonique** de classification, nommé `ErrorClass` partout (et non `ErrClass`). Le brief décrivait une forme minimale à 4 classes (`Retryable | Overloaded(529) | Auth | InvalidRequest`) ; ce document fixe la forme **complète à 5 classes** avec `Auth` paramétré, qui est la version canonique à propager dans ADR-4, `ROADMAP.md` et `ARCHITECTURE.md §3.4`. La variante `Overloaded` **porte le code HTTP** (`Overloaded(u16)`, instancié `Overloaded(529)`) — signature identique dans tous les docs.
+`ErrorClass` est le type **canonique** de classification. Sa forme complète a sept classes; `Overloaded` porte le code HTTP (`Overloaded(u16)`) et `Auth` porte la décision credential.
 
 ```rust
 pub enum ErrorClass {
     Retryable,                 // 5xx transitoires, timeouts réseau
     Overloaded(u16),           // 529 (porte le code) — backoff agressif
     RateLimited,               // 429 — honore Retry-After
+    ContextLimit,              // compaction réactive, budget commun
+    ReasoningReplayRejected,   // une reprise sans replay, budget commun
     Auth(AuthError),           // 401/403 — refresh, ou go/no-go
     InvalidRequest,            // 4xx non-retryable (400, 422)
 }
@@ -150,10 +152,11 @@ pub enum AuthError {
     Expired,                   // token expiré → refresh OAuth
     ThirdPartyBlocked,         // blocage Anthropic des outils tiers (voir §5.2 / §6)
     Invalid,                   // creds invalides → erreur utilisateur
+    ReconnectRequired,         // refresh absent, refusé ou déjà tenté
 }
 ```
 
-> **Réconciliation cross-docs (à acter).** Trois formulations préexistaient : (a) brief / ADR-4 / ROADMAP : 4 classes, `Auth` nu ; (b) ce fichier : 5 classes + `Auth(AuthError)` ; (c) `ARCHITECTURE.md §3.4` : `ErrClass` (nom divergent), 4 variantes. La forme canonique est **(b)**. Action : mettre à jour ADR-4 et ROADMAP pour ajouter `RateLimited` + `Auth(AuthError)`, et renommer `ErrClass` → `ErrorClass` dans `ARCHITECTURE.md`, en harmonisant la signature `Overloaded(u16)`.
+Cette taxonomie est additive pour les consommateurs d'événements; les erreurs terminales provider portent la classe exacte qui a fermé le budget.
 
 **Règle d'architecture.** `agent-core` ne dépend ni de `agent-tui` ni d'un `agent-provider` *concret*. Il dépend du **trait** `Provider` (injecté). Le `ContextBudget` est calculé **une fois par modèle** à partir de `capabilities().max_context` — source unique de vérité pour la compaction.
 
@@ -255,33 +258,35 @@ fn update_budget(&mut self, ev: &StreamEvent, transcript: &Transcript) {
 
 ### 5.1 Retry & classification d'erreurs
 
-`classify_error` (par adapter) est la **source de vérité** du retry. La logique de backoff vit dans `agent-provider`, au-dessus des adapters. La taxonomie est `ErrorClass` (§2.2).
+`classify_error` (par adapter) est la **source de vérité** de la classification. La politique résolue et son état vivent dans `agent-core::run_agent`: `max_attempts` inclut l'ouverture initiale et toute réouverture après erreur, refresh, retrait du reasoning replay ou fallback modèle. Le fallback ne remet ni l'ordinal ni le budget à zéro. L'adapter construit une requête et un stream par appel; le cœur reconstruit un `PromptSnapshot` avant chaque réouverture.
 
 | Classe | Déclencheur | Politique |
 |---|---|---|
 | `Retryable` | 5xx transitoire, timeout réseau | backoff exponentiel + jitter |
-| `Overloaded(529)` | **529** | backoff **agressif** ; après **3× 529 consécutifs → fallback model** |
+| `Overloaded(529)` | **529** | fallback modèle immédiat si résolu, sinon backoff agressif |
 | `RateLimited` | 429 | honore **`Retry-After`** (header) avant retry |
-| `Auth(Expired)` | 401 token expiré | **refresh OAuth** puis 1 retry |
+| `ContextLimit` | 413 / contexte trop long | compaction réactive puis réouverture dans le budget commun |
+| `ReasoningReplayRejected` | 400 imputable au replay chiffré | une reprise sans replay |
+| `Auth(Expired)` | 401 sur un adapter refresh-capable | un refresh cancellation-guarded puis réouverture |
 | `Auth(ThirdPartyBlocked)` | message Anthropic (§5.2) | **pas de retry** — remonte le go/no-go |
-| `Auth(Invalid)` | 401/403 creds invalides | pas de retry, erreur utilisateur |
+| `Auth(Invalid)` | credential invalide ou 403 | pas de retry, erreur utilisateur |
+| `Auth(ReconnectRequired)` | refresh absent, refusé ou déjà consommé | terminal avec action de reconnexion |
 | `InvalidRequest` | 400/422 | **pas de retry** (bug client) |
 
 ```rust
 match provider.classify_error(&err) {
-    ErrorClass::Overloaded(_code) => {
-        backoff.aggressive();
-        if consecutive_529 >= 3 { switch_to_fallback_model(); }
-    }
+    ErrorClass::Overloaded(_code) => fallback_or_aggressive_backoff(),
     ErrorClass::RateLimited => backoff.honor_retry_after(&err),
-    ErrorClass::Auth(AuthError::Expired) => { auth.refresh().await?; retry_once(); }
+    ErrorClass::ContextLimit => compact_then_reopen_within_budget(),
+    ErrorClass::ReasoningReplayRejected => disable_replay_once(),
+    ErrorClass::Auth(AuthError::Expired) => refresh_once_under_cancel(),
     ErrorClass::Auth(AuthError::ThirdPartyBlocked) => return Err(BlockedThirdParty),
     ErrorClass::Retryable => backoff.exponential_jitter(),
-    ErrorClass::InvalidRequest | ErrorClass::Auth(_) => return Err(err.into()),
+    ErrorClass::InvalidRequest | ErrorClass::Auth(_) => return terminal(err),
 }
 ```
 
-**Le backoff transverse n'est PAS le withholding.** Les classes `Overloaded(529)` / `Retryable` / `RateLimited` relèvent du **retry transverse** ci-dessus (backoff dans `agent-provider`). Le **withholding** est un mécanisme distinct de la boucle d'agent : il retient une erreur **PTL / max-tokens** dans un `Option<PendingError>` jusqu'à **échec confirmé du recovery** (tentative de compaction réactive), pour ne pas avorter un tour qui pouvait être sauvé par une compaction. Ne pas confondre les deux : un 529 ne peuple jamais `PendingError`, il déclenche le backoff ; seules les erreurs PTL/max-tokens transitent par le withholding. Voir la boucle d'agent dans `ARCHITECTURE.md §3.4`.
+**Le backoff transverse n'est PAS le withholding.** Les classes `Overloaded(529)` / `Retryable` / `RateLimited` relèvent du moteur d'attempt dans `run_agent`. Le **withholding** retient seulement une erreur PTL / max-tokens dans `PendingError` jusqu'à l'échec confirmé de la compaction réactive. Un 529 ne peuple jamais `PendingError`.
 
 ### 5.2 Classification du blocage Anthropic des outils tiers
 

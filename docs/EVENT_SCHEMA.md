@@ -59,6 +59,9 @@ contrat que consomme aussi la TUI.
 | `stream_reset` | — | Le flux en cours est abandonné avant validation (retry). Un consommateur doit jeter les `text` et `reasoning` non encore clos. |
 | `text` | chaîne | Fragment de texte assistant. |
 | `reasoning` | chaîne | Fragment de raisonnement, si le provider en émet. |
+| `reasoning_replay_disabled` | `{reason}` | Le backend a refusé le replay chiffré; le sampling repart une fois sans replay dans le même budget d'attempts. |
+| `retry_scheduled` | `{turn_id?, step, ordinal, max_attempts, cause, delay_ms, fallback_model?, prompt_fingerprint, model_runtime_fingerprint, tool_plan_fingerprint}` | Une nouvelle ouverture provider est planifiée. Aucun corps d'erreur, prompt, token ou account ID n'est inclus. |
+| `credential_refresh` | `{turn_id?, step, attempt_ordinal, outcome}` | Cycle de récupération OAuth borné. `outcome` vaut `started`, `succeeded`, `rejected` ou `cancelled`. |
 | `tool_call` | `{id, name, input}` | Un outil va s'exécuter. `input` est le JSON d'arguments réassemblé. |
 | `tool_output_delta` | `{id, chunk}` | Fragment de sortie d'un outil encore en cours. Informatif : le transcript ne retient que `tool_result`. |
 | `tool_result` | `{id, content, is_error, error_kind?, untrusted}` | Résultat d'outil. `untrusted` vaut `true` pour tout contenu externe. |
@@ -77,6 +80,20 @@ contrat que consomme aussi la TUI.
 avec `run_summary.data.end = "error"` et un `exit_code` non nul. `operation`
 nomme la frontière (`create`, `append`, `commit_recovery`, `flush`, `read`,
 `fork` ou `close`) sans inclure le contenu du prompt.
+
+### `retry_scheduled` et `credential_refresh`
+
+`ordinal` est 1-based et compte l'ouverture initiale, même si celle-ci ne produit
+pas un événement de retry. Il reste monotone lors d'un fallback modèle et ne
+redémarre qu'après une réponse provider complète, donc au sampling suivant.
+`max_attempts` vient du profil résolu. `delay_ms` inclut le backoff, le jitter et
+le délai serveur borné; il vaut zéro après refresh, retrait du reasoning replay ou
+fallback immédiat. Si l'attempt courant est le dernier, aucun `retry_scheduled`
+n'est émis et l'événement `error` terminal porte la classification exacte.
+
+Les fingerprints relient le retry au snapshot abandonné sans exposer son contenu.
+Un 401 émet au plus un couple `credential_refresh` started/résultat par sampling.
+Après rejet, absence de refresh ou second 401, le terminal demande une reconnexion.
 
 ### `model_turn`
 
