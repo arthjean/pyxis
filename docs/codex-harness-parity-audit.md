@@ -1,5 +1,11 @@
 # Audit de parité harness : Pyxis vs Codex CLI
 
+> **Statut : contexte historique, non normatif.** La cible de parité est
+> `docs/parity/codex-baseline-matrix.json`, générée depuis le clone Codex figé
+> au commit `fa1d4c40d0e63eef2e0ba8a9e004ccd0a80b77f5`
+> (`cargo run -p agent-parity -- check`). Ce document décrit un instantané
+> antérieur : il informe, il n'arbitre plus un écart.
+
 Audit en lecture seule, réalisé le 2026-07-24. Référence amont : Codex CLI (~363k lignes Rust, ~100 crates). Cible : Pyxis (~39k lignes, 10 crates).
 
 **Méthode.** Douze dimensions du harness cartographiées en parallèle, puis chaque écart allégué soumis à un vérificateur adversarial chargé de le réfuter en cherchant la capacité dans Pyxis sous un autre nom, une autre crate ou une autre forme. 221 écarts retenus, 7 réfutés et retirés. Toute affirmation porte une preuve `chemin:ligne`. Les écarts marqués `non-applicable` relèvent de l'infrastructure interne OpenAI, du support Windows/macOS ou du multi-provider déjà assumé comme différé (ADR-11).

@@ -1,5 +1,11 @@
 # Atteindre une parité Codex CLI réelle : audit profond et plan
 
+> **Statut : contexte historique, non normatif.** La cible de parité est
+> `docs/parity/codex-baseline-matrix.json`, générée depuis le clone Codex figé
+> au commit `fa1d4c40d0e63eef2e0ba8a9e004ccd0a80b77f5`
+> (`cargo run -p agent-parity -- check`). Ce document décrit un instantané
+> antérieur : il informe, il n'arbitre plus un écart.
+
 Document de décision, 2026-07-27. Complète
 [`docs/codex-harness-parity-audit-2026-07-27.md`](./codex-harness-parity-audit-2026-07-27.md), qui
 énumère les écarts. Celui-ci répond à une question différente : **par quel chemin**.

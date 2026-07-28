@@ -1,5 +1,11 @@
 # Audit de parité harness : Pyxis vs Codex CLI — passe du 2026-07-27
 
+> **Statut : contexte historique, non normatif.** La cible de parité est
+> `docs/parity/codex-baseline-matrix.json`, générée depuis le clone Codex figé
+> au commit `fa1d4c40d0e63eef2e0ba8a9e004ccd0a80b77f5`
+> (`cargo run -p agent-parity -- check`). Ce document décrit un instantané
+> antérieur : il informe, il n'arbitre plus un écart.
+
 Troisième passe, en lecture seule. Aucune ligne de code n'a été modifiée.
 
 **Baseline.** [`docs/codex-harness-parity-audit.md`](./codex-harness-parity-audit.md) (2026-07-24,
