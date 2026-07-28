@@ -1,0 +1,31 @@
+[package]
+name = "agent-code-mode-v8"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# V8 engine behind the `CellEngine` contract of `agent-code-mode` (EP-002,
+# US-007). It is a crate of its own because it is the ONLY thing in the
+# workspace that costs a statically linked V8: a headless consumer that never
+# runs Code Mode does not pay for it (US-005 verdict, reserve 1).
+[dependencies]
+agent-code-mode.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Exact pin, same as the Codex baseline (`codex-rs/Cargo.toml`), because the
+# US-005 envelope was measured against this build and no other.
+v8 = "=149.2.0"
+# ICU data is not embedded in the prebuilt static library; V8 refuses `Intl`
+# without it.
+deno_core_icudata = "0.77.0"
+
+[dev-dependencies]
+agent-core.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

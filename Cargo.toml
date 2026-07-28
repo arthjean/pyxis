@@ -110,6 +110,7 @@ agent-tokenizer = { path = "crates/agent-tokenizer" }
 agent-mcp = { path = "crates/agent-mcp" }
 agent-core = { path = "crates/agent-core" }
 agent-code-mode = { path = "crates/agent-code-mode" }
+agent-code-mode-v8 = { path = "crates/agent-code-mode-v8" }
 agent-runtime = { path = "crates/agent-runtime" }
 agent-session = { path = "crates/agent-session" }
 agent-tools = { path = "crates/agent-tools" }
