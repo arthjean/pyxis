@@ -10,6 +10,7 @@
 //! forbids `core -> tools`; stopping the loop is a core decision).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod agent;
 pub mod bash;
 pub mod command;
 pub mod edit;
@@ -35,6 +36,7 @@ pub mod write;
 #[cfg(test)]
 mod tests_integration;
 
+pub use agent::{InterruptAgent, ListAgents, SendAgent, SpawnAgent, WaitAgent};
 pub use bash::Bash;
 pub use command::{CommandClass, classify};
 pub use edit::Edit;

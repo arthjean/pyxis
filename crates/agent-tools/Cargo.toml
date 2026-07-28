@@ -14,6 +14,11 @@ workspace = true
 # on `agent-core` for the canonical types (ToolInvocation/ToolOutcome/ToolSpec).
 [dependencies]
 agent-core.workspace = true
+# EP-004: the sub-agent tools are the model-facing surface of the runtime's
+# agent graph. One-way dependency, like `agent-session` -> `agent-runtime`: the
+# runtime never depends on the tools, which is what keeps its policy testable
+# without a registry.
+agent-runtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true

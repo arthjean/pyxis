@@ -159,6 +159,7 @@ name = "agent-tools"
 version = "0.0.0"
 dependencies = [
  "agent-core",
+ "agent-runtime",
  "async-trait",
  "base64",
  "futures-util",
