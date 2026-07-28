@@ -847,11 +847,11 @@ fn specs_from_tools(tools: &HashMap<String, Arc<dyn DynTool>>) -> Vec<ToolSpec> 
         .values()
         .map(|tool| {
             let raw_description = tool.description();
-            ToolSpec::function(
-                tool.name().to_string(),
-                truncate_utf8_prefix(&raw_description, MAX_DESCRIPTION).to_string(),
-                tool.input_schema(),
-            )
+            ToolSpec {
+                name: tool.name().to_string(),
+                description: truncate_utf8_prefix(&raw_description, MAX_DESCRIPTION).to_string(),
+                kind: tool.kind(),
+            }
         })
         .collect();
     specs.sort_by(|left, right| left.name.cmp(&right.name));

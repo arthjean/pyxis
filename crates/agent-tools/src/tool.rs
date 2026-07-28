@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_core::event::PlanView;
+use agent_core::provider::ToolKind;
 use agent_core::sandbox::SandboxPolicy;
 use agent_core::tools::{ToolExecution, ToolImage};
 use async_trait::async_trait;
@@ -242,6 +243,16 @@ pub trait Tool: Send + Sync {
     /// Input JSON Schema (exposed to the model in `ToolSpec`).
     fn input_schema(&self) -> serde_json::Value;
 
+    /// How the model addresses this tool. The default is the function shape
+    /// every native tool has had so far; a tool whose input is TEXT overrides
+    /// it and its `input_schema` is then never exposed, which is what stops an
+    /// adapter from inventing a schema for a freeform tool (US-002).
+    fn tool_kind(&self) -> ToolKind {
+        ToolKind::Function {
+            input_schema: self.input_schema(),
+        }
+    }
+
     // ───── FAIL-CLOSED defaults (invariant 4): a tool widens them explicitly.
     /// Can run alongside other tools (typically reads).
     fn is_concurrency_safe(&self) -> bool {
@@ -313,6 +324,12 @@ pub trait DynTool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> String;
     fn input_schema(&self) -> serde_json::Value;
+    /// Function by default, so every existing implementor keeps its shape.
+    fn kind(&self) -> ToolKind {
+        ToolKind::Function {
+            input_schema: self.input_schema(),
+        }
+    }
     fn is_concurrency_safe(&self) -> bool;
     fn is_read_only(&self) -> bool;
     fn is_sensitive(&self) -> bool;
@@ -353,6 +370,9 @@ impl<T: Tool> DynTool for DynToolAdapter<T> {
     }
     fn input_schema(&self) -> serde_json::Value {
         self.inner.input_schema()
+    }
+    fn kind(&self) -> ToolKind {
+        self.inner.tool_kind()
     }
     fn is_concurrency_safe(&self) -> bool {
         self.inner.is_concurrency_safe()

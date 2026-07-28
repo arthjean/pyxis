@@ -14,6 +14,10 @@ workspace = true
 # on `agent-core` for the canonical types (ToolInvocation/ToolOutcome/ToolSpec).
 [dependencies]
 agent-core.workspace = true
+# EP-002: the model-visible `exec`/`wait` pair. `agent-tools` owns the tool
+# pipeline, so the two tools live here; the cell state machine stays in
+# `agent-code-mode` and V8 stays out of this crate entirely.
+agent-code-mode.workspace = true
 # EP-004: the sub-agent tools are the model-facing surface of the runtime's
 # agent graph. One-way dependency, like `agent-session` -> `agent-runtime`: the
 # runtime never depends on the tools, which is what keeps its policy testable

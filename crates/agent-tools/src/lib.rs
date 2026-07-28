@@ -12,6 +12,7 @@
 
 pub mod agent;
 pub mod bash;
+pub mod code_mode;
 pub mod command;
 pub mod edit;
 pub mod error;
@@ -38,6 +39,7 @@ mod tests_integration;
 
 pub use agent::{InterruptAgent, ListAgents, SendAgent, SpawnAgent, WaitAgent};
 pub use bash::Bash;
+pub use code_mode::{CodeModeHandle, CodeModeSessionFactory, ExecTool, WaitTool};
 pub use command::{CommandClass, classify};
 pub use edit::Edit;
 pub use error::{ToolError, ValidationError};
