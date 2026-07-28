@@ -637,6 +637,14 @@ pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
     fn capabilities(&self) -> &Capabilities;
 
+    /// Tool mode of `slug`, for the surfaces that must compose a tool plan
+    /// WITHOUT resolving a full runtime (a step boundary is one of them).
+    /// `Direct` by default, which is what an adapter that knows no code mode
+    /// should answer.
+    fn tool_mode(&self, _slug: &str) -> crate::model::ModelToolMode {
+        crate::model::ModelToolMode::Direct
+    }
+
     /// Context window to use for a precise slug. Providers without a per-model
     /// table can keep the global capabilities value.
     fn max_context_for_model(&self, model: &str) -> u32 {

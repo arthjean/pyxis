@@ -182,6 +182,15 @@ impl OpenAiChatGptProvider {
         )
     }
 
+    /// Declares that this process can run Code Mode cells. Without it, a model
+    /// whose tool mode needs code mode stays visible and is refused before any
+    /// request, naming the missing runtime (PRD edge case 1).
+    pub fn set_code_mode(&self, available: bool) {
+        if let Ok(mut catalog) = self.catalog.write() {
+            catalog.set_code_mode(available);
+        }
+    }
+
     /// Overrides the SSE idle timeout (US-022). `Duration::ZERO` is ignored (keeps
     /// the default) so that an absurd env value does not disable the watchdog.
     pub fn with_idle_timeout(mut self, idle: Duration) -> Self {
@@ -607,6 +616,14 @@ impl Provider for OpenAiChatGptProvider {
                 backoff_base_ms,
             },
         )
+    }
+
+    fn tool_mode(&self, slug: &str) -> agent_core::model::ModelToolMode {
+        self.catalog
+            .read()
+            .ok()
+            .and_then(|catalog| catalog.tool_mode(slug))
+            .unwrap_or(agent_core::model::ModelToolMode::Direct)
     }
 
     async fn stream(

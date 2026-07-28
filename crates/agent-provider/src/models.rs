@@ -63,6 +63,11 @@ pub struct ModelCatalog {
     embedded_order: Vec<String>,
     remote: Option<RemoteCatalog>,
     diagnostics: Vec<String>,
+    /// Is a Code Mode runtime wired in this process? Fail-closed default
+    /// `false`: without one, a model that needs code mode is refused BEFORE any
+    /// provider call, naming the missing component instead of failing later
+    /// with an empty answer.
+    code_mode: bool,
 }
 
 impl Default for ModelCatalog {
@@ -87,7 +92,18 @@ impl ModelCatalog {
             embedded_order,
             remote: None,
             diagnostics: Vec::new(),
+            code_mode: false,
         }
+    }
+
+    /// Declares whether this process can run Code Mode cells. Set once, by the
+    /// binary that owns the runtime; the catalog itself knows nothing about V8.
+    pub fn set_code_mode(&mut self, available: bool) {
+        self.code_mode = available;
+    }
+
+    pub fn code_mode(&self) -> bool {
+        self.code_mode
     }
 
     /// Installs one complete remote snapshot. Errors and empty snapshots leave
@@ -172,6 +188,14 @@ impl ModelCatalog {
         &self.diagnostics
     }
 
+    /// Tool mode of a slug, without resolving a runtime. Used at a step
+    /// boundary, where composing the tool plan must not cost a full resolve.
+    pub fn tool_mode(&self, slug: &str) -> Option<ModelToolMode> {
+        self.descriptor(slug)
+            .ok()
+            .map(|(descriptor, _)| descriptor.tool_mode)
+    }
+
     pub fn context_window(&self, slug: &str) -> Option<u32> {
         self.descriptor(slug)
             .ok()
@@ -188,10 +212,10 @@ impl ModelCatalog {
         let slug = slug.trim();
         let (descriptor, source) = self.descriptor(slug)?;
         descriptor.validate()?;
-        if descriptor.tool_mode == ModelToolMode::CodeModeOnly {
+        if let Some(reason) = code_mode_incompatibility(descriptor.tool_mode, self.code_mode) {
             return Err(ModelRuntimeError::Incompatible {
                 slug: slug.into(),
-                reason: "code mode is required but Pyxis does not implement code mode".into(),
+                reason,
             });
         }
         let effort = reasoning_effort
@@ -293,9 +317,9 @@ impl ModelCatalog {
             .as_ref()
             .and_then(|catalog| catalog.entries.get(slug));
         match remote {
-            Some(RemoteEntry::Complete { descriptor, source }) => {
-                Some(catalog_model_from_descriptor(descriptor, source.clone()))
-            }
+            Some(RemoteEntry::Complete { descriptor, source }) => Some(
+                catalog_model_from_descriptor(descriptor, source.clone(), self.code_mode),
+            ),
             Some(RemoteEntry::Partial {
                 display_name,
                 reason,
@@ -307,6 +331,7 @@ impl ModelCatalog {
                         ModelRuntimeSource::Embedded {
                             version: EMBEDDED_CATALOG_VERSION.into(),
                         },
+                        self.code_mode,
                     )
                 })
                 .or_else(|| {
@@ -341,6 +366,7 @@ impl ModelCatalog {
                     ModelRuntimeSource::Embedded {
                         version: EMBEDDED_CATALOG_VERSION.into(),
                     },
+                    self.code_mode,
                 )
             }),
         }
@@ -447,6 +473,7 @@ fn descriptor_from_wire(
     let tool_mode = match model.tool_mode {
         None | Some(serde_json::Value::Null) => ModelToolMode::Direct,
         Some(serde_json::Value::String(mode)) if mode == "direct" => ModelToolMode::Direct,
+        Some(serde_json::Value::String(mode)) if mode == "code_mode" => ModelToolMode::CodeMode,
         Some(serde_json::Value::String(mode)) if mode == "code_mode_only" => {
             ModelToolMode::CodeModeOnly
         }
@@ -600,9 +627,20 @@ fn bounded_wire_text(value: &str, max_chars: usize) -> String {
     }
 }
 
+/// The one place that decides whether a tool mode is usable here. `None` means
+/// usable; `Some(reason)` names the missing component, which is what edge case
+/// 1 of the PRD requires the user to see instead of a silent non-answer.
+fn code_mode_incompatibility(mode: ModelToolMode, code_mode_available: bool) -> Option<String> {
+    (mode.needs_code_mode() && !code_mode_available).then(|| {
+        "this model requires Code Mode, but no Code Mode runtime is available in this build"
+            .to_string()
+    })
+}
+
 fn catalog_model_from_descriptor(
     descriptor: &ModelDescriptor,
     source: ModelRuntimeSource,
+    code_mode_available: bool,
 ) -> CatalogModel {
     CatalogModel {
         slug: descriptor.slug.clone(),
@@ -611,8 +649,10 @@ fn catalog_model_from_descriptor(
         supported_reasoning_efforts: descriptor.supported_reasoning_efforts.clone(),
         context_window: Some(descriptor.context_window),
         source,
-        incompatibility_reason: (descriptor.tool_mode == ModelToolMode::CodeModeOnly)
-            .then(|| "code mode is required but Pyxis does not implement code mode".to_string()),
+        incompatibility_reason: code_mode_incompatibility(
+            descriptor.tool_mode,
+            code_mode_available,
+        ),
     }
 }
 
@@ -1005,9 +1045,12 @@ mod tests {
         assert!(error.to_string().contains("instructions exceed"));
     }
 
+    /// Without a Code Mode runtime the behaviour is unchanged: the model stays
+    /// visible and is refused before any provider call, naming what is missing.
     #[test]
-    fn code_mode_only_models_are_listed_but_cannot_start() {
+    fn a_code_mode_model_is_refused_when_no_runtime_is_wired() {
         let catalog = ModelCatalog::embedded();
+        assert!(!catalog.code_mode());
         let listed = catalog
             .models()
             .into_iter()
@@ -1017,7 +1060,9 @@ mod tests {
             listed
                 .incompatibility_reason
                 .as_deref()
-                .is_some_and(|reason| reason.contains("code mode"))
+                .is_some_and(|reason| reason.contains("Code Mode")),
+            "{:?}",
+            listed.incompatibility_reason
         );
         let error = catalog
             .resolve(
@@ -1029,8 +1074,56 @@ mod tests {
                     backoff_base_ms: 50,
                 },
             )
-            .expect_err("code mode is not implemented");
-        assert!(error.to_string().contains("code mode"));
+            .expect_err("no runtime, no start");
+        assert!(error.to_string().contains("Code Mode"), "{error}");
+    }
+
+    /// US-009 AC2: with a runtime wired, the same model resolves without any
+    /// local incompatibility and keeps its declared tool mode.
+    #[test]
+    fn a_code_mode_model_resolves_once_a_runtime_is_wired() {
+        let mut catalog = ModelCatalog::embedded();
+        catalog.set_code_mode(true);
+        let listed = catalog
+            .models()
+            .into_iter()
+            .find(|model| model.slug == "gpt-5.6-sol")
+            .expect("embedded frontier model");
+        assert_eq!(listed.incompatibility_reason, None);
+        let runtime = catalog
+            .resolve(
+                "gpt-5.6-sol",
+                None,
+                4096,
+                ModelRetryPolicy {
+                    max_attempts: 4,
+                    backoff_base_ms: 50,
+                },
+            )
+            .expect("a wired runtime makes the model usable");
+        assert_eq!(runtime.tool_mode, ModelToolMode::CodeModeOnly);
+        runtime.validate().expect("the resolved runtime is valid");
+    }
+
+    /// A direct model is untouched by the flag in either position.
+    #[test]
+    fn a_direct_model_is_unaffected_by_the_code_mode_flag() {
+        for available in [false, true] {
+            let mut catalog = ModelCatalog::embedded();
+            catalog.set_code_mode(available);
+            let runtime = catalog
+                .resolve(
+                    "gpt-5.5",
+                    None,
+                    4096,
+                    ModelRetryPolicy {
+                        max_attempts: 4,
+                        backoff_base_ms: 50,
+                    },
+                )
+                .expect("a direct model always resolves");
+            assert_eq!(runtime.tool_mode, ModelToolMode::Direct);
+        }
     }
 
     #[test]

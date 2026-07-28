@@ -37,8 +37,25 @@ pub enum ResponsesDialect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelToolMode {
+    /// Every tool is called directly by the model.
     Direct,
+    /// The model may call tools directly AND orchestrate them from a cell.
+    CodeMode,
+    /// The model orchestrates only: the nested tools stay dispatchable but
+    /// invisible, and `exec`/`wait` are the model-facing surface.
     CodeModeOnly,
+}
+
+impl ModelToolMode {
+    /// Does this mode need a Code Mode runtime to be usable at all?
+    pub fn needs_code_mode(self) -> bool {
+        matches!(self, Self::CodeMode | Self::CodeModeOnly)
+    }
+
+    /// Are the nested tools hidden from the model?
+    pub fn hides_nested_tools(self) -> bool {
+        matches!(self, Self::CodeModeOnly)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
