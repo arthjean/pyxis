@@ -33,10 +33,10 @@
     {
       "id": "EP-004",
       "title": "Sous-agents bornés",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "stories_total": 5,
-      "stories_done": 0
+      "stories_done": 5
     },
     {
       "id": "EP-005",
@@ -210,7 +210,7 @@
       "id": "US-012",
       "title": "Persister le graphe et réserver les leases d'agents",
       "epic": "EP-004",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "M",
       "blocked_by": [
@@ -218,30 +218,30 @@
         "US-008",
         "US-009"
       ],
-      "started_at": null,
-      "completed_at": null,
+      "started_at": "2026-07-28",
+      "completed_at": "2026-07-28",
       "reviewed_at": null
     },
     {
       "id": "US-013",
       "title": "Spawn, list et wait d'enfants lecture seule",
       "epic": "EP-004",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "L",
       "blocked_by": [
         "US-006",
         "US-012"
       ],
-      "started_at": null,
-      "completed_at": null,
+      "started_at": "2026-07-28",
+      "completed_at": "2026-07-28",
       "reviewed_at": null
     },
     {
       "id": "US-014",
       "title": "Envoyer, poursuivre et interrompre un enfant",
       "epic": "EP-004",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "M",
       "blocked_by": [
@@ -249,37 +249,37 @@
         "US-008",
         "US-013"
       ],
-      "started_at": null,
-      "completed_at": null,
+      "started_at": "2026-07-28",
+      "completed_at": "2026-07-28",
       "reviewed_at": null
     },
     {
       "id": "US-015",
       "title": "Handoff borné et provenance des résultats",
       "epic": "EP-004",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "M",
       "blocked_by": [
         "US-013"
       ],
-      "started_at": null,
-      "completed_at": null,
+      "started_at": "2026-07-28",
+      "completed_at": "2026-07-28",
       "reviewed_at": null
     },
     {
       "id": "US-016",
       "title": "Valider un enfant mutateur dans un worktree isolé",
       "epic": "EP-004",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P2",
       "size": "M",
       "blocked_by": [
         "US-012",
         "US-013"
       ],
-      "started_at": null,
-      "completed_at": null,
+      "started_at": "2026-07-28",
+      "completed_at": "2026-07-28",
       "reviewed_at": null
     },
     {
