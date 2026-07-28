@@ -3,7 +3,7 @@
     "file": "tasks/prd-frontier-harness-runtime.md",
     "title": "Pyxis : contrats du runtime frontier et fiabilité agentique",
     "created_at": "2026-07-28",
-    "status": "IN_PROGRESS"
+    "status": "DONE"
   },
   "epics": [
     {
@@ -41,10 +41,10 @@
     {
       "id": "EP-005",
       "title": "Retry, récupération de credential et preuve verticale",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "stories_total": 3,
-      "stories_done": 0
+      "stories_done": 3
     }
   ],
   "stories": [
@@ -261,36 +261,36 @@
       "id": "US-016",
       "title": "Centraliser et observer la politique de retry",
       "epic": "EP-005",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "L",
       "blocked_by": [
         "US-002",
         "US-004"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-28T15:05:04+02:00",
+      "completed_at": "2026-07-28T15:40:48+02:00",
+      "reviewed_at": "2026-07-28T15:40:48+02:00"
     },
     {
       "id": "US-017",
       "title": "Rendre la récupération 401 bornée et explicite",
       "epic": "EP-005",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "M",
       "blocked_by": [
         "US-016"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-28T15:13:03+02:00",
+      "completed_at": "2026-07-28T15:40:48+02:00",
+      "reviewed_at": "2026-07-28T15:40:48+02:00"
     },
     {
       "id": "US-018",
       "title": "Prouver les contrats bout en bout et réconcilier la documentation",
       "epic": "EP-005",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "L",
       "blocked_by": [
@@ -301,9 +301,9 @@
         "US-016",
         "US-017"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-28T15:15:10+02:00",
+      "completed_at": "2026-07-28T15:40:48+02:00",
+      "reviewed_at": "2026-07-28T15:40:48+02:00"
     }
   ]
 }
