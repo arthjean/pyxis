@@ -7,6 +7,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod approver;
+mod code_mode;
 mod context;
 mod headless;
 mod interactive;
@@ -1240,6 +1241,10 @@ async fn run(
         args.model = model;
     }
     let run_config = run_config_from_args(&args, &mut config)?;
+    // EP-002: the Code Mode runtime of this process. `None` leaves every direct
+    // model untouched and keeps a code-mode model refused with its cause named.
+    let code_mode = code_mode::build();
+    let code_mode_available = code_mode.is_some();
     let headless = args.prompt.is_some();
     let initial_reasoning_effort = config
         .reasoning_effort
@@ -1262,6 +1267,10 @@ async fn run(
         chatgpt = chatgpt.with_idle_timeout(std::time::Duration::from_secs(secs));
     }
     let chatgpt = Arc::new(chatgpt);
+    // The catalog only stops refusing a code-mode model once a runtime really
+    // exists in this process. Set before any resolve, and before the model list
+    // is published, so no surface ever shows a compatibility the run lacks.
+    chatgpt.set_code_mode(code_mode_available);
     // `/models` catalog discovered on the connected account, off the critical path:
     // the session starts on the bundled catalog and switches as soon as the answer arrives. A
     // failure (offline, expired token) simply leaves the bundled catalog.
@@ -1480,6 +1489,11 @@ async fn run(
         .register(ViewImage)
         .register(ExecCommand)
         .register(WriteStdin);
+    if let Some(handle) = &code_mode {
+        builder = builder
+            .register(agent_tools::ExecTool::new(Arc::clone(handle)))
+            .register(agent_tools::WaitTool::new(Arc::clone(handle)));
+    }
     for tool in mcp_startup.tools {
         builder = builder.register_dyn(tool);
     }
@@ -1516,7 +1530,15 @@ async fn run(
         },
         Arc::clone(&provider),
     );
-    let steps = runtime::CliStepSource::new(Arc::clone(&registry), context_msgs);
+    // The catalog only stops refusing a code-mode model once a runtime really
+    // exists in this process.
+
+    let steps = runtime::CliStepSource::with_code_mode(
+        Arc::clone(&registry),
+        context_msgs,
+        code_mode.clone(),
+        Arc::clone(&settings),
+    );
 
     // 6. Headless (-p) vs interactive dispatch. Wrapped so that `SessionEnd`
     // fires on every way out, including the failures each branch bails on.
@@ -1539,8 +1561,10 @@ async fn run(
             })
             .await;
             // US-012 AC4: a one-shot run leaves no shell session behind, whatever
-            // the outcome (several paths bail from here).
+            // the outcome (several paths bail from here). Same reasoning for the
+            // Code Mode session: a cell must not outlive the run that opened it.
             exec_sessions.shutdown();
+            steps.shutdown_code_mode().await;
             outcome?;
         } else {
             let cfg = InteractiveConfig {
@@ -1584,8 +1608,10 @@ async fn run(
             )
             .await;
             // US-012 AC4: the session ending closes every shell session and kills
-            // its process tree, on the error path too.
+            // its process tree, on the error path too. The Code Mode session is
+            // closed on the same reasoning: no cell outlives the run.
             exec_sessions.shutdown();
+            steps.shutdown_code_mode().await;
             outcome?;
         }
         Ok(())

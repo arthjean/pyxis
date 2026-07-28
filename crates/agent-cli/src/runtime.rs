@@ -20,9 +20,11 @@ use std::time::Instant;
 
 use agent_core::clock::{Clock, SystemClock};
 use agent_core::message::Message;
-use agent_core::provider::Provider;
+use agent_core::model::ModelToolMode;
+use agent_core::provider::{Provider, ToolSpec};
 use agent_core::session::Session;
 use agent_core::step::StepContextSource;
+use agent_core::tools::ToolDispatchSnapshot;
 use agent_core::{AgentContext, Deps, RunConfig};
 use agent_runtime::context::{
     CapturedTurnContext, StepContexts, StepSection, StepSnapshot, StepSource, TurnContext,
@@ -91,6 +93,16 @@ impl SettingsCell {
         self.settings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Tool mode of the model in force. `Direct` without a provider, which is
+    /// what a test cell built with `new` should answer.
+    pub fn tool_mode(&self) -> ModelToolMode {
+        let Some(provider) = &self.provider else {
+            return ModelToolMode::Direct;
+        };
+        let model = self.lock().model.clone();
+        provider.tool_mode(&model)
     }
 
     pub fn read<T>(&self, f: impl FnOnce(&TurnSettings) -> T) -> T {
@@ -178,6 +190,14 @@ impl TurnContextSource for SettingsCell {
 pub struct CliStepSource {
     registry: Arc<agent_tools::Registry>,
     state: Mutex<StepState>,
+    /// Code Mode wiring. `None` in a build or a run without a JavaScript
+    /// runtime: the `exec`/`wait` pair is then never exposed and every direct
+    /// model behaves exactly as before.
+    code_mode: Option<Arc<agent_tools::CodeModeHandle>>,
+    /// Read at each step to know which tool plan the active model wants. Held
+    /// as the settings cell rather than a copied value, so a `/models` in
+    /// session moves the plan at the next request without a second setter.
+    settings: Option<Arc<SettingsCell>>,
 }
 
 #[derive(Default)]
@@ -194,7 +214,57 @@ impl CliStepSource {
                 project,
                 injections: Vec::new(),
             }),
+            code_mode: None,
+            settings: None,
         })
+    }
+
+    /// Attaches the Code Mode runtime and the settings the tool plan is read
+    /// from. Without this, the source composes the direct plan it always has.
+    pub fn with_code_mode(
+        registry: Arc<agent_tools::Registry>,
+        project: Vec<Message>,
+        code_mode: Option<Arc<agent_tools::CodeModeHandle>>,
+        settings: Arc<SettingsCell>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            registry,
+            state: Mutex::new(StepState {
+                project,
+                injections: Vec::new(),
+            }),
+            code_mode,
+            settings: Some(settings),
+        })
+    }
+
+    /// Follows the conversation: a thread that opens, forks or is resumed gets
+    /// a NEW Code Mode session, and the previous one is shut down. A JavaScript
+    /// session therefore never survives the thread it belonged to (US-009 AC3).
+    pub async fn bind_thread(&self, thread: &ThreadId) {
+        let Some(handle) = &self.code_mode else {
+            return;
+        };
+        if let Err(detail) = handle.bind_thread(&thread.to_string()).await {
+            tracing::warn!(%detail, "cannot open the code mode session of this thread");
+        }
+    }
+
+    /// Closes the Code Mode session of the run, if any.
+    pub async fn shutdown_code_mode(&self) {
+        if let Some(handle) = &self.code_mode
+            && let Some(report) = handle.shutdown().await
+            && !report.joined
+        {
+            tracing::warn!(detail = ?report.detail, "code mode shutdown left a worker behind");
+        }
+    }
+
+    fn tool_mode(&self) -> ModelToolMode {
+        let Some(settings) = &self.settings else {
+            return ModelToolMode::Direct;
+        };
+        settings.tool_mode()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, StepState> {
@@ -235,6 +305,65 @@ impl CliStepSource {
     }
 }
 
+impl CliStepSource {
+    /// Decides what the model SEES and what a nested call may dispatch, from
+    /// the same captured snapshot.
+    ///
+    /// The two views share one dispatcher, so a tool hidden from a
+    /// `code_mode_only` model still meets the same permissions, taint, hooks
+    /// and cancellation it would meet as a direct call. `exec` and `wait` are
+    /// removed from the direct plan of a model that does not orchestrate, so a
+    /// direct model never sees a tool it cannot use.
+    fn compose_tool_plan(
+        &self,
+        captured: ToolDispatchSnapshot,
+    ) -> (Vec<ToolSpec>, Option<ToolDispatchSnapshot>) {
+        let mode = self.tool_mode();
+        let all = captured.specs().to_vec();
+        let visible: Vec<ToolSpec> = match (&self.code_mode, mode.needs_code_mode()) {
+            (Some(handle), true) => {
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    handle.bind_step(
+                        Arc::new(agent_code_mode::PlanDispatcher::new(
+                            &captured,
+                            &CODE_MODE_TOOLS,
+                            agent_core::tools::ToolEventSink::default(),
+                            runtime,
+                        )),
+                        mode.hides_nested_tools(),
+                    );
+                }
+                if mode.hides_nested_tools() {
+                    all.iter()
+                        .filter(|spec| is_code_mode_tool(spec))
+                        .cloned()
+                        .collect()
+                } else {
+                    all.clone()
+                }
+            }
+            _ => all
+                .iter()
+                .filter(|spec| !is_code_mode_tool(spec))
+                .cloned()
+                .collect(),
+        };
+        let dispatch = captured.with_specs(visible.clone());
+        (visible, Some(dispatch))
+    }
+}
+
+/// Model-facing Code Mode tools. A cell never calls them: one would recurse
+/// into itself, the other would drive the session it runs in.
+const CODE_MODE_TOOLS: [&str; 2] = [
+    agent_code_mode::EXEC_TOOL_NAME,
+    agent_code_mode::WAIT_TOOL_NAME,
+];
+
+fn is_code_mode_tool(spec: &ToolSpec) -> bool {
+    CODE_MODE_TOOLS.contains(&spec.name.as_str())
+}
+
 impl StepSource for CliStepSource {
     fn snapshot(&self) -> StepSnapshot {
         // The exposed tool set moves HERE, at a step boundary. A server that
@@ -242,8 +371,8 @@ impl StepSource for CliStepSource {
         // request, and the request in flight keeps the catalog it was built with
         // (US-006 AC4).
         self.registry.commit_staged();
-        let tool_dispatch = self.registry.step_snapshot();
-        let tools = tool_dispatch.specs().to_vec();
+        let captured = self.registry.step_snapshot();
+        let (tools, tool_dispatch) = self.compose_tool_plan(captured);
         let state = self.lock();
         let mut sections = Vec::with_capacity(state.project.len() + state.injections.len());
         // The environment block is the last project message and the only
@@ -268,7 +397,7 @@ impl StepSource for CliStepSource {
         StepSnapshot {
             tools,
             sections,
-            tool_dispatch: Some(tool_dispatch),
+            tool_dispatch,
         }
     }
 }
@@ -910,5 +1039,189 @@ mod tests {
         let snapshot = steps.snapshot();
         assert!(!snapshot.sections[0].volatile);
         assert!(snapshot.sections[1].volatile);
+    }
+}
+
+#[cfg(test)]
+mod code_mode_plan_tests {
+    //! US-009 AC1/AC2: what the model SEES per tool mode, and what a nested
+    //! call may still dispatch.
+
+    use std::sync::Arc;
+
+    use agent_code_mode::nested::NestedToolBinding;
+    use agent_code_mode::protocol::SessionId;
+    use agent_code_mode::session::CodeModeSession;
+    use agent_core::model::ModelToolMode;
+    use agent_core::provider::{Capabilities, Provider, ProviderKind};
+    use agent_tools::{CodeModeHandle, CodeModeSessionFactory, ExecTool, WaitTool};
+
+    use super::*;
+
+    /// Declares the tool mode of every slug it is asked about.
+    struct ModeProvider {
+        caps: Capabilities,
+        mode: ModelToolMode,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for ModeProvider {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::OpenAiChatGpt
+        }
+        fn capabilities(&self) -> &Capabilities {
+            &self.caps
+        }
+        fn tool_mode(&self, _slug: &str) -> ModelToolMode {
+            self.mode
+        }
+        async fn stream(
+            &self,
+            _req: agent_core::provider::CanonicalRequest,
+        ) -> Result<
+            futures_util::stream::BoxStream<
+                'static,
+                Result<agent_core::provider::StreamEvent, agent_core::provider::ProviderError>,
+            >,
+            agent_core::provider::ProviderError,
+        > {
+            Err(agent_core::provider::ProviderError::Transport(
+                "unused".into(),
+            ))
+        }
+        async fn complete(
+            &self,
+            _req: agent_core::provider::CanonicalRequest,
+        ) -> Result<agent_core::provider::CanonicalResponse, agent_core::provider::ProviderError>
+        {
+            Err(agent_core::provider::ProviderError::Transport(
+                "unused".into(),
+            ))
+        }
+        fn classify_error(
+            &self,
+            _err: &agent_core::provider::ProviderError,
+        ) -> agent_core::provider::ErrorClass {
+            agent_core::provider::ErrorClass::InvalidRequest
+        }
+    }
+
+    struct NoEngineFactory;
+
+    impl CodeModeSessionFactory for NoEngineFactory {
+        fn open(&self, id: SessionId) -> Result<Arc<CodeModeSession>, String> {
+            struct Inert;
+            impl agent_code_mode::session::CellEngine for Inert {
+                fn start(
+                    &self,
+                    _cell: agent_code_mode::protocol::CellId,
+                    _request: &agent_code_mode::protocol::ExecuteRequest,
+                    _sink: agent_code_mode::session::CellSink,
+                ) -> Result<(), String> {
+                    Ok(())
+                }
+                fn interrupt(&self, _cell: &agent_code_mode::protocol::CellId) {}
+                fn shutdown(
+                    &self,
+                    _deadline: std::time::Duration,
+                ) -> agent_code_mode::protocol::ShutdownReport {
+                    agent_code_mode::protocol::ShutdownReport::joined()
+                }
+            }
+            Ok(Arc::new(CodeModeSession::new(id, Arc::new(Inert))))
+        }
+    }
+
+    fn source(mode: ModelToolMode) -> Arc<CliStepSource> {
+        let handle = Arc::new(CodeModeHandle::new(
+            Arc::new(NoEngineFactory),
+            NestedToolBinding::default(),
+        ));
+        let registry = Arc::new(
+            agent_tools::Registry::builder(std::env::temp_dir())
+                .register(agent_tools::read::Read)
+                .register(ExecTool::new(Arc::clone(&handle)))
+                .register(WaitTool::new(Arc::clone(&handle)))
+                .build(),
+        );
+        let settings = SettingsCell::with_provider(
+            TurnSettings {
+                model: "gpt-5.6-sol".into(),
+                reasoning_effort: None,
+                tool_guidelines: Vec::new(),
+                goal: None,
+                run_config: RunConfig::default(),
+                permission_mode: "ask".into(),
+                sandbox: "enforced (workspace)".into(),
+                workspace: std::env::temp_dir(),
+            },
+            Arc::new(ModeProvider {
+                caps: Capabilities::default(),
+                mode,
+            }),
+        );
+        CliStepSource::with_code_mode(registry, Vec::new(), Some(handle), settings)
+    }
+
+    fn visible(mode: ModelToolMode) -> Vec<String> {
+        let mut names: Vec<String> = source(mode)
+            .snapshot()
+            .tools
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// AC1: a `code_mode_only` model sees `exec` and `wait` and nothing else.
+    #[tokio::test]
+    async fn a_code_mode_only_model_sees_only_the_orchestration_pair() {
+        assert_eq!(
+            visible(ModelToolMode::CodeModeOnly),
+            vec!["exec".to_string(), "wait".to_string()]
+        );
+    }
+
+    /// AC2: a `code_mode` model keeps its direct tools AND the pair.
+    #[tokio::test]
+    async fn a_code_mode_model_keeps_its_direct_tools_and_the_pair() {
+        assert_eq!(
+            visible(ModelToolMode::CodeMode),
+            vec!["exec".to_string(), "read".to_string(), "wait".to_string()]
+        );
+    }
+
+    /// A direct model never sees a tool it cannot drive.
+    #[tokio::test]
+    async fn a_direct_model_never_sees_the_orchestration_pair() {
+        assert_eq!(visible(ModelToolMode::Direct), vec!["read".to_string()]);
+    }
+
+    /// The dispatch view and the visible view agree, so the model can never
+    /// call something the plan would reject as unknown.
+    #[tokio::test]
+    async fn the_dispatch_view_matches_what_the_model_sees() {
+        for mode in [
+            ModelToolMode::Direct,
+            ModelToolMode::CodeMode,
+            ModelToolMode::CodeModeOnly,
+        ] {
+            let snapshot = source(mode).snapshot();
+            let dispatch = snapshot.tool_dispatch.expect("a plan is always captured");
+            let mut seen: Vec<String> = dispatch
+                .specs()
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect();
+            let mut shown: Vec<String> = snapshot
+                .tools
+                .iter()
+                .map(|spec| spec.name.clone())
+                .collect();
+            seen.sort();
+            shown.sort();
+            assert_eq!(seen, shown, "{mode:?}");
+        }
     }
 }

@@ -83,6 +83,8 @@ pub async fn run(run: HeadlessRun<'_>) -> anyhow::Result<()> {
         &cancel,
     )
     .await?;
+    // US-009: the Code Mode session follows the thread, so it opens with it.
+    steps.bind_thread(&runtime.thread_id()).await;
     if let Some(injection) = injection {
         steps.inject(format!("skill:{}", injection.name), injection.block);
     }

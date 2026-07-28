@@ -27,6 +27,9 @@ agent-session.workspace = true
 agent-auth.workspace = true
 agent-provider.workspace = true
 agent-tools.workspace = true
+# EP-002: the binary is the only place that knows Code Mode runs on V8.
+agent-code-mode.workspace = true
+agent-code-mode-v8.workspace = true
 agent-sandbox.workspace = true
 agent-mcp.workspace = true
 agent-tui.workspace = true

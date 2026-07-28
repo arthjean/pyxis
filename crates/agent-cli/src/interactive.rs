@@ -652,6 +652,10 @@ async fn open_session(
         root,
     )
     .await?;
+    // Every way into a thread goes through here, `/fork` and `/rewind`
+    // included, so this is the single place a Code Mode session is attached and
+    // the previous one closed (US-009 AC3).
+    cfg.steps.bind_thread(&runtime.thread_id()).await;
     cfg.provider
         .set_prompt_cache_key(&prompt_cache_key_for_session(path));
     let events = runtime.subscribe();
