@@ -521,17 +521,6 @@ fn run_config_from_args(args: &Args, config: &mut settings::Config) -> anyhow::R
     if let Some(layer) = fallback_layer {
         config.sources.claim(settings::OVERLOAD_FALLBACK_KEY, layer);
     }
-    if let Some(fallback) = &overload_fallback_model
-        && prompt::uses_codex_finetuned_prompt(&args.model)
-            != prompt::uses_codex_finetuned_prompt(fallback)
-    {
-        anyhow::bail!(
-            "fallback model is incompatible with the system prompt: primary={} fallback={}",
-            args.model,
-            fallback
-        );
-    }
-
     Ok(RunConfig {
         token_budget,
         cost_budget,
@@ -1255,8 +1244,7 @@ async fn run(
     let initial_reasoning_effort = config
         .reasoning_effort
         .as_deref()
-        .and_then(|effort| agent_tui::normalize_reasoning_effort_for_model(&args.model, effort))
-        .or_else(|| agent_tui::default_reasoning_effort_for_model(&args.model).map(str::to_string));
+        .and_then(agent_tui::normalize_reasoning_effort);
     // 1. ChatGPT subscription credential loaded before the sandbox. When it is missing in
     // interactive mode, the OAuth onboarding has already run before we get here.
     let mut chatgpt = OpenAiChatGptProvider::new(
@@ -1280,19 +1268,27 @@ async fn run(
     if !headless {
         let catalog_source = Arc::clone(&chatgpt);
         tokio::spawn(async move {
-            // Error deliberately silent: the TUI owns the terminal, and the
-            // bundled catalog stays a correct fallback.
-            if let Ok(models) = catalog_source.list_models().await {
-                agent_tui::set_models(
-                    models
-                        .into_iter()
-                        .map(|model| agent_tui::ModelCatalogEntry {
-                            slug: model.slug,
-                            default_reasoning_effort: model.default_reasoning_effort,
-                            supported_reasoning_efforts: model.supported_reasoning_efforts,
-                        })
-                        .collect(),
-                );
+            match catalog_source.list_models().await {
+                Ok(models) => {
+                    agent_tui::set_models(
+                        models
+                            .into_iter()
+                            .map(|model| agent_tui::ModelCatalogEntry {
+                                slug: model.slug,
+                                default_reasoning_effort: model.default_reasoning_effort,
+                                supported_reasoning_efforts: model.supported_reasoning_efforts,
+                                incompatibility_reason: model.incompatibility_reason,
+                            })
+                            .collect(),
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "pyxis::models",
+                        error = %error,
+                        "remote model catalog unavailable; using embedded descriptors"
+                    );
+                }
             }
         });
     }
@@ -1507,16 +1503,19 @@ async fn run(
     let sandbox_scope = sandbox_scope_label(&sandbox.policy, sandbox.enforced);
     // What every turn is captured from, and what the model sees at each step.
     // Shared with both clients: TUI and headless drive the SAME runtime.
-    let settings = runtime::SettingsCell::new(runtime::TurnSettings {
-        model: args.model.clone(),
-        reasoning_effort: initial_reasoning_effort.clone(),
-        tool_guidelines: tool_guidelines.clone(),
-        goal: goal.clone(),
-        run_config,
-        permission_mode: settings::permission_mode_id(initial_permission_mode).to_string(),
-        sandbox: sandbox_scope.clone(),
-        workspace: workspace.clone(),
-    });
+    let settings = runtime::SettingsCell::with_provider(
+        runtime::TurnSettings {
+            model: args.model.clone(),
+            reasoning_effort: initial_reasoning_effort.clone(),
+            tool_guidelines: tool_guidelines.clone(),
+            goal: goal.clone(),
+            run_config,
+            permission_mode: settings::permission_mode_id(initial_permission_mode).to_string(),
+            sandbox: sandbox_scope.clone(),
+            workspace: workspace.clone(),
+        },
+        Arc::clone(&provider),
+    );
     let steps = runtime::CliStepSource::new(Arc::clone(&registry), context_msgs);
 
     // 6. Headless (-p) vs interactive dispatch. Wrapped so that `SessionEnd`
@@ -1811,14 +1810,12 @@ mod tests {
     }
 
     #[test]
-    fn run_config_rejects_cross_prompt_family_fallback() {
+    fn run_config_does_not_infer_prompt_compatibility_from_model_slugs() {
         let mut args = args();
         args.model = "gpt-5-codex".into();
         args.overload_fallback_model = Some("gpt-5.5".into());
-        let err = run_config_from_args(&args, &mut settings::Config::default())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("fallback model is incompatible"));
+        let cfg = run_config_from_args(&args, &mut settings::Config::default()).unwrap();
+        assert_eq!(cfg.overload_fallback_model.as_deref(), Some("gpt-5.5"));
     }
 
     #[test]

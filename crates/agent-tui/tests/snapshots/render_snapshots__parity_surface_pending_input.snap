@@ -14,9 +14,9 @@ expression: "harness::frame_parity(\"parity_surface_pending_input\", &s, &surfac
 › Récapitule
 
 
-› gpt-5.6-sol          [openai-codex]
-  gpt-5.6-terra        [openai-codex]
-  gpt-5.6-luna         [openai-codex]
+› gpt-5.6-sol          code mode required
+  gpt-5.6-terra        code mode required
+  gpt-5.6-luna         code mode required
   gpt-5.5              [openai-codex]
   gpt-5.4              [openai-codex]
   gpt-5.4-mini         [openai-codex]

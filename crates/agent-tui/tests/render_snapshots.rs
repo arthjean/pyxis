@@ -505,6 +505,7 @@ fn context_indicator_narrow() {
         output_tokens: 12_900,
         context_tokens: Some(231_200),
         context_window: Some(272_000),
+        auto_compact_token_limit: Some(244_800),
         estimated_context_tokens: None,
     }));
     s.reasoning_effort = Some("high".into());

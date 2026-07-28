@@ -184,6 +184,7 @@ pub struct ModelMeta {
     pub tag: &'static str,
     pub default_reasoning_effort: Option<&'static str>,
     pub supported_reasoning_efforts: &'static [&'static str],
+    pub incompatibility_reason: Option<&'static str>,
 }
 
 /// FALLBACK catalog, used until the backend has answered (startup,
@@ -196,42 +197,49 @@ const BUNDLED_MODELS: &[ModelMeta] = &[
         tag: CODEX_TAG,
         default_reasoning_effort: Some("low"),
         supported_reasoning_efforts: EFFORTS_TO_ULTRA,
+        incompatibility_reason: Some("code mode required"),
     },
     ModelMeta {
         slug: "gpt-5.6-terra",
         tag: CODEX_TAG,
         default_reasoning_effort: Some("medium"),
         supported_reasoning_efforts: EFFORTS_TO_ULTRA,
+        incompatibility_reason: Some("code mode required"),
     },
     ModelMeta {
         slug: "gpt-5.6-luna",
         tag: CODEX_TAG,
         default_reasoning_effort: Some("medium"),
         supported_reasoning_efforts: EFFORTS_TO_MAX,
+        incompatibility_reason: Some("code mode required"),
     },
     ModelMeta {
         slug: "gpt-5.5",
         tag: CODEX_TAG,
         default_reasoning_effort: Some("medium"),
         supported_reasoning_efforts: GPT5_REASONING_EFFORTS,
+        incompatibility_reason: None,
     },
     ModelMeta {
         slug: "gpt-5.4",
         tag: CODEX_TAG,
         default_reasoning_effort: Some("medium"),
         supported_reasoning_efforts: GPT5_REASONING_EFFORTS,
+        incompatibility_reason: None,
     },
     ModelMeta {
         slug: "gpt-5.4-mini",
         tag: CODEX_TAG,
         default_reasoning_effort: Some("medium"),
         supported_reasoning_efforts: GPT5_REASONING_EFFORTS,
+        incompatibility_reason: None,
     },
     ModelMeta {
         slug: "gpt-5.3-codex-spark",
         tag: CODEX_TAG,
         default_reasoning_effort: Some("high"),
         supported_reasoning_efforts: GPT5_REASONING_EFFORTS,
+        incompatibility_reason: None,
     },
 ];
 
@@ -245,6 +253,7 @@ pub struct ModelCatalogEntry {
     pub slug: String,
     pub default_reasoning_effort: Option<String>,
     pub supported_reasoning_efforts: Vec<String>,
+    pub incompatibility_reason: Option<String>,
 }
 
 /// Active catalog: the backend one as soon as it is known, `BUNDLED_MODELS` otherwise.
@@ -278,6 +287,9 @@ pub fn set_models(entries: Vec<ModelCatalogEntry>) -> bool {
                     .map(|effort| &*String::leak(effort))
                     .collect::<Vec<&'static str>>(),
             ),
+            incompatibility_reason: entry
+                .incompatibility_reason
+                .map(|reason| &*String::leak(reason)),
         })
         .collect();
     REMOTE_MODELS
@@ -314,24 +326,14 @@ pub fn model_meta(model: &str) -> Option<&'static ModelMeta> {
 
 pub fn supported_reasoning_efforts_for_model(model: &str) -> &'static [&'static str] {
     let trimmed = model.trim();
-    if let Some(meta) = model_meta(trimmed) {
-        return meta.supported_reasoning_efforts;
-    }
-    if trimmed.starts_with("gpt-5.") {
-        return GPT5_REASONING_EFFORTS;
-    }
-    &[]
+    model_meta(trimmed)
+        .map(|meta| meta.supported_reasoning_efforts)
+        .unwrap_or(&[])
 }
 
 pub fn default_reasoning_effort_for_model(model: &str) -> Option<&'static str> {
     let trimmed = model.trim();
-    if let Some(meta) = model_meta(trimmed) {
-        return meta.default_reasoning_effort;
-    }
-    if trimmed.starts_with("gpt-5.") {
-        return Some("medium");
-    }
-    None
+    model_meta(trimmed).and_then(|meta| meta.default_reasoning_effort)
 }
 
 pub fn normalize_reasoning_effort_for_model(model: &str, value: &str) -> Option<String> {
@@ -441,11 +443,24 @@ impl MenuItem {
     fn new(id: &str, label: &str, hint: &str, enabled: bool) -> Self {
         Self {
             id: id.to_string(),
-            label: label.to_string(),
-            hint: hint.to_string(),
+            label: terminal_safe_text(label),
+            hint: terminal_safe_text(hint),
             enabled,
         }
     }
+}
+
+fn terminal_safe_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 /// Which submenu does the current input open? (breadcrumb in the input).
@@ -1575,10 +1590,17 @@ impl AppState {
                 let mut items = models()
                     .iter()
                     .filter(|meta| meta.slug.starts_with(q))
-                    .map(|meta| MenuItem::new(meta.slug, meta.slug, meta.tag, true))
+                    .map(|meta| {
+                        MenuItem::new(
+                            meta.slug,
+                            meta.slug,
+                            meta.incompatibility_reason.unwrap_or(meta.tag),
+                            meta.incompatibility_reason.is_none(),
+                        )
+                    })
                     .collect::<Vec<_>>();
                 if !q.trim().is_empty() && !models().iter().any(|meta| meta.slug == q) {
-                    items.push(MenuItem::new(q, q, "custom", true));
+                    items.push(MenuItem::new(q, q, "descriptor unavailable", false));
                 }
                 items
             }
@@ -1855,6 +1877,7 @@ impl AppState {
         let provider = self.active_provider();
         let value = match kind {
             Menu::Commands => format!("{} ", item.id),
+            Menu::Models if !item.enabled => return,
             Menu::Models => format!("/models {}", item.id),
             Menu::Effort => format!("/effort {}", item.id),
             Menu::Permissions => format!("/permissions {}", item.id),
@@ -1892,10 +1915,11 @@ impl AppState {
                     InputAction::Command(item.id)
                 }
             }
-            Menu::Models => {
+            Menu::Models if item.enabled => {
                 self.clear_input();
                 InputAction::Command(format!("/models {}", item.id))
             }
+            Menu::Models => InputAction::None,
             Menu::Effort => {
                 self.clear_input();
                 InputAction::Command(format!("/effort {}", item.id))
@@ -3166,25 +3190,37 @@ mod tests {
         assert_eq!(s.input, "/models ");
         assert!(s.menu_open());
         assert_eq!(s.menu_items().len(), models().len());
-        // Navigate then select a model -> runs `/models <slug>`.
-        s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // -> 2nd of the catalog
+        // The first three require code mode. Navigate to the first compatible model.
+        for _ in 0..3 {
+            s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(
-            action,
-            InputAction::Command(format!("/models {}", models()[1].slug))
-        );
+        assert_eq!(action, InputAction::Command("/models gpt-5.5".into()));
     }
 
     #[test]
-    fn models_submenu_accepts_custom_slug() {
+    fn models_submenu_refuses_a_slug_without_a_descriptor() {
         let mut s = AppState::new("gpt-5", false);
         s.set_input("/models gpt-6-preview".into());
         let items = s.menu_items();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "gpt-6-preview");
-        assert_eq!(items[0].hint, "custom");
+        assert_eq!(items[0].hint, "descriptor unavailable");
+        assert!(!items[0].enabled);
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(action, InputAction::Command("/models gpt-6-preview".into()));
+        assert_eq!(action, InputAction::None);
+    }
+
+    #[test]
+    fn menu_items_strip_terminal_controls_from_labels_and_hints() {
+        let item = MenuItem::new(
+            "safe-id",
+            "model\x1b]52;clipboard\x07",
+            "reason\x1b[31m",
+            false,
+        );
+        assert!(!item.label.chars().any(char::is_control));
+        assert!(!item.hint.chars().any(char::is_control));
     }
 
     #[test]
@@ -3552,6 +3588,7 @@ mod tests {
             output_tokens: u64::from(index) * 100,
             context_tokens,
             context_window: window,
+            auto_compact_token_limit: window.map(|window| window * 9 / 10),
             estimated_context_tokens: None,
         })
     }

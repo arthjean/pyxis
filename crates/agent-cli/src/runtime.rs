@@ -20,11 +20,13 @@ use std::time::Instant;
 
 use agent_core::clock::{Clock, SystemClock};
 use agent_core::message::Message;
+use agent_core::provider::Provider;
 use agent_core::session::Session;
 use agent_core::step::StepContextSource;
 use agent_core::{AgentContext, Deps, RunConfig};
 use agent_runtime::context::{
-    StepContexts, StepSection, StepSnapshot, StepSource, TurnContext, TurnContextSource, TurnLimits,
+    CapturedTurnContext, StepContexts, StepSection, StepSnapshot, StepSource, TurnContext,
+    TurnContextError, TurnContextSource, TurnLimits,
 };
 use agent_runtime::id::{IdGenerator, RandomIds, ThreadId, TurnId};
 use agent_runtime::runner::{RunAgentRunner, TurnRequest};
@@ -61,18 +63,32 @@ pub struct TurnSettings {
 }
 
 /// Shared, mutable settings cell. Also the runtime's [`TurnContextSource`].
-pub struct SettingsCell(Mutex<TurnSettings>);
+pub struct SettingsCell {
+    settings: Mutex<TurnSettings>,
+    provider: Option<Arc<dyn Provider>>,
+}
 
 impl SettingsCell {
+    #[cfg(test)]
     pub fn new(settings: TurnSettings) -> Arc<Self> {
-        Arc::new(Self(Mutex::new(settings)))
+        Arc::new(Self {
+            settings: Mutex::new(settings),
+            provider: None,
+        })
+    }
+
+    pub fn with_provider(settings: TurnSettings, provider: Arc<dyn Provider>) -> Arc<Self> {
+        Arc::new(Self {
+            settings: Mutex::new(settings),
+            provider: Some(provider),
+        })
     }
 
     /// A poisoned lock is recovered rather than propagated: losing a setting
     /// degrades the next turn, it does not corrupt the log, and the runtime must
     /// not panic on a turn boundary.
     fn lock(&self) -> std::sync::MutexGuard<'_, TurnSettings> {
-        self.0
+        self.settings
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -87,21 +103,49 @@ impl SettingsCell {
 }
 
 impl TurnContextSource for SettingsCell {
-    fn capture(&self, turn_id: TurnId) -> TurnContext {
+    fn capture(&self, turn_id: TurnId) -> Result<CapturedTurnContext, TurnContextError> {
         let settings = self.lock();
-        TurnContext {
-            turn_id,
-            model: settings.model.clone(),
-            reasoning_effort: settings.reasoning_effort.clone(),
-            permission_mode: settings.permission_mode.clone(),
-            sandbox: settings.sandbox.clone(),
-            workspace: settings.workspace.clone(),
-            limits: TurnLimits {
-                max_turns: settings.run_config.max_turns,
-                max_output_tokens: settings.run_config.max_output_tokens,
-                max_pending_inputs: MAX_PENDING_INPUTS,
+        let model_runtime = self
+            .provider
+            .as_ref()
+            .map(|provider| {
+                provider.resolve_model_runtime(
+                    &settings.model,
+                    settings.reasoning_effort.as_deref(),
+                    settings.run_config.max_output_tokens,
+                    settings.run_config.max_retries,
+                    settings.run_config.backoff_base_ms,
+                )
+            })
+            .transpose()
+            .map_err(|error| TurnContextError(error.to_string()))?;
+        let effective_model = model_runtime
+            .as_ref()
+            .map(|runtime| runtime.slug.clone())
+            .unwrap_or_else(|| settings.model.clone());
+        let effective_reasoning = model_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.reasoning_effort.clone())
+            .or_else(|| settings.reasoning_effort.clone());
+        Ok(CapturedTurnContext {
+            context: TurnContext {
+                turn_id,
+                model: effective_model,
+                reasoning_effort: effective_reasoning,
+                model_runtime_fingerprint: model_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.fingerprint.clone()),
+                permission_mode: settings.permission_mode.clone(),
+                sandbox: settings.sandbox.clone(),
+                workspace: settings.workspace.clone(),
+                limits: TurnLimits {
+                    max_turns: settings.run_config.max_turns,
+                    max_output_tokens: settings.run_config.max_output_tokens,
+                    max_pending_inputs: MAX_PENDING_INPUTS,
+                },
             },
-        }
+            model_runtime,
+        })
     }
 }
 
@@ -263,7 +307,11 @@ fn build_context(
     let (base, goal, mut config) = settings.read(|settings| {
         (
             crate::interactive::with_tool_guidelines(
-                crate::prompt::select_system_prompt(&captured.model),
+                request
+                    .model_runtime
+                    .as_ref()
+                    .map(crate::prompt::select_system_prompt)
+                    .unwrap_or("You are a helpful assistant."),
                 &settings.tool_guidelines,
             ),
             settings.goal.clone(),
@@ -275,6 +323,7 @@ fn build_context(
 
     AgentContext {
         model: captured.model.clone(),
+        model_runtime: request.model_runtime.clone(),
         reasoning_effort: captured.reasoning_effort.clone(),
         system: Some(crate::interactive::compose_system(&base, goal.as_deref())),
         messages,

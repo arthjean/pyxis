@@ -662,9 +662,11 @@ fn render_command_menu(
         } else {
             theme.faint()
         };
-        let name_disp = fit(&item.label, namecol);
+        let safe_label = sanitize(&item.label);
+        let safe_hint = sanitize(&item.hint);
+        let name_disp = fit(&safe_label, namecol);
         let desc_room = width.saturating_sub(2 + namecol + 2).max(1);
-        let desc_disp = fit(&item.hint, desc_room);
+        let desc_disp = fit(&safe_hint, desc_room);
         let desc_len = measure::width(&desc_disp);
         let mut spans = vec![
             Span::styled(marker, marker_st),

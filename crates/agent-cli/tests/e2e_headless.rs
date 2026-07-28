@@ -299,6 +299,7 @@ fn harness_with_hooks(
 fn context(prompt: &str, tools: Vec<agent_core::provider::ToolSpec>) -> AgentContext {
     AgentContext {
         model: "gpt-5".to_string(),
+        model_runtime: None,
         reasoning_effort: None,
         system: Some("Tu es Pyxis en test d'intégration.".to_string()),
         messages: vec![Message::user(prompt)],
@@ -435,6 +436,7 @@ async fn interrupted_turn_leaves_a_resumable_session() {
     let replay = ReplayProvider::new([FINAL_TURN]);
     let request = CanonicalRequest {
         model: "gpt-5".to_string(),
+        model_runtime: None,
         reasoning_effort: None,
         system: None,
         messages,
