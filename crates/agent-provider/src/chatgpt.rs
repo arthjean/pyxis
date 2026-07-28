@@ -15,6 +15,9 @@ use std::time::Duration;
 use agent_auth::OAuthCredential;
 use agent_auth::oauth::openai_chatgpt;
 use agent_core::message::ContentBlock;
+use agent_core::model::{
+    ModelRetryPolicy, ModelRuntimeError, ResolvedModelRuntime, ResponsesDialect,
+};
 use agent_core::provider::{
     AuthError, CacheCapabilities, CanonicalRequest, CanonicalResponse, Capabilities,
     CapabilityLimits, ErrorClass, Provider, ProviderError, ProviderKind, ReasoningCapabilities,
@@ -29,6 +32,7 @@ use futures_util::stream::BoxStream;
 use crate::chatgpt_events::CodexEventMapper;
 use crate::chatgpt_request::{ResponsesBodyOptions, build_responses_body, inject_cache_key};
 use crate::credential::CredentialManager;
+use crate::models::ModelCatalog;
 
 /// Keyring key of the ChatGPT subscription credential (rotating refresh rewritten here).
 pub const KEYRING_ACCOUNT: &str = "oauth:openai_chatgpt";
@@ -48,34 +52,6 @@ pub const DEFAULT_REASONING_EFFORT: &str = "medium";
 /// `/models` command in session (see `agent_tui::MODELS`).
 pub const DEFAULT_MODEL: &str = "gpt-5.5";
 
-#[derive(Debug, Clone, Copy)]
-struct ModelProfile {
-    max_context: u32,
-    supports_reasoning: bool,
-    parallel_tool_calls: bool,
-    text_verbosity: &'static str,
-}
-
-fn model_profile(model: &str, fallback_max_context: u32) -> ModelProfile {
-    let model = model.trim();
-    let is_gpt5_family = matches!(model, "gpt-5.4" | "gpt-5.5") || model.starts_with("gpt-5.");
-    if is_gpt5_family {
-        ModelProfile {
-            max_context: DEFAULT_MAX_CONTEXT,
-            supports_reasoning: true,
-            parallel_tool_calls: true,
-            text_verbosity: "low",
-        }
-    } else {
-        ModelProfile {
-            max_context: fallback_max_context,
-            supports_reasoning: false,
-            parallel_tool_calls: false,
-            text_verbosity: "low",
-        }
-    }
-}
-
 fn reasoning_effort_for_request(effort: &str) -> &str {
     if effort.eq_ignore_ascii_case("ultra") {
         "max"
@@ -91,6 +67,7 @@ const MAX_ERR_BODY: usize = 2000;
 /// a slow backend must never delay the session, the bundled catalog takes
 /// over.
 const MODELS_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_MODELS_BODY: usize = 4 * 1024 * 1024;
 
 /// Connection ESTABLISHMENT timeout (US-022). A backend that never establishes
 /// the connection (corporate proxy, blackholed DNS) fails here rather than freezing;
@@ -115,11 +92,9 @@ pub struct OpenAiChatGptProvider {
     session_id: RwLock<String>,
     /// US-031: reinject the encrypted reasoning items in stateless mode.
     reasoning_replay: bool,
-    /// Context windows declared by the `/models` catalog, filled by
-    /// `list_models` (US-001). Empty until the catalog answers, and in headless
-    /// mode where no discovery happens: an absent slug means "unknown window",
-    /// never "default window".
-    catalog_windows: RwLock<std::collections::HashMap<String, u32>>,
+    /// Last valid remote catalog layered over the versioned embedded fallback.
+    /// Shared by interactive discovery and headless turn resolution.
+    catalog: RwLock<ModelCatalog>,
 }
 
 /// Generates a UUID v4 (RFC 4122) from 16 random bytes. Avoids the `uuid` crate
@@ -195,7 +170,7 @@ impl OpenAiChatGptProvider {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             session_id: RwLock::new(new_session_id()),
             reasoning_replay: false,
-            catalog_windows: RwLock::new(std::collections::HashMap::new()),
+            catalog: RwLock::new(ModelCatalog::embedded()),
         }
     }
 
@@ -253,44 +228,54 @@ impl OpenAiChatGptProvider {
             .await
             .map_err(|e| ProviderError::Transport(format!("models: {e}")))?;
         let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| ProviderError::Transport(format!("models body: {e}")))?;
+        let mut body_bytes = Vec::new();
+        let mut body_stream = resp.bytes_stream();
+        while let Some(chunk) = body_stream.next().await {
+            let chunk =
+                chunk.map_err(|error| ProviderError::Transport(format!("models body: {error}")))?;
+            if body_bytes.len().saturating_add(chunk.len()) > MAX_MODELS_BODY {
+                return Err(ProviderError::Decode(format!(
+                    "models: response exceeds {MAX_MODELS_BODY} bytes"
+                )));
+            }
+            body_bytes.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8(body_bytes)
+            .map_err(|error| ProviderError::Decode(format!("models: invalid UTF-8: {error}")))?;
         if !status.is_success() {
-            let mut message = body;
-            message.truncate(MAX_ERR_BODY);
+            let message = truncate_chars(&body, MAX_ERR_BODY);
             return Err(ProviderError::Http {
                 status: status.as_u16(),
                 message,
                 retry_after_ms: None,
             });
         }
-        let catalog = crate::models::parse_catalog(&body)
-            .map_err(|e| ProviderError::Decode(format!("models: {e}")))?;
-        self.record_catalog_windows(&catalog);
-        Ok(catalog)
-    }
-
-    /// US-001: memorizes the windows declared by the catalog so that the loop
-    /// and the clients stop reasoning on a heuristic. A model without a declared
-    /// window is NOT recorded: its window stays unknown.
-    fn record_catalog_windows(&self, catalog: &[crate::models::CatalogModel]) {
-        let Ok(mut windows) = self.catalog_windows.write() else {
-            return;
-        };
-        for model in catalog {
-            if let Some(window) = model.context_window {
-                windows.insert(model.slug.clone(), window);
-            }
+        let fetched_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs().to_string())
+            .unwrap_or_else(|_| "unknown".into());
+        let mut catalog = self
+            .catalog
+            .write()
+            .map_err(|_| ProviderError::Decode("models: catalog lock poisoned".into()))?;
+        let models = catalog
+            .install_remote(&body, &fetched_at)
+            .map_err(|error| ProviderError::Decode(format!("models: {error}")))?;
+        for diagnostic in catalog.diagnostics() {
+            tracing::warn!(
+                target: "pyxis::models",
+                diagnostic,
+                "remote model descriptor was not used"
+            );
         }
+        Ok(models)
     }
 
     fn catalog_window(&self, model: &str) -> Option<u32> {
-        self.catalog_windows
+        self.catalog
             .read()
             .ok()
-            .and_then(|windows| windows.get(model.trim()).copied())
+            .and_then(|catalog| catalog.context_window(model.trim()))
     }
 }
 
@@ -356,7 +341,7 @@ async fn http_error_from_response(resp: reqwest::Response) -> ProviderError {
     let mut text = sanitize_error_body(&resp.text().await.unwrap_or_default());
     // Truncated BEFORE prefixing: the terminal-quota markers sit at the start of
     // the body, and `is_terminal_rate_limit` must keep seeing them.
-    text.truncate(MAX_ERR_BODY);
+    text = truncate_chars(&text, MAX_ERR_BODY);
     // US-003 AC3: an exhausted quota is announced by naming the limit and its
     // reset instead of handing back the raw body. The body stays appended: it
     // carries the markers used for the terminal/transient classification.
@@ -371,6 +356,10 @@ async fn http_error_from_response(resp: reqwest::Response) -> ProviderError {
         message: text,
         retry_after_ms,
     }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 fn should_retry_with_originator_fallback(status: u16, message: &str) -> bool {
@@ -607,42 +596,86 @@ impl Provider for OpenAiChatGptProvider {
     }
 
     fn max_context_for_model(&self, model: &str) -> u32 {
-        // The window declared by the backend wins over the family heuristic:
-        // it is the only value that is not an approximation. The heuristic stays
-        // the fallback as long as the catalog has not answered (or in headless
-        // mode, where no discovery happens), because the compaction geometry
-        // needs a number in every case.
         self.catalog_window(model)
-            .unwrap_or_else(|| model_profile(model, self.capabilities.max_context).max_context)
+            .unwrap_or(self.capabilities.max_context)
     }
 
     fn context_window_for_model(&self, model: &str) -> Option<u32> {
         self.catalog_window(model)
     }
 
+    fn resolve_model_runtime(
+        &self,
+        model: &str,
+        reasoning_effort: Option<&str>,
+        max_output_tokens: u32,
+        max_retries: u32,
+        backoff_base_ms: u64,
+    ) -> Result<ResolvedModelRuntime, ModelRuntimeError> {
+        let catalog = self
+            .catalog
+            .read()
+            .map_err(|_| ModelRuntimeError::InvalidField {
+                field: "catalog",
+                detail: "lock poisoned".into(),
+            })?;
+        catalog.resolve(
+            model,
+            reasoning_effort.or(self.reasoning_effort.as_deref()),
+            max_output_tokens,
+            ModelRetryPolicy {
+                max_retries,
+                backoff_base_ms,
+            },
+        )
+    }
+
     async fn stream(
         &self,
         req: CanonicalRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
-        // 1. fresh credential (refresh + keyring when needed) -> URL + headers.
-        let spec = self.creds.request_spec().await?;
-        // 2. Responses body (stateless SSE).
-        let profile = model_profile(&req.model, self.capabilities.max_context);
-        let reasoning_effort = if profile.supports_reasoning {
-            req.reasoning_effort
-                .as_deref()
-                .or(self.reasoning_effort.as_deref())
-                .map(reasoning_effort_for_request)
-        } else {
-            None
+        req.validate()
+            .map_err(|error| ProviderError::Decode(error.to_string()))?;
+        let runtime = match req.model_runtime.clone() {
+            Some(runtime) => runtime,
+            None => self
+                .resolve_model_runtime(
+                    &req.model,
+                    req.reasoning_effort.as_deref(),
+                    req.max_output_tokens,
+                    3,
+                    50,
+                )
+                .map_err(|error| ProviderError::Decode(error.to_string()))?,
         };
+        let mut req = req;
+        if req.model_runtime.is_none() {
+            req.reasoning_effort = runtime.reasoning_effort.clone();
+            req.model_runtime = Some(runtime.clone());
+        }
+        req.validate()
+            .map_err(|error| ProviderError::Decode(error.to_string()))?;
+
+        // Credential access and every network operation happen only after the
+        // complete effective request has passed canonical validation.
+        let spec = self.creds.request_spec().await?;
+        let reasoning_effort = runtime
+            .reasoning_effort
+            .as_deref()
+            .map(reasoning_effort_for_request);
         let mut body = build_responses_body(
             &req,
             ResponsesBodyOptions {
                 reasoning_effort,
-                include_encrypted_reasoning: self.reasoning_replay && profile.supports_reasoning,
-                parallel_tool_calls: profile.parallel_tool_calls,
-                text_verbosity: profile.text_verbosity,
+                include_encrypted_reasoning: self.reasoning_replay
+                    && runtime.reasoning_effort.is_some(),
+                parallel_tool_calls: runtime.supports_parallel_tool_calls,
+                text_verbosity: if runtime.supports_verbosity {
+                    runtime.verbosity.as_deref()
+                } else {
+                    None
+                },
+                dialect: runtime.responses_dialect,
             },
         );
         // US-029: stable per-session cache key -> reuse of the backend cache.
@@ -664,6 +697,9 @@ impl Provider for OpenAiChatGptProvider {
             }
             if let Some(originator) = originator_override {
                 rb = rb.header("originator", originator);
+            }
+            if runtime.responses_dialect == ResponsesDialect::Lite {
+                rb = rb.header("x-openai-internal-codex-responses-lite", "true");
             }
             rb
         };
@@ -833,6 +869,27 @@ mod tests {
         assert_eq!(p.kind(), ProviderKind::OpenAiChatGpt);
     }
 
+    #[tokio::test]
+    async fn direct_stream_validates_before_credentials_or_network() {
+        let p = provider();
+        let request = CanonicalRequest {
+            model: String::new(),
+            model_runtime: None,
+            reasoning_effort: None,
+            system: None,
+            messages: Vec::new(),
+            tools: Vec::new(),
+            max_output_tokens: 4096,
+        };
+        assert!(
+            matches!(
+                p.stream(request).await,
+                Err(ProviderError::Decode(ref detail)) if detail.contains("model is empty")
+            ),
+            "invalid request must fail before opening a stream"
+        );
+    }
+
     #[test]
     fn reasoning_replay_flag_updates_capabilities() {
         let p = provider();
@@ -842,61 +899,38 @@ mod tests {
     }
 
     #[test]
-    fn model_profile_controls_context_and_features() {
+    fn resolved_runtime_controls_context_and_features() {
         let p = provider();
-        assert_eq!(p.max_context_for_model("gpt-5.5"), DEFAULT_MAX_CONTEXT);
-        assert_eq!(p.max_context_for_model("gpt-5.4"), DEFAULT_MAX_CONTEXT);
-
-        let fallback = OpenAiChatGptProvider::new(
-            OAuthCredential {
-                provider: agent_auth::ProviderId::OpenAiChatGpt,
-                access: agent_auth::Secret::new("AT"),
-                refresh: agent_auth::Secret::new("RT"),
-                expires_at: u64::MAX,
-                account_id: Some("acct".into()),
-            },
-            12_345,
-            None,
+        let runtime = p
+            .resolve_model_runtime("gpt-5.5", Some("high"), 4096, 3, 50)
+            .expect("embedded descriptor resolves");
+        assert_eq!(runtime.context_window, 272_000);
+        assert!(runtime.supports_parallel_tool_calls);
+        assert_eq!(runtime.reasoning_effort.as_deref(), Some("high"));
+        assert!(
+            p.resolve_model_runtime("unknown-model", None, 4096, 3, 50)
+                .is_err()
         );
-        assert_eq!(fallback.max_context_for_model("unknown-model"), 12_345);
-        let unknown = model_profile("unknown-model", 12_345);
-        assert!(!unknown.supports_reasoning);
-        assert!(!unknown.parallel_tool_calls);
     }
 
     /// US-001: once the catalog has answered, the declared window replaces the
     /// heuristic, and a slug the catalog does not describe stays unknown instead
     /// of borrowing the default.
     #[test]
-    fn catalog_window_overrides_heuristic_and_absence_stays_unknown() {
+    fn remote_catalog_window_overrides_embedded_descriptor() {
         let p = provider();
-        assert_eq!(
-            p.context_window_for_model("gpt-5.4"),
-            None,
-            "avant le catalogue, la fenêtre est inconnue"
-        );
-        assert_eq!(p.max_context_for_model("gpt-5.4"), DEFAULT_MAX_CONTEXT);
-
-        p.record_catalog_windows(&crate::models::parse_catalog(
-            r#"{"models":[
-                {"slug":"gpt-5.4","display_name":"GPT-5.4","visibility":"list","context_window":272000},
-                {"slug":"gpt-5.6-sol","display_name":"Sol","visibility":"list"}
-            ]}"#,
-        )
-        .expect("catalog parses"));
-
         assert_eq!(p.context_window_for_model("gpt-5.4"), Some(272_000));
         assert_eq!(p.max_context_for_model("gpt-5.4"), 272_000);
-        assert_eq!(
-            p.context_window_for_model("gpt-5.6-sol"),
-            None,
-            "modèle listé sans fenêtre déclarée: toujours inconnu"
-        );
-        assert_eq!(
-            p.max_context_for_model("gpt-5.6-sol"),
-            DEFAULT_MAX_CONTEXT,
-            "la géométrie de compaction garde son repli"
-        );
+        p.catalog
+            .write()
+            .expect("catalog lock")
+            .install_remote(
+                include_str!("../fixtures/models-2026-07-28.json"),
+                "2026-07-28",
+            )
+            .expect("fixture installs");
+        assert_eq!(p.context_window_for_model("fixture-lite"), Some(200_000));
+        assert_eq!(p.max_context_for_model("fixture-lite"), 200_000);
     }
 
     #[test]

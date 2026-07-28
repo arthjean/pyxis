@@ -28,6 +28,7 @@ use std::collections::HashSet;
 use agent_core::message::{
     ContentBlock, INTERRUPTED_TOOL_RESULT, Message, Role, unanswered_tool_calls,
 };
+use agent_core::model::ResponsesDialect;
 use agent_core::provider::{CanonicalRequest, ToolSpec};
 use serde_json::{Value, json};
 
@@ -38,7 +39,8 @@ pub struct ResponsesBodyOptions<'a> {
     pub reasoning_effort: Option<&'a str>,
     pub include_encrypted_reasoning: bool,
     pub parallel_tool_calls: bool,
-    pub text_verbosity: &'a str,
+    pub text_verbosity: Option<&'a str>,
+    pub dialect: ResponsesDialect,
 }
 
 impl Default for ResponsesBodyOptions<'_> {
@@ -47,7 +49,8 @@ impl Default for ResponsesBodyOptions<'_> {
             reasoning_effort: None,
             include_encrypted_reasoning: false,
             parallel_tool_calls: true,
-            text_verbosity: "low",
+            text_verbosity: Some("low"),
+            dialect: ResponsesDialect::Standard,
         }
     }
 }
@@ -55,27 +58,57 @@ impl Default for ResponsesBodyOptions<'_> {
 /// Builds the complete JSON body of the Responses request (SSE).
 pub fn build_responses_body(req: &CanonicalRequest, options: ResponsesBodyOptions<'_>) -> Value {
     let instructions = req.system.as_deref().unwrap_or(DEFAULT_INSTRUCTIONS);
+    let lite = options.dialect == ResponsesDialect::Lite;
+    let mut input = build_input(&req.messages, lite);
+    if lite {
+        input.insert(
+            0,
+            json!({
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": build_tools(&req.tools),
+            }),
+        );
+        if !instructions.is_empty() {
+            input.insert(
+                1,
+                json!({
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{ "type": "input_text", "text": instructions }],
+                }),
+            );
+        }
+    }
 
     let mut body = json!({
         "model": req.model,
         // load-bearing: the Codex backend rejects store:true.
         "store": false,
         "stream": true,
-        "instructions": instructions,
-        "input": build_input(&req.messages),
-        "text": { "verbosity": options.text_verbosity },
+        "input": input,
         "tool_choice": "auto",
-        "parallel_tool_calls": options.parallel_tool_calls,
+        "parallel_tool_calls": options.parallel_tool_calls && !lite,
     });
+    if let Some(verbosity) = options.text_verbosity {
+        body["text"] = json!({ "verbosity": verbosity });
+    }
+    if !lite {
+        body["instructions"] = json!(instructions);
+    }
 
     if options.include_encrypted_reasoning {
         body["include"] = json!(["reasoning.encrypted_content"]);
     }
-    if !req.tools.is_empty() {
+    if !lite && !req.tools.is_empty() {
         body["tools"] = build_tools(&req.tools);
     }
     if let Some(effort) = options.reasoning_effort {
-        body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
+        let mut reasoning = json!({ "effort": effort, "summary": "auto" });
+        if lite {
+            reasoning["context"] = json!("all_turns");
+        }
+        body["reasoning"] = reasoning;
     }
     body
 }
@@ -108,7 +141,7 @@ fn trace_transcript_anomaly(detail: &str) {
 }
 
 /// Converts the canonical transcript into the `input[]` of the Responses API.
-fn build_input(messages: &[Message]) -> Value {
+fn build_input(messages: &[Message], lite: bool) -> Vec<Value> {
     // US-003: pairing computed on the WHOLE transcript before emission: a
     // result can arrive several messages after its call. On a healthy transcript,
     // both sets leave the building strictly unchanged.
@@ -129,7 +162,7 @@ fn build_input(messages: &[Message]) -> Value {
             // The system prompt lives in `instructions`, not in input[].
             Role::System => {}
             Role::User => {
-                let content = user_content(&msg.content);
+                let content = user_content(&msg.content, lite);
                 if !content.is_empty() {
                     input.push(json!({
                         "type": "message",
@@ -142,11 +175,11 @@ fn build_input(messages: &[Message]) -> Value {
             Role::Tool => tool_result_items(&msg.content, &known_calls, &mut input),
         }
     }
-    Value::Array(input)
+    input
 }
 
 /// Blocks of a user message -> `input_text` / `input_image` parts.
-fn user_content(blocks: &[ContentBlock]) -> Vec<Value> {
+fn user_content(blocks: &[ContentBlock], lite: bool) -> Vec<Value> {
     let mut content = Vec::new();
     for b in blocks {
         match b {
@@ -165,11 +198,14 @@ fn user_content(blocks: &[ContentBlock]) -> Vec<Value> {
                 content.push(json!({ "type": "input_text", "text": text }));
             }
             ContentBlock::Image { media_type, data } => {
-                content.push(json!({
+                let mut image = json!({
                     "type": "input_image",
-                    "detail": "auto",
                     "image_url": format!("data:{media_type};base64,{data}"),
-                }));
+                });
+                if !lite {
+                    image["detail"] = json!("auto");
+                }
+                content.push(image);
             }
             // tool_use / tool_result are not carried by a user message.
             _ => {}
@@ -334,6 +370,7 @@ mod tests {
     fn req(messages: Vec<Message>, tools: Vec<ToolSpec>, system: Option<&str>) -> CanonicalRequest {
         CanonicalRequest {
             model: "gpt-5.4".into(),
+            model_runtime: None,
             reasoning_effort: None,
             system: system.map(String::from),
             messages,
@@ -384,6 +421,65 @@ mod tests {
     fn default_instructions_when_no_system() {
         let body = request_body(&req(vec![Message::user("hi")], vec![], None));
         assert_eq!(body["instructions"], DEFAULT_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn responses_lite_moves_instructions_and_tools_into_input() {
+        let spec = ToolSpec {
+            name: "read".into(),
+            description: "read a file".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+        };
+        let body = request_body_with_options(
+            &req(
+                vec![Message::user("hi")],
+                vec![spec],
+                Some("runtime prompt"),
+            ),
+            ResponsesBodyOptions {
+                reasoning_effort: Some("high"),
+                dialect: ResponsesDialect::Lite,
+                ..ResponsesBodyOptions::default()
+            },
+        );
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["input"][0]["type"], "additional_tools");
+        assert_eq!(body["input"][0]["tools"][0]["name"], "read");
+        assert_eq!(body["input"][1]["role"], "developer");
+        assert_eq!(body["input"][1]["content"][0]["text"], "runtime prompt");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+    }
+
+    #[test]
+    fn responses_lite_strips_image_detail_while_standard_keeps_it() {
+        let image = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }],
+        };
+        let request = req(vec![image], vec![], Some("runtime prompt"));
+        let standard = request_body(&request);
+        let lite = request_body_with_options(
+            &request,
+            ResponsesBodyOptions {
+                dialect: ResponsesDialect::Lite,
+                ..ResponsesBodyOptions::default()
+            },
+        );
+        assert_eq!(standard["input"][0]["content"][0]["detail"], "auto");
+        assert!(
+            lite["input"][2]["content"][0].get("detail").is_none(),
+            "Responses Lite rejects image detail"
+        );
     }
 
     #[test]

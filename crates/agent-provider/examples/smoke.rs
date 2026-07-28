@@ -45,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider = OpenAiChatGptProvider::from_credential(cred);
     let req = CanonicalRequest {
         model,
+        model_runtime: None,
         reasoning_effort: None,
         system: Some("Tu es Pyxis, un agent de codage concis.".to_string()),
         messages: vec![Message::user(prompt)],

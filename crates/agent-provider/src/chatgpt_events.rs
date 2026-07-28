@@ -89,7 +89,7 @@ impl CodexEventMapper {
             }
             "response.output_item.done" => self.on_item_done(&v),
             "response.completed" | "response.done" | "response.incomplete" => {
-                Ok(self.on_terminal(&v))
+                self.on_terminal(&v, typ)
             }
             "error" => Err(stream_error(&v)),
             "response.failed" => Err(failed_error(&v)),
@@ -282,31 +282,86 @@ impl CodexEventMapper {
         )))
     }
 
-    fn on_terminal(&mut self, v: &Value) -> Vec<StreamEvent> {
+    fn on_terminal(
+        &mut self,
+        v: &Value,
+        event_type: &str,
+    ) -> Result<Vec<StreamEvent>, ProviderError> {
         let response = v.get("response");
-        let status = response
+        let declared_status = response
             .and_then(|r| r.get("status"))
-            .and_then(Value::as_str)
-            .unwrap_or("completed");
+            .and_then(Value::as_str);
+        let status = declared_status.unwrap_or(match event_type {
+            "response.incomplete" => "incomplete",
+            _ => "completed",
+        });
+        let expected = match event_type {
+            "response.completed" => Some("completed"),
+            "response.incomplete" => Some("incomplete"),
+            _ => None,
+        };
+        if let Some(expected) = expected
+            && status != expected
+        {
+            return Err(ProviderError::Decode(format!(
+                "contradictory terminal: {event_type} carries status {status}"
+            )));
+        }
+        let end_turn = match response.and_then(|r| r.get("end_turn")) {
+            None => None,
+            Some(Value::Bool(value)) => Some(*value),
+            Some(_) => {
+                return Err(ProviderError::Decode(
+                    "response.end_turn must be a boolean".into(),
+                ));
+            }
+        };
+        if status == "incomplete" && end_turn.is_some() {
+            return Err(ProviderError::Decode(
+                "incomplete response must not carry end_turn".into(),
+            ));
+        }
 
         let mut out = Vec::new();
         if let Some(usage) = response.and_then(|r| r.get("usage")).and_then(parse_usage) {
             out.push(StreamEvent::Usage { usage });
         }
         out.push(StreamEvent::Done {
-            stop: self.stop_for(status),
+            stop: self.stop_for(status, end_turn, response)?,
         });
-        out
+        Ok(out)
     }
 
-    fn stop_for(&self, status: &str) -> StopReason {
+    fn stop_for(
+        &self,
+        status: &str,
+        end_turn: Option<bool>,
+        response: Option<&Value>,
+    ) -> Result<StopReason, ProviderError> {
+        if self.saw_tool_call && status == "completed" {
+            return Ok(StopReason::ToolUse);
+        }
         match status {
-            "incomplete" => StopReason::MaxTokens,
-            "failed" | "cancelled" => StopReason::Refusal,
-            // completed / in_progress / queued / absent -> normal end;
-            // overridden to ToolUse when tool calls were emitted.
-            _ if self.saw_tool_call => StopReason::ToolUse,
-            _ => StopReason::EndTurn,
+            "completed" => Ok(if end_turn.unwrap_or(true) {
+                StopReason::EndTurn
+            } else {
+                StopReason::Continue
+            }),
+            "incomplete" => {
+                let reason = response
+                    .and_then(|value| value.get("incomplete_details"))
+                    .and_then(|details| details.get("reason"))
+                    .and_then(Value::as_str);
+                Ok(match reason {
+                    Some("max_output_tokens") | Some("max_tokens") => StopReason::MaxTokens,
+                    Some("content_filter") => StopReason::ContentFilter,
+                    _ => StopReason::IncompleteUnknown,
+                })
+            }
+            "failed" | "cancelled" => Ok(StopReason::Refusal),
+            other => Err(ProviderError::Decode(format!(
+                "unknown terminal status {other}"
+            ))),
         }
     }
 }
@@ -478,6 +533,61 @@ mod tests {
                 stop: StopReason::EndTurn
             })
         );
+    }
+
+    #[test]
+    fn completed_end_turn_false_requests_continuation() {
+        let ev = ingest_all(&[
+            r#"{"type":"response.completed","response":{"status":"completed","end_turn":false}}"#,
+        ]);
+        assert_eq!(
+            ev,
+            [StreamEvent::Done {
+                stop: StopReason::Continue
+            }]
+        );
+    }
+
+    #[test]
+    fn missing_end_turn_keeps_legacy_end_turn_behavior() {
+        let ev =
+            ingest_all(&[r#"{"type":"response.completed","response":{"status":"completed"}}"#]);
+        assert_eq!(
+            ev,
+            [StreamEvent::Done {
+                stop: StopReason::EndTurn
+            }]
+        );
+    }
+
+    #[test]
+    fn incomplete_reasons_are_distinct() {
+        for (reason, expected) in [
+            ("max_output_tokens", StopReason::MaxTokens),
+            ("content_filter", StopReason::ContentFilter),
+            ("future_reason", StopReason::IncompleteUnknown),
+        ] {
+            let event = format!(
+                r#"{{"type":"response.incomplete","response":{{"status":"incomplete","incomplete_details":{{"reason":"{reason}"}}}}}}"#
+            );
+            let ev = ingest_all(&[&event]);
+            assert_eq!(ev.last(), Some(&StreamEvent::Done { stop: expected }));
+        }
+    }
+
+    #[test]
+    fn invalid_end_turn_and_contradictory_terminals_fail_closed() {
+        for event in [
+            r#"{"type":"response.completed","response":{"status":"completed","end_turn":"false"}}"#,
+            r#"{"type":"response.completed","response":{"status":"incomplete"}}"#,
+            r#"{"type":"response.incomplete","response":{"status":"incomplete","end_turn":false}}"#,
+        ] {
+            let mut mapper = CodexEventMapper::new();
+            assert!(matches!(
+                mapper.ingest(event),
+                Err(ProviderError::Decode(_))
+            ));
+        }
     }
 
     #[test]
@@ -667,13 +777,13 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_status_maps_to_maxtokens() {
+    fn incomplete_status_without_a_reason_fails_closed_as_unknown() {
         let ev =
             ingest_all(&[r#"{"type":"response.incomplete","response":{"status":"incomplete"}}"#]);
         assert_eq!(
             ev,
             vec![StreamEvent::Done {
-                stop: StopReason::MaxTokens
+                stop: StopReason::IncompleteUnknown
             }]
         );
     }
