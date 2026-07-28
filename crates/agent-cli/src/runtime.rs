@@ -224,6 +224,8 @@ impl StepSource for CliStepSource {
         // request, and the request in flight keeps the catalog it was built with
         // (US-006 AC4).
         self.registry.commit_staged();
+        let tool_dispatch = self.registry.step_snapshot();
+        let tools = tool_dispatch.specs().to_vec();
         let state = self.lock();
         let mut sections = Vec::with_capacity(state.project.len() + state.injections.len());
         // The environment block is the last project message and the only
@@ -246,8 +248,9 @@ impl StepSource for CliStepSource {
             ));
         }
         StepSnapshot {
-            tools: self.registry.tool_specs(),
+            tools,
             sections,
+            tool_dispatch: Some(tool_dispatch),
         }
     }
 }

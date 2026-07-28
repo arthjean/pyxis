@@ -164,8 +164,20 @@ impl DynTool for McpTool {
         };
         match self.client.call(&self.original_name, arguments).await {
             // Functional failure: the model sees it and can react.
-            Ok(outcome) if outcome.is_error => Ok(ToolOutput::error(outcome.text)),
-            Ok(outcome) => Ok(ToolOutput::text(outcome.text)),
+            Ok(outcome) if outcome.is_error => {
+                let mut output = ToolOutput::error(outcome.text);
+                if let Some(structured) = outcome.structured_content {
+                    output = output.with_structured_content(structured);
+                }
+                Ok(output)
+            }
+            Ok(outcome) => {
+                let mut output = ToolOutput::text(outcome.text);
+                if let Some(structured) = outcome.structured_content {
+                    output = output.with_structured_content(structured);
+                }
+                Ok(output)
+            }
             // Transport/protocol failure: a pipeline error, whose message names
             // the server (`McpError::Call`).
             Err(err) => Err(ToolError::Io(err.to_string())),

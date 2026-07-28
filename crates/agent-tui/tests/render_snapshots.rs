@@ -46,9 +46,14 @@ fn tool_result(id: &str, content: &str, is_error: bool) -> AgentEvent {
     AgentEvent::ToolResult(ToolResultView {
         id: id.to_string(),
         content: content.to_string(),
+        status: None,
+        structured_content: None,
         is_error,
         error_kind: is_error.then_some(ToolErrorKind::Semantic),
         untrusted: true,
+        duration_ms: None,
+        truncation: None,
+        execution: None,
     })
 }
 

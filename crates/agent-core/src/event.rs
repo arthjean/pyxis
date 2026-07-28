@@ -5,6 +5,7 @@
 use crate::compaction::CompactKind;
 use crate::error::AgentError;
 use crate::message::{ToolCallId, ToolErrorKind};
+use crate::tools::{ToolExecution, ToolResultStatus, ToolResultTruncation};
 use crate::transition::ExhaustReason;
 use serde::{Deserialize, Serialize};
 
@@ -74,11 +75,38 @@ pub struct ToolOutputDeltaView {
 pub struct ToolResultView {
     pub id: ToolCallId,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ToolResultStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<serde_json::Value>,
     pub is_error: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<ToolErrorKind>,
     /// Tool output = untrusted by default (taint, US-013).
     pub untrusted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<ToolResultTruncation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ToolExecution>,
+}
+
+impl ToolResultView {
+    pub fn from_model(result: &crate::tools::ModelToolResult) -> Self {
+        Self {
+            id: result.id.clone(),
+            content: result.content.clone(),
+            status: Some(result.status),
+            structured_content: result.structured_content.clone(),
+            is_error: result.is_error,
+            error_kind: result.error_kind,
+            untrusted: result.untrusted,
+            duration_ms: result.duration_ms,
+            truncation: result.truncation.clone(),
+            execution: result.execution.clone(),
+        }
+    }
 }
 
 /// End of a model round-trip (US-017). The counters are CUMULATED since the
@@ -190,4 +218,27 @@ pub struct PermissionReq {
     pub input_summary: String,
     pub input: serde_json::Value,
     pub mode: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::{ModelToolResult, ToolExecution, ToolResultStatus};
+
+    #[test]
+    fn public_tool_result_event_preserves_typed_terminal_metadata() {
+        let mut result = ModelToolResult::new("call".into(), "timed out".into(), true, true, None);
+        result.status = ToolResultStatus::TimedOut;
+        result.duration_ms = Some(125);
+        result.execution = Some(ToolExecution {
+            timed_out: true,
+            ..ToolExecution::default()
+        });
+
+        let json = serde_json::to_value(ToolResultView::from_model(&result)).unwrap();
+
+        assert_eq!(json["status"], "timed_out");
+        assert_eq!(json["duration_ms"], 125);
+        assert_eq!(json["execution"]["timed_out"], true);
+    }
 }

@@ -8,7 +8,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_core::ToolErrorKind;
-use agent_core::tools::{ToolInvocation, ToolOutcome};
+use agent_core::tools::{
+    StepToolPlan, ToolEventSink, ToolInvocation, ToolOutcome, ToolResultStatus,
+};
 use async_trait::async_trait;
 use serde::Deserialize;
 
@@ -296,6 +298,38 @@ impl Tool for Hang {
     }
 }
 
+struct Panics;
+
+#[async_trait]
+impl Tool for Panics {
+    type Input = serde_json::Value;
+    fn name(&self) -> &str {
+        "panics"
+    }
+    fn description(&self) -> String {
+        "panic fixture".into()
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        empty_schema()
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
+    fn is_sensitive(&self) -> bool {
+        false
+    }
+    fn permission(&self, _i: &Self::Input, _c: &PermCtx) -> PermissionDecision {
+        PermissionDecision::Allow
+    }
+    #[allow(clippy::panic)]
+    async fn call(&self, _i: Self::Input, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        panic!("adapter panic fixture")
+    }
+}
+
 struct FailsUntrusted;
 
 #[async_trait]
@@ -568,6 +602,23 @@ async fn timeout_does_not_hang_the_dispatch() {
     assert!(out[0].content.contains("timeout"));
     assert_eq!(out[0].error_kind, Some(ToolErrorKind::Timeout));
     assert!(reg.taint_recent(), "untrusted timeout should mark taint");
+}
+
+#[tokio::test]
+async fn adapter_panic_becomes_one_correlated_typed_result() {
+    let reg = Registry::builder("/tmp")
+        .approver(allow_approver())
+        .register(Panics)
+        .build();
+    let out = reg
+        .dispatch(vec![call("panic-call", "panics", serde_json::json!({}))])
+        .await;
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].id, "panic-call");
+    assert_eq!(out[0].status, ToolResultStatus::Error);
+    assert!(out[0].content.contains("panicked"));
+    assert!(out[0].duration_ms.is_some());
+    assert!(reg.taint_recent(), "an untrusted adapter panic marks taint");
 }
 
 #[tokio::test]
@@ -1203,6 +1254,11 @@ async fn bash_nonzero_exit_is_error_but_keeps_output() {
     assert!(o.is_error);
     assert!(o.content.contains("oops"));
     assert!(o.content.contains("3"));
+    assert_eq!(
+        o.execution.as_ref().and_then(|meta| meta.exit_code),
+        Some(3)
+    );
+    assert!(o.duration_ms.is_some());
 }
 
 #[tokio::test]
@@ -1228,6 +1284,8 @@ async fn bash_timeout_is_reported_by_bash_cleanup_path() {
     let o = by_id(&out, "a");
     assert!(o.is_error);
     assert!(o.content.contains("tool timeout exceeded"), "{}", o.content);
+    assert!(o.execution.as_ref().is_some_and(|meta| meta.timed_out));
+    assert_eq!(o.status, ToolResultStatus::TimedOut);
 }
 
 #[tokio::test]
@@ -2957,4 +3015,77 @@ async fn a_staged_name_never_replaces_an_exposed_tool() {
     assert_eq!(exposed_ran.load(Ordering::SeqCst), 1);
     assert_eq!(collider_ran.load(Ordering::SeqCst), 0);
     assert_eq!(reg.tool_specs().iter().filter(|s| s.name == "p").count(), 1);
+}
+
+#[tokio::test]
+async fn a_step_plan_keeps_its_old_dispatch_view_after_registry_removal() {
+    let probe = Probe::new("p", true, true);
+    let ran = Arc::clone(&probe.ran);
+    let reg = Registry::builder("/tmp")
+        .approver(allow_approver())
+        .register(probe)
+        .build();
+
+    let old_plan = StepToolPlan::capture(reg.step_snapshot(), true);
+    reg.stage_removal(vec!["p".to_string()]);
+    assert!(reg.commit_staged());
+
+    let old_result = old_plan
+        .dispatch(
+            vec![call("old", "p", serde_json::json!({}))],
+            ToolEventSink::default(),
+        )
+        .await;
+    assert_eq!(old_result[0].status, ToolResultStatus::Success);
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+
+    let new_plan = StepToolPlan::capture(reg.step_snapshot(), true);
+    let new_result = new_plan
+        .dispatch(
+            vec![call("new", "p", serde_json::json!({}))],
+            ToolEventSink::default(),
+        )
+        .await;
+    assert_eq!(new_result[0].status, ToolResultStatus::Rejected);
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "the missing name never falls through to a global registry lookup"
+    );
+    assert!(new_plan.generation() > old_plan.generation());
+}
+
+#[tokio::test]
+async fn a_non_parallel_model_plan_serializes_safe_calls_at_dispatch_too() {
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let mut first = Probe::new("first", true, true);
+    first.active = Arc::clone(&active);
+    first.max_active = Arc::clone(&max_active);
+    let mut second = Probe::new("second", true, true);
+    second.active = Arc::clone(&active);
+    second.max_active = Arc::clone(&max_active);
+    let reg = Registry::builder("/tmp")
+        .approver(allow_approver())
+        .register(first)
+        .register(second)
+        .build();
+    let plan = StepToolPlan::capture(reg.step_snapshot(), false);
+
+    let outcomes = plan
+        .dispatch(
+            vec![
+                call("a", "first", serde_json::json!({})),
+                call("b", "second", serde_json::json!({})),
+            ],
+            ToolEventSink::default(),
+        )
+        .await;
+
+    assert!(outcomes.iter().all(|outcome| !outcome.is_error));
+    assert_eq!(
+        max_active.load(Ordering::SeqCst),
+        1,
+        "wire and execution both honor the model's non-parallel contract"
+    );
 }

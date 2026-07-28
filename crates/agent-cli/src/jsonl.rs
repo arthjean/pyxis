@@ -390,9 +390,14 @@ mod tests {
         let event = AgentEvent::ToolResult(ToolResultView {
             id: "call_1".to_string(),
             content: hostile.to_string(),
+            status: None,
+            structured_content: None,
             is_error: false,
             error_kind: None,
             untrusted: true,
+            duration_ms: None,
+            truncation: None,
+            execution: None,
         });
 
         let json = serde_json::to_string(&EventLine {

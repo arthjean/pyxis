@@ -13,17 +13,21 @@
 
 use crate::message::Message;
 use crate::provider::ToolSpec;
+use crate::tools::ToolDispatchSnapshot;
 
 /// Model-visible context of exactly one model request.
 ///
 /// Two frames sharing a `generation` are byte-identical, which is what lets the
 /// loop skip re-estimating the static prompt and what keeps the cacheable prefix
 /// stable across steps.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct StepFrame {
     pub generation: u64,
     pub tools: Vec<ToolSpec>,
     pub context_messages: Vec<Message>,
+    /// Immutable dispatch view captured with `tools`. `None` is reserved for
+    /// static/test sources, where the injected dispatcher is already frozen.
+    pub tool_dispatch: Option<ToolDispatchSnapshot>,
 }
 
 /// Rebuilds the model-visible context before EVERY model request.

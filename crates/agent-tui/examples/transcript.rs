@@ -35,9 +35,14 @@ fn tool(s: &mut AppState, name: &str, input: serde_json::Value, out: &str) {
     s.apply(&AgentEvent::ToolResult(ToolResultView {
         id: name.into(),
         content: out.into(),
+        status: None,
+        structured_content: None,
         is_error: false,
         untrusted: true,
         error_kind: None,
+        duration_ms: None,
+        truncation: None,
+        execution: None,
     }));
 }
 

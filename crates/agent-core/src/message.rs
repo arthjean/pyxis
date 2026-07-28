@@ -6,6 +6,8 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::tools::{ModelToolResult, ToolExecution, ToolResultStatus, ToolResultTruncation};
+
 pub type ToolCallId = String;
 
 /// US-002: content of the result written for a tool call left unanswered
@@ -57,7 +59,9 @@ pub enum ToolErrorKind {
     Io,
     Rejected,
     PermissionDenied,
+    SandboxDenied,
     Timeout,
+    Cancelled,
     Semantic,
 }
 
@@ -97,6 +101,12 @@ pub enum ContentBlock {
     ToolResult {
         tool_use_id: ToolCallId,
         content: String,
+        /// New canonical metadata is additive so historical JSONL stays
+        /// readable. Fresh results always set `status`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<ToolResultStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured_content: Option<serde_json::Value>,
         /// Tool result untrusted by default. Older JSONL without this field
         /// are read back fail-closed.
         #[serde(default = "default_untrusted")]
@@ -105,6 +115,12 @@ pub enum ContentBlock {
         is_error: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error_kind: Option<ToolErrorKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        truncation: Option<ToolResultTruncation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution: Option<ToolExecution>,
     },
     Image {
         media_type: String,
@@ -176,14 +192,25 @@ impl Message {
         untrusted: bool,
         error_kind: Option<ToolErrorKind>,
     ) -> Self {
+        let result =
+            ModelToolResult::new(id.into(), content.into(), is_error, untrusted, error_kind);
+        Self::tool_result_from_model(&result)
+    }
+
+    pub fn tool_result_from_model(result: &ModelToolResult) -> Self {
         Self::single(
             Role::Tool,
             ContentBlock::ToolResult {
-                tool_use_id: id.into(),
-                content: content.into(),
-                untrusted,
-                is_error,
-                error_kind,
+                tool_use_id: result.id.clone(),
+                content: result.content.clone(),
+                status: Some(result.status),
+                structured_content: result.structured_content.clone(),
+                untrusted: result.untrusted,
+                is_error: result.is_error,
+                error_kind: result.error_kind,
+                duration_ms: result.duration_ms,
+                truncation: result.truncation.clone(),
+                execution: result.execution.clone(),
             },
         )
     }
@@ -465,10 +492,57 @@ mod tests {
         let msg = Message::assistant(vec![ContentBlock::ToolResult {
             tool_use_id: "c1".into(),
             content: "out".into(),
+            status: None,
+            structured_content: None,
             untrusted: true,
             is_error: false,
             error_kind: None,
+            duration_ms: None,
+            truncation: None,
+            execution: None,
         }]);
         assert!(msg.validate().is_err());
+    }
+
+    #[test]
+    fn typed_tool_result_metadata_survives_canonical_serde() {
+        let mut result = ModelToolResult::new(
+            "c1".into(),
+            "bounded output".into(),
+            true,
+            true,
+            Some(ToolErrorKind::Timeout),
+        );
+        result.status = ToolResultStatus::TimedOut;
+        result.structured_content = Some(serde_json::json!({"partial": true}));
+        result.duration_ms = Some(42);
+        result.truncation = Some(ToolResultTruncation {
+            original_bytes: 100,
+            kept_bytes: 14,
+            strategy: crate::tools::TruncationStrategy::Tail,
+            continuation_hint: "continue".into(),
+        });
+        result.execution = Some(ToolExecution {
+            timed_out: true,
+            stderr_tail: Some("last stderr".into()),
+            ..ToolExecution::default()
+        });
+
+        let message = Message::tool_result_from_model(&result);
+        let json = serde_json::to_string(&message).unwrap();
+        let resumed: Message = serde_json::from_str(&json).unwrap();
+        assert_eq!(resumed, message);
+        assert!(matches!(
+            &resumed.content[0],
+            ContentBlock::ToolResult {
+                status: Some(ToolResultStatus::TimedOut),
+                duration_ms: Some(42),
+                execution: Some(ToolExecution {
+                    timed_out: true,
+                    ..
+                }),
+                ..
+            }
+        ));
     }
 }

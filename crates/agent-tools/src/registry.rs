@@ -13,14 +13,17 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_core::event::PermissionReq;
 use agent_core::message::ToolErrorKind;
 use agent_core::provider::ToolSpec;
 use agent_core::tools::{
-    ToolDispatch, ToolDispatchEvent, ToolEventSink, ToolInvocation, ToolOutcome,
+    ToolDispatch, ToolDispatchEvent, ToolDispatchSnapshot, ToolEventSink, ToolInvocation,
+    ToolOutcome, ToolResultStatus,
 };
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use futures_util::stream::{self, StreamExt};
 
 use crate::error::ToolError;
@@ -58,10 +61,11 @@ const CONCURRENCY: usize = 10;
 pub struct Registry {
     tools: std::sync::RwLock<HashMap<String, Arc<dyn DynTool>>>,
     staged: std::sync::Mutex<Vec<StagedChange>>,
+    generation: AtomicU64,
     mode: PermissionModeState,
     approver: Arc<dyn Approver>,
     approvals: ApprovalMemory,
-    taint: TaintTracker,
+    taint: Arc<TaintTracker>,
     hooks: Arc<dyn Hooks>,
     /// Turns an approved sandbox escalation into an actual widening (US-004).
     /// `None` = no perimeter can be widened, hence no escalation is offered.
@@ -191,28 +195,38 @@ impl Registry {
                 }
             }
         }
+        if changed {
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
         changed
     }
 
     /// Specs exposed to the model (capped descriptions), for `AgentContext.tools`.
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
-        let mut specs: Vec<ToolSpec> = self
-            .tools_read()
-            .values()
-            .map(|t| {
-                let raw_description = t.description();
-                let description =
-                    truncate_utf8_prefix(&raw_description, MAX_DESCRIPTION).to_string();
-                ToolSpec {
-                    name: t.name().to_string(),
-                    description,
-                    input_schema: t.input_schema(),
-                }
-            })
-            .collect();
-        // Stable order (prompt / test determinism).
-        specs.sort_by(|a, b| a.name.cmp(&b.name));
-        specs
+        specs_from_tools(&self.tools_read())
+    }
+
+    /// Captures specs and an immutable restricted dispatcher under the same
+    /// registry read. Later staged changes cannot alter this dispatch view.
+    pub fn step_snapshot(&self) -> ToolDispatchSnapshot {
+        let tools_guard = self.tools_read();
+        let generation = self.generation.load(Ordering::Acquire);
+        let tools = tools_guard.clone();
+        let specs = specs_from_tools(&tools);
+        drop(tools_guard);
+        let frozen = Registry {
+            tools: std::sync::RwLock::new(tools),
+            staged: std::sync::Mutex::new(Vec::new()),
+            generation: AtomicU64::new(generation),
+            mode: self.mode.clone(),
+            approver: Arc::clone(&self.approver),
+            approvals: self.approvals.clone(),
+            taint: Arc::clone(&self.taint),
+            hooks: Arc::clone(&self.hooks),
+            escalator: self.escalator.clone(),
+            ctx: self.ctx.clone(),
+        };
+        ToolDispatchSnapshot::new(generation, specs, Arc::new(frozen))
     }
 
     /// Collects the behavioral guidelines of every tool (US-026), for
@@ -242,6 +256,13 @@ impl Registry {
     /// Strict pipeline of a single call. Never panics: always returns a
     /// `ToolOutcome` correlated by `id`.
     async fn run_one(&self, call: ToolInvocation, events: ToolEventSink) -> ToolOutcome {
+        let started = tokio::time::Instant::now();
+        self.run_one_inner(call, events)
+            .await
+            .with_duration(started.elapsed())
+    }
+
+    async fn run_one_inner(&self, call: ToolInvocation, events: ToolEventSink) -> ToolOutcome {
         let id = call.id.clone();
         // The `Arc` is cloned out of the map so no lock is held across an await:
         // a tool removed mid-call keeps running to completion on this handle.
@@ -429,39 +450,64 @@ impl Registry {
         // offer is possible and nothing is copied.
         let retry_input = self.escalator.as_ref().map(|_| call.input.clone());
         let mut denial: Option<SandboxDenial> = None;
-        let outcome =
-            match tokio::time::timeout(tool.timeout(&ctx), tool.invoke(call.input, &ctx)).await {
-                Err(_elapsed) => {
-                    if untrusted {
-                        self.taint.mark();
-                    }
-                    err_outcome_tainted(
-                        id.clone(),
-                        ToolError::Timeout.to_string(),
-                        untrusted,
-                        ToolErrorKind::Timeout,
-                    )
+        let outcome = match tokio::time::timeout(
+            tool.timeout(&ctx),
+            std::panic::AssertUnwindSafe(tool.invoke(call.input, &ctx)).catch_unwind(),
+        )
+        .await
+        {
+            Err(_elapsed) => {
+                if untrusted {
+                    self.taint.mark();
                 }
-                Ok(Err(e)) => {
-                    if untrusted {
-                        self.taint.mark();
-                    }
-                    err_outcome_tainted(id.clone(), e.to_string(), untrusted, e.kind())
+                err_outcome_tainted(
+                    id.clone(),
+                    ToolError::Timeout.to_string(),
+                    untrusted,
+                    ToolErrorKind::Timeout,
+                )
+            }
+            Ok(Err(_panic)) => {
+                if untrusted {
+                    self.taint.mark();
                 }
-                Ok(Ok(out)) => {
-                    // 5. taint: an untrusted output just entered the context.
-                    if untrusted {
-                        self.taint.mark();
-                    }
-                    denial = out.denial;
-                    // US-009: the plan is addressed to the client, so it travels
-                    // on the event channel, correlated to nothing but this turn.
-                    if let Some(plan) = out.plan {
-                        events.emit(ToolDispatchEvent::Plan(plan));
-                    }
-                    outcome_from(id.clone(), out.content, out.is_error, untrusted, out.images)
+                err_outcome_tainted(
+                    id.clone(),
+                    "tool adapter panicked before producing a result".to_string(),
+                    untrusted,
+                    ToolErrorKind::Io,
+                )
+            }
+            Ok(Ok(Err(e))) => {
+                if untrusted {
+                    self.taint.mark();
                 }
-            };
+                err_outcome_tainted(id.clone(), e.to_string(), untrusted, e.kind())
+            }
+            Ok(Ok(Ok(out))) => {
+                // 5. taint: an untrusted output just entered the context.
+                if untrusted {
+                    self.taint.mark();
+                }
+                let sandbox_denied = out.denial.is_some();
+                denial = out.denial;
+                // US-009: the plan is addressed to the client, so it travels
+                // on the event channel, correlated to nothing but this turn.
+                if let Some(plan) = out.plan {
+                    events.emit(ToolDispatchEvent::Plan(plan));
+                }
+                outcome_from(
+                    id.clone(),
+                    out.content,
+                    out.structured_content,
+                    out.is_error,
+                    untrusted,
+                    out.images,
+                    out.execution,
+                    sandbox_denied,
+                )
+            }
+        };
 
         // 5bis. US-004: a failure the sandbox caused, and that a perimeter can
         // actually lift, becomes an explicit offer to re-run this ONE call.
@@ -556,7 +602,12 @@ impl Registry {
             tool = %req.tool,
             "sandbox escalation granted for one call"
         );
-        match tokio::time::timeout(tool.timeout(ctx), tool.invoke(input, ctx)).await {
+        match tokio::time::timeout(
+            tool.timeout(ctx),
+            std::panic::AssertUnwindSafe(tool.invoke(input, ctx)).catch_unwind(),
+        )
+        .await
+        {
             Err(_elapsed) => {
                 if untrusted {
                     self.taint.mark();
@@ -568,20 +619,41 @@ impl Registry {
                     ToolErrorKind::Timeout,
                 )
             }
-            Ok(Err(e)) => {
+            Ok(Err(_panic)) => {
+                if untrusted {
+                    self.taint.mark();
+                }
+                err_outcome_tainted(
+                    id,
+                    "tool adapter panicked before producing a result".to_string(),
+                    untrusted,
+                    ToolErrorKind::Io,
+                )
+            }
+            Ok(Ok(Err(e))) => {
                 if untrusted {
                     self.taint.mark();
                 }
                 err_outcome_tainted(id, e.to_string(), untrusted, e.kind())
             }
-            Ok(Ok(out)) => {
+            Ok(Ok(Ok(out))) => {
                 if untrusted {
                     self.taint.mark();
                 }
+                let sandbox_denied = out.denial.is_some();
                 if let Some(plan) = out.plan {
                     events.emit(ToolDispatchEvent::Plan(plan));
                 }
-                outcome_from(id, out.content, out.is_error, untrusted, out.images)
+                outcome_from(
+                    id,
+                    out.content,
+                    out.structured_content,
+                    out.is_error,
+                    untrusted,
+                    out.images,
+                    out.execution,
+                    sandbox_denied,
+                )
             }
         }
     }
@@ -691,14 +763,20 @@ fn err_outcome(
 }
 
 /// Outcome of a call that ran to completion, error or not.
+#[allow(clippy::too_many_arguments)]
 fn outcome_from(
     id: agent_core::message::ToolCallId,
     content: String,
+    structured_content: Option<serde_json::Value>,
     is_error: bool,
     untrusted: bool,
     images: Vec<agent_core::tools::ToolImage>,
+    execution: Option<agent_core::tools::ToolExecution>,
+    sandbox_denied: bool,
 ) -> ToolOutcome {
-    ToolOutcome {
+    let mut outcome = ToolOutcome {
+        structured_content,
+        execution,
         images,
         ..ToolOutcome::new(
             id,
@@ -707,7 +785,21 @@ fn outcome_from(
             untrusted,
             is_error.then_some(ToolErrorKind::Semantic),
         )
+    };
+    if sandbox_denied {
+        outcome.status = ToolResultStatus::SandboxDenied;
+        outcome.is_error = true;
+        outcome.error_kind = Some(ToolErrorKind::SandboxDenied);
+    } else if outcome
+        .execution
+        .as_ref()
+        .is_some_and(|execution| execution.timed_out)
+    {
+        outcome.status = ToolResultStatus::TimedOut;
+        outcome.is_error = true;
+        outcome.error_kind = Some(ToolErrorKind::Timeout);
     }
+    outcome
 }
 
 fn err_outcome_tainted(
@@ -748,6 +840,22 @@ fn truncate_utf8_prefix(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+fn specs_from_tools(tools: &HashMap<String, Arc<dyn DynTool>>) -> Vec<ToolSpec> {
+    let mut specs: Vec<ToolSpec> = tools
+        .values()
+        .map(|tool| {
+            let raw_description = tool.description();
+            ToolSpec {
+                name: tool.name().to_string(),
+                description: truncate_utf8_prefix(&raw_description, MAX_DESCRIPTION).to_string(),
+                input_schema: tool.input_schema(),
+            }
+        })
+        .collect();
+    specs.sort_by(|left, right| left.name.cmp(&right.name));
+    specs
 }
 
 /// `Registry` builder. The default `Approver` is `AutoDeny` (fail-closed:
@@ -857,10 +965,11 @@ impl RegistryBuilder {
         let registry = Registry {
             tools: std::sync::RwLock::new(self.tools),
             staged: std::sync::Mutex::new(Vec::new()),
+            generation: AtomicU64::new(1),
             mode: self.mode,
             approver: self.approver.unwrap_or_else(|| Arc::new(AutoDeny)),
             approvals: self.approvals,
-            taint: TaintTracker::new(self.taint_window),
+            taint: Arc::new(TaintTracker::new(self.taint_window)),
             hooks: self.hooks.unwrap_or_else(|| Arc::new(NoHooks)),
             escalator: self.escalator,
             ctx: self.ctx,

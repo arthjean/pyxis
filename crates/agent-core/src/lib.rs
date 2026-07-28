@@ -53,7 +53,9 @@ pub use sandbox::{SandboxPolicy, WritableRoot, WriteRefusal};
 pub use session::{Session, SessionEntry, SessionError};
 pub use step::{StepContextSource, StepFrame};
 pub use tools::{
-    ToolDispatch, ToolDispatchEvent, ToolEventSink, ToolImage, ToolInvocation, ToolOutcome,
+    MAX_MODEL_TOOL_RESULT_BYTES, ModelToolResult, StepToolPlan, ToolDispatch, ToolDispatchEvent,
+    ToolDispatchSnapshot, ToolEventSink, ToolExecution, ToolImage, ToolInvocation, ToolOutcome,
+    ToolResultStatus, ToolResultTruncation, TruncationStrategy,
 };
 
 #[cfg(test)]
@@ -70,7 +72,7 @@ mod loop_tests {
     use crate::message::{ContentBlock, INTERRUPTED_TOOL_RESULT, Message, unanswered_tool_calls};
     use crate::provider::{
         AuthError, CanonicalRequest, CanonicalResponse, Capabilities, ErrorClass, Provider,
-        ProviderError, ProviderKind, StopReason, StreamEvent, TokenUsage,
+        ProviderError, ProviderKind, StopReason, StreamEvent, TokenUsage, ToolSpec,
     };
     use crate::session::{Session, SessionError};
     use crate::tools::{ToolDispatch, ToolEventSink, ToolInvocation, ToolOutcome};
@@ -269,12 +271,8 @@ mod loop_tests {
             calls
                 .into_iter()
                 .map(|c| ToolOutcome {
-                    id: c.id,
-                    content: format!("echo:{}", c.input),
-                    is_error: false,
-                    untrusted: true,
-                    error_kind: None,
                     images: Vec::new(),
+                    ..ToolOutcome::new(c.id, format!("echo:{}", c.input), false, true, None)
                 })
                 .collect()
         }
@@ -297,12 +295,8 @@ mod loop_tests {
                         chunk: "progression...\n".into(),
                     });
                     ToolOutcome {
-                        id: c.id,
-                        content: format!("echo:{}", c.input),
-                        is_error: false,
-                        untrusted: true,
-                        error_kind: None,
                         images: Vec::new(),
+                        ..ToolOutcome::new(c.id, format!("echo:{}", c.input), false, true, None)
                     }
                 })
                 .collect()
@@ -350,12 +344,8 @@ mod loop_tests {
             calls
                 .into_iter()
                 .map(|c| ToolOutcome {
-                    id: c.id,
-                    content: "real output".into(),
-                    is_error: false,
-                    untrusted: true,
-                    error_kind: None,
                     images: Vec::new(),
+                    ..ToolOutcome::new(c.id, "real output".into(), false, true, None)
                 })
                 .collect()
         }
@@ -386,12 +376,8 @@ mod loop_tests {
             calls
                 .into_iter()
                 .map(|c| ToolOutcome {
-                    id: c.id,
-                    content: "real output".into(),
-                    is_error: false,
-                    untrusted: true,
-                    error_kind: None,
                     images: Vec::new(),
+                    ..ToolOutcome::new(c.id, "real output".into(), false, true, None)
                 })
                 .collect()
         }
@@ -469,8 +455,26 @@ mod loop_tests {
         }
     }
 
+    fn with_mock_tool(mut ctx: AgentContext) -> AgentContext {
+        if ctx.tools.is_empty() {
+            ctx.tools.push(ToolSpec {
+                name: "bash".into(),
+                description: "mock shell".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "cmd": { "type": "string" }
+                    },
+                    "required": ["cmd"],
+                    "additionalProperties": false
+                }),
+            });
+        }
+        ctx
+    }
+
     async fn drive(ctx: AgentContext, deps: Deps) -> Vec<AgentEvent> {
-        let stream = run_agent(ctx, deps);
+        let stream = run_agent(with_mock_tool(ctx), deps);
         pin_mut!(stream);
         let mut out = Vec::new();
         while let Some(ev) = stream.next().await {
@@ -532,7 +536,7 @@ mod loop_tests {
     #[tokio::test]
     async fn multi_turn_headless_runs_without_tui() {
         let h = harness(vec![tool_turn("c1"), text_turn("fini")], false, 100_000);
-        let ctx = AgentContext::new("mock").push(Message::user("fais un ls"));
+        let ctx = with_mock_tool(AgentContext::new("mock").push(Message::user("fais un ls")));
         let res = run_headless(ctx, h.deps).await;
         assert!(res.text.contains("fini"));
         assert!(matches!(res.ended, crate::HeadlessEnd::EndTurn));
@@ -1043,7 +1047,7 @@ mod loop_tests {
         let turns = || vec![tool_turn("t1"), text_turn("resultat final")];
         let plain = harness(turns(), false, 100_000);
         let plain_res = run_headless(
-            AgentContext::new("mock").push(Message::user("go")),
+            with_mock_tool(AgentContext::new("mock").push(Message::user("go"))),
             plain.deps,
         )
         .await;
@@ -1051,7 +1055,7 @@ mod loop_tests {
         let mut streamed = harness(turns(), false, 100_000);
         streamed.deps.tools = Arc::new(StreamingTools);
         let streamed_res = run_headless(
-            AgentContext::new("mock").push(Message::user("go")),
+            with_mock_tool(AgentContext::new("mock").push(Message::user("go"))),
             streamed.deps,
         )
         .await;

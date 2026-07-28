@@ -189,10 +189,14 @@ impl ModelDescriptor {
                 detail: "must contain at most 64 bytes".into(),
             });
         }
-        if self.truncation.limit == 0 {
+        let minimum_feedback = match self.truncation.mode {
+            TruncationMode::Bytes => crate::tools::MIN_MODEL_TOOL_RESULT_BYTES,
+            TruncationMode::Tokens => crate::tools::MIN_MODEL_TOOL_RESULT_TOKENS,
+        };
+        if usize::try_from(self.truncation.limit).unwrap_or(usize::MAX) < minimum_feedback {
             return Err(ModelRuntimeError::InvalidField {
                 field: "truncation.limit",
-                detail: "must be greater than zero".into(),
+                detail: format!("must be at least {minimum_feedback} for terminal tool feedback"),
             });
         }
         if self.comp_hash.as_ref().is_some_and(|hash| {
@@ -326,5 +330,39 @@ mod tests {
             descriptor.validate(),
             Err(ModelRuntimeError::InstructionsTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn undersized_tool_feedback_budget_is_rejected() {
+        let mut descriptor = ModelDescriptor {
+            slug: "model".into(),
+            display_name: "Model".into(),
+            instructions: "instructions".into(),
+            context_window: 10_000,
+            auto_compact_token_limit: 8_000,
+            input_modalities: vec![InputModality::Text],
+            supports_reasoning: false,
+            default_reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_verbosity: false,
+            default_verbosity: None,
+            supports_parallel_tool_calls: false,
+            responses_dialect: ResponsesDialect::Standard,
+            tool_mode: ModelToolMode::Direct,
+            truncation: TruncationPolicy {
+                mode: TruncationMode::Tokens,
+                limit: 1,
+            },
+            comp_hash: None,
+        };
+        assert!(matches!(
+            descriptor.validate(),
+            Err(ModelRuntimeError::InvalidField {
+                field: "truncation.limit",
+                ..
+            })
+        ));
+        descriptor.truncation.limit = crate::tools::MIN_MODEL_TOOL_RESULT_TOKENS as u32;
+        assert!(descriptor.validate().is_ok());
     }
 }

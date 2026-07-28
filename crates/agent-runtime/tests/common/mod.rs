@@ -15,7 +15,7 @@ use agent_core::event::AgentEvent;
 use agent_core::message::{ContentBlock, Message};
 use agent_core::provider::{
     CanonicalRequest, CanonicalResponse, Capabilities, ErrorClass, Provider, ProviderError,
-    ProviderKind, StopReason, StreamEvent,
+    ProviderKind, StopReason, StreamEvent, ToolSpec,
 };
 use agent_core::session::{FileSnapshot, Session, SessionError};
 use agent_core::tools::{ToolDispatch, ToolEventSink, ToolInvocation, ToolOutcome};
@@ -333,13 +333,27 @@ pub fn turn_context(turn_id: TurnId) -> TurnContext {
 /// Builds the `AgentContext` of a turn: the transcript is the turn's text alone,
 /// so a request's messages are exactly what the runtime handed over.
 pub fn agent_context(request: &TurnRequest) -> AgentContext {
-    AgentContext::new(request.context.model.clone())
+    let mut context = AgentContext::new(request.context.model.clone())
         .with_config(RunConfig {
             max_retries: 1,
             backoff_base_ms: 0,
             ..RunConfig::default()
         })
-        .push(Message::user(request.text.clone()))
+        .push(Message::user(request.text.clone()));
+    context.tools = ["bash", "bloquant", "echo", "lent", "read"]
+        .into_iter()
+        .map(|name| ToolSpec {
+            name: name.into(),
+            description: "runtime test dispatcher".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+        })
+        .collect();
+    context
 }
 
 pub struct Harness {

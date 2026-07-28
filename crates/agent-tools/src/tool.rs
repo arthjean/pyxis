@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use agent_core::event::PlanView;
 use agent_core::sandbox::SandboxPolicy;
-use agent_core::tools::ToolImage;
+use agent_core::tools::{ToolExecution, ToolImage};
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 
@@ -159,6 +159,9 @@ impl ToolCtx {
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: String,
+    /// Protocol-native payload retained alongside the text fallback. The core
+    /// decides whether it fits the active model feedback budget atomically.
+    pub structured_content: Option<serde_json::Value>,
     pub is_error: bool,
     /// Set when the tool attributes its failure to the confinement (US-004).
     /// The Registry, which owns the approver, is what turns it into an
@@ -171,6 +174,9 @@ pub struct ToolOutput {
     /// Images the call brought into the turn (US-011), forwarded by the
     /// Registry into the outcome so the loop can turn them into content blocks.
     pub images: Vec<ToolImage>,
+    /// Terminal shell facts, kept outside display text so later truncation can
+    /// preserve them.
+    pub execution: Option<ToolExecution>,
 }
 
 impl ToolOutput {
@@ -178,20 +184,24 @@ impl ToolOutput {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            structured_content: None,
             is_error: false,
             denial: None,
             plan: None,
             images: Vec::new(),
+            execution: None,
         }
     }
     /// Output marked as a semantic error (the content is kept for the model).
     pub fn error(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
+            structured_content: None,
             is_error: true,
             denial: None,
             plan: None,
             images: Vec::new(),
+            execution: None,
         }
     }
     /// Attributes the failure to the confinement (US-004 AC1).
@@ -207,6 +217,14 @@ impl ToolOutput {
     /// Brings images into the turn (US-011).
     pub fn with_images(mut self, images: Vec<ToolImage>) -> Self {
         self.images = images;
+        self
+    }
+    pub fn with_structured_content(mut self, content: serde_json::Value) -> Self {
+        self.structured_content = Some(content);
+        self
+    }
+    pub fn with_execution(mut self, execution: ToolExecution) -> Self {
+        self.execution = Some(execution);
         self
     }
 }

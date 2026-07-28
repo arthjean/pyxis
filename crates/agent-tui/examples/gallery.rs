@@ -44,9 +44,14 @@ fn main() {
     s.apply(&AgentEvent::ToolResult(ToolResultView {
         id: "c1".into(),
         content: "   1\tfn lex(input: &str) -> Vec<Token> {\n   2\t    todo!()\n   3\t}".into(),
+        status: None,
+        structured_content: None,
         is_error: false,
         untrusted: true,
         error_kind: None,
+        duration_ms: None,
+        truncation: None,
+        execution: None,
     }));
     s.apply(&AgentEvent::Text("Je remplace le ".into()));
     s.apply(&AgentEvent::Text("`todo!()` par un vrai lexer.".into()));

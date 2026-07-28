@@ -11,6 +11,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 
 use agent_core::provider::ToolSpec;
+use agent_core::tools::ToolDispatchSnapshot;
 use agent_runtime::context::{
     StepContexts, StepSection, StepSnapshot, StepSource, TurnContextSource,
 };
@@ -58,12 +59,18 @@ fn tool(name: &str) -> ToolSpec {
 }
 
 fn snapshot(tools: Vec<ToolSpec>, environment: &str) -> StepSnapshot {
+    let tool_dispatch = ToolDispatchSnapshot::new(
+        u64::try_from(tools.len()).unwrap_or(u64::MAX),
+        tools.clone(),
+        Arc::new(EchoTools),
+    );
     StepSnapshot {
         tools,
         sections: vec![
             StepSection::stable("agents", Some("# règles projet".into())),
             StepSection::volatile("environment", Some(environment.into())),
         ],
+        tool_dispatch: Some(tool_dispatch),
     }
 }
 

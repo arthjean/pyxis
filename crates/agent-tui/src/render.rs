@@ -2304,9 +2304,14 @@ mod tests {
         s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
             id: "c1".into(),
             content: "Edited: src/main.rs (level 1: exact)".into(),
+            status: None,
+            structured_content: None,
             is_error: false,
             untrusted: false,
             error_kind: None,
+            duration_ms: None,
+            truncation: None,
+            execution: None,
         }));
         let out = draw(&s, 60, 16);
         assert!(out.contains("Update("), "label Update absent:\n{out}");
@@ -2330,9 +2335,14 @@ mod tests {
         s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
             id: "r1".into(),
             content: "     1\tfn main() {\n     2\t}\n".into(),
+            status: None,
+            structured_content: None,
             is_error: false,
             untrusted: true,
             error_kind: None,
+            duration_ms: None,
+            truncation: None,
+            execution: None,
         }));
         let out = draw(&s, 50, 10);
         assert!(out.contains("Read"), "verbe Read absent:\n{out}");
@@ -2346,9 +2356,14 @@ mod tests {
         s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
             id: "x1".into(),
             content: "anchor not found in src/x.rs".into(),
+            status: None,
+            structured_content: None,
             is_error: true,
             untrusted: true,
             error_kind: None,
+            duration_ms: None,
+            truncation: None,
+            execution: None,
         }));
         let out = draw(&s, 60, 8);
         assert!(out.contains("Error:"), "error grammar missing:\n{out}");
@@ -2362,9 +2377,14 @@ mod tests {
         s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
             id: "x2".into(),
             content: "action \"edit\" rejected by user".into(),
+            status: None,
+            structured_content: None,
             is_error: true,
             untrusted: false,
             error_kind: Some(agent_core::ToolErrorKind::PermissionDenied),
+            duration_ms: None,
+            truncation: None,
+            execution: None,
         }));
         let out = draw(&s, 64, 8);
         assert!(out.contains("rejected"), "rejection label missing:\n{out}");
@@ -2408,9 +2428,14 @@ mod tests {
         s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
             id: "c1".into(),
             content: "Edited: a.rs (level 1)".into(),
+            status: None,
+            structured_content: None,
             is_error: false,
             untrusted: false,
             error_kind: None,
+            duration_ms: None,
+            truncation: None,
+            execution: None,
         }));
         let out = draw(&s, 60, 12);
         assert!(out.contains("let x = 1;"), "removed line missing:\n{out}");
@@ -2433,9 +2458,14 @@ mod tests {
         s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
             id: "c1".into(),
             content: "anchor not found in a.rs".into(),
+            status: None,
+            structured_content: None,
             is_error: true,
             untrusted: true,
             error_kind: None,
+            duration_ms: None,
+            truncation: None,
+            execution: None,
         }));
         let out = draw(&s, 60, 10);
         assert!(out.contains("Error:"), "error missing:\n{out}");

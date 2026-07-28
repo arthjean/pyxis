@@ -30,6 +30,8 @@ const STRUCTURED_CAP: usize = 8_192;
 pub struct McpCallOutcome {
     /// Text handed to the model (already bounded).
     pub text: String,
+    /// Protocol-native structure, retained whole for model-side rendering.
+    pub structured_content: Option<serde_json::Value>,
     /// Functional failure reported by the server itself.
     pub is_error: bool,
 }
@@ -129,7 +131,15 @@ fn render_result(result: &CallToolResult) -> McpCallOutcome {
     if parts.is_empty()
         && let Some(structured) = &result.structured_content
     {
-        parts.push(truncate_tail(&structured.to_string(), STRUCTURED_CAP));
+        let json = structured.to_string();
+        if json.len() <= STRUCTURED_CAP {
+            parts.push(json);
+        } else {
+            parts.push(format!(
+                "[mcp structured content omitted: {} bytes]",
+                json.len()
+            ));
+        }
     }
     let mut text = parts.join("\n");
     if text.trim().is_empty() {
@@ -138,6 +148,7 @@ fn render_result(result: &CallToolResult) -> McpCallOutcome {
     text = truncate_tail(&text, MAX_TOOL_OUTPUT_BYTES);
     McpCallOutcome {
         text,
+        structured_content: result.structured_content.clone(),
         is_error: result.is_error.unwrap_or(false),
     }
 }
@@ -259,8 +270,29 @@ mod tests {
     fn empty_result_falls_back_on_structured_then_placeholder() {
         let mut structured = result(Vec::new());
         structured.structured_content = Some(serde_json::json!({"ok": true}));
-        assert_eq!(render_result(&structured).text, r#"{"ok":true}"#);
+        let rendered = render_result(&structured);
+        assert_eq!(rendered.text, r#"{"ok":true}"#);
+        assert_eq!(
+            rendered.structured_content,
+            Some(serde_json::json!({"ok": true}))
+        );
         assert_eq!(render_result(&result(Vec::new())).text, "(no content)");
+    }
+
+    #[test]
+    fn oversized_structured_only_result_uses_an_atomic_text_fallback() {
+        let mut structured = result(Vec::new());
+        structured.structured_content = Some(serde_json::json!({"blob": "x".repeat(20_000)}));
+
+        let rendered = render_result(&structured);
+
+        assert!(
+            rendered
+                .text
+                .starts_with("[mcp structured content omitted:")
+        );
+        assert!(!rendered.text.contains("xxxx"));
+        assert_eq!(rendered.structured_content, structured.structured_content);
     }
 
     #[test]

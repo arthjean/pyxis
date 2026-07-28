@@ -20,15 +20,16 @@ use crate::error::{AgentError, ProviderFailure};
 use crate::event::{AgentEvent, ToolCallView, ToolOutputDeltaView, ToolResultView};
 use crate::guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget, batch_signature};
 use crate::input::InputQueue;
-use crate::message::{
-    INTERRUPTED_TOOL_RESULT, Message, ToolCallId, ToolErrorKind, unanswered_tool_calls,
-};
-use crate::model::ResolvedModelRuntime;
+use crate::message::{INTERRUPTED_TOOL_RESULT, Message, ToolCallId, unanswered_tool_calls};
+use crate::model::{ResolvedModelRuntime, TruncationMode};
 use crate::provider::{
     AuthError, CanonicalRequest, ErrorClass, ProviderError, StreamEvent, TokenUsage, ToolSpec,
 };
 use crate::step::StepContextSource;
-use crate::tools::{ToolDispatchEvent, ToolEventSink, ToolOutcome};
+use crate::tools::{
+    MAX_MODEL_TOOL_RESULT_BYTES, ModelToolResult, StepToolPlan, ToolDispatchEvent,
+    ToolDispatchSnapshot, ToolEventSink, ToolOutcome,
+};
 use crate::transition::{
     Accumulator, ContextErrorKind, ExhaustReason, PendingError, Transition, post_stream_transition,
     pre_stream_transition,
@@ -347,22 +348,27 @@ fn reconcile_interrupted_calls(messages: &mut Vec<Message>) -> Vec<ToolResultVie
     let pending = unanswered_tool_calls(messages);
     let mut views = Vec::with_capacity(pending.len());
     for id in pending {
-        views.push(ToolResultView {
-            id: id.clone(),
-            content: INTERRUPTED_TOOL_RESULT.to_string(),
-            is_error: true,
-            error_kind: Some(ToolErrorKind::Semantic),
-            untrusted: false,
-        });
-        messages.push(Message::tool_result_with_metadata(
-            id,
-            INTERRUPTED_TOOL_RESULT,
-            true,
-            false,
-            Some(ToolErrorKind::Semantic),
-        ));
+        let result = ModelToolResult::cancelled(id, INTERRUPTED_TOOL_RESULT);
+        views.push(ToolResultView::from_model(&result));
+        messages.push(Message::tool_result_from_model(&result));
     }
     views
+}
+
+fn feedback_limits(model_runtime: &Option<ResolvedModelRuntime>) -> (usize, usize) {
+    match model_runtime.as_ref().map(|runtime| runtime.truncation) {
+        Some(policy) if policy.mode == TruncationMode::Tokens => (
+            usize::try_from(policy.limit).unwrap_or(usize::MAX),
+            MAX_MODEL_TOOL_RESULT_BYTES,
+        ),
+        Some(policy) => (
+            usize::MAX,
+            usize::try_from(policy.limit)
+                .unwrap_or(MAX_MODEL_TOOL_RESULT_BYTES)
+                .min(MAX_MODEL_TOOL_RESULT_BYTES),
+        ),
+        None => (usize::MAX, MAX_MODEL_TOOL_RESULT_BYTES),
+    }
 }
 
 fn estimate_current_input(messages: &[Message], static_input_tokens: u32, deps: &Deps) -> u32 {
@@ -412,7 +418,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
             mut reasoning_effort,
             system,
             mut messages,
-            mut tools,
+            tools,
             mut config,
             mut context_messages,
             ephemeral_messages,
@@ -432,6 +438,14 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
             config.backoff_base_ms = runtime.retry.backoff_base_ms;
             config.overload_fallback_model = None;
         }
+
+        let parallel_tools = model_runtime
+            .as_ref()
+            .is_none_or(|runtime| runtime.supports_parallel_tool_calls);
+        let mut tool_plan = StepToolPlan::capture(
+            ToolDispatchSnapshot::new(0, tools, Arc::clone(&deps.tools)),
+            parallel_tools,
+        );
 
         // ContextBudget computed for the active model (recomputed on overload fallback).
         let max_context = model_runtime
@@ -458,7 +472,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
         let mut static_input_tokens = estimate_static_input(
             &system,
             &context_messages,
-            &tools,
+            tool_plan.specs(),
             deps.tokenizer.as_ref(),
         )
         .saturating_add(estimate_input(&ephemeral_messages, deps.tokenizer.as_ref()));
@@ -543,12 +557,27 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         let frame = source.next_frame();
                         if step_generation != Some(frame.generation) {
                             step_generation = Some(frame.generation);
-                            tools = frame.tools;
+                            let dispatch = match frame.tool_dispatch {
+                                Some(snapshot) => snapshot,
+                                None if frame.tools.is_empty() => ToolDispatchSnapshot::new(
+                                    frame.generation,
+                                    Vec::new(),
+                                    Arc::clone(&deps.tools),
+                                ),
+                                None => {
+                                    yield AgentEvent::Error(AgentError::InvalidRequest(
+                                        "tool-bearing step is missing its frozen dispatch snapshot"
+                                            .to_string(),
+                                    ));
+                                    return;
+                                }
+                            };
+                            tool_plan = StepToolPlan::capture(dispatch, parallel_tools);
                             context_messages = frame.context_messages;
                             static_input_tokens = estimate_static_input(
                                 &system,
                                 &context_messages,
-                                &tools,
+                                tool_plan.specs(),
                                 deps.tokenizer.as_ref(),
                             )
                             .saturating_add(estimate_input(
@@ -600,7 +629,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         &context_messages,
                         &messages,
                         &ephemeral_messages,
-                        &tools,
+                        tool_plan.specs(),
                         config.max_output_tokens,
                     );
                     if let Err(e) = req.validate() {
@@ -1020,20 +1049,15 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     c.name,
                                     loop_guard.count(),
                                 );
-                                yield AgentEvent::ToolResult(ToolResultView {
-                                    id: c.id.clone(),
-                                    content: msg.clone(),
-                                    is_error: true,
-                                    error_kind: Some(crate::message::ToolErrorKind::Semantic),
-                                    untrusted: false,
-                                });
-                                messages.push(Message::tool_result_with_metadata(
+                                let result = ModelToolResult::new(
                                     c.id.clone(),
                                     msg,
                                     true,
                                     false,
                                     Some(crate::message::ToolErrorKind::Semantic),
-                                ));
+                                );
+                                yield AgentEvent::ToolResult(ToolResultView::from_model(&result));
+                                messages.push(Message::tool_result_from_model(&result));
                             }
                             // loop back: the model gets the signal and can correct itself.
                         }
@@ -1050,7 +1074,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             let expected_ids: Vec<ToolCallId> =
                                 calls.iter().map(|c| c.id.clone()).collect();
                             let dispatch =
-                                deps.tools.dispatch(calls, ToolEventSink::new(tool_event_tx));
+                                tool_plan.dispatch(calls, ToolEventSink::new(tool_event_tx));
                             tokio::pin!(dispatch);
                             let mut tool_events_open = true;
                             // US-001: `biased` with the dispatch FIRST. A batch that just
@@ -1085,6 +1109,18 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 // reconciles each of them before persisting (US-002).
                                 continue;
                             };
+                            let (feedback_tokens, feedback_bytes) =
+                                feedback_limits(&model_runtime);
+                            let outcomes: Vec<ModelToolResult> = outcomes
+                                .into_iter()
+                                .map(|outcome| {
+                                    outcome.bound_feedback(
+                                        deps.tokenizer.as_ref(),
+                                        feedback_tokens,
+                                        feedback_bytes,
+                                    )
+                                })
+                                .collect();
                             while let Ok(event) = tool_event_rx.try_recv() {
                                 match event {
                                     ToolDispatchEvent::PermissionAsk(req) => {
@@ -1103,20 +1139,8 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 return;
                             }
                             for o in &outcomes {
-                                yield AgentEvent::ToolResult(ToolResultView {
-                                    id: o.id.clone(),
-                                    content: o.content.clone(),
-                                    is_error: o.is_error,
-                                    error_kind: o.error_kind,
-                                    untrusted: o.untrusted,
-                                });
-                                messages.push(Message::tool_result_with_metadata(
-                                    o.id.clone(),
-                                    o.content.clone(),
-                                    o.is_error,
-                                    o.untrusted,
-                                    o.error_kind,
-                                ));
+                                yield AgentEvent::ToolResult(ToolResultView::from_model(o));
+                                messages.push(Message::tool_result_from_model(o));
                                 // US-011: a `tool_result` block carries text only. The
                                 // images the tool read therefore enter as a user message
                                 // right after it, which is also what makes them

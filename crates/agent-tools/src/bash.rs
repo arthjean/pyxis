@@ -8,6 +8,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
+use agent_core::tools::ToolExecution;
+
 use crate::error::{ToolError, ValidationError};
 use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{MAX_COMMAND_BYTES, Tool, ToolCtx, ToolOutput, truncate_tail};
@@ -240,7 +242,16 @@ impl Tool for Bash {
             body = truncate_tail(&body, MAX_OUTPUT);
         }
 
-        if timed_out {
+        let code = status.as_ref().and_then(std::process::ExitStatus::code);
+        let execution = ToolExecution {
+            exit_code: code,
+            signal: status.as_ref().and_then(exit_signal),
+            timed_out,
+            cancelled: false,
+            stderr_tail: (!stderr_text.is_empty()).then(|| truncate_tail(&stderr_text, 8 * 1024)),
+        };
+
+        let output = if timed_out {
             if !body.is_empty() && !body.ends_with('\n') {
                 body.push('\n');
             }
@@ -248,26 +259,39 @@ impl Tool for Bash {
             if cleanup_timed_out {
                 body.push_str("\n[process-tree cleanup incomplete after timeout]");
             }
-            return Ok(ToolOutput::error(body));
-        }
-
-        let code = status.and_then(|s| s.code());
-        match code {
-            Some(0) => {
-                if body.is_empty() {
-                    body.push_str("(no output, success)");
+            ToolOutput::error(body)
+        } else {
+            match code {
+                Some(0) => {
+                    if body.is_empty() {
+                        body.push_str("(no output, success)");
+                    }
+                    ToolOutput::text(body)
                 }
-                Ok(ToolOutput::text(body))
+                Some(n) => {
+                    body.push_str(&format!("\n[exit code {n}]"));
+                    finish_failure(body, ctx, sandbox_mark)
+                }
+                None => {
+                    body.push_str("\n[terminated by signal]");
+                    finish_failure(body, ctx, sandbox_mark)
+                }
             }
-            Some(n) => {
-                body.push_str(&format!("\n[exit code {n}]"));
-                Ok(finish_failure(body, ctx, sandbox_mark))
-            }
-            None => {
-                body.push_str("\n[terminated by signal]");
-                Ok(finish_failure(body, ctx, sandbox_mark))
-            }
-        }
+        };
+        Ok(output.with_execution(execution))
+    }
+}
+
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
     }
 }
 

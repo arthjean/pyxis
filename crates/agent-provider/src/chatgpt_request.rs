@@ -297,6 +297,7 @@ fn tool_result_items(blocks: &[ContentBlock], known_calls: &HashSet<&str>, input
             untrusted,
             is_error,
             error_kind,
+            ..
         } = b
         {
             // US-003: a result without a matching call is refused by the

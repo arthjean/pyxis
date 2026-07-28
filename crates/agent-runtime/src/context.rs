@@ -22,6 +22,7 @@ use agent_core::message::Message;
 use agent_core::model::ResolvedModelRuntime;
 use agent_core::provider::ToolSpec;
 use agent_core::step::{StepContextSource, StepFrame};
+use agent_core::tools::ToolDispatchSnapshot;
 use serde::{Deserialize, Serialize};
 
 use crate::id::{IdGenerator, StepId, TurnId};
@@ -180,10 +181,11 @@ impl StepSection {
 
 /// What a source knows at one instant. Read entirely before a step is built, so
 /// a change landing mid-build cannot split a catalog across two generations.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub struct StepSnapshot {
     pub tools: Vec<ToolSpec>,
     pub sections: Vec<StepSection>,
+    pub tool_dispatch: Option<ToolDispatchSnapshot>,
 }
 
 /// Supplies the raw material of a step. Every read of a file, an MCP catalog or
@@ -193,13 +195,14 @@ pub trait StepSource: Send + Sync {
 }
 
 /// The model-visible context actually injected into one model request.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct StepContext {
     pub step_id: StepId,
     /// Bumped only when the injected bytes moved. Two steps sharing a generation
     /// produced the same prefix.
     pub generation: u64,
     pub tools: Vec<ToolSpec>,
+    pub tool_dispatch: Option<ToolDispatchSnapshot>,
     pub context_messages: Vec<Message>,
     /// Bounded notes about what was truncated, reused or omitted. Section names
     /// and byte counts ONLY: no fragment of context ever lands in a diagnostic,
@@ -310,7 +313,16 @@ impl StepContexts {
         //    what gives two steps without a source change the same prefix, and
         //    what makes a staged MCP catalog observable at the NEXT step.
         let moved = state.last.as_ref().is_none_or(|last| {
-            last.tools != snapshot.tools || last.context_messages != context_messages
+            last.tools != snapshot.tools
+                || last.context_messages != context_messages
+                || last
+                    .tool_dispatch
+                    .as_ref()
+                    .map(ToolDispatchSnapshot::generation)
+                    != snapshot
+                        .tool_dispatch
+                        .as_ref()
+                        .map(ToolDispatchSnapshot::generation)
         });
         if moved {
             state.generation = state.generation.saturating_add(1);
@@ -324,6 +336,7 @@ impl StepContexts {
             step_id,
             generation: state.generation,
             tools: snapshot.tools,
+            tool_dispatch: snapshot.tool_dispatch,
             context_messages,
             diagnostics,
         };
@@ -339,6 +352,7 @@ impl StepContextSource for StepContexts {
             generation: context.generation,
             tools: context.tools,
             context_messages: context.context_messages,
+            tool_dispatch: context.tool_dispatch,
         }
     }
 }
@@ -399,6 +413,7 @@ mod tests {
                 StepSection::stable("agents", Some("regles".into())),
                 StepSection::volatile("environment", Some("<cwd>/tmp</cwd>".into())),
             ],
+            tool_dispatch: None,
         });
         let builder = builder(source);
 
@@ -421,6 +436,7 @@ mod tests {
                 StepSection::volatile("environment", Some("volatile".into())),
                 StepSection::stable("agents", Some("stable".into())),
             ],
+            tool_dispatch: None,
         });
         let context = builder(source).build();
         let texts: Vec<String> = context.context_messages.iter().map(|m| m.text()).collect();
@@ -432,6 +448,7 @@ mod tests {
         let source = Fixed::new(StepSnapshot {
             tools: vec![tool("read")],
             sections: Vec::new(),
+            tool_dispatch: None,
         });
         let builder = builder(Arc::clone(&source) as Arc<dyn StepSource>);
         let first = builder.build();
@@ -439,6 +456,7 @@ mod tests {
         source.set(StepSnapshot {
             tools: vec![tool("read"), tool("mcp__search")],
             sections: Vec::new(),
+            tool_dispatch: None,
         });
         let second = builder.build();
 
@@ -452,6 +470,7 @@ mod tests {
         let source = Fixed::new(StepSnapshot {
             tools: Vec::new(),
             sections: vec![StepSection::stable("agents", Some(huge))],
+            tool_dispatch: None,
         });
         let context = builder(source).build();
 
@@ -474,6 +493,7 @@ mod tests {
                 StepSection::stable("two", Some(block.clone())),
                 StepSection::stable("three", Some(block)),
             ],
+            tool_dispatch: None,
         });
         let context = builder(source).build();
 
@@ -503,6 +523,7 @@ mod tests {
         let source = Fixed::new(StepSnapshot {
             tools: Vec::new(),
             sections: vec![StepSection::stable("agents", Some("v1".into()))],
+            tool_dispatch: None,
         });
         let builder = builder(Arc::clone(&source) as Arc<dyn StepSource>);
         let first = builder.build();
@@ -510,6 +531,7 @@ mod tests {
         source.set(StepSnapshot {
             tools: Vec::new(),
             sections: vec![StepSection::stable("agents", None)],
+            tool_dispatch: None,
         });
         let second = builder.build();
 
@@ -529,6 +551,7 @@ mod tests {
                 StepSection::stable("agents", None),
                 StepSection::volatile("environment", Some("env".into())),
             ],
+            tool_dispatch: None,
         });
         let context = builder(source).build();
 

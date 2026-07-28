@@ -92,7 +92,9 @@ pub enum TranscriptToolErrorKind {
     Io,
     Rejected,
     PermissionDenied,
+    SandboxDenied,
     Timeout,
+    Cancelled,
     Semantic,
 }
 
@@ -200,7 +202,9 @@ impl From<ToolErrorKind> for TranscriptToolErrorKind {
             ToolErrorKind::Io => Self::Io,
             ToolErrorKind::Rejected => Self::Rejected,
             ToolErrorKind::PermissionDenied => Self::PermissionDenied,
+            ToolErrorKind::SandboxDenied => Self::SandboxDenied,
             ToolErrorKind::Timeout => Self::Timeout,
+            ToolErrorKind::Cancelled => Self::Cancelled,
             ToolErrorKind::Semantic => Self::Semantic,
         }
     }
@@ -1132,9 +1136,14 @@ mod tests {
         let result = mapper.map_event(&AgentEvent::ToolResult(ToolResultView {
             id: "call-1".into(),
             content: "ok".into(),
+            status: None,
+            structured_content: None,
             is_error: false,
             error_kind: None,
             untrusted: true,
+            duration_ms: None,
+            truncation: None,
+            execution: None,
         }));
 
         assert_eq!(call[0].lifecycle, TranscriptLifecycle::Started);
@@ -1159,9 +1168,14 @@ mod tests {
         let result = mapper.map_event(&AgentEvent::ToolResult(ToolResultView {
             id: "call-1".into(),
             content: "     1\t# Pyxis\n     2\t\n     3\tcontent".into(),
+            status: None,
+            structured_content: None,
             is_error: false,
             error_kind: None,
             untrusted: true,
+            duration_ms: None,
+            truncation: None,
+            execution: None,
         }));
 
         assert_eq!(call[0].item.kind, TranscriptItemKind::ExecCommand);
@@ -1194,9 +1208,14 @@ mod tests {
         let result = mapper.map_event(&AgentEvent::ToolResult(ToolResultView {
             id: "call-1".into(),
             content: "ok".into(),
+            status: None,
+            structured_content: None,
             is_error: false,
             error_kind: None,
             untrusted: true,
+            duration_ms: None,
+            truncation: None,
+            execution: None,
         }));
 
         assert_eq!(call[0].item.kind, TranscriptItemKind::ExecCommand);
@@ -1224,9 +1243,14 @@ mod tests {
         let result = mapper.map_event(&AgentEvent::ToolResult(ToolResultView {
             id: "call-1".into(),
             content: "denied".into(),
+            status: None,
+            structured_content: None,
             is_error: true,
             error_kind: Some(ToolErrorKind::PermissionDenied),
             untrusted: true,
+            duration_ms: None,
+            truncation: None,
+            execution: None,
         }));
 
         assert_eq!(result[0].item.status, TranscriptItemStatus::Failed);

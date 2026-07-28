@@ -594,9 +594,14 @@ mod tests {
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "c1".into(),
                 content: "out".into(),
+                status: None,
+                structured_content: None,
                 untrusted: true,
                 is_error: false,
                 error_kind: None,
+                duration_ms: None,
+                truncation: None,
+                execution: None,
             }],
         };
         let req = CanonicalRequest {

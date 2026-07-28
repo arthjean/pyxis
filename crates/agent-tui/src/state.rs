@@ -562,6 +562,7 @@ pub fn blocks_from_messages(messages: &[Message]) -> Vec<Block> {
                         untrusted,
                         is_error,
                         error_kind,
+                        ..
                     } = b
                     {
                         blocks.push(Block::ToolResult {
@@ -2585,9 +2586,14 @@ mod tests {
         s.apply(&AgentEvent::ToolResult(ToolResultView {
             id: "c1".into(),
             content: "done".into(),
+            status: None,
+            structured_content: None,
             is_error: false,
             untrusted: true,
             error_kind: None,
+            duration_ms: None,
+            truncation: None,
+            execution: None,
         }));
         assert!(s.live_output_lines().is_empty());
     }
@@ -2602,9 +2608,14 @@ mod tests {
         s.apply(&AgentEvent::ToolResult(ToolResultView {
             id: "c1".into(),
             content: agent_core::INTERRUPTED_TOOL_RESULT.into(),
+            status: None,
+            structured_content: None,
             is_error: true,
             untrusted: false,
             error_kind: Some(ToolErrorKind::Semantic),
+            duration_ms: None,
+            truncation: None,
+            execution: None,
         }));
         s.apply(&AgentEvent::Interrupted);
         assert_eq!(s.live_output_lines(), vec!["warning: unused".to_string()]);
@@ -2652,9 +2663,14 @@ mod tests {
         s.apply(&AgentEvent::ToolResult(ToolResultView {
             id: "c1".into(),
             content: "oops".into(),
+            status: None,
+            structured_content: None,
             is_error: true,
             untrusted: true,
             error_kind: None,
+            duration_ms: None,
+            truncation: None,
+            execution: None,
         }));
         assert_eq!(
             s.blocks[0],

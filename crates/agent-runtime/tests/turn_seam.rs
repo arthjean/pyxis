@@ -17,7 +17,7 @@ use agent_core::event::AgentEvent;
 use agent_core::message::{ContentBlock, Message};
 use agent_core::provider::{
     CanonicalRequest, CanonicalResponse, Capabilities, ErrorClass, Provider, ProviderError,
-    ProviderKind, StopReason, StreamEvent,
+    ProviderKind, StopReason, StreamEvent, ToolSpec,
 };
 use agent_core::session::{FileSnapshot, Session, SessionError};
 use agent_core::tools::{ToolDispatch, ToolEventSink, ToolInvocation, ToolOutcome};
@@ -186,13 +186,24 @@ fn provider(turns: Vec<Scripted>, calls: Arc<Mutex<usize>>) -> Arc<FakeProvider>
 }
 
 fn context(request: &TurnRequest) -> AgentContext {
-    AgentContext::new("test-model")
+    let mut context = AgentContext::new("test-model")
         .with_config(RunConfig {
             max_retries: 2,
             backoff_base_ms: 0,
             ..RunConfig::default()
         })
-        .push(Message::user(request.text.clone()))
+        .push(Message::user(request.text.clone()));
+    context.tools.push(ToolSpec {
+        name: "echo".into(),
+        description: "test dispatcher".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+    });
+    context
 }
 
 fn turn_id() -> TurnId {
