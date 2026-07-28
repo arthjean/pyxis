@@ -17,10 +17,13 @@ use agent_runtime::event::{ThreadEvent, ThreadEventPayload};
 use agent_runtime::id::{RandomIds, ThreadId, TurnId};
 use agent_runtime::lifecycle::TurnState;
 use agent_runtime::runner::{TurnOutcome, TurnRequest, TurnRunner};
-use agent_runtime::store::{MemoryThreadStore, StoreError, ThreadSnapshot, ThreadStore};
+use agent_runtime::store::{
+    FailingThreadStore, FailurePoint, MemoryThreadStore, StoreError, StoreOperation,
+    ThreadSnapshot, ThreadStore,
+};
 use agent_runtime::thread::{
     COMMAND_MAILBOX, MAX_PENDING_INPUTS, RuntimeEventPayload, Submission, SubmitError,
-    ThreadHandle, ThreadOptions,
+    ThreadHandle, ThreadHealth, ThreadOptions,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -121,6 +124,13 @@ impl ThreadStore for GatedStore {
     async fn append(&self, event: &ThreadEvent) -> Result<(), StoreError> {
         let _gate = self.gate.lock().await;
         self.inner.append(event).await
+    }
+    async fn commit_recovery(
+        &self,
+        repair: &agent_runtime::store::RecoveryCommit,
+    ) -> Result<(), StoreError> {
+        let _gate = self.gate.lock().await;
+        self.inner.commit_recovery(repair).await
     }
     async fn flush(&self) -> Result<(), StoreError> {
         self.inner.flush().await
@@ -242,7 +252,208 @@ async fn wait_for(mut check: impl FnMut() -> bool, what: &str) {
     assert!(check(), "timed out waiting for {what}");
 }
 
+fn store_event(thread_id: ThreadId) -> ThreadEvent {
+    ThreadEvent {
+        event_id: agent_runtime::EventId::generate(&RandomIds),
+        thread_id,
+        seq: 1,
+        at_ms: 1,
+        payload: ThreadEventPayload::ThreadCreated,
+    }
+}
+
 // ───────── tests ─────────
+
+#[tokio::test]
+async fn the_failing_store_targets_named_ordinals_and_poisoned_writes_stay_inspectable() {
+    for operation in [
+        StoreOperation::Create,
+        StoreOperation::Flush,
+        StoreOperation::Read,
+        StoreOperation::Close,
+    ] {
+        let inner = Arc::new(MemoryThreadStore::new());
+        let failing = FailingThreadStore::new(
+            Arc::clone(&inner) as Arc<dyn ThreadStore>,
+            FailurePoint::before(operation, 1, format!("{operation} fault")),
+        );
+        let thread_id = ThreadId::generate(&RandomIds);
+        let result = match operation {
+            StoreOperation::Create => failing.create(&thread_id).await,
+            StoreOperation::Flush => failing.flush().await,
+            StoreOperation::Read => failing.read().await.map(|_| ()),
+            StoreOperation::Close => failing.close().await,
+            StoreOperation::Append | StoreOperation::CommitRecovery | StoreOperation::Fork => {
+                continue;
+            }
+        };
+        assert!(matches!(
+            result,
+            Err(StoreError::Injected {
+                operation: failed,
+                ref detail,
+            }) if failed == operation && detail.contains(operation.to_string().as_str())
+        ));
+        assert_eq!(
+            failing.calls().unwrap(),
+            [agent_runtime::StoreCall {
+                operation,
+                ordinal: 1
+            }]
+        );
+    }
+
+    let inner = Arc::new(MemoryThreadStore::new());
+    let thread_id = ThreadId::generate(&RandomIds);
+    inner.create(&thread_id).await.unwrap();
+    let failing = FailingThreadStore::new(
+        Arc::clone(&inner) as Arc<dyn ThreadStore>,
+        FailurePoint::after_touch(StoreOperation::Append, 1, "write reached the store"),
+    );
+    let event = store_event(thread_id);
+    assert!(matches!(
+        failing.append(&event).await,
+        Err(StoreError::Injected {
+            operation: StoreOperation::Append,
+            ..
+        })
+    ));
+    assert_eq!(
+        inner.read().await.unwrap().events,
+        std::slice::from_ref(&event)
+    );
+    assert!(matches!(
+        failing.append(&event).await,
+        Err(StoreError::Poisoned)
+    ));
+    assert_eq!(
+        failing.calls().unwrap(),
+        [
+            agent_runtime::StoreCall {
+                operation: StoreOperation::Append,
+                ordinal: 1
+            },
+            agent_runtime::StoreCall {
+                operation: StoreOperation::Append,
+                ordinal: 2
+            }
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_running_commit_failure_keeps_the_accepted_input_queued_and_closes_admission() {
+    let inner = Arc::new(MemoryThreadStore::new());
+    let failing = Arc::new(FailingThreadStore::new(
+        Arc::clone(&inner) as Arc<dyn ThreadStore>,
+        // ThreadCreated, InputSubmitted, then Running.
+        FailurePoint::before(StoreOperation::Append, 3, "running commit refused"),
+    ));
+    let (runner, started) = ScriptedRunner::new(Behavior::CompleteNow);
+    let (handle, _, _root) = start(failing as Arc<dyn ThreadStore>, runner).await;
+    let mut events = handle.subscribe();
+    let submission = Submission {
+        text: "durable queued input".into(),
+        client_message_id: Some("client-queued".into()),
+    };
+
+    let accepted = handle.submit(submission.clone()).await.unwrap();
+    wait_for(
+        || matches!(handle.status().health, ThreadHealth::StoreFailed { .. }),
+        "store failure health",
+    )
+    .await;
+    let status = handle.status();
+    assert!(matches!(
+        status.health,
+        ThreadHealth::StoreFailed {
+            operation: StoreOperation::Append,
+            ..
+        }
+    ));
+    assert_eq!(status.pending_inputs, 1);
+    assert!(started.lock().unwrap().is_empty(), "no engine was minted");
+    assert_eq!(
+        handle.submit(submission).await.unwrap(),
+        accepted,
+        "an idempotent replay still recovers the accepted identity"
+    );
+    assert!(matches!(
+        handle.submit(Submission::new("new")).await,
+        Err(SubmitError::StoreFailed)
+    ));
+    assert!(matches!(
+        handle.steer(Submission::new("steer"), None).await,
+        Err(SubmitError::StoreFailed)
+    ));
+    assert!(matches!(
+        handle.fork(None).await,
+        Err(agent_runtime::thread::ForkError::Submit(
+            SubmitError::StoreFailed
+        ))
+    ));
+    assert_eq!(handle.interrupt(None).await.unwrap(), None);
+
+    let mut failures = 0;
+    while let Ok(event) = events.try_recv() {
+        if matches!(event.payload, RuntimeEventPayload::StoreFailed { .. }) {
+            failures += 1;
+        }
+    }
+    assert_eq!(failures, 1, "the live store failure is published once");
+    let snapshot = inner.read().await.unwrap();
+    assert!(snapshot.events.iter().any(|event| {
+        event.event_id == accepted.event_id
+            && matches!(&event.payload, ThreadEventPayload::InputSubmitted { .. })
+    }));
+    assert!(!states(&snapshot).contains(&TurnState::Running));
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_terminal_commit_failure_publishes_no_terminal_and_releases_no_slot() {
+    let inner = Arc::new(MemoryThreadStore::new());
+    let failing = Arc::new(FailingThreadStore::new(
+        Arc::clone(&inner) as Arc<dyn ThreadStore>,
+        // ThreadCreated, InputSubmitted, Running, then the terminal.
+        FailurePoint::before(StoreOperation::Append, 4, "terminal commit refused"),
+    ));
+    let (runner, started) = ScriptedRunner::new(Behavior::CompleteNow);
+    let (handle, _, _root) = start(failing as Arc<dyn ThreadStore>, runner).await;
+    let mut events = handle.subscribe();
+
+    handle.submit(Submission::new("finish")).await.unwrap();
+    wait_for(
+        || matches!(handle.status().health, ThreadHealth::StoreFailed { .. }),
+        "terminal store failure",
+    )
+    .await;
+    assert_eq!(started.lock().unwrap().len(), 1);
+    assert_eq!(
+        handle.status().turn.map(|turn| turn.state),
+        Some(TurnState::Running),
+        "the uncommitted terminal is not projected through status"
+    );
+    assert!(matches!(
+        handle.submit(Submission::new("must not start")).await,
+        Err(SubmitError::StoreFailed)
+    ));
+    let snapshot = inner.read().await.unwrap();
+    assert_eq!(states(&snapshot), [TurnState::Running]);
+
+    let mut terminals = 0;
+    let mut failures = 0;
+    while let Ok(event) = events.try_recv() {
+        match event.payload {
+            RuntimeEventPayload::TurnStateChanged { to, .. } if to.is_terminal() => terminals += 1,
+            RuntimeEventPayload::StoreFailed { .. } => failures += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(terminals, 0);
+    assert_eq!(failures, 1);
+    handle.shutdown().await;
+}
 
 #[tokio::test]
 async fn a_runtime_descriptor_is_persisted_once_and_turns_reference_it() {
@@ -309,15 +520,16 @@ async fn a_runtime_descriptor_is_persisted_once_and_turns_reference_it() {
     assert!(contexts.iter().all(|context| {
         context.model_runtime_fingerprint.as_deref() == Some(runtime.fingerprint.as_str())
     }));
-    let requests = started.lock().unwrap();
-    assert!(requests.iter().all(|request| {
-        request
-            .model_runtime
-            .as_ref()
-            .map(|runtime| runtime.fingerprint.as_str())
-            == Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-    }));
-    drop(requests);
+    {
+        let requests = started.lock().unwrap();
+        assert!(requests.iter().all(|request| {
+            request
+                .model_runtime
+                .as_ref()
+                .map(|runtime| runtime.fingerprint.as_str())
+                == Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        }));
+    }
     handle.shutdown().await;
 }
 

@@ -23,7 +23,7 @@ use crate::event::{ForkOrigin, ThreadEventPayload};
 use crate::id::{ThreadId, TurnId};
 use crate::lifecycle::TurnState;
 use crate::store::ThreadSnapshot;
-use crate::thread::{Accepted, TurnStatus};
+use crate::thread::{Accepted, Submission, TurnStatus};
 
 /// State a client gets back when it opens an existing thread.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,8 +63,12 @@ impl ResumedThread {
 /// What the actor has to persist before it starts serving commands.
 pub(crate) struct ResumePlan {
     pub(crate) resumed: ResumedThread,
-    /// Turns to close, with the state they were left in. In log order.
+    /// Running turns to close, with the state they were left in. In log order.
     pub(crate) unfinished: Vec<(TurnId, TurnState)>,
+    /// Durable queued inputs to promote after the repair is committed.
+    pub(crate) queued: Vec<(TurnId, Submission)>,
+    /// Messages the recovery commit must add to the canonical transcript.
+    pub(crate) tool_results: Vec<Message>,
     pub(crate) thread_created: bool,
 }
 
@@ -77,6 +81,7 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
     // the log and not a hash order.
     let mut states: Vec<(TurnId, TurnState)> = Vec::new();
     let mut accepted: HashMap<String, Accepted> = HashMap::new();
+    let mut submitted: Vec<(TurnId, Submission)> = Vec::new();
     let mut agents: Vec<AgentRecord> = Vec::new();
     let mut turn_context: Option<TurnContext> = None;
     let mut thread_created = false;
@@ -88,7 +93,7 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
             ThreadEventPayload::InputSubmitted {
                 turn_id,
                 client_message_id,
-                ..
+                text,
             } => {
                 if let Some(key) = client_message_id {
                     // First acceptance wins: a replay must get the identifiers
@@ -100,6 +105,13 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
                 }
                 if !states.iter().any(|(id, _)| id == turn_id) {
                     states.push((*turn_id, TurnState::Queued));
+                    submitted.push((
+                        *turn_id,
+                        Submission {
+                            text: text.clone(),
+                            client_message_id: client_message_id.clone(),
+                        },
+                    ));
                 }
             }
             ThreadEventPayload::TurnStateChanged {
@@ -148,8 +160,18 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
 
     let unfinished: Vec<(TurnId, TurnState)> = states
         .iter()
-        .filter(|(_, state)| !state.is_terminal())
+        .filter(|(_, state)| matches!(state, TurnState::Running | TurnState::NeedsInput))
         .copied()
+        .collect();
+    let queued = states
+        .iter()
+        .filter(|(_, state)| *state == TurnState::Queued)
+        .filter_map(|(turn_id, _)| {
+            submitted
+                .iter()
+                .find(|(submitted_id, _)| submitted_id == turn_id)
+                .cloned()
+        })
         .collect();
     let turn = states.last().map(|(turn_id, state)| TurnStatus {
         turn_id: *turn_id,
@@ -157,7 +179,9 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
     });
 
     let mut messages = snapshot.messages.clone();
-    let reconciled_calls = reconcile(&mut messages);
+    let tool_results = reconciliation_results(&messages);
+    let reconciled_calls = tool_results.len();
+    messages.extend(tool_results.clone());
 
     ResumePlan {
         resumed: ResumedThread {
@@ -172,8 +196,25 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
             agents,
         },
         unfinished,
+        queued,
+        tool_results,
         thread_created,
     }
+}
+
+fn reconciliation_results(messages: &[Message]) -> Vec<Message> {
+    unanswered_tool_calls(messages)
+        .into_iter()
+        .map(|id| {
+            Message::tool_result_with_metadata(
+                id,
+                INTERRUPTED_TOOL_RESULT,
+                true,
+                false,
+                Some(ToolErrorKind::Semantic),
+            )
+        })
+        .collect()
 }
 
 /// Answers every tool call the transcript left pending and returns how many.
@@ -182,17 +223,10 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
 /// engine owns anymore. Real results are never replaced: `unanswered_tool_calls`
 /// only reports what has no answer at all.
 pub fn reconcile(messages: &mut Vec<Message>) -> usize {
-    let pending = unanswered_tool_calls(messages);
-    for id in &pending {
-        messages.push(Message::tool_result_with_metadata(
-            id.clone(),
-            INTERRUPTED_TOOL_RESULT,
-            true,
-            false,
-            Some(ToolErrorKind::Semantic),
-        ));
-    }
-    pending.len()
+    let results = reconciliation_results(messages);
+    let repaired = results.len();
+    messages.extend(results);
+    repaired
 }
 
 /// Cause recorded on a turn closed by resume.

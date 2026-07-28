@@ -128,6 +128,14 @@ pub async fn run(run: HeadlessRun<'_>) -> anyhow::Result<()> {
                 // the stream a line, not the run. Reported rather than hidden.
                 Err(broadcast::error::RecvError::Lagged(dropped)) => {
                     eprintln!("[runtime] {dropped} event(s) dropped from the live stream");
+                    if let agent_runtime::ThreadHealth::StoreFailed { operation, detail } =
+                        runtime.status().health
+                    {
+                        writer.thread_store_failed(operation, &detail, &identity);
+                        break RunEnd::Error(format!(
+                            "thread store failed during {operation}: {detail}"
+                        ));
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     break terminal_from_status(&runtime, turn_id);
@@ -231,6 +239,17 @@ fn observe(
         {
             Some(RunEnd::from_terminal(*to, cause.clone()))
         }
+        RuntimeEventPayload::StoreFailed { operation, detail } => {
+            let identity = EventIdentity {
+                thread_id: Some(thread_id.to_string()),
+                turn_id: event.turn_id.map(|id| id.to_string()),
+                event_id: Some(event.event_id.to_string()),
+            };
+            writer.thread_store_failed(*operation, detail, &identity);
+            Some(RunEnd::Error(format!(
+                "thread store failed during {operation}: {detail}"
+            )))
+        }
         _ => None,
     }
 }
@@ -242,7 +261,11 @@ fn observe(
 /// other channel, so the run still reports what happened instead of an
 /// unexplained success.
 fn terminal_from_status(runtime: &SessionRuntime, turn_id: agent_runtime::TurnId) -> RunEnd {
-    match runtime.status().turn {
+    let status = runtime.status();
+    if let agent_runtime::ThreadHealth::StoreFailed { operation, detail } = status.health {
+        return RunEnd::Error(format!("thread store failed during {operation}: {detail}"));
+    }
+    match status.turn {
         Some(status) if status.turn_id == turn_id && status.state.is_terminal() => {
             RunEnd::from_terminal(status.state, None)
         }

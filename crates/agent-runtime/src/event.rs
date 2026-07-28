@@ -23,6 +23,8 @@ use crate::lifecycle::TurnState;
 pub const THREAD_META_ENTRY: &str = "thread_meta";
 /// `entry` tag of an orchestration event line in the JSONL log.
 pub const THREAD_EVENT_ENTRY: &str = "thread_event";
+/// `entry` tag of an atomic cold-resume repair line.
+pub const RECOVERY_COMMIT_ENTRY: &str = "recovery_commit";
 /// Version of the orchestration layer written in the binding line.
 pub const THREAD_RUNTIME_VERSION: u32 = 1;
 

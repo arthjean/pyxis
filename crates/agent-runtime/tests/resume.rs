@@ -17,7 +17,10 @@ use agent_runtime::event::{ThreadEvent, ThreadEventPayload};
 use agent_runtime::id::{EventId, RandomIds, ThreadId, TurnId};
 use agent_runtime::lifecycle::TurnState;
 use agent_runtime::runner::{RunAgentRunner, TurnRunner};
-use agent_runtime::store::{ForkPoint, StoreError, ThreadSnapshot, ThreadStore};
+use agent_runtime::store::{
+    FailingThreadStore, FailurePoint, ForkPoint, RecoveryCommit, StoreError, StoreOperation,
+    ThreadSnapshot, ThreadStore,
+};
 use agent_runtime::thread::{Submission, ThreadHandle, ThreadOptions};
 use common::{FakeProvider, FakeSession, Scripted, done_end_turn, text, wait_for_terminal};
 use tokio_util::sync::CancellationToken;
@@ -29,11 +32,21 @@ struct Log {
     thread_id: Arc<Mutex<Option<ThreadId>>>,
     events: Arc<Mutex<Vec<ThreadEvent>>>,
     messages: Arc<Mutex<Vec<Message>>>,
+    repairs: Arc<Mutex<Vec<RecoveryCommit>>>,
 }
 
 impl Log {
     fn events(&self) -> Vec<ThreadEvent> {
         self.events.lock().unwrap().clone()
+    }
+
+    fn repairs(&self) -> Vec<EventId> {
+        self.repairs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|repair| repair.repair_id)
+            .collect()
     }
 
     /// Appends without going through a store: how a previous process left the
@@ -98,6 +111,40 @@ impl ThreadStore for SharedStore {
         self.log.events.lock().unwrap().push(event.clone());
         Ok(())
     }
+    async fn commit_recovery(&self, repair: &RecoveryCommit) -> Result<(), StoreError> {
+        self.live()?;
+        let mut repairs = self.log.repairs.lock().unwrap();
+        if let Some(applied) = repairs
+            .iter()
+            .find(|applied| applied.repair_id == repair.repair_id)
+        {
+            return if applied == repair {
+                Ok(())
+            } else {
+                Err(StoreError::InvalidRecovery(format!(
+                    "repair ID {} was reused with another body",
+                    repair.repair_id
+                )))
+            };
+        }
+        let thread_id = self
+            .log
+            .thread_id
+            .lock()
+            .unwrap()
+            .ok_or_else(|| StoreError::InvalidRecovery("shared log is unbound".into()))?;
+        let mut events = self.log.events.lock().unwrap();
+        let next_seq = events.last().map_or(1, |event| event.seq.saturating_add(1));
+        repair.validate(thread_id, next_seq)?;
+        self.log
+            .messages
+            .lock()
+            .unwrap()
+            .extend(repair.tool_results.clone());
+        events.extend(repair.closures.clone());
+        repairs.push(repair.clone());
+        Ok(())
+    }
     async fn flush(&self) -> Result<(), StoreError> {
         self.live()
     }
@@ -121,6 +168,7 @@ impl ThreadStore for SharedStore {
             thread_id: Arc::new(Mutex::new(Some(at.child_thread_id))),
             events: Arc::new(Mutex::new(events[..=cut].to_vec())),
             messages: Arc::new(Mutex::new(self.log.messages.lock().unwrap().clone())),
+            repairs: Arc::new(Mutex::new(Vec::new())),
         };
         Ok(SharedStore::open(&branch) as Arc<dyn ThreadStore>)
     }
@@ -133,9 +181,23 @@ impl ThreadStore for SharedStore {
 // ───────── wiring ─────────
 
 async fn open(log: &Log, thread_id: ThreadId, runner: Arc<dyn TurnRunner>) -> ThreadHandle {
-    ThreadHandle::start(ThreadOptions {
+    ThreadHandle::start(options(
         thread_id,
-        store: SharedStore::open(log) as Arc<dyn ThreadStore>,
+        SharedStore::open(log) as Arc<dyn ThreadStore>,
+        runner,
+    ))
+    .await
+    .expect("the thread opens")
+}
+
+fn options(
+    thread_id: ThreadId,
+    store: Arc<dyn ThreadStore>,
+    runner: Arc<dyn TurnRunner>,
+) -> ThreadOptions {
+    ThreadOptions {
+        thread_id,
+        store,
         runner,
         turn_contexts: Arc::new(FixedTurnContext::new(common::turn_context(
             TurnId::generate(&RandomIds),
@@ -144,9 +206,7 @@ async fn open(log: &Log, thread_id: ThreadId, runner: Arc<dyn TurnRunner>) -> Th
         clock: Arc::new(common::InstantClock),
         parent_cancel: CancellationToken::new(),
         agents: None,
-    })
-    .await
-    .expect("the thread opens")
+    }
 }
 
 fn echo_runner(turns: usize) -> Arc<dyn TurnRunner> {
@@ -272,6 +332,7 @@ async fn a_turn_left_open_by_a_crash_is_recovered_once_after_reconciliation() {
         })
         .collect();
     assert_eq!(recoveries.len(), 1, "exactly one recovery event");
+    assert_eq!(log.repairs().len(), 1, "one physical recovery commit");
     assert!(
         matches!(
             &recoveries[0].payload,
@@ -287,7 +348,150 @@ async fn a_turn_left_open_by_a_crash_is_recovered_once_after_reconciliation() {
     let again = open(&log, thread_id, echo_runner(1)).await;
     assert!(again.resumed().recovered.is_empty());
     assert_eq!(log.events().len(), after, "recovery is not repeated");
+    assert_eq!(
+        log.repairs().len(),
+        1,
+        "the physical repair is not repeated"
+    );
     again.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_queued_input_is_promoted_once_instead_of_being_closed_by_resume() {
+    let log = Log::default();
+    let thread_id = ThreadId::generate(&RandomIds);
+    let turn_id = TurnId::generate(&RandomIds);
+    log.seed(
+        thread_id,
+        vec![
+            ThreadEventPayload::ThreadCreated,
+            ThreadEventPayload::InputSubmitted {
+                turn_id,
+                client_message_id: Some("queued-1".into()),
+                text: "reprends".into(),
+            },
+        ],
+    );
+
+    let handle = open(&log, thread_id, echo_runner(1)).await;
+    let terminal = wait_for_terminal(&handle).await;
+    assert_eq!(terminal.turn_id, turn_id);
+    assert_eq!(terminal.state, TurnState::Completed);
+    assert!(handle.resumed().recovered.is_empty());
+    let states: Vec<_> = log
+        .events()
+        .iter()
+        .filter_map(|event| match &event.payload {
+            ThreadEventPayload::TurnStateChanged {
+                turn_id: id, to, ..
+            } if *id == turn_id => Some(*to),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(states, [TurnState::Running, TurnState::Completed]);
+    handle.shutdown().await;
+
+    let durable_len = log.events().len();
+    let reopened = open(&log, thread_id, echo_runner(1)).await;
+    assert_eq!(reopened.status().turn, Some(terminal));
+    assert_eq!(
+        log.events().len(),
+        durable_len,
+        "a terminal queued turn is not started twice"
+    );
+    reopened.shutdown().await;
+}
+
+#[tokio::test]
+async fn recovery_is_all_or_nothing_across_failures_before_and_after_the_commit() {
+    for after_touch in [false, true] {
+        let log = Log::default();
+        let thread_id = ThreadId::generate(&RandomIds);
+        let turn_id = TurnId::generate(&RandomIds);
+        log.seed(
+            thread_id,
+            vec![
+                ThreadEventPayload::ThreadCreated,
+                ThreadEventPayload::InputSubmitted {
+                    turn_id,
+                    client_message_id: None,
+                    text: "outil".into(),
+                },
+                ThreadEventPayload::TurnStateChanged {
+                    turn_id,
+                    from: Some(TurnState::Queued),
+                    to: TurnState::Running,
+                    cause: None,
+                    context: None,
+                },
+            ],
+        );
+        *log.messages.lock().unwrap() = vec![Message::assistant(vec![ContentBlock::ToolUse {
+            id: "orphan".into(),
+            name: "bash".into(),
+            input: serde_json::json!({}),
+        }])];
+
+        let point = if after_touch {
+            FailurePoint::after_touch(
+                StoreOperation::CommitRecovery,
+                1,
+                "crash after recovery write",
+            )
+        } else {
+            FailurePoint::before(
+                StoreOperation::CommitRecovery,
+                1,
+                "crash before recovery write",
+            )
+        };
+        let failing = Arc::new(FailingThreadStore::new(
+            SharedStore::open(&log) as Arc<dyn ThreadStore>,
+            point,
+        ));
+        let failed = ThreadHandle::start(options(
+            thread_id,
+            failing as Arc<dyn ThreadStore>,
+            echo_runner(1),
+        ))
+        .await;
+        assert!(
+            matches!(
+                failed,
+                Err(agent_runtime::thread::RuntimeError::StoreOperation {
+                    operation: StoreOperation::CommitRecovery,
+                    ..
+                })
+            ),
+            "a failed repair publishes no commandable actor"
+        );
+        assert_eq!(log.repairs().len(), if after_touch { 1 } else { 0 });
+
+        let reopened = open(&log, thread_id, echo_runner(1)).await;
+        assert!(
+            reopened
+                .resumed()
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        );
+        assert_eq!(log.repairs().len(), 1, "the repair lands exactly once");
+        assert_eq!(
+            log.events()
+                .iter()
+                .filter(|event| matches!(
+                    &event.payload,
+                    ThreadEventPayload::TurnStateChanged {
+                        to: TurnState::Interrupted,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        reopened.shutdown().await;
+    }
 }
 
 // ───────── AC3: a replayed submission is not a second submission ─────────

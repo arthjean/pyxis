@@ -19,7 +19,7 @@ use agent_core::message::Message;
 use agent_core::session::{FileSnapshot, Session, SessionEntry, SessionError};
 use agent_runtime::event::{THREAD_RUNTIME_VERSION, ThreadEvent};
 use agent_runtime::id::{EventId, ID_BYTES, ThreadId};
-use agent_runtime::store::{ForkPoint, StoreError, ThreadSnapshot, ThreadStore};
+use agent_runtime::store::{ForkPoint, RecoveryCommit, StoreError, ThreadSnapshot, ThreadStore};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -166,18 +166,40 @@ fn derive_thread_id(path: &Path) -> Result<ThreadId, StoreError> {
 
 /// Byte length of the prefix ending with the line that carries `event_id`,
 /// newline included. `None` when the log does not carry that event.
-fn prefix_through_event(content: &str, event_id: EventId) -> Option<usize> {
+fn prefix_through_event(content: &str, event_id: EventId) -> Option<String> {
     let mut start = 0usize;
     while start < content.len() {
         let (line, end) = match content[start..].find('\n') {
             Some(rel) => (&content[start..start + rel], start + rel + 1),
             None => (&content[start..], content.len()),
         };
-        if let Ok(LogLine::Thread(ThreadLine::ThreadEvent(event))) =
+        if let Ok(LogLine::Thread(thread_line)) =
             parse_log_line(line.strip_suffix('\r').unwrap_or(line))
-            && event.event_id == event_id
         {
-            return Some(end);
+            match thread_line {
+                ThreadLine::ThreadEvent(event) if event.event_id == event_id => {
+                    return Some(content[..end].to_string());
+                }
+                ThreadLine::RecoveryCommit(mut repair) => {
+                    if let Some(index) = repair
+                        .closures
+                        .iter()
+                        .position(|event| event.event_id == event_id)
+                    {
+                        repair.closures.truncate(index + 1);
+                        let mut prefix = content[..start].to_string();
+                        if !prefix.ends_with('\n') {
+                            prefix.push('\n');
+                        }
+                        let line =
+                            serde_json::to_string(&ThreadLine::RecoveryCommit(repair)).ok()?;
+                        prefix.push_str(&line);
+                        prefix.push('\n');
+                        return Some(prefix);
+                    }
+                }
+                _ => {}
+            }
         }
         start = end;
     }
@@ -203,9 +225,10 @@ pub fn branch_path(parent: &Path, child: ThreadId) -> PathBuf {
 fn materialize(parent: &Path, at: &ForkPoint) -> Result<PathBuf, StoreError> {
     let io = |e: std::io::Error| StoreError::Io(e.to_string());
     let content = std::fs::read_to_string(parent).map_err(io)?;
-    let cut = prefix_through_event(&content, at.fork_event_id).ok_or(StoreError::NoSuchEvent {
-        event_id: at.fork_event_id,
-    })?;
+    let prefix =
+        prefix_through_event(&content, at.fork_event_id).ok_or(StoreError::NoSuchEvent {
+            event_id: at.fork_event_id,
+        })?;
     let binding = serde_json::to_string(&ThreadLine::ThreadMeta {
         thread_id: at.child_thread_id,
         runtime_version: THREAD_RUNTIME_VERSION,
@@ -225,7 +248,6 @@ fn materialize(parent: &Path, at: &ForkPoint) -> Result<PathBuf, StoreError> {
 
     let staged = (|| -> Result<(), StoreError> {
         let mut file = std::fs::File::create(&staging).map_err(io)?;
-        let prefix = &content[..cut];
         file.write_all(prefix.as_bytes()).map_err(io)?;
         if !prefix.ends_with('\n') {
             file.write_all(b"\n").map_err(io)?;
@@ -299,6 +321,46 @@ impl ThreadStore for JsonlThreadStore {
             });
         }
         write_json(writer, &ThreadLine::ThreadEvent(event.clone()))
+    }
+
+    async fn commit_recovery(&self, repair: &RecoveryCommit) -> Result<(), StoreError> {
+        let mut state = self.lock()?;
+        let StoreState {
+            writer,
+            thread_id: bound,
+        } = &mut *state;
+        let Some(writer) = writer.as_mut() else {
+            return Err(StoreError::Closed);
+        };
+        let thread_id = (*bound).ok_or_else(|| {
+            StoreError::InvalidRecovery("cannot repair an unbound JSONL store".into())
+        })?;
+        let resumed = resume_file(&self.path).map_err(map_session_error)?;
+        let mut persisted = repair.clone();
+        redact_encrypted_reasoning(&mut persisted.tool_results);
+        if let Some(applied) = resumed
+            .recovery_commits
+            .iter()
+            .find(|applied| applied.repair_id == repair.repair_id)
+        {
+            return if applied == &persisted {
+                Ok(())
+            } else {
+                Err(StoreError::InvalidRecovery(format!(
+                    "repair ID {} was reused with another body",
+                    repair.repair_id
+                )))
+            };
+        }
+        let next_seq = resumed
+            .thread_events
+            .last()
+            .map_or(1, |event| event.seq.saturating_add(1));
+        persisted.validate(thread_id, next_seq)?;
+
+        write_json(writer, &ThreadLine::RecoveryCommit(persisted))?;
+        writer.cursor = writer.cursor.saturating_add(repair.tool_results.len());
+        Ok(())
     }
 
     async fn flush(&self) -> Result<(), StoreError> {
@@ -429,7 +491,7 @@ impl Session for JsonlThreadStore {
 
 #[cfg(test)]
 mod tests {
-    use agent_core::message::Message;
+    use agent_core::message::{ContentBlock, Message};
     use agent_runtime::event::ThreadEventPayload;
     use agent_runtime::id::{EventId, SequentialIds, TurnId};
     use agent_runtime::lifecycle::TurnState;
@@ -481,6 +543,131 @@ mod tests {
         let path = tmp("fork-contract");
         let store = JsonlThreadStore::open(&path).unwrap();
         assert_thread_fork_contract(&store).await;
+        cleanup(&path);
+    }
+
+    #[tokio::test]
+    async fn a_recovery_commit_is_one_line_and_forks_at_embedded_event_ids() {
+        let path = tmp("recovery-commit");
+        let ids = SequentialIds::new();
+        let thread_id = ThreadId::generate(&ids);
+        let first_turn = TurnId::generate(&ids);
+        let second_turn = TurnId::generate(&ids);
+        let store = JsonlThreadStore::open(&path).unwrap();
+        store.create(&thread_id).await.unwrap();
+
+        let created = ThreadEvent {
+            event_id: EventId::generate(&ids),
+            thread_id,
+            seq: 1,
+            at_ms: 1,
+            payload: ThreadEventPayload::ThreadCreated,
+        };
+        store.append(&created).await.unwrap();
+        let orphan = Message::assistant(vec![ContentBlock::ToolUse {
+            id: "call-recovery".into(),
+            name: "bash".into(),
+            input: serde_json::json!({}),
+        }]);
+        Session::sync(&store, std::slice::from_ref(&orphan))
+            .await
+            .unwrap();
+        let result = Message::tool_result_with_trust("call-recovery", "interrupted", true, false);
+        let closures = [
+            (first_turn, TurnState::Running),
+            (second_turn, TurnState::NeedsInput),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (turn_id, from))| ThreadEvent {
+            event_id: EventId::generate(&ids),
+            thread_id,
+            seq: index as u64 + 2,
+            at_ms: index as u64 + 2,
+            payload: ThreadEventPayload::TurnStateChanged {
+                turn_id,
+                from: Some(from),
+                to: TurnState::Interrupted,
+                cause: Some("interrupted: recovered".into()),
+                context: None,
+            },
+        })
+        .collect::<Vec<_>>();
+        let repair = RecoveryCommit {
+            repair_id: EventId::generate(&ids),
+            thread_id,
+            next_seq: 2,
+            tool_results: vec![result.clone()],
+            closures: closures.clone(),
+        };
+        store.commit_recovery(&repair).await.unwrap();
+        store.commit_recovery(&repair).await.unwrap();
+        let mut collision = repair.clone();
+        collision.tool_results[0] =
+            Message::tool_result_with_trust("call-recovery", "different body", true, false);
+        assert!(matches!(
+            store.commit_recovery(&collision).await,
+            Err(StoreError::InvalidRecovery(_))
+        ));
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content
+                .lines()
+                .filter(|line| line.contains("\"entry\":\"recovery_commit\""))
+                .count(),
+            1,
+            "messages and closures share one physical record"
+        );
+        let snapshot = store.read().await.unwrap();
+        assert_eq!(
+            snapshot.events,
+            [vec![created.clone()], closures.clone()].concat()
+        );
+        assert_eq!(snapshot.messages, [orphan.clone(), result.clone()]);
+        assert_eq!(snapshot.next_seq(), 4);
+
+        // The recovery result advanced the shared transcript cursor, so the next
+        // engine sync cannot rewrite it as a second message line.
+        Session::sync(&store, &[orphan, result]).await.unwrap();
+        assert_eq!(store.read().await.unwrap().messages.len(), 2);
+
+        let child = store
+            .fork(&ForkPoint {
+                parent_thread_id: thread_id,
+                child_thread_id: ThreadId::generate(&ids),
+                fork_turn_id: first_turn,
+                fork_event_id: closures[0].event_id,
+            })
+            .await
+            .unwrap();
+        let child_snapshot = child.read().await.unwrap();
+        assert_eq!(
+            child_snapshot.events,
+            [created, closures[0].clone()],
+            "the physical repair is truncated at its logical fork event"
+        );
+        assert_eq!(child_snapshot.messages.len(), 2);
+
+        child.close().await.unwrap();
+        store.close().await.unwrap();
+        let reopened = JsonlThreadStore::open(&path).unwrap();
+        let before = reopened.read().await.unwrap();
+        reopened.commit_recovery(&repair).await.unwrap();
+        assert_eq!(
+            reopened.read().await.unwrap(),
+            before,
+            "an identical repair stays idempotent after reopening"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .filter(|line| line.contains("\"entry\":\"recovery_commit\""))
+                .count(),
+            1
+        );
+        reopened.close().await.unwrap();
         cleanup(&path);
     }
 

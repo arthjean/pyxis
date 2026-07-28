@@ -582,7 +582,8 @@ fn count_encrypted_reasoning(messages: &[Message]) -> usize {
 /// True while the thread is running a turn. Read from the runtime's last-state
 /// signal, never inferred from the events the loop happened to see.
 fn is_running(status: &ThreadStatus) -> bool {
-    status.turn.is_some_and(|turn| !turn.state.is_terminal())
+    matches!(&status.health, agent_runtime::ThreadHealth::Healthy)
+        && status.turn.is_some_and(|turn| !turn.state.is_terminal())
 }
 
 /// Mirrors the runtime's last state into the frontend (US-017 AC5). Thread,
@@ -1889,6 +1890,13 @@ async fn event_loop(
                             RuntimeEventPayload::InputAccepted { .. }
                             | RuntimeEventPayload::Forked { .. }
                             | RuntimeEventPayload::ShuttingDown => {}
+                            RuntimeEventPayload::StoreFailed { operation, detail } => {
+                                let failure =
+                                    format!("thread store failed during {operation}: {detail}");
+                                state.blocks.push(Block::Error(failure.clone()));
+                                runtime_failure = Some(failure);
+                                state.should_quit = true;
+                            }
                         }
                         status = runtime.status();
                         running = is_running(&status);
@@ -1912,6 +1920,18 @@ async fn event_loop(
                             "{dropped} runtime event(s) dropped from the live stream; the \
                              transcript on disk stays complete."
                         )));
+                        status = runtime.status();
+                        if let agent_runtime::ThreadHealth::StoreFailed { operation, detail } =
+                            &status.health
+                        {
+                            let failure =
+                                format!("thread store failed during {operation}: {detail}");
+                            state.blocks.push(Block::Error(failure.clone()));
+                            runtime_failure = Some(failure);
+                            state.should_quit = true;
+                        }
+                        running = is_running(&status);
+                        apply_runtime_status(&mut state, &status);
                     }
                     // AC8: the runtime went away. The terminal is restored by `run`,
                     // and the session ends on a named error instead of a panic or a
@@ -2533,6 +2553,7 @@ mod tests {
 
         let idle = ThreadStatus {
             thread_id,
+            health: agent_runtime::ThreadHealth::Healthy,
             turn: None,
             pending_inputs: 0,
             pending_steers: 0,

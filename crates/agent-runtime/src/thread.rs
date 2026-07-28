@@ -32,7 +32,9 @@ use crate::inputs::TurnInputs;
 use crate::lifecycle::{TurnLifecycle, TurnState};
 use crate::resume::{self, ResumedThread};
 use crate::runner::{TurnOutcome, TurnRequest, TurnRunner};
-use crate::store::{ForkPoint, StoreError, ThreadSnapshot, ThreadStore};
+use crate::store::{
+    ForkPoint, RecoveryCommit, StoreError, StoreOperation, ThreadSnapshot, ThreadStore,
+};
 use crate::supervisor::{AgentJournal, AgentSupervisor};
 
 /// Control mailbox depth. A producer that finds it full is refused, never
@@ -85,6 +87,8 @@ pub struct TurnStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadStatus {
     pub thread_id: ThreadId,
+    #[serde(default)]
+    pub health: ThreadHealth,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn: Option<TurnStatus>,
     /// Inputs waiting to open a turn of their own.
@@ -92,6 +96,23 @@ pub struct ThreadStatus {
     /// Inputs accepted for the RUNNING turn and not consumed yet (US-007 AC1).
     pub pending_steers: usize,
     pub shutting_down: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ThreadHealth {
+    #[default]
+    Healthy,
+    StoreFailed {
+        operation: StoreOperation,
+        detail: String,
+    },
+}
+
+impl ThreadHealth {
+    fn is_failed(&self) -> bool {
+        matches!(self, Self::StoreFailed { .. })
+    }
 }
 
 /// Live event published by the runtime.
@@ -128,6 +149,11 @@ pub enum RuntimeEventPayload {
     Forked {
         child_thread_id: ThreadId,
     },
+    /// Live-only signal: the failing writer cannot durably record its own fault.
+    StoreFailed {
+        operation: StoreOperation,
+        detail: String,
+    },
     ShuttingDown,
 }
 
@@ -146,6 +172,8 @@ pub enum SubmitError {
     ShuttingDown,
     #[error("thread runtime stopped")]
     Stopped,
+    #[error("thread store failed")]
+    StoreFailed,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -154,6 +182,12 @@ pub enum SubmitError {
 pub enum RuntimeError {
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error("thread store {operation} failed during open: {source}")]
+    StoreOperation {
+        operation: StoreOperation,
+        #[source]
+        source: StoreError,
+    },
 }
 
 /// A materialized branch (US-010). Carries its provenance AND its open store,
@@ -344,15 +378,63 @@ impl ThreadHandle {
         } = options;
 
         store.create(&thread_id).await?;
-        let snapshot = store.read().await?;
-        let plan = resume::plan(thread_id, &snapshot);
+        let mut snapshot = store.read().await?;
+        let mut plan = resume::plan(thread_id, &snapshot);
+        let mut recovered = Vec::new();
+        let mut reconciled_calls = 0;
+        if !plan.tool_results.is_empty() || !plan.unfinished.is_empty() {
+            let next_seq = snapshot.next_seq();
+            let repair_id = EventId::generate(ids.as_ref());
+            let closures = plan
+                .unfinished
+                .iter()
+                .enumerate()
+                .map(|(index, (turn_id, from))| ThreadEvent {
+                    event_id: EventId::generate(ids.as_ref()),
+                    thread_id,
+                    seq: next_seq.saturating_add(index as u64),
+                    at_ms: clock.now_ms(),
+                    payload: ThreadEventPayload::TurnStateChanged {
+                        turn_id: *turn_id,
+                        from: Some(*from),
+                        to: TurnState::Interrupted,
+                        cause: Some(resume::recovery_cause(*from)),
+                        context: None,
+                    },
+                })
+                .collect::<Vec<_>>();
+            recovered.extend(plan.unfinished.iter().map(|(turn_id, _)| *turn_id));
+            reconciled_calls = plan.tool_results.len();
+            let repair = RecoveryCommit {
+                repair_id,
+                thread_id,
+                next_seq,
+                tool_results: plan.tool_results.clone(),
+                closures,
+            };
+            store.commit_recovery(&repair).await.map_err(|source| {
+                RuntimeError::StoreOperation {
+                    operation: StoreOperation::CommitRecovery,
+                    source,
+                }
+            })?;
+            snapshot = store
+                .read()
+                .await
+                .map_err(|source| RuntimeError::StoreOperation {
+                    operation: StoreOperation::Read,
+                    source,
+                })?;
+            plan = resume::plan(thread_id, &snapshot);
+        }
 
         let token = parent_cancel.child_token();
         let (events, _) = broadcast::channel(LIVE_EVENT_BUFFER);
         let (status_tx, status_rx) = watch::channel(ThreadStatus {
             thread_id,
+            health: ThreadHealth::Healthy,
             turn: plan.resumed.turn,
-            pending_inputs: 0,
+            pending_inputs: plan.queued.len(),
             pending_steers: 0,
             shutting_down: false,
         });
@@ -390,35 +472,17 @@ impl ThreadHandle {
             finished_tx,
             finished_rx,
             shutting_down: false,
+            health: ThreadHealth::Healthy,
         };
         if !plan.thread_created {
             actor.commit(ThreadEventPayload::ThreadCreated).await?;
         }
 
+        actor.pending = plan.queued.into();
         let mut resumed = plan.resumed;
-        // US-009 AC2: the transcript was reconciled by `resume::plan` BEFORE the
-        // recovery terminal is written, so the log never claims a turn stopped
-        // cleanly while its tool calls are still unanswered.
-        for (turn_id, from) in plan.unfinished {
-            let cause = resume::recovery_cause(from);
-            actor
-                .commit(ThreadEventPayload::TurnStateChanged {
-                    turn_id,
-                    from: Some(from),
-                    to: TurnState::Interrupted,
-                    cause: Some(cause),
-                    context: None,
-                })
-                .await?;
-            actor.last_turn = Some(TurnStatus {
-                turn_id,
-                state: TurnState::Interrupted,
-            });
-            resumed.recovered.push(turn_id);
-        }
-        if !resumed.recovered.is_empty() {
-            resumed.turn = actor.last_turn;
-            actor.publish_status();
+        resumed.recovered = recovered;
+        resumed.reconciled_calls = reconciled_calls;
+        if !resumed.recovered.is_empty() || resumed.reconciled_calls > 0 {
             tracing::debug!(
                 target: "pyxis::runtime",
                 thread_id = %thread_id,
@@ -458,6 +522,7 @@ impl ThreadHandle {
             agents.restore(resumed.agents.clone());
         }
 
+        actor.start_next_turn().await;
         let join = tokio::spawn(actor.run(command_rx));
         Ok(Self {
             thread_id,
@@ -611,6 +676,7 @@ struct ThreadActor {
     finished_tx: mpsc::Sender<TurnFinished>,
     finished_rx: mpsc::Receiver<TurnFinished>,
     shutting_down: bool,
+    health: ThreadHealth,
 }
 
 /// Resolves the cut a fork asks for against the durable log (US-010).
@@ -668,6 +734,9 @@ impl ThreadActor {
     /// Persists an event then advances the sequence. On failure the sequence
     /// does NOT move: a refused operation leaves no hole in the log.
     async fn commit(&mut self, payload: ThreadEventPayload) -> Result<ThreadEvent, StoreError> {
+        if self.health.is_failed() {
+            return Err(StoreError::Poisoned);
+        }
         let event = ThreadEvent {
             event_id: EventId::generate(self.ids.as_ref()),
             thread_id: self.thread_id,
@@ -675,9 +744,43 @@ impl ThreadActor {
             at_ms: self.clock.now_ms(),
             payload,
         };
-        self.store.append(&event).await?;
+        if let Err(error) = self.store.append(&event).await {
+            self.enter_store_failed(StoreOperation::Append, &error);
+            return Err(error);
+        }
         self.seq = self.seq.saturating_add(1);
         Ok(event)
+    }
+
+    fn enter_store_failed(&mut self, operation: StoreOperation, error: &StoreError) {
+        if self.health.is_failed() {
+            return;
+        }
+        let detail = error
+            .to_string()
+            .chars()
+            .take(MAX_TURN_FAILURE_CAUSE_CHARS)
+            .collect::<String>();
+        self.health = ThreadHealth::StoreFailed {
+            operation,
+            detail: detail.clone(),
+        };
+        self.publish(
+            EventId::generate(self.ids.as_ref()),
+            None,
+            RuntimeEventPayload::StoreFailed { operation, detail },
+        );
+        self.publish_status();
+    }
+
+    fn ensure_admission(&self) -> Result<(), SubmitError> {
+        if self.health.is_failed() {
+            return Err(SubmitError::StoreFailed);
+        }
+        if self.shutting_down {
+            return Err(SubmitError::ShuttingDown);
+        }
+        Ok(())
     }
 
     fn publish(&self, event_id: EventId, turn_id: Option<TurnId>, payload: RuntimeEventPayload) {
@@ -692,6 +795,7 @@ impl ThreadActor {
     fn publish_status(&self) {
         self.status.send_replace(ThreadStatus {
             thread_id: self.thread_id,
+            health: self.health.clone(),
             turn: self
                 .turn
                 .as_ref()
@@ -760,11 +864,14 @@ impl ThreadActor {
                 let _ = reply.send(outcome);
             }
             Command::Record { payload, reply } => {
-                let outcome = self
-                    .commit(*payload)
-                    .await
-                    .map(|event| event.event_id)
-                    .map_err(SubmitError::from);
+                let outcome = match self.ensure_admission() {
+                    Ok(()) => self
+                        .commit(*payload)
+                        .await
+                        .map(|event| event.event_id)
+                        .map_err(|_| SubmitError::StoreFailed),
+                    Err(error) => Err(error),
+                };
                 let _ = reply.send(outcome);
             }
         }
@@ -827,9 +934,7 @@ impl ThreadActor {
         if let Some(prior) = self.already_accepted(&submission) {
             return Ok(prior);
         }
-        if self.shutting_down {
-            return Err(SubmitError::ShuttingDown);
-        }
+        self.ensure_admission()?;
         if self.turn.is_some() && self.pending.len() >= MAX_PENDING_INPUTS {
             return Err(SubmitError::PendingFull {
                 max: MAX_PENDING_INPUTS,
@@ -837,15 +942,14 @@ impl ThreadActor {
         }
 
         let turn_id = TurnId::generate(self.ids.as_ref());
-        let event_id = self.persist_input(turn_id, &submission).await?;
+        let event_id = self
+            .persist_input(turn_id, &submission)
+            .await
+            .map_err(|_| SubmitError::StoreFailed)?;
 
-        if self.turn.is_some() {
-            // FR-02: a single regular turn at a time. The input stays queued
-            // until the active turn reaches its terminal.
-            self.pending.push_back((turn_id, submission));
-        } else {
-            self.start_turn(turn_id, submission).await;
-        }
+        // The durable input remains queued until `start_turn` commits Running.
+        self.pending.push_back((turn_id, submission));
+        self.start_next_turn().await;
         self.publish_status();
         Ok(Accepted { turn_id, event_id })
     }
@@ -858,9 +962,7 @@ impl ThreadActor {
         if let Some(prior) = self.already_accepted(&submission) {
             return Ok(prior);
         }
-        if self.shutting_down {
-            return Err(SubmitError::ShuttingDown);
-        }
+        self.ensure_admission()?;
 
         let Some(running) = self.turn.as_ref() else {
             // The turn reached its terminal before this steer was serialized. A
@@ -892,7 +994,10 @@ impl ThreadActor {
         }
         let inputs = Arc::clone(&running.inputs);
 
-        let event_id = self.persist_input(active, &submission).await?;
+        let event_id = self
+            .persist_input(active, &submission)
+            .await
+            .map_err(|_| SubmitError::StoreFailed)?;
         // Queued only AFTER the event is durable: the engine must never consume
         // an input the log does not carry.
         inputs.push(submission.text);
@@ -940,9 +1045,7 @@ impl ThreadActor {
     /// only then record the fork in the parent. A failure at any step leaves the
     /// parent exactly as it was.
     async fn on_fork(&mut self, at: Option<TurnId>) -> Result<Fork, ForkError> {
-        if self.shutting_down {
-            return Err(SubmitError::ShuttingDown.into());
-        }
+        self.ensure_admission()?;
         if let Some(running) = self.turn.as_ref() {
             // Edge case #12: a moving transcript has no boundary to copy.
             return Err(ForkError::TurnActive {
@@ -955,7 +1058,13 @@ impl ThreadActor {
 
         // Read back rather than trust in-memory state: the cut is a byte offset
         // in the log, so the log is what has to name it.
-        let snapshot = self.store.read().await?;
+        let snapshot = match self.store.read().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.enter_store_failed(StoreOperation::Read, &error);
+                return Err(SubmitError::StoreFailed.into());
+            }
+        };
         let (fork_turn_id, fork_event_id) = resolve_fork_point(&snapshot, at)?;
         let child_thread_id = ThreadId::generate(self.ids.as_ref());
         let point = ForkPoint {
@@ -964,7 +1073,13 @@ impl ThreadActor {
             fork_turn_id,
             fork_event_id,
         };
-        let store = self.store.fork(&point).await?;
+        let store = match self.store.fork(&point).await {
+            Ok(store) => store,
+            Err(error) => {
+                self.enter_store_failed(StoreOperation::Fork, &error);
+                return Err(SubmitError::StoreFailed.into());
+            }
+        };
 
         let event = match self
             .commit(ThreadEventPayload::Forked {
@@ -986,7 +1101,7 @@ impl ThreadActor {
                     error = %err,
                     "branch materialized but its parent could not record it"
                 );
-                return Err(err.into());
+                return Err(SubmitError::StoreFailed.into());
             }
         };
         self.publish(
@@ -1010,9 +1125,41 @@ impl ThreadActor {
         })
     }
 
-    async fn start_turn(&mut self, turn_id: TurnId, submission: Submission) {
+    /// Promotes queued inputs in order. A store fault leaves the front item in
+    /// place, so a healthy reopen can start the accepted turn exactly once.
+    async fn start_next_turn(&mut self) {
+        while self.turn.is_none() && !self.health.is_failed() {
+            let Some((turn_id, submission)) = self.pending.front().cloned() else {
+                break;
+            };
+            match self.start_turn(turn_id, &submission).await {
+                Ok(()) => {
+                    self.pending.pop_front();
+                    if self.turn.is_some() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        thread_id = %self.thread_id,
+                        turn_id = %turn_id,
+                        error = %error,
+                        "queued turn could not be promoted"
+                    );
+                    break;
+                }
+            }
+        }
+        self.publish_status();
+    }
+
+    async fn start_turn(
+        &mut self,
+        turn_id: TurnId,
+        submission: &Submission,
+    ) -> Result<(), StoreError> {
         if self.shutting_down {
-            return;
+            return Ok(());
         }
         // US-006 AC1: captured ONCE, before the transition that starts the turn
         // is written, so the log records the configuration the engine actually
@@ -1082,17 +1229,10 @@ impl ThreadActor {
                             },
                         );
                     }
-                    Err(store_error) => {
-                        tracing::warn!(
-                            thread_id = %self.thread_id,
-                            turn_id = %turn_id,
-                            error = %store_error,
-                            "model runtime refusal could not be persisted"
-                        );
-                    }
+                    Err(store_error) => return Err(store_error),
                 }
                 self.publish_status();
-                return;
+                return Ok(());
             }
         };
         let context = captured.context;
@@ -1114,13 +1254,13 @@ impl ThreadActor {
                     error = %error,
                     "model runtime descriptor not persisted"
                 );
-                return;
+                return Err(error);
             }
             self.resolved_runtimes.insert(fingerprint);
         }
         let mut lifecycle = TurnLifecycle::queued(turn_id);
         let Ok(from) = lifecycle.transition(TurnState::Running) else {
-            return;
+            return Ok(());
         };
         // US-005 AC1: `running` is durable BEFORE the engine exists, so no
         // provider call can happen for a turn the log never started.
@@ -1136,10 +1276,9 @@ impl ThreadActor {
         {
             Ok(event) => event,
             Err(err) => {
-                // The store refused: no engine starts, because its terminal
-                // could not be recorded either. The thread stays commandable.
+                // The input remains queued and admission closes until reopen.
                 tracing::warn!(thread_id = %self.thread_id, turn_id = %turn_id, error = %err, "turn start not persisted");
-                return;
+                return Err(err);
             }
         };
         self.publish(
@@ -1162,7 +1301,7 @@ impl ThreadActor {
         let thread_id = self.thread_id;
         let request = TurnRequest {
             turn_id,
-            text: submission.text,
+            text: submission.text.clone(),
             context,
             model_runtime,
             inputs: Arc::clone(&inputs),
@@ -1195,6 +1334,7 @@ impl ThreadActor {
             inputs,
         });
         self.publish_status();
+        Ok(())
     }
 
     async fn on_turn_finished(&mut self, finished: TurnFinished) {
@@ -1206,7 +1346,8 @@ impl ThreadActor {
         }
         let to = finished.outcome.terminal_state();
         let cause = finished.outcome.cause();
-        let from = match running.lifecycle.transition(to) {
+        let mut terminal = running.lifecycle.clone();
+        let from = match terminal.transition(to) {
             Ok(from) => from,
             Err(err) => {
                 // A terminal was already written: refusing here is what makes a
@@ -1215,10 +1356,16 @@ impl ThreadActor {
                 return;
             }
         };
-        self.record_terminal(finished.turn_id, from, to, cause)
-            .await;
-        if let Some(running) = self.turn.take() {
-            self.release_turn(running).await;
+        if self
+            .record_terminal(finished.turn_id, from, to, cause)
+            .await
+        {
+            if let Some(running) = self.turn.as_mut() {
+                running.lifecycle = terminal;
+            }
+            if let Some(running) = self.turn.take() {
+                self.release_turn(running).await;
+            }
         }
     }
 
@@ -1263,16 +1410,25 @@ impl ThreadActor {
             );
         }
 
-        if let Ok(from) = running.lifecycle.transition(TurnState::Interrupted) {
+        let mut terminal = running.lifecycle.clone();
+        let committed = if let Ok(from) = terminal.transition(TurnState::Interrupted) {
             self.record_terminal(
                 turn_id,
                 from,
                 TurnState::Interrupted,
                 Some("interrupted: task aborted".into()),
             )
-            .await;
+            .await
+        } else {
+            false
+        };
+        if committed {
+            running.lifecycle = terminal;
+            self.release_turn(running).await;
+        } else {
+            self.turn = Some(running);
+            self.publish_status();
         }
-        self.release_turn(running).await;
     }
 
     /// Frees the turn slot after its terminal was written: disarm the abort
@@ -1294,12 +1450,11 @@ impl ThreadActor {
                     Ok(_) => self.pending.push_back((turn_id, submission)),
                     Err(err) => {
                         tracing::warn!(thread_id = %self.thread_id, error = %err, "unconsumed input not re-admitted");
+                        break;
                     }
                 }
             }
-            if let Some((turn_id, submission)) = self.pending.pop_front() {
-                self.start_turn(turn_id, submission).await;
-            }
+            self.start_next_turn().await;
         }
         self.publish_status();
     }
@@ -1310,8 +1465,7 @@ impl ThreadActor {
         from: TurnState,
         to: TurnState,
         cause: Option<String>,
-    ) {
-        self.last_turn = Some(TurnStatus { turn_id, state: to });
+    ) -> bool {
         match self
             .commit(ThreadEventPayload::TurnStateChanged {
                 turn_id,
@@ -1322,19 +1476,10 @@ impl ThreadActor {
             })
             .await
         {
-            Ok(event) => self.publish(
-                event.event_id,
-                Some(turn_id),
-                RuntimeEventPayload::TurnStateChanged {
-                    from: Some(from),
-                    to,
-                    cause,
-                },
-            ),
-            Err(err) => {
-                tracing::warn!(thread_id = %self.thread_id, turn_id = %turn_id, error = %err, "terminal state not persisted");
+            Ok(event) => {
+                self.last_turn = Some(TurnStatus { turn_id, state: to });
                 self.publish(
-                    EventId::generate(self.ids.as_ref()),
+                    event.event_id,
                     Some(turn_id),
                     RuntimeEventPayload::TurnStateChanged {
                         from: Some(from),
@@ -1342,6 +1487,12 @@ impl ThreadActor {
                         cause,
                     },
                 );
+                self.publish_status();
+                true
+            }
+            Err(err) => {
+                tracing::warn!(thread_id = %self.thread_id, turn_id = %turn_id, error = %err, "terminal state not persisted");
+                false
             }
         }
     }
@@ -1416,16 +1567,24 @@ impl ThreadActor {
             self.on_turn_finished(finished).await;
         }
         // A turn still alive here was force-stopped and owes its single terminal.
-        if let Some(running) = self.turn.as_mut() {
+        if !self.health.is_failed()
+            && let Some(running) = self.turn.as_ref()
+        {
             let turn_id = running.lifecycle.turn_id();
-            if let Ok(from) = running.lifecycle.transition(TurnState::Interrupted) {
+            let mut terminal = running.lifecycle.clone();
+            if let Ok(from) = terminal.transition(TurnState::Interrupted) {
                 let cause = if aborted {
                     "shutdown: task aborted"
                 } else {
                     "shutdown"
                 };
-                self.record_terminal(turn_id, from, TurnState::Interrupted, Some(cause.into()))
-                    .await;
+                if self
+                    .record_terminal(turn_id, from, TurnState::Interrupted, Some(cause.into()))
+                    .await
+                    && let Some(running) = self.turn.as_mut()
+                {
+                    running.lifecycle = terminal;
+                }
             }
         }
         self.turn = None;
@@ -1434,6 +1593,7 @@ impl ThreadActor {
         self.publish_status();
         if let Err(err) = self.store.close().await {
             tracing::warn!(thread_id = %self.thread_id, error = %err, "thread store close failed");
+            self.enter_store_failed(StoreOperation::Close, &err);
         }
     }
 }

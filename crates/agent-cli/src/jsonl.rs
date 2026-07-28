@@ -77,6 +77,21 @@ struct EventLine<'a> {
     identity: &'a EventIdentity,
 }
 
+#[derive(Serialize)]
+struct StoreFailedLine<'a> {
+    schema: u32,
+    r#type: &'static str,
+    data: StoreFailedData<'a>,
+}
+
+#[derive(Serialize)]
+struct StoreFailedData<'a> {
+    operation: agent_runtime::StoreOperation,
+    detail: &'a str,
+    #[serde(flatten)]
+    identity: &'a EventIdentity,
+}
+
 /// How a headless run ended, as the runtime reports it.
 ///
 /// `Interrupted` is the variant `HeadlessEnd` never had: before EP-005 nothing
@@ -204,6 +219,33 @@ impl EventWriter {
         }
     }
 
+    /// Live-only machine event for a writer that can no longer persist its own
+    /// health transition.
+    pub fn thread_store_failed(
+        &mut self,
+        operation: agent_runtime::StoreOperation,
+        detail: &str,
+        identity: &EventIdentity,
+    ) {
+        if self.format != OutputFormat::Json {
+            eprintln!("[runtime] thread store failed during {operation}: {detail}");
+            return;
+        }
+        let line = StoreFailedLine {
+            schema: SCHEMA_VERSION,
+            r#type: "thread_store_failed",
+            data: StoreFailedData {
+                operation,
+                detail,
+                identity,
+            },
+        };
+        match serde_json::to_string(&line) {
+            Ok(json) => write_line(&json),
+            Err(err) => eprintln!("[jsonl] store failure not serializable: {err}"),
+        }
+    }
+
     /// Last line of the run (AC3, AC6). `exit_code` distinguishes a success from a
     /// failure for a caller that would only read the return code.
     pub fn run_summary(&mut self, session_id: &str, ended: &RunEnd, identity: &EventIdentity) {
@@ -280,6 +322,34 @@ mod tests {
         let value = line_of(&AgentEvent::EndTurn);
         assert_eq!(value["schema"], SCHEMA_VERSION);
         assert_eq!(value["type"], "end_turn");
+    }
+
+    #[test]
+    fn store_failure_is_a_machine_event_and_an_error_summary() {
+        let identity = EventIdentity {
+            thread_id: Some("thr_test".into()),
+            turn_id: Some("trn_test".into()),
+            event_id: Some("evt_test".into()),
+        };
+        let value = serde_json::to_value(StoreFailedLine {
+            schema: SCHEMA_VERSION,
+            r#type: "thread_store_failed",
+            data: StoreFailedData {
+                operation: agent_runtime::StoreOperation::Append,
+                detail: "writer poisoned",
+                identity: &identity,
+            },
+        })
+        .unwrap();
+        assert_eq!(value["type"], "thread_store_failed");
+        assert_eq!(value["data"]["operation"], "append");
+        assert_eq!(value["data"]["detail"], "writer poisoned");
+        assert_eq!(value["data"]["thread_id"], "thr_test");
+
+        let (end, detail, exit_code) = RunEnd::Error("store failed".into()).parts();
+        assert_eq!(end, "error");
+        assert_eq!(detail.as_deref(), Some("store failed"));
+        assert_ne!(exit_code, 0);
     }
 
     /// US-009 AC3/AC5: the plan is emitted on the JSONL stream exactly like any

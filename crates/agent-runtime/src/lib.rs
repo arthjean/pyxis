@@ -38,8 +38,8 @@ pub use context::{
     TurnContextSource, TurnLimits,
 };
 pub use event::{
-    ForkOrigin, THREAD_EVENT_ENTRY, THREAD_META_ENTRY, THREAD_RUNTIME_VERSION, ThreadEvent,
-    ThreadEventPayload,
+    ForkOrigin, RECOVERY_COMMIT_ENTRY, THREAD_EVENT_ENTRY, THREAD_META_ENTRY,
+    THREAD_RUNTIME_VERSION, ThreadEvent, ThreadEventPayload,
 };
 pub use handoff::{AgentHandoff, HandoffDraft, MAX_HANDOFF_SUMMARY, UNTRUSTED_BANNER};
 pub use id::{
@@ -49,7 +49,10 @@ pub use inputs::TurnInputs;
 pub use lifecycle::{LifecycleError, TurnLifecycle, TurnState};
 pub use resume::ResumedThread;
 pub use runner::{RunAgentRunner, TurnOutcome, TurnRequest, TurnRunner};
-pub use store::{ForkPoint, MemoryThreadStore, StoreError, ThreadSnapshot, ThreadStore};
+pub use store::{
+    FailingThreadStore, FailureMode, FailurePoint, ForkPoint, MemoryThreadStore, RecoveryCommit,
+    StoreCall, StoreError, StoreOperation, ThreadSnapshot, ThreadStore,
+};
 pub use supervisor::{
     AgentJournal, AgentSent, AgentSpawned, AgentSpawner, AgentSupervisor, AgentView, ChildParts,
     ChildRequest, MAX_AGENT_TASK, WaitOutcome,
@@ -57,5 +60,5 @@ pub use supervisor::{
 pub use thread::{
     Accepted, COMMAND_MAILBOX, Fork, ForkError, LIVE_EVENT_BUFFER, MAX_PENDING_INPUTS,
     RuntimeError, RuntimeEvent, RuntimeEventPayload, SHUTDOWN_DEADLINE, STRAGGLER_ABORT_AFTER,
-    Submission, SubmitError, ThreadHandle, ThreadOptions, ThreadStatus, TurnStatus,
+    Submission, SubmitError, ThreadHandle, ThreadHealth, ThreadOptions, ThreadStatus, TurnStatus,
 };

@@ -10,12 +10,41 @@
 //! a transition. The runtime owns the `IdGenerator` and the lifecycle; the store
 //! only guarantees that what it accepted survived.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use agent_core::message::Message;
+use serde::{Deserialize, Serialize};
 
 use crate::event::{ForkOrigin, ThreadEvent};
 use crate::id::{EventId, ThreadId, TurnId};
+
+/// Store boundary named in health, diagnostics and deterministic fault plans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoreOperation {
+    Create,
+    Append,
+    CommitRecovery,
+    Flush,
+    Read,
+    Fork,
+    Close,
+}
+
+impl std::fmt::Display for StoreOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Create => "create",
+            Self::Append => "append",
+            Self::CommitRecovery => "commit_recovery",
+            Self::Flush => "flush",
+            Self::Read => "read",
+            Self::Fork => "fork",
+            Self::Close => "close",
+        })
+    }
+}
 
 /// Named failures of a store. Every variant is a refusal to acknowledge: a
 /// caller that gets one must NOT treat the operation as accepted.
@@ -43,6 +72,13 @@ pub enum StoreError {
     /// `fork` from materializing an arbitrary prefix (US-010 AC5).
     #[error("no event {event_id} in this thread log")]
     NoSuchEvent { event_id: EventId },
+    #[error("invalid recovery commit: {0}")]
+    InvalidRecovery(String),
+    #[error("injected thread store failure during {operation}: {detail}")]
+    Injected {
+        operation: StoreOperation,
+        detail: String,
+    },
 }
 
 /// Where a branch is cut and what it must remember about its source (US-010).
@@ -91,6 +127,81 @@ impl ThreadSnapshot {
     }
 }
 
+/// One physical recovery record which expands into ordinary transcript messages
+/// and terminal events during replay. Its single durable append is the crash
+/// boundary: readers either see the complete repair or none of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecoveryCommit {
+    pub repair_id: EventId,
+    pub thread_id: ThreadId,
+    /// Sequence expected before the first embedded closure.
+    pub next_seq: u64,
+    /// Synthetic results for tool calls left unanswered by the crashed process.
+    pub tool_results: Vec<Message>,
+    /// Logical terminal events, each with its own identity and sequence.
+    pub closures: Vec<ThreadEvent>,
+}
+
+impl RecoveryCommit {
+    /// Refuses malformed or misplaced repairs before an adapter mutates state.
+    pub fn validate(&self, thread_id: ThreadId, next_seq: u64) -> Result<(), StoreError> {
+        if self.thread_id != thread_id {
+            return Err(StoreError::ThreadMismatch {
+                holds: thread_id,
+                given: self.thread_id,
+            });
+        }
+        if self.next_seq != next_seq {
+            return Err(StoreError::InvalidRecovery(format!(
+                "repair {} expected seq {}, log expects {next_seq}",
+                self.repair_id, self.next_seq
+            )));
+        }
+        for (index, result) in self.tool_results.iter().enumerate() {
+            result.validate().map_err(|error| {
+                StoreError::InvalidRecovery(format!(
+                    "repair {} has invalid tool result {index}: {error}",
+                    self.repair_id
+                ))
+            })?;
+        }
+
+        let mut event_ids = HashSet::with_capacity(self.closures.len());
+        for (index, event) in self.closures.iter().enumerate() {
+            let expected_seq = next_seq.saturating_add(index as u64);
+            if event.thread_id != thread_id {
+                return Err(StoreError::ThreadMismatch {
+                    holds: thread_id,
+                    given: event.thread_id,
+                });
+            }
+            if event.seq != expected_seq {
+                return Err(StoreError::InvalidRecovery(format!(
+                    "repair {} closure {index} has seq {}, expected {expected_seq}",
+                    self.repair_id, event.seq
+                )));
+            }
+            if !event_ids.insert(event.event_id) {
+                return Err(StoreError::InvalidRecovery(format!(
+                    "repair {} repeats event {}",
+                    self.repair_id, event.event_id
+                )));
+            }
+            if !matches!(
+                &event.payload,
+                crate::event::ThreadEventPayload::TurnStateChanged { to, .. }
+                    if to.is_terminal()
+            ) {
+                return Err(StoreError::InvalidRecovery(format!(
+                    "repair {} closure {index} is not terminal",
+                    self.repair_id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Durable log of ONE thread.
 ///
 /// `create`, `append` and `flush` fail once the store is closed. `read` stays
@@ -104,6 +215,11 @@ pub trait ThreadStore: Send + Sync {
 
     /// Appends an event. Returns only once the event is durable.
     async fn append(&self, event: &ThreadEvent) -> Result<(), StoreError>;
+
+    /// Persists a complete cold-resume repair as one adapter-level unit.
+    /// Replaying the same `repair_id` and body is an idempotent success; reusing
+    /// an identifier for another body is a corruption.
+    async fn commit_recovery(&self, repair: &RecoveryCommit) -> Result<(), StoreError>;
 
     /// Forces every pending byte (data AND metadata) out. Used before copying a
     /// prefix at fork time (US-010).
@@ -135,7 +251,9 @@ pub struct MemoryThreadStore {
 #[derive(Debug, Default)]
 struct MemoryState {
     thread_id: Option<ThreadId>,
+    messages: Vec<Message>,
     events: Vec<ThreadEvent>,
+    repairs: Vec<RecoveryCommit>,
     origin: Option<ForkOrigin>,
     closed: bool,
 }
@@ -147,11 +265,19 @@ impl MemoryThreadStore {
 
     /// Branch of another memory store: bound, pre-filled with the copied prefix
     /// and carrying its provenance.
-    fn branched(thread_id: ThreadId, events: Vec<ThreadEvent>, origin: ForkOrigin) -> Self {
+    fn branched(
+        thread_id: ThreadId,
+        messages: Vec<Message>,
+        events: Vec<ThreadEvent>,
+        repairs: Vec<RecoveryCommit>,
+        origin: ForkOrigin,
+    ) -> Self {
         Self {
             state: std::sync::Mutex::new(MemoryState {
                 thread_id: Some(thread_id),
+                messages,
                 events,
+                repairs,
                 origin: Some(origin),
                 closed: false,
             }),
@@ -202,6 +328,39 @@ impl ThreadStore for MemoryThreadStore {
         Ok(())
     }
 
+    async fn commit_recovery(&self, repair: &RecoveryCommit) -> Result<(), StoreError> {
+        let mut state = self.lock()?;
+        if state.closed {
+            return Err(StoreError::Closed);
+        }
+        if let Some(applied) = state
+            .repairs
+            .iter()
+            .find(|applied| applied.repair_id == repair.repair_id)
+        {
+            return if applied == repair {
+                Ok(())
+            } else {
+                Err(StoreError::InvalidRecovery(format!(
+                    "repair ID {} was reused with another body",
+                    repair.repair_id
+                )))
+            };
+        }
+        let thread_id = state.thread_id.ok_or_else(|| {
+            StoreError::InvalidRecovery("cannot repair an unbound memory store".into())
+        })?;
+        let next_seq = state
+            .events
+            .last()
+            .map_or(1, |event| event.seq.saturating_add(1));
+        repair.validate(thread_id, next_seq)?;
+        state.messages.extend(repair.tool_results.clone());
+        state.events.extend(repair.closures.clone());
+        state.repairs.push(repair.clone());
+        Ok(())
+    }
+
     async fn flush(&self) -> Result<(), StoreError> {
         let state = self.lock()?;
         if state.closed {
@@ -214,7 +373,7 @@ impl ThreadStore for MemoryThreadStore {
         let state = self.lock()?;
         Ok(ThreadSnapshot {
             thread_id: state.thread_id,
-            messages: Vec::new(),
+            messages: state.messages.clone(),
             events: state.events.clone(),
             schema_version: None,
             skipped_partial: false,
@@ -242,9 +401,26 @@ impl ThreadStore for MemoryThreadStore {
             .ok_or(StoreError::NoSuchEvent {
                 event_id: at.fork_event_id,
             })?;
+        let cut_seq = state.events[cut].seq;
+        let repairs = state
+            .repairs
+            .iter()
+            .filter(|repair| repair.next_seq <= cut_seq)
+            .cloned()
+            .map(|mut repair| {
+                repair.closures.retain(|event| event.seq <= cut_seq);
+                repair
+            })
+            .collect::<Vec<_>>();
+        let messages = repairs
+            .iter()
+            .flat_map(|repair| repair.tool_results.iter().cloned())
+            .collect();
         Ok(Arc::new(MemoryThreadStore::branched(
             at.child_thread_id,
+            messages,
             state.events[..=cut].to_vec(),
+            repairs,
             at.origin(),
         )))
     }
@@ -252,6 +428,227 @@ impl ThreadStore for MemoryThreadStore {
     async fn close(&self) -> Result<(), StoreError> {
         self.lock()?.closed = true;
         Ok(())
+    }
+}
+
+/// Whether a configured fault happens before the delegated operation or after
+/// the inner store has been touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureMode {
+    Before,
+    AfterTouch,
+}
+
+/// One deterministic, one-shot store failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailurePoint {
+    pub operation: StoreOperation,
+    pub nth: usize,
+    pub mode: FailureMode,
+    pub detail: String,
+}
+
+impl FailurePoint {
+    pub fn before(operation: StoreOperation, nth: usize, detail: impl Into<String>) -> Self {
+        Self {
+            operation,
+            nth: nth.max(1),
+            mode: FailureMode::Before,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn after_touch(operation: StoreOperation, nth: usize, detail: impl Into<String>) -> Self {
+        Self {
+            operation,
+            nth: nth.max(1),
+            mode: FailureMode::AfterTouch,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// One attempted store call, including its per-operation ordinal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoreCall {
+    pub operation: StoreOperation,
+    pub ordinal: usize,
+}
+
+#[derive(Debug)]
+enum FaultDisposition {
+    Pass,
+    Fail(FailureMode, String),
+}
+
+struct FailingState {
+    failure: Option<FailurePoint>,
+    counts: HashMap<StoreOperation, usize>,
+    calls: Vec<StoreCall>,
+    poisoned: bool,
+}
+
+/// Deterministic fault-injection adapter used by actor and recovery contracts.
+///
+/// A configured fault fires exactly once. An append or recovery commit that
+/// touches the inner writer before failing poisons subsequent mutations, while
+/// `read` remains available for inspection and restart assertions.
+pub struct FailingThreadStore {
+    inner: Arc<dyn ThreadStore>,
+    state: Mutex<FailingState>,
+}
+
+impl FailingThreadStore {
+    pub fn new(inner: Arc<dyn ThreadStore>, failure: FailurePoint) -> Self {
+        Self {
+            inner,
+            state: Mutex::new(FailingState {
+                failure: Some(failure),
+                counts: HashMap::new(),
+                calls: Vec::new(),
+                poisoned: false,
+            }),
+        }
+    }
+
+    pub fn calls(&self) -> Result<Vec<StoreCall>, StoreError> {
+        Ok(self.lock()?.calls.clone())
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, FailingState>, StoreError> {
+        self.state
+            .lock()
+            .map_err(|_| StoreError::Io("poisoned failing-store lock".into()))
+    }
+
+    fn begin(&self, operation: StoreOperation) -> Result<FaultDisposition, StoreError> {
+        let mut state = self.lock()?;
+        let ordinal = {
+            let count = state.counts.entry(operation).or_default();
+            *count = count.saturating_add(1);
+            *count
+        };
+        state.calls.push(StoreCall { operation, ordinal });
+        if state.poisoned && operation != StoreOperation::Read {
+            return Err(StoreError::Poisoned);
+        }
+        let should_fail = state
+            .failure
+            .as_ref()
+            .is_some_and(|point| point.operation == operation && point.nth == ordinal);
+        if should_fail {
+            let point = state.failure.take().ok_or_else(|| {
+                StoreError::Io("failing-store fault disappeared while selected".into())
+            })?;
+            Ok(FaultDisposition::Fail(point.mode, point.detail))
+        } else {
+            Ok(FaultDisposition::Pass)
+        }
+    }
+
+    fn injected(operation: StoreOperation, detail: String) -> StoreError {
+        StoreError::Injected { operation, detail }
+    }
+
+    fn poison(&self) -> Result<(), StoreError> {
+        self.lock()?.poisoned = true;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ThreadStore for FailingThreadStore {
+    async fn create(&self, thread_id: &ThreadId) -> Result<(), StoreError> {
+        match self.begin(StoreOperation::Create)? {
+            FaultDisposition::Pass => self.inner.create(thread_id).await,
+            FaultDisposition::Fail(FailureMode::Before, detail) => {
+                Err(Self::injected(StoreOperation::Create, detail))
+            }
+            FaultDisposition::Fail(FailureMode::AfterTouch, detail) => {
+                self.inner.create(thread_id).await?;
+                Err(Self::injected(StoreOperation::Create, detail))
+            }
+        }
+    }
+
+    async fn append(&self, event: &ThreadEvent) -> Result<(), StoreError> {
+        match self.begin(StoreOperation::Append)? {
+            FaultDisposition::Pass => self.inner.append(event).await,
+            FaultDisposition::Fail(FailureMode::Before, detail) => {
+                Err(Self::injected(StoreOperation::Append, detail))
+            }
+            FaultDisposition::Fail(FailureMode::AfterTouch, detail) => {
+                self.inner.append(event).await?;
+                self.poison()?;
+                Err(Self::injected(StoreOperation::Append, detail))
+            }
+        }
+    }
+
+    async fn commit_recovery(&self, repair: &RecoveryCommit) -> Result<(), StoreError> {
+        match self.begin(StoreOperation::CommitRecovery)? {
+            FaultDisposition::Pass => self.inner.commit_recovery(repair).await,
+            FaultDisposition::Fail(FailureMode::Before, detail) => {
+                Err(Self::injected(StoreOperation::CommitRecovery, detail))
+            }
+            FaultDisposition::Fail(FailureMode::AfterTouch, detail) => {
+                self.inner.commit_recovery(repair).await?;
+                self.poison()?;
+                Err(Self::injected(StoreOperation::CommitRecovery, detail))
+            }
+        }
+    }
+
+    async fn flush(&self) -> Result<(), StoreError> {
+        match self.begin(StoreOperation::Flush)? {
+            FaultDisposition::Pass => self.inner.flush().await,
+            FaultDisposition::Fail(FailureMode::Before, detail) => {
+                Err(Self::injected(StoreOperation::Flush, detail))
+            }
+            FaultDisposition::Fail(FailureMode::AfterTouch, detail) => {
+                self.inner.flush().await?;
+                Err(Self::injected(StoreOperation::Flush, detail))
+            }
+        }
+    }
+
+    async fn read(&self) -> Result<ThreadSnapshot, StoreError> {
+        match self.begin(StoreOperation::Read)? {
+            FaultDisposition::Pass => self.inner.read().await,
+            FaultDisposition::Fail(FailureMode::Before, detail) => {
+                Err(Self::injected(StoreOperation::Read, detail))
+            }
+            FaultDisposition::Fail(FailureMode::AfterTouch, detail) => {
+                self.inner.read().await?;
+                Err(Self::injected(StoreOperation::Read, detail))
+            }
+        }
+    }
+
+    async fn fork(&self, at: &ForkPoint) -> Result<Arc<dyn ThreadStore>, StoreError> {
+        match self.begin(StoreOperation::Fork)? {
+            FaultDisposition::Pass => self.inner.fork(at).await,
+            FaultDisposition::Fail(FailureMode::Before, detail) => {
+                Err(Self::injected(StoreOperation::Fork, detail))
+            }
+            FaultDisposition::Fail(FailureMode::AfterTouch, detail) => {
+                self.inner.fork(at).await?;
+                Err(Self::injected(StoreOperation::Fork, detail))
+            }
+        }
+    }
+
+    async fn close(&self) -> Result<(), StoreError> {
+        match self.begin(StoreOperation::Close)? {
+            FaultDisposition::Pass => self.inner.close().await,
+            FaultDisposition::Fail(FailureMode::Before, detail) => {
+                Err(Self::injected(StoreOperation::Close, detail))
+            }
+            FaultDisposition::Fail(FailureMode::AfterTouch, detail) => {
+                self.inner.close().await?;
+                Err(Self::injected(StoreOperation::Close, detail))
+            }
+        }
     }
 }
 
@@ -265,10 +662,11 @@ pub mod contract {
     //! be visible from `agent-session`), so it asserts and unwraps like a test.
     #![allow(clippy::expect_used)]
 
-    use super::{ForkPoint, StoreError, ThreadStore};
+    use super::{ForkPoint, RecoveryCommit, StoreError, ThreadStore};
     use crate::event::{ThreadEvent, ThreadEventPayload};
     use crate::id::{EventId, IdGenerator, SequentialIds, ThreadId, TurnId};
     use crate::lifecycle::TurnState;
+    use agent_core::message::Message;
 
     fn event(
         ids: &dyn IdGenerator,
@@ -352,17 +750,62 @@ pub mod contract {
         assert_eq!(snapshot.events, appended, "events must replay in order");
         assert_eq!(snapshot.next_seq(), 4);
 
-        // 5. An event belonging to another thread is refused, and refusing it
+        // 5. A recovery record expands into ordinary messages and terminal
+        //    events with the next logical sequence.
+        let closure = event(
+            &ids,
+            thread_id,
+            4,
+            ThreadEventPayload::TurnStateChanged {
+                turn_id,
+                from: Some(TurnState::Running),
+                to: TurnState::Interrupted,
+                cause: Some("interrupted: recovered".into()),
+                context: None,
+            },
+        );
+        let tool_result =
+            Message::tool_result_with_trust("call-recovery", "interrupted", true, false);
+        let repair = RecoveryCommit {
+            repair_id: EventId::generate(&ids),
+            thread_id,
+            next_seq: 4,
+            tool_results: vec![tool_result.clone()],
+            closures: vec![closure.clone()],
+        };
+        store
+            .commit_recovery(&repair)
+            .await
+            .expect("commit recovery");
+        store
+            .commit_recovery(&repair)
+            .await
+            .expect("an identical repair is idempotent");
+        let mut collision = repair.clone();
+        collision.tool_results[0] =
+            Message::tool_result_with_trust("call-recovery", "another body", true, false);
+        assert!(matches!(
+            store.commit_recovery(&collision).await,
+            Err(StoreError::InvalidRecovery(_))
+        ));
+        let mut recovered_events = appended.clone();
+        recovered_events.push(closure);
+        let snapshot = store.read().await.expect("read after recovery");
+        assert_eq!(snapshot.messages, [tool_result]);
+        assert_eq!(snapshot.events, recovered_events);
+        assert_eq!(snapshot.next_seq(), 5);
+
+        // 6. An event belonging to another thread is refused, and refusing it
         //    persists nothing.
-        let foreign = event(&ids, other_thread, 4, ThreadEventPayload::ThreadCreated);
+        let foreign = event(&ids, other_thread, 5, ThreadEventPayload::ThreadCreated);
         assert!(matches!(
             store.append(&foreign).await,
             Err(StoreError::ThreadMismatch { .. })
         ));
         let snapshot = store.read().await.expect("read after a refused append");
-        assert_eq!(snapshot.events.len(), 3, "a refused append writes nothing");
+        assert_eq!(snapshot.events.len(), 4, "a refused append writes nothing");
 
-        // 6. Flush then close. After close, admission is refused but the durable
+        // 7. Flush then close. After close, admission is refused but the durable
         //    state stays readable.
         store.flush().await.expect("flush");
         store.close().await.expect("close");
@@ -379,7 +822,7 @@ pub mod contract {
 
         let snapshot = store.read().await.expect("read a closed store");
         assert_eq!(snapshot.thread_id, Some(thread_id));
-        assert_eq!(snapshot.events, appended);
+        assert_eq!(snapshot.events, recovered_events);
     }
 
     /// Fork contract (US-010), run on a freshly opened empty store. Kept apart
@@ -422,6 +865,31 @@ pub mod contract {
             store.append(&e).await.expect("append");
             log.push(e);
         }
+        let recovery_result =
+            Message::tool_result_with_trust("fork-future", "interrupted", true, false);
+        let recovered = event(
+            &ids,
+            thread_id,
+            5,
+            ThreadEventPayload::TurnStateChanged {
+                turn_id: second_turn,
+                from: Some(TurnState::Running),
+                to: TurnState::Interrupted,
+                cause: Some("interrupted: recovered".into()),
+                context: None,
+            },
+        );
+        store
+            .commit_recovery(&RecoveryCommit {
+                repair_id: EventId::generate(&ids),
+                thread_id,
+                next_seq: 5,
+                tool_results: vec![recovery_result.clone()],
+                closures: vec![recovered.clone()],
+            })
+            .await
+            .expect("commit later recovery");
+        log.push(recovered);
         // Cut on the terminal of the first turn: everything after it belongs to
         // the parent alone.
         let cut = log[2].event_id;
@@ -455,6 +923,10 @@ pub mod contract {
             snapshot.events,
             log[..3],
             "the child holds the prefix up to the cut, and nothing after it"
+        );
+        assert!(
+            snapshot.messages.is_empty(),
+            "a fork before the recovery excludes its future tool results"
         );
 
         // 3. Parent and child diverge without cross-writes.
@@ -525,5 +997,41 @@ mod tests {
             .await
             .expect("append without create");
         assert_eq!(store.read().await.unwrap().events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_thousand_fault_runs_are_scheduler_and_network_independent() {
+        for _ in 0..1_000 {
+            let ids = SequentialIds::new();
+            let inner = Arc::new(MemoryThreadStore::new());
+            let thread_id = ThreadId::generate(&ids);
+            inner.create(&thread_id).await.unwrap();
+            let store = FailingThreadStore::new(
+                Arc::clone(&inner) as Arc<dyn ThreadStore>,
+                FailurePoint::after_touch(StoreOperation::Append, 1, "deterministic cut"),
+            );
+            let event = ThreadEvent {
+                event_id: EventId::generate(&ids),
+                thread_id,
+                seq: 1,
+                at_ms: 42,
+                payload: ThreadEventPayload::ThreadCreated,
+            };
+            assert!(matches!(
+                store.append(&event).await,
+                Err(StoreError::Injected {
+                    operation: StoreOperation::Append,
+                    ..
+                })
+            ));
+            assert_eq!(
+                inner.read().await.unwrap().events,
+                std::slice::from_ref(&event)
+            );
+            assert!(matches!(
+                store.append(&event).await,
+                Err(StoreError::Poisoned)
+            ));
+        }
     }
 }

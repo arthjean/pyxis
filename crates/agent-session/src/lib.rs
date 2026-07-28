@@ -28,8 +28,11 @@ use agent_core::CompactKind;
 use agent_core::compaction::is_summary_message;
 use agent_core::message::{ContentBlock, Message, Role};
 use agent_core::session::{FileSnapshot, Session, SessionEntry, SessionError};
-use agent_runtime::event::{ForkOrigin, THREAD_EVENT_ENTRY, THREAD_META_ENTRY, ThreadEvent};
+use agent_runtime::event::{
+    ForkOrigin, RECOVERY_COMMIT_ENTRY, THREAD_EVENT_ENTRY, THREAD_META_ENTRY, ThreadEvent,
+};
 use agent_runtime::id::ThreadId;
+use agent_runtime::store::RecoveryCommit;
 use serde::{Deserialize, Serialize};
 
 pub mod thread_store;
@@ -71,6 +74,7 @@ pub(crate) enum ThreadLine {
         origin: Option<ForkOrigin>,
     },
     ThreadEvent(ThreadEvent),
+    RecoveryCommit(RecoveryCommit),
 }
 
 pub(crate) enum LogLine {
@@ -85,7 +89,9 @@ pub(crate) fn parse_log_line(line: &str) -> Result<LogLine, serde_json::Error> {
     let is_thread_line = value
         .get("entry")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|tag| tag == THREAD_META_ENTRY || tag == THREAD_EVENT_ENTRY);
+        .is_some_and(|tag| {
+            tag == THREAD_META_ENTRY || tag == THREAD_EVENT_ENTRY || tag == RECOVERY_COMMIT_ENTRY
+        });
     if is_thread_line {
         serde_json::from_value::<ThreadLine>(value).map(LogLine::Thread)
     } else {
@@ -371,6 +377,11 @@ pub struct ResumedSession {
     pub origin: Option<ForkOrigin>,
     /// Orchestration events replayed in file order (EP-001).
     pub thread_events: Vec<ThreadEvent>,
+    /// Recovery bodies already applied while replaying this file. Kept
+    /// adapter-internal so `commit_recovery` can make repair IDs idempotent
+    /// across process restarts without exposing persistence metadata at the
+    /// runtime snapshot boundary.
+    pub(crate) recovery_commits: Vec<RecoveryCommit>,
 }
 
 /// Resumes the session of a directory (`<dir>/session.jsonl`).
@@ -488,6 +499,41 @@ fn replay_line(
                     out.origin = origin;
                 }
                 LogLine::Thread(ThreadLine::ThreadEvent(event)) => out.thread_events.push(event),
+                LogLine::Thread(ThreadLine::RecoveryCommit(repair)) => {
+                    let thread_id = out.thread_id.ok_or_else(|| SessionError::Corrupt {
+                        offset: start as u64,
+                        detail: "recovery commit precedes the thread binding".into(),
+                    })?;
+                    if let Some(applied) = out
+                        .recovery_commits
+                        .iter()
+                        .find(|applied| applied.repair_id == repair.repair_id)
+                    {
+                        if applied != &repair {
+                            return Err(SessionError::Corrupt {
+                                offset: start as u64,
+                                detail: format!(
+                                    "repair ID {} was reused with another body",
+                                    repair.repair_id
+                                ),
+                            });
+                        }
+                    } else {
+                        let next_seq = out
+                            .thread_events
+                            .last()
+                            .map_or(1, |event| event.seq.saturating_add(1));
+                        repair.validate(thread_id, next_seq).map_err(|error| {
+                            SessionError::Corrupt {
+                                offset: start as u64,
+                                detail: error.to_string(),
+                            }
+                        })?;
+                        out.messages.extend(repair.tool_results.clone());
+                        out.thread_events.extend(repair.closures.clone());
+                        out.recovery_commits.push(repair);
+                    }
+                }
             }
             out.valid_bytes = if has_newline {
                 (start + raw_len + 1) as u64
