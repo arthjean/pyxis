@@ -400,6 +400,156 @@ pub async fn start_on(
     }
 }
 
+// ───────── sub-agents (EP-004) ─────────
+
+/// One child's provider script. `fatal` makes its errors non-retryable, which
+/// is how a test gets a child that actually fails instead of one the engine
+/// patiently retries.
+pub struct ChildScript {
+    pub turns: Vec<Scripted>,
+    pub fatal: bool,
+}
+
+impl ChildScript {
+    pub fn new(turns: Vec<Scripted>) -> Self {
+        Self {
+            turns,
+            fatal: false,
+        }
+    }
+
+    pub fn fatal(turns: Vec<Scripted>) -> Self {
+        Self { turns, fatal: true }
+    }
+}
+
+/// What a test keeps of a spawned child: its store and its provider, so both
+/// its durable log and the requests it made are assertable.
+type SpawnedChild = (
+    agent_runtime::id::AgentId,
+    Arc<MemoryThreadStore>,
+    Arc<FakeProvider>,
+);
+
+/// Builds children out of the same fakes as the parent (US-013).
+///
+/// One provider script per spawn, handed out in order. The requests it received
+/// and the store of each child stay reachable, so a test can assert what a child
+/// was asked to do and what its own durable log holds.
+pub struct ScriptedSpawner {
+    scripts: Mutex<VecDeque<ChildScript>>,
+    seen: Mutex<Vec<agent_runtime::supervisor::ChildRequest>>,
+    children: Mutex<Vec<SpawnedChild>>,
+    /// Observed at the START of each spawn: what the parent had already done
+    /// before the child existed at all.
+    before_create: Mutex<Vec<usize>>,
+    parent_store: Mutex<Option<Arc<MemoryThreadStore>>>,
+    /// Refuses every spawn, to exercise the failure path.
+    broken: bool,
+}
+
+impl ScriptedSpawner {
+    pub fn new(scripts: Vec<ChildScript>) -> Arc<Self> {
+        Arc::new(Self {
+            scripts: Mutex::new(scripts.into()),
+            seen: Mutex::new(Vec::new()),
+            children: Mutex::new(Vec::new()),
+            before_create: Mutex::new(Vec::new()),
+            parent_store: Mutex::new(None),
+            broken: false,
+        })
+    }
+
+    pub fn broken() -> Arc<Self> {
+        let mut spawner = Self::new(Vec::new());
+        Arc::get_mut(&mut spawner).unwrap().broken = true;
+        spawner
+    }
+
+    /// Watches the parent's log at the instant each child is created.
+    pub fn watch(&self, parent: Arc<MemoryThreadStore>) {
+        *self.parent_store.lock().unwrap() = Some(parent);
+    }
+
+    pub fn requests(&self) -> Vec<agent_runtime::supervisor::ChildRequest> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    pub fn store_of(&self, agent_id: agent_runtime::id::AgentId) -> Arc<MemoryThreadStore> {
+        self.children
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, ..)| *id == agent_id)
+            .map(|(_, store, _)| Arc::clone(store))
+            .expect("a child store for this agent")
+    }
+
+    pub fn provider_of(&self, agent_id: agent_runtime::id::AgentId) -> Arc<FakeProvider> {
+        self.children
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, ..)| *id == agent_id)
+            .map(|(.., provider)| Arc::clone(provider))
+            .expect("a child provider for this agent")
+    }
+
+    /// Events the parent's log already held when each child was created.
+    pub fn parent_events_before_create(&self) -> Vec<usize> {
+        self.before_create.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl agent_runtime::supervisor::AgentSpawner for ScriptedSpawner {
+    async fn spawn(
+        &self,
+        request: &agent_runtime::supervisor::ChildRequest,
+    ) -> Result<agent_runtime::supervisor::ChildParts, String> {
+        if self.broken {
+            return Err("store enfant indisponible".into());
+        }
+        let watched = self.parent_store.lock().unwrap().clone();
+        if let Some(parent) = watched {
+            let events = parent.read().await.map(|s| s.events.len()).unwrap_or(0);
+            self.before_create.lock().unwrap().push(events);
+        }
+        self.seen.lock().unwrap().push(request.clone());
+        let script = self
+            .scripts
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| ChildScript::new(Vec::new()));
+        let provider = if script.fatal {
+            FakeProvider::failing(script.turns)
+        } else {
+            FakeProvider::new(script.turns)
+        };
+        let store = Arc::new(MemoryThreadStore::new());
+        self.children.lock().unwrap().push((
+            request.agent_id,
+            Arc::clone(&store),
+            Arc::clone(&provider),
+        ));
+        Ok(agent_runtime::supervisor::ChildParts {
+            store: store as Arc<dyn ThreadStore>,
+            runner: Arc::new(agent_runtime::runner::RunAgentRunner::new(
+                deps(
+                    Arc::clone(&provider),
+                    FakeSession::new(),
+                    Arc::new(EchoTools),
+                ),
+                agent_context,
+            )),
+            turn_contexts: Arc::new(FixedTurnContext::new(turn_context(TurnId::generate(
+                &RandomIds,
+            )))),
+        })
+    }
+}
+
 /// Collects the live event stream until the channel closes.
 pub fn collect_events(
     mut rx: tokio::sync::broadcast::Receiver<RuntimeEvent>,
