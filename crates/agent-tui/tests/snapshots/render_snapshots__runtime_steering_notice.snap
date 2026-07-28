@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"runtime_steering_notice\", &s, W, H)"
+---
+› Explique la boucle d'agent et montre le code
+
+● La boucle est un Stream d'AgentEvent.
+
+
+  Elle rend la main à chaque frontière.
+
+  · Steering the current turn.
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────
+›
+────────────────────────────────────────────────────────────────────────────────
+gpt-5 · pyxis · Ask for approval           ctrl+j newline · ctrl+c twice to quit

@@ -23,7 +23,10 @@ expect_used = "warn"
 unwrap_in_result = "warn"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync"] }
+# `signal`: the headless client turns Ctrl+C into a runtime interruption
+# (US-018 AC5) instead of letting the default handler kill the process in the
+# middle of a durable write.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal"] }
 # Thread runtime (EP-001): `CancellationToken` gives the PARENT->CHILD cancellation
 # tree the in-house `CancelToken` cannot express, and `TaskTracker` (feature `rt`)
 # accounts for dynamically spawned tasks so a shutdown can wait for them before

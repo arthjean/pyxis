@@ -21,6 +21,7 @@ path = "src/main.rs"
 
 [dependencies]
 agent-core.workspace = true
+agent-runtime.workspace = true
 agent-tokenizer.workspace = true
 agent-session.workspace = true
 agent-auth.workspace = true
@@ -30,6 +31,7 @@ agent-sandbox.workspace = true
 agent-mcp.workspace = true
 agent-tui.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 crossterm.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true

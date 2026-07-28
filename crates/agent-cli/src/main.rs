@@ -8,10 +8,12 @@
 
 mod approver;
 mod context;
+mod headless;
 mod interactive;
 mod jsonl;
 mod observability;
 mod prompt;
+mod runtime;
 mod session;
 mod settings;
 mod skills;
@@ -19,12 +21,12 @@ mod skills;
 use std::sync::Arc;
 
 use agent_auth::{OAuthCredential, ProviderId, store};
+use agent_core::RunConfig;
 use agent_core::clock::SystemClock;
 use agent_core::guardrail::CostBudget;
 use agent_core::message::{Message, recent_untrusted_content};
 use agent_core::provider::Provider;
 use agent_core::sandbox::SandboxPolicy;
-use agent_core::{AgentContext, CancellationToken, Deps, RunConfig};
 use agent_provider::{KEYRING_ACCOUNT, OpenAiChatGptProvider};
 use agent_sandbox::{ProxyPolicy, set_proxy_env};
 use agent_tokenizer::HeuristicCounter;
@@ -36,7 +38,6 @@ use agent_tools::{
 
 use crate::approver::TuiApprover;
 use crate::interactive::InteractiveConfig;
-use crate::session::SharedSession;
 
 const RESUME_TAINT_SCAN_MESSAGES: usize = 8;
 
@@ -1341,24 +1342,12 @@ async fn run(
         (interactive::new_session_path(&sessions_dir), Vec::new())
     };
     provider.set_prompt_cache_key(&interactive::prompt_cache_key_for_session(&current_session));
-    // US-020 AC4: under `--ephemeral` the file is never opened, so nothing can be
-    // written to it. The identifier keeps naming the run in the summary line.
-    let (shared_session, conversation) = if args.ephemeral {
-        SharedSession::ephemeral()
-    } else {
-        let jsonl = agent_session::JsonlSession::create_at(&current_session)
-            .map_err(|e| anyhow::anyhow!("session: {e}"))?;
-        SharedSession::new(jsonl)
-    };
-    if !initial_messages.is_empty() {
-        *conversation
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session: poisoned snapshot"))? = initial_messages;
-    }
-    let initial_taint_recent = recent_untrusted_content(
-        &conversation.lock().map(|g| g.clone()).unwrap_or_default(),
-        RESUME_TAINT_SCAN_MESSAGES,
-    );
+    // US-018 AC4: under `--ephemeral` the durable log is an in-memory adapter, so
+    // no file of any kind is opened. The identifier keeps naming the run in the
+    // summary line. The transcript itself is opened by the thread runtime, which
+    // is the single writer of that file since EP-005.
+    let initial_taint_recent =
+        recent_untrusted_content(&initial_messages, RESUME_TAINT_SCAN_MESSAGES);
 
     // Persistent per-session goal (`/goal`): interactive mode only.
     let goal = if headless {
@@ -1502,148 +1491,63 @@ async fn run(
     // the frontend (which stages the tools of a server connected in session and
     // recomposes the specs at each turn boundary).
     let registry = Arc::new(builder.build());
-    let tool_specs = registry.tool_specs();
-    // US-026/US-027: behavioral guidelines of the tools, collected BEFORE
-    // `registry` is moved into `Deps`. The base system prompt is now
-    // selected PER SLUG (US-027) when composing (headless here, per turn in
-    // interactive mode), not frozen: a `/models` must be able to change the template.
+    // US-026/US-027: behavioral guidelines of the tools. The base system prompt
+    // is selected PER SLUG (US-027) when composing, per turn, not frozen: a
+    // `/models` must be able to change the template.
     let tool_guidelines = registry.behavioral_guidelines();
 
-    // 5. Deps injected into the loop.
-    let deps = Deps {
-        provider,
-        session: shared_session.clone(),
+    // 5. What the thread runtime needs to run a turn. The session is NOT here:
+    // it is the thread log, and `SessionRuntime` is what opens it (EP-005).
+    let engine = runtime::EngineDeps {
+        provider: Arc::clone(&provider),
         tokenizer: Arc::new(HeuristicCounter),
         clock: Arc::new(SystemClock),
         tools: Arc::clone(&registry) as Arc<dyn agent_core::tools::ToolDispatch>,
-        // US-001: base token never signalled. The interactive loop substitutes a
-        // PER-TURN token (`launch_turn`); the headless mode keeps this one.
-        cancel: CancellationToken::new(),
     };
+    let sandbox_scope = sandbox_scope_label(&sandbox.policy, sandbox.enforced);
+    // What every turn is captured from, and what the model sees at each step.
+    // Shared with both clients: TUI and headless drive the SAME runtime.
+    let settings = runtime::SettingsCell::new(runtime::TurnSettings {
+        model: args.model.clone(),
+        reasoning_effort: initial_reasoning_effort.clone(),
+        tool_guidelines: tool_guidelines.clone(),
+        goal: goal.clone(),
+        run_config,
+        permission_mode: settings::permission_mode_id(initial_permission_mode).to_string(),
+        sandbox: sandbox_scope.clone(),
+        workspace: workspace.clone(),
+    });
+    let steps = runtime::CliStepSource::new(Arc::clone(&registry), context_msgs);
 
     // 6. Headless (-p) vs interactive dispatch. Wrapped so that `SessionEnd`
     // fires on every way out, including the failures each branch bails on.
     let output_last_message = args.output_last_message.take();
     let outcome: anyhow::Result<()> = async {
         if let Some(prompt) = args.prompt {
-            // Headless one-shot: fixed slug (`args.model`) -> template selected once.
-            let base = interactive::with_tool_guidelines(
-                prompt::select_system_prompt(&args.model),
-                &tool_guidelines,
-            );
-            // US-017 AC2: the prompt is submitted to the hooks before it becomes a
-            // turn. A refusal names the reason and no turn starts.
-            if let agent_tools::hooks::HookDecision::Deny(reason) = hooks
-                .lifecycle(agent_tools::hooks::Lifecycle::UserPromptSubmit { prompt: &prompt })
-                .await
-            {
-                anyhow::bail!("hook: {reason}");
-            }
-            // US-016: a prompt opening on `/<skill>` injects that skill's instructions
-            // for this turn. An unreadable skill fails the run instead of sending a
-            // turn that would only carry its name.
-            let skill_messages = match skills::invocation(&skills, &prompt) {
-                Some(Ok(injection)) => vec![Message::user(injection.block)],
-                Some(Err(err)) => anyhow::bail!("skill: {err}"),
-                None => Vec::new(),
-            };
-            let mut messages = conversation.lock().map(|g| g.clone()).unwrap_or_default();
-            messages.push(Message::user(prompt));
-            let ctx = AgentContext {
-                model: args.model,
-                reasoning_effort: initial_reasoning_effort.clone(),
-                system: Some(interactive::compose_system(&base, goal.as_deref())),
-                messages,
-                tools: tool_specs,
-                config: run_config,
-                context_messages: context_msgs,
-                ephemeral_messages: skill_messages,
-                // US-018 wires the headless client on the runtime; a one-shot
-                // run has no steering and no mid-run context refresh yet.
-                step_source: None,
-                inputs: None,
-            };
-            let mut events = jsonl::EventWriter::new(args.output_format);
-            // US-018: reference taken BEFORE the turn, on the workspace as it is.
-            // Machine output only: the text format must stay identical to the
-            // character (US-017 AC4), so it has no consumer for this diff
-            // and must not pay for a `git status` per run.
-            let mut diff_tracker = if events.is_json() {
-                Some(agent_tools::turn_diff::TurnDiffTracker::begin(&workspace).await)
-            } else {
-                None
-            };
-            let result =
-                agent_core::run_headless_observed(ctx, deps, |event| events.event(event)).await;
+            let outcome = headless::run(headless::HeadlessRun {
+                prompt,
+                session_path: (!args.ephemeral).then(|| current_session.clone()),
+                session_id: session_id.clone(),
+                workspace: workspace.clone(),
+                output_format: args.output_format,
+                output_last_message,
+                hooks: Arc::clone(&hooks),
+                skills: &skills,
+                registry: Arc::clone(&registry),
+                engine,
+                settings: Arc::clone(&settings),
+                steps: Arc::clone(&steps),
+            })
+            .await;
             // US-012 AC4: a one-shot run leaves no shell session behind, whatever
-            // the outcome below (several paths bail from here).
+            // the outcome (several paths bail from here).
             exec_sessions.shutdown();
-
-            // Aggregated diff after the end of the turn, hence after the last tool write
-            // (US-018 AC6: including when the turn was interrupted).
-            if let Some(tracker) = diff_tracker.as_mut() {
-                match tracker.turn_diff().await {
-                    Ok(diff) if !diff.is_empty() => {
-                        events.event(&agent_core::AgentEvent::TurnDiff(diff))
-                    }
-                    Ok(_) => {}
-                    Err(err) => eprintln!("[diff] {err}"),
-                }
-            }
-            events.run_summary(&session_id, &result.ended);
-
-            // US-017: end of turn. Nothing follows it here, so the hook observes and
-            // a failure of its own is reported, never fatal.
-            if matches!(result.ended, agent_core::HeadlessEnd::EndTurn) {
-                hooks.lifecycle(agent_tools::hooks::Lifecycle::Stop).await;
-            }
-
-            // US-020 AC3: the last assistant message alone, raw, at the requested
-            // destination. Written whatever the outcome, because the exit code is
-            // what tells a pipeline whether the run succeeded; the failure of the
-            // WRITE is reported after the outcome, which owns the exit code.
-            let last_message_write = output_last_message.map(|path| {
-                let text = result
-                    .text
-                    .replace(interactive::GOAL_DONE_MARKER, "")
-                    .trim_end()
-                    .to_string();
-                // A destination outside the writable perimeter is refused by the
-                // sandbox, not widened for it: an argument may come from a script
-                // of the repository (same reasoning as `-c`).
-                std::fs::write(&path, text)
-                    .map_err(|e| anyhow::anyhow!("--output-last-message {path}: {e}"))
-            });
-
-            match result.ended {
-                agent_core::HeadlessEnd::Error(e) => anyhow::bail!("{e}"),
-                agent_core::HeadlessEnd::Exhausted(reason) => anyhow::bail!("stopped: {reason:?}"),
-                agent_core::HeadlessEnd::EndTurn => {}
-            }
-            if let Some(written) = last_message_write {
-                written?;
-            }
-            // In JSON mode, the text already lives in the `text` events: writing it
-            // again would inject non-JSON lines into the stream.
-            if !events.is_json() {
-                // In one-shot mode, no goal loop: we simply remove the marker.
-                let text = result
-                    .text
-                    .replace(interactive::GOAL_DONE_MARKER, "")
-                    .trim_end()
-                    .to_string();
-                print!("{text}");
-                if !text.ends_with('\n') {
-                    println!();
-                }
-            }
+            outcome?;
         } else {
             let cfg = InteractiveConfig {
                 model: args.model,
                 reasoning_effort: initial_reasoning_effort,
-                tool_guidelines,
-                context_messages: context_msgs,
-                run_config,
+                goal,
                 truecolor: agent_tui::supports_truecolor(),
                 // Reduced motion: spinner degraded to a pulsing dot (US-044).
                 reduced_motion: std::env::var_os("NO_COLOR").is_some()
@@ -1651,7 +1555,6 @@ async fn run(
                 // credential loaded above (otherwise we bail) -> connected.
                 connected: true,
                 skills,
-                goal,
                 hooks: Arc::clone(&hooks),
                 hook_specs: config.hooks.clone(),
                 command_hardener: Arc::clone(&mcp_harden),
@@ -1662,19 +1565,20 @@ async fn run(
                 approvals,
                 settings_path,
                 workspace: workspace.clone(),
-                sandbox_scope: sandbox_scope_label(&sandbox.policy, sandbox.enforced),
+                sandbox_scope,
                 // US-005 AC2: computed here, where the layers were resolved. The loop
                 // only filters out the values it changed in session.
                 config_sources: settings::status_sources(&config),
                 profile: config.profile.clone(),
+                engine,
+                settings: Arc::clone(&settings),
+                steps: Arc::clone(&steps),
+                provider: Arc::clone(&provider),
             };
             let outcome = interactive::run(
-                deps,
-                conversation,
                 perm_rx,
                 hook_notice_rx,
                 cfg,
-                shared_session,
                 sessions_dir,
                 current_session,
                 mcp,

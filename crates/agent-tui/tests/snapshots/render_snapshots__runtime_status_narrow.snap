@@ -1,0 +1,36 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"runtime_status_narrow\", &s, NARROW, 32)"
+---
+› Explique la boucle d'agent et montre
+  le code
+
+● La boucle est un Stream d'AgentEvent.
+
+
+  Elle rend la main à chaque frontière.
+
+  · Session status  model: gpt-5
+    reasoning effort: unavailable
+    permissions: Ask for approval
+    sandbox: enforced (workspace)
+    workspace: pyxis  session:
+    20260728-101112.jsonl  thread:
+    th_9f2c4a17b3d84e0192cf5a7b6d3e8140
+     turn:
+    tu_5b1e07d4c2a9f38610be4d27a95c0f3e
+    (running)  pending inputs: 2 (max
+    16 per turn, mailbox 64)
+    sub-agents: 0 active (max 4 active,
+    8 created, depth 1)
+
+
+
+
+
+
+
+────────────────────────────────────────
+›
+────────────────────────────────────────
+gpt-5 · pyxis · As  ctrl+c twice to quit

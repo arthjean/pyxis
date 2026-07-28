@@ -12,7 +12,7 @@
 
 use std::io::Write;
 
-use agent_core::{AgentEvent, HeadlessEnd};
+use agent_core::AgentEvent;
 use serde::Serialize;
 
 /// Version of the event schema. To be incremented as soon as an already emitted line
@@ -52,6 +52,20 @@ pub fn usage_probe_line(view: &agent_core::ModelTurnView) -> Option<String> {
     ))
 }
 
+/// Durable identity of a line (US-018 AC2). Added NEXT TO the existing fields,
+/// never in place of one: a consumer that ignores them reads exactly what it
+/// read before (AC3). Absent when the run has no runtime identity to report,
+/// which keeps them out of the way rather than emitting nulls to handle.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EventIdentity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+}
+
 /// Event line. `event` is flattened: the shape of `AgentEvent`
 /// (`{"type": ..., "data": ...}`) stays visible as is, augmented with the `schema`.
 #[derive(Serialize)]
@@ -59,6 +73,53 @@ struct EventLine<'a> {
     schema: u32,
     #[serde(flatten)]
     event: &'a AgentEvent,
+    #[serde(flatten)]
+    identity: &'a EventIdentity,
+}
+
+/// How a headless run ended, as the runtime reports it.
+///
+/// `Interrupted` is the variant `HeadlessEnd` never had: before EP-005 nothing
+/// could interrupt a `-p` run, so the case could not be observed. It is now
+/// reachable through Ctrl+C and reported as what it is rather than as a
+/// successful end of turn (US-018 AC5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunEnd {
+    EndTurn,
+    Interrupted(Option<String>),
+    Exhausted(String),
+    Error(String),
+}
+
+impl RunEnd {
+    /// Terminal state of the turn, as the durable log names it.
+    pub fn from_terminal(state: agent_runtime::TurnState, cause: Option<String>) -> Self {
+        match state {
+            agent_runtime::TurnState::Completed => Self::EndTurn,
+            agent_runtime::TurnState::Interrupted => Self::Interrupted(cause),
+            // `failed` covers both a real error and a guardrail stop; the cause
+            // the runtime recorded is what tells them apart.
+            _ => match cause {
+                Some(cause) if cause.starts_with("exhausted: ") => {
+                    Self::Exhausted(cause["exhausted: ".len()..].to_string())
+                }
+                Some(cause) => Self::Error(cause),
+                None => Self::Error("turn failed without a recorded cause".into()),
+            },
+        }
+    }
+
+    /// Label, detail and exit code of a run end. The exit code is the ONLY
+    /// thing a pipeline that ignores the stream can read, so it is decided here,
+    /// next to the label, and never twice.
+    fn parts(&self) -> (&'static str, Option<String>, i32) {
+        match self {
+            Self::EndTurn => ("end_turn", None, 0),
+            Self::Interrupted(cause) => ("interrupted", cause.clone(), 1),
+            Self::Exhausted(reason) => ("exhausted", Some(reason.clone()), 1),
+            Self::Error(err) => ("error", Some(err.clone()), 1),
+        }
+    }
 }
 
 /// End-of-run summary (AC3). This is NOT an `AgentEvent`: the session identifier
@@ -78,12 +139,14 @@ struct RunSummary<'a> {
     model_turns: u32,
     input_tokens: u64,
     output_tokens: u64,
-    /// End cause: `end_turn`, `exhausted` or `error`.
+    /// End cause: `end_turn`, `interrupted`, `exhausted` or `error`.
     end: &'static str,
     /// Detail of the cause when there is one.
     #[serde(skip_serializing_if = "Option::is_none")]
     end_detail: Option<String>,
     exit_code: i32,
+    #[serde(flatten)]
+    identity: &'a EventIdentity,
 }
 
 /// Line writer. In `Text` mode, everything is inert: not a byte is written,
@@ -110,10 +173,10 @@ impl EventWriter {
         self.format == OutputFormat::Json
     }
 
-    /// Writes an event and updates the summary accounting. Called
-    /// for EVERY event, including in text mode, so that the counting does not
-    /// depend on the chosen format.
-    pub fn event(&mut self, event: &AgentEvent) {
+    /// Writes an event, with the durable identity the runtime correlated it to,
+    /// and updates the summary accounting. Called for EVERY event, including in
+    /// text mode, so that the counting does not depend on the chosen format.
+    pub fn identified_event(&mut self, event: &AgentEvent, identity: &EventIdentity) {
         if let AgentEvent::ModelTurn(view) = event {
             self.model_turns = self.model_turns.max(view.index);
             self.input_tokens = view.input_tokens;
@@ -131,6 +194,7 @@ impl EventWriter {
         let line = EventLine {
             schema: SCHEMA_VERSION,
             event,
+            identity,
         };
         // A non-serializable event would be a contract bug, not a
         // runtime condition: we report it on stderr without cutting the stream.
@@ -142,15 +206,11 @@ impl EventWriter {
 
     /// Last line of the run (AC3, AC6). `exit_code` distinguishes a success from a
     /// failure for a caller that would only read the return code.
-    pub fn run_summary(&mut self, session_id: &str, ended: &HeadlessEnd) {
+    pub fn run_summary(&mut self, session_id: &str, ended: &RunEnd, identity: &EventIdentity) {
         if self.format != OutputFormat::Json {
             return;
         }
-        let (end, end_detail, exit_code) = match ended {
-            HeadlessEnd::EndTurn => ("end_turn", None, 0),
-            HeadlessEnd::Exhausted(reason) => ("exhausted", Some(format!("{reason:?}")), 1),
-            HeadlessEnd::Error(err) => ("error", Some(err.to_string()), 1),
-        };
+        let (end, end_detail, exit_code) = ended.parts();
         let line = SummaryLine {
             schema: SCHEMA_VERSION,
             r#type: "run_summary",
@@ -162,6 +222,7 @@ impl EventWriter {
                 end,
                 end_detail,
                 exit_code,
+                identity,
             },
         };
         match serde_json::to_string(&line) {
@@ -190,6 +251,7 @@ mod tests {
         let line = EventLine {
             schema: SCHEMA_VERSION,
             event,
+            identity: &EventIdentity::default(),
         };
         serde_json::to_value(&line).unwrap()
     }
@@ -266,6 +328,7 @@ mod tests {
         let json = serde_json::to_string(&EventLine {
             schema: SCHEMA_VERSION,
             event: &event,
+            identity: &EventIdentity::default(),
         })
         .unwrap();
 
@@ -283,12 +346,15 @@ mod tests {
     fn summary_tracks_the_last_cumulative_counters() {
         let mut writer = EventWriter::new(OutputFormat::Text);
         for index in 1..=3 {
-            writer.event(&AgentEvent::ModelTurn(ModelTurnView {
-                index,
-                input_tokens: u64::from(index) * 100,
-                output_tokens: u64::from(index) * 10,
-                ..ModelTurnView::default()
-            }));
+            writer.identified_event(
+                &AgentEvent::ModelTurn(ModelTurnView {
+                    index,
+                    input_tokens: u64::from(index) * 100,
+                    output_tokens: u64::from(index) * 10,
+                    ..ModelTurnView::default()
+                }),
+                &EventIdentity::default(),
+            );
         }
 
         assert_eq!(writer.model_turns, 3);
@@ -333,7 +399,65 @@ mod tests {
         assert!(!writer.is_json());
         // Nothing to observe on stdout: the absence of a write is structural
         // (early return on the format), not a property of this test.
-        writer.event(&AgentEvent::Text("x".into()));
-        writer.run_summary("s.jsonl", &HeadlessEnd::EndTurn);
+        writer.identified_event(&AgentEvent::Text("x".into()), &EventIdentity::default());
+        writer.run_summary("s.jsonl", &RunEnd::EndTurn, &EventIdentity::default());
+    }
+
+    /// US-018 AC2/AC3: the identity is added NEXT TO the existing fields. A line
+    /// read by a client that ignores them is byte-identical to what it was.
+    #[test]
+    fn the_runtime_identity_is_additive() {
+        let event = AgentEvent::Text("bonjour".into());
+        let before = line_of(&event);
+
+        let identity = EventIdentity {
+            thread_id: Some("th_1".into()),
+            turn_id: Some("tu_2".into()),
+            event_id: Some("ev_3".into()),
+        };
+        let after = serde_json::to_value(EventLine {
+            schema: SCHEMA_VERSION,
+            event: &event,
+            identity: &identity,
+        })
+        .unwrap();
+
+        assert_eq!(after["schema"], before["schema"]);
+        assert_eq!(after["type"], before["type"]);
+        assert_eq!(after["data"], before["data"]);
+        assert_eq!(after["thread_id"], "th_1");
+        assert_eq!(after["turn_id"], "tu_2");
+        assert_eq!(after["event_id"], "ev_3");
+    }
+
+    /// US-018 AC5: an interruption is reported as one, with a non-zero exit
+    /// code, instead of borrowing the shape of a clean end of turn.
+    #[test]
+    fn a_terminal_state_maps_to_its_own_end_and_exit_code() {
+        use agent_runtime::TurnState;
+
+        assert_eq!(
+            RunEnd::from_terminal(TurnState::Completed, None),
+            RunEnd::EndTurn
+        );
+        assert_eq!(RunEnd::EndTurn.parts().2, 0);
+
+        let interrupted = RunEnd::from_terminal(TurnState::Interrupted, Some("shutdown".into()));
+        assert_eq!(interrupted.parts().0, "interrupted");
+        assert_eq!(interrupted.parts().2, 1);
+
+        let exhausted =
+            RunEnd::from_terminal(TurnState::Failed, Some("exhausted: MaxTurns(50)".into()));
+        assert_eq!(exhausted, RunEnd::Exhausted("MaxTurns(50)".into()));
+        assert_eq!(exhausted.parts().2, 1);
+
+        let failed = RunEnd::from_terminal(TurnState::Failed, Some("provider down".into()));
+        assert_eq!(failed, RunEnd::Error("provider down".into()));
+
+        // A failed turn without a cause is still an error, named as such.
+        assert!(matches!(
+            RunEnd::from_terminal(TurnState::Failed, None),
+            RunEnd::Error(_)
+        ));
     }
 }

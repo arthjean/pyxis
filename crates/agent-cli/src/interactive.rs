@@ -1,40 +1,48 @@
-//! Interactive loop: assembles the frontend (`agent-tui`), the agent stream
-//! (`agent-core`) and the permission requests into a single `tokio::select`.
+//! Interactive loop: assembles the frontend (`agent-tui`), the thread runtime
+//! (`agent-runtime`) and the permission requests into a single `tokio::select`.
 //!
 //! - Keystrokes arrive from a dedicated thread (crossterm `read()` blocks).
-//! - Each submission spawns `run_agent`; its `AgentEvent` come back through an mpsc.
+//! - Every input is an operation SUBMITTED to a `ThreadHandle`; the turn
+//!   lifecycle, the ordering, the steering and the interruption belong to the
+//!   runtime. This loop owns none of them, which is what US-017 removed: no
+//!   client-side turn object, no turn counter, no direct join handle and no
+//!   post-turn prompt FIFO. A test at the bottom of this file keeps them out.
 //! - A permission request suspends the tool pipeline until the user
 //!   answers (the dialog does NOT freeze the loop: the select keeps rendering
 //!   and reading the keyboard).
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::message::{ContentBlock, Message, recent_untrusted_content};
-use agent_core::{
-    AgentContext, AgentEvent, CancellationToken, Deps, RunConfig, Session, run_agent,
-};
+use agent_core::provider::Provider;
+use agent_core::{AgentEvent, Session};
 use agent_provider::KEYRING_ACCOUNT;
+use agent_runtime::lifecycle::TurnState;
+use agent_runtime::thread::{
+    RuntimeEvent, RuntimeEventPayload, Submission, SubmitError, ThreadStatus,
+};
 use agent_tools::PermissionModeState;
 use agent_tui::{
     AppState, Block, COMMANDS, InputAction, McpServerMeta, McpStatus, SessionMeta,
     blocks_from_messages, default_reasoning_effort_for_model, normalize_reasoning_effort_for_model,
     permission_mode_label, reasoning_effort_label, supported_reasoning_efforts_for_model,
 };
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
+
+use crate::runtime::{CliStepSource, EngineDeps, SessionRuntime, SettingsCell};
 #[cfg(feature = "codex_tui_parity")]
 use agent_tui::{
     BottomPane, ChatSurface, HistoryInserter, InsertHistoryMode, PermissionTranscriptRequest,
     TerminalViewport, TerminalViewportState, TranscriptMapper,
 };
 use crossterm::event::{Event, KeyEventKind, MouseEventKind};
-use futures_util::StreamExt;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 
 use crate::approver::{PermissionMsg, to_prompt};
-use crate::session::SharedSession;
 use crate::settings::{permission_mode_from_arg, permission_mode_id};
 
 /// Maximum number of prompt history entries aggregated per directory.
@@ -54,112 +62,12 @@ enum McpEvent {
     },
 }
 
-struct AgentTurnEvent {
-    turn_id: u64,
-    event: AgentEvent,
-}
-
-/// A message typed while a turn was running. The skill invocation is resolved at
-/// submission, not at dequeue: the user is told right away when a skill is
-/// unusable.
-struct QueuedPrompt {
-    text: String,
-    skill: Option<String>,
-}
-
-struct ActiveTurn {
-    next_id: u64,
-    id: Option<u64>,
-    handle: Option<JoinHandle<()>>,
-    /// US-001: cancellation signal of the current turn, one per turn.
-    cancel: Option<CancellationToken>,
-}
-
-impl ActiveTurn {
-    fn new() -> Self {
-        Self {
-            next_id: 1,
-            id: None,
-            handle: None,
-            cancel: None,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn start(
-        &mut self,
-        conversation: &Arc<Mutex<Vec<Message>>>,
-        cfg: &InteractiveConfig,
-        deps: &Deps,
-        tx: &mpsc::Sender<AgentTurnEvent>,
-        user_msg: &str,
-        persist_user_message: bool,
-        skill_block: Option<String>,
-    ) {
-        self.abort();
-        let turn_id = self.next_id;
-        self.next_id = self.next_id.saturating_add(1);
-        self.id = Some(turn_id);
-        // US-001: every turn carries ITS signal, so that a cancellation cannot
-        // reach the next turn.
-        let cancel = CancellationToken::new();
-        let mut deps = deps.clone();
-        deps.cancel = cancel.clone();
-        self.handle = Some(launch_turn(
-            conversation,
-            cfg,
-            &deps,
-            tx,
-            turn_id,
-            user_msg,
-            persist_user_message,
-            skill_block,
-        ));
-        self.cancel = Some(cancel);
-    }
-
-    fn is_current(&self, turn_id: u64) -> bool {
-        self.id == Some(turn_id)
-    }
-
-    fn finish(&mut self) {
-        self.handle.take();
-        self.cancel.take();
-        self.id = None;
-    }
-
-    /// US-001: requests the COOPERATIVE stop of the turn. The core loop reconciles
-    /// its in-flight tool calls, persists, then emits `Interrupted` itself:
-    /// that event is what closes the turn on the client side, not this call.
-    fn request_cancel(&self) {
-        if let Some(cancel) = &self.cancel {
-            cancel.cancel();
-        }
-    }
-
-    fn abort(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-        }
-        self.cancel.take();
-        self.id = None;
-    }
-}
-
 pub struct InteractiveConfig {
     pub model: String,
     pub reasoning_effort: Option<String>,
-    /// Behavioral guidelines of the tools (US-026), injected into the system
-    /// prompt. Stored raw (not pre-composed) because the base system depends on the
-    /// current slug (US-027) and is recomposed per turn.
-    pub tool_guidelines: Vec<String>,
-    /// Ephemeral project context (AGENTS.md + env, US-028), re-injected on every turn
-    /// into `AgentContext::context_messages` (never persisted).
-    pub context_messages: Vec<Message>,
-    pub run_config: RunConfig,
     /// Tool registry, shared with the loop that dispatches through it. Held here
-    /// because the exposed set moves in session (US-016): the specs of a turn are
-    /// read from it at the turn boundary, never frozen at startup.
+    /// because the exposed set moves in session (US-016): the specs are read from
+    /// it at each step boundary, never frozen at startup.
     pub registry: Arc<agent_tools::Registry>,
     pub truecolor: bool,
     /// Reduced motion (`NO_COLOR` / `PYXIS_REDUCED_MOTION`): spinner degraded to a
@@ -207,6 +115,18 @@ pub struct InteractiveConfig {
     pub config_sources: Vec<(&'static str, &'static str)>,
     /// Profile applied to this session (US-006), shown by `/status`.
     pub profile: Option<String>,
+    /// What a thread needs to run a turn, minus the session: the runtime opens
+    /// that itself (EP-005).
+    pub engine: EngineDeps,
+    /// Configuration every turn is CAPTURED from. The loop writes its session
+    /// changes here; the runtime reads it once per turn.
+    pub settings: Arc<SettingsCell>,
+    /// What the model sees at each step: tool catalog, project context, invoked
+    /// skill bodies.
+    pub steps: Arc<CliStepSource>,
+    /// Kept out of `EngineDeps` reach for the two things the loop does with it
+    /// directly: the prompt cache key of a session, and signing out.
+    pub provider: Arc<dyn Provider>,
 }
 
 /// US-005 AC2: provenance is stated only for the values still as the
@@ -523,9 +443,9 @@ const LOGOUT_SERVER_NOTE: &str = "The ChatGPT session is NOT revoked server-side
 /// disconnect` so the two cannot drift apart. Keyring first: if the provider
 /// forgot the credential while the stored one survived, the next start would
 /// silently reconnect.
-async fn sign_out(deps: &Deps) -> Result<(), String> {
+async fn sign_out(provider: &Arc<dyn Provider>) -> Result<(), String> {
     agent_auth::store::delete(KEYRING_ACCOUNT).map_err(|err| format!("keyring: {err}"))?;
-    deps.provider
+    provider
         .disconnect_auth()
         .await
         .map_err(|err| format!("provider: {err}"))
@@ -559,118 +479,6 @@ fn hooks_report(specs: &[agent_tools::hooks::HookSpec]) -> String {
         ));
     }
     lines.join("\n")
-}
-
-/// Builds the turn context (up-to-date conversation + message) and launches
-/// `run_agent` in a task whose events come back through `tx`.
-#[allow(clippy::too_many_arguments)]
-fn launch_turn(
-    conversation: &Arc<Mutex<Vec<Message>>>,
-    cfg: &InteractiveConfig,
-    deps: &Deps,
-    tx: &mpsc::Sender<AgentTurnEvent>,
-    turn_id: u64,
-    user_msg: &str,
-    persist_user_message: bool,
-    skill_block: Option<String>,
-) -> JoinHandle<()> {
-    let mut msgs = conversation.lock().map(|g| g.clone()).unwrap_or_default();
-    let mut ephemeral_messages = Vec::new();
-    if persist_user_message {
-        msgs.push(Message::user(user_msg.to_string()));
-    } else {
-        ephemeral_messages.push(Message::user(user_msg.to_string()));
-    }
-    // US-016: the skill body is injected for THIS turn only and never persisted,
-    // like the project context. The transcript keeps the `/<name>` the user typed,
-    // which is what says afterwards which skill was injected.
-    if let Some(block) = skill_block {
-        ephemeral_messages.push(Message::user(block));
-    }
-    // US-027: base system prompt selected by the CURRENT slug (recomputed per turn ->
-    // a `/models` changes the template) + tool guidelines + goal directive.
-    let base = with_tool_guidelines(
-        crate::prompt::select_system_prompt(&cfg.model),
-        &cfg.tool_guidelines,
-    );
-    // US-016: the turn boundary is HERE, and it is the only place the exposed set
-    // moves. A server connected while the previous turn was running enters the
-    // registry now, so the model can call its tools from this turn on and no turn
-    // ever sees its tool set change under it (AC4).
-    cfg.registry.commit_staged();
-    let ctx = AgentContext {
-        model: cfg.model.clone(),
-        reasoning_effort: cfg.reasoning_effort.clone(),
-        system: Some(compose_system(&base, cfg.goal.as_deref())),
-        messages: msgs,
-        tools: cfg.registry.tool_specs(),
-        config: cfg.run_config.clone(),
-        // US-028: project context re-injected every turn, never persisted.
-        context_messages: cfg.context_messages.clone(),
-        ephemeral_messages,
-        // US-017 moves this client onto `ThreadHandle`, which is what supplies
-        // the per-step context and the steering queue. Until then the turn keeps
-        // the catalog it was started with.
-        step_source: None,
-        inputs: None,
-    };
-    // The received `Deps` already carries the turn cancellation signal (`ActiveTurn::start`).
-    let deps = deps.clone();
-    let tx = tx.clone();
-    let workspace = cfg.workspace.clone();
-    tokio::spawn(async move {
-        // US-018: diff reference taken before the first round-trip.
-        let mut diff_tracker = agent_tools::turn_diff::TurnDiffTracker::begin(&workspace).await;
-        let stream = run_agent(ctx, deps);
-        futures_util::pin_mut!(stream);
-        // The terminal event is held back long enough to compute the diff: the
-        // interface loop closes the turn as soon as it sees it, and anything
-        // arriving afterwards would be discarded by the `turn_id` filter.
-        let mut terminal: Option<AgentEvent> = None;
-        while let Some(ev) = stream.next().await {
-            if matches!(
-                ev,
-                AgentEvent::EndTurn
-                    | AgentEvent::Interrupted
-                    | AgentEvent::Error(_)
-                    | AgentEvent::Exhausted(_)
-            ) {
-                terminal = Some(ev);
-                break;
-            }
-            if tx
-                .send(AgentTurnEvent { turn_id, event: ev })
-                .await
-                .is_err()
-            {
-                return;
-            }
-        }
-        if let Some(terminal) = terminal {
-            match diff_tracker.turn_diff().await {
-                Ok(diff) if !diff.is_empty() => {
-                    if tx
-                        .send(AgentTurnEvent {
-                            turn_id,
-                            event: AgentEvent::TurnDiff(diff),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                Ok(_) => {}
-                Err(err) => agent_tui::debug_log::log(&format!("turn diff: {err}")),
-            }
-            let _ = tx
-                .send(AgentTurnEvent {
-                    turn_id,
-                    event: terminal,
-                })
-                .await;
-        }
-    })
 }
 
 /// When the last assistant reply carries the completion marker, removes it
@@ -722,18 +530,17 @@ fn write_goal_iters(path: &Path, value: u32) -> std::io::Result<()> {
     std::fs::write(path, value.to_string())
 }
 
+/// Quit path. The turn is NOT killed here: the runtime's shutdown closes
+/// admission, cancels the tree, drains the tasks and writes the terminal the
+/// turn owes. All this does is stop waiting on a human and let the loop exit.
 fn show_shutdown_feedback(
     state: &mut AppState,
-    active_turn: &mut ActiveTurn,
     pending_resp: &mut Option<oneshot::Sender<agent_tools::permission::ApprovalResponse>>,
-    running: &mut bool,
     turn_start: &mut Option<Instant>,
 ) {
     if let Some(resp) = pending_resp.take() {
         let _ = resp.send(agent_tools::permission::ApprovalResponse::DENY_ONCE);
     }
-    active_turn.abort();
-    *running = false;
     *turn_start = None;
     state.end_turn();
     state.show_shutdown_in_progress();
@@ -772,35 +579,130 @@ fn count_encrypted_reasoning(messages: &[Message]) -> usize {
         .sum()
 }
 
-/// Starts the interactive session. Restores the terminal on exit whatever happens.
-#[allow(clippy::too_many_arguments)]
+/// True while the thread is running a turn. Read from the runtime's last-state
+/// signal, never inferred from the events the loop happened to see.
+fn is_running(status: &ThreadStatus) -> bool {
+    status.turn.is_some_and(|turn| !turn.state.is_terminal())
+}
+
+/// Mirrors the runtime's last state into the frontend (US-017 AC5). Thread,
+/// turn, state and queue depth are displayed from HERE: the TUI never re-reads
+/// the store to answer "where am I?".
+fn apply_runtime_status(state: &mut AppState, status: &ThreadStatus) {
+    state.thread_id = status.thread_id.to_string();
+    state.turn_id = status.turn.map(|turn| turn.turn_id.to_string());
+    state.turn_state = status.turn.map(|turn| turn.state.as_str().to_string());
+    state.pending_inputs = status.pending_inputs.saturating_add(status.pending_steers);
+}
+
+/// The v1 orchestration bounds, as `/status` reports them (US-019 AC3).
+///
+/// Read from the runtime CONSTANTS, never from a setting: FR-20 forbids a
+/// configuration key for orchestration in v1, and a `/status` that read one
+/// would be describing a knob that does not exist.
+fn runtime_facts() -> agent_tui::RuntimeFacts {
+    agent_tui::RuntimeFacts {
+        // EP-004 built the supervisor and its five tools but the binary does not
+        // expose them yet, so a session of this version owns no child. Reported
+        // as the zero it is, next to the bounds that would apply.
+        active_agents: 0,
+        max_active_agents: agent_runtime::MAX_ACTIVE_AGENTS,
+        max_agents_per_root: agent_runtime::MAX_AGENTS_PER_ROOT,
+        max_agent_depth: agent_runtime::MAX_AGENT_DEPTH,
+        command_mailbox: agent_runtime::COMMAND_MAILBOX,
+        max_pending_inputs: agent_runtime::MAX_PENDING_INPUTS,
+    }
+}
+
+/// Reads the optional `<turn-id>` argument of `/fork` and `/rewind`.
+///
+/// An identifier that does not parse is refused HERE, before the runtime is
+/// asked for anything: a malformed argument is a typo, not a branch that failed.
+fn parse_turn_argument(arg: &str) -> Result<Option<agent_runtime::TurnId>, String> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return Ok(None);
+    }
+    agent_runtime::TurnId::parse(arg)
+        .map(Some)
+        .map_err(|err| format!("turn id `{arg}`: {err}"))
+}
+
+/// A conversation the loop is driving.
+struct OpenSession {
+    runtime: SessionRuntime,
+    events: broadcast::Receiver<RuntimeEvent>,
+    status: ThreadStatus,
+}
+
+/// Opens the thread whose durable log is `path` and binds the provider's prompt
+/// cache key to it.
+async fn open_session(
+    cfg: &InteractiveConfig,
+    path: &Path,
+    root: &CancellationToken,
+) -> anyhow::Result<OpenSession> {
+    let runtime = SessionRuntime::open(
+        Some(path),
+        cfg.engine.clone(),
+        Arc::clone(&cfg.registry),
+        Arc::clone(&cfg.settings),
+        Arc::clone(&cfg.steps),
+        root,
+    )
+    .await?;
+    cfg.provider
+        .set_prompt_cache_key(&prompt_cache_key_for_session(path));
+    let events = runtime.subscribe();
+    let status = runtime.status();
+    Ok(OpenSession {
+        runtime,
+        events,
+        status,
+    })
+}
+
+/// Pushes the session settings the loop owns into the cell the runtime captures
+/// each turn from. Called after every command that moves one of them, so the
+/// NEXT turn is captured from what the user last asked for.
+fn sync_settings(cfg: &InteractiveConfig) {
+    cfg.settings.update(|settings| {
+        settings.model = cfg.model.clone();
+        settings.reasoning_effort = cfg.reasoning_effort.clone();
+        settings.goal = cfg.goal.clone();
+        settings.permission_mode = permission_mode_id(cfg.permission_mode.get()).to_string();
+    });
+}
+
+/// Starts the interactive session. Restores the terminal on exit whatever
+/// happens, including when the runtime channel closes under it (US-017 AC8).
 pub async fn run(
-    deps: Deps,
-    conversation: Arc<Mutex<Vec<Message>>>,
     perm_rx: mpsc::Receiver<PermissionMsg>,
     hook_notices: mpsc::Receiver<String>,
     cfg: InteractiveConfig,
-    session: Arc<SharedSession>,
     sessions_dir: PathBuf,
     current_session: PathBuf,
     mcp: Arc<Mutex<agent_mcp::McpRegistry>>,
 ) -> anyhow::Result<()> {
+    // Root of the process cancellation tree. Every thread the session opens is a
+    // CHILD of it, so quitting reaches every turn, tool and process descendant.
+    let root = CancellationToken::new();
     let mut tui = agent_tui::enter()?;
     let result = event_loop(
         &mut tui,
-        deps,
-        conversation,
         perm_rx,
         hook_notices,
         cfg,
-        session,
         sessions_dir,
         current_session,
         mcp,
+        &root,
     )
     .await;
     let clear_result = agent_tui::clear(&mut tui);
     agent_tui::leave(&mut tui)?;
+    // Whatever happened above, nothing of this session is left running.
+    root.cancel();
     clear_result?;
     result
 }
@@ -808,15 +710,13 @@ pub async fn run(
 #[allow(clippy::too_many_arguments)]
 async fn event_loop(
     tui: &mut agent_tui::Tui,
-    deps: Deps,
-    conversation: Arc<Mutex<Vec<Message>>>,
     mut perm_rx: mpsc::Receiver<PermissionMsg>,
     mut hook_notices: mpsc::Receiver<String>,
     mut cfg: InteractiveConfig,
-    session: Arc<SharedSession>,
     sessions_dir: PathBuf,
     mut current_session: PathBuf,
     mcp: Arc<Mutex<agent_mcp::McpRegistry>>,
+    root: &CancellationToken,
 ) -> anyhow::Result<()> {
     // US-005 AC2: the values as the CONFIGURATION resolved them. `/models`,
     // `/effort` and `/permissions` change them in session, and a layer name would
@@ -858,7 +758,16 @@ async fn event_loop(
         Some(&current_session),
         PROMPT_HISTORY_CAP,
     ));
-    let initial_messages = conversation.lock().map(|g| g.clone()).unwrap_or_default();
+    // The thread runtime of the CURRENT conversation. `/new`, `/resume`, `/fork`
+    // and `/rewind` replace it wholesale rather than moving a file under a live
+    // writer: a conversation is a thread, and switching conversation is opening
+    // another one.
+    let OpenSession {
+        mut runtime,
+        mut events,
+        mut status,
+    } = open_session(&cfg, &current_session, root).await?;
+    let initial_messages = runtime.messages();
     if !initial_messages.is_empty() {
         state.blocks = blocks_from_messages(&initial_messages);
         state.blocks.push(Block::Notice(format!(
@@ -866,6 +775,7 @@ async fn event_loop(
             initial_messages.len()
         )));
     }
+    apply_runtime_status(&mut state, &status);
     #[cfg(feature = "codex_tui_parity")]
     let mut parity_mapper = TranscriptMapper::new();
     #[cfg(feature = "codex_tui_parity")]
@@ -910,10 +820,8 @@ async fn event_loop(
         }
     });
 
-    let (agent_tx, mut agent_rx) = mpsc::channel::<AgentTurnEvent>(256);
     let (mcp_tx, mut mcp_rx) = mpsc::channel::<McpEvent>(16);
-    let mut running = false;
-    let mut active_turn = ActiveTurn::new();
+    let mut running = is_running(&status);
     // Counter of automatic re-prompts of the goal loop (reset on every
     // user input / new goal).
     let mut goal_iters: u32 = if cfg.goal.is_some() {
@@ -930,7 +838,11 @@ async fn event_loop(
     // branch closes for good once the emitter is gone (no hook declared, or
     // registry dropped), so the loop never spins on a closed channel.
     let mut hook_notices_open = true;
-    let mut queued_prompts: VecDeque<QueuedPrompt> = VecDeque::new();
+    // Aggregated workspace diff of the running turn. Opened when a turn starts,
+    // read when it reaches its terminal.
+    let mut diff_tracker: Option<agent_tools::turn_diff::TurnDiffTracker> = None;
+    // Set when the loop must stop because the runtime went away (AC8).
+    let mut runtime_failure: Option<String> = None;
 
     // Spinner animation tick (US-044). 100 ms is about 10 fps: fluid and nearly free
     // (the render cache serves the baked blocks). `Skip` avoids any redraw burst when
@@ -1070,6 +982,9 @@ async fn event_loop(
                         // US-016: `/<skill> …` injects the skill instructions instead
                         // of sending its name. Resolved HERE, at submission, so an
                         // unreadable skill blocks the turn while the user is looking.
+                        // The body enters the STEP context, so it reaches the next
+                        // model request whether this input opened a turn or steered
+                        // one, and it is still never persisted.
                         let skill = match crate::skills::invocation(&cfg.skills, &prompt) {
                             Some(Ok(injection)) => {
                                 if injection.truncated {
@@ -1078,7 +993,7 @@ async fn event_loop(
                                         injection.name
                                     )));
                                 }
-                                Some(injection.block)
+                                Some((injection.name, injection.block))
                             }
                             Some(Err(err)) => {
                                 state
@@ -1091,25 +1006,56 @@ async fn event_loop(
                             }
                             None => None,
                         };
-                        state.push_user(prompt.clone());
-                        #[cfg(feature = "codex_tui_parity")]
-                        parity_surface.apply_update(parity_mapper.map_user_message(prompt.clone()));
-                        if running {
-                            state.blocks.push(Block::Notice("Message queued.".into()));
-                            queued_prompts.push_back(QueuedPrompt { text: prompt, skill });
-                        } else {
-                            goal_iters = 0;
-                            active_turn.start(
-                                &conversation,
-                                &cfg,
-                                &deps,
-                                &agent_tx,
-                                &prompt,
-                                true,
-                                skill,
-                            );
-                            running = true;
+                        let injected = skill
+                            .as_ref()
+                            .map(|(name, body)| {
+                                let section = format!("skill:{name}");
+                                cfg.steps.inject(section.clone(), body.clone());
+                                section
+                            });
+                        // AC6: `expected_turn_id = None` accepts EITHER branch of
+                        // the steer/terminal race, which is what a typed message
+                        // needs: it steers the turn that is running, or opens one
+                        // of its own if that turn ended meanwhile. Never a
+                        // post-turn FIFO, and never lost.
+                        let was_running = running;
+                        match runtime.steer(Submission::new(prompt.clone()), None).await {
+                            Ok(_) => {
+                                if !was_running {
+                                    goal_iters = 0;
+                                }
+                                state.push_user(prompt.clone());
+                                #[cfg(feature = "codex_tui_parity")]
+                                parity_surface
+                                    .apply_update(parity_mapper.map_user_message(prompt.clone()));
+                                if was_running {
+                                    state.blocks.push(Block::Notice(
+                                        "Steering the current turn.".into(),
+                                    ));
+                                }
+                            }
+                            Err(err) => {
+                                // Only what this input added: another injection
+                                // may belong to the turn that is running.
+                                if let Some(section) = &injected {
+                                    cfg.steps.remove_injection(section);
+                                }
+                                // AC8: a store that refuses is a named error and
+                                // the session goes on; a runtime that STOPPED is
+                                // terminal, because nothing can run any more.
+                                if matches!(err, SubmitError::Stopped) {
+                                    runtime_failure = Some(format!("runtime stopped: {err}"));
+                                    state.should_quit = true;
+                                }
+                                state
+                                    .blocks
+                                    .push(Block::Error(format!("Input refused: {err}")));
+                                state.set_input(prompt);
+                            }
                         }
+                        status = runtime.status();
+                        running = is_running(&status);
+                        apply_runtime_status(&mut state, &status);
                     }
                     InputAction::Command(line) => {
                         let mut it = line.splitn(2, ' ');
@@ -1130,12 +1076,10 @@ async fn event_loop(
                                         "Usage : /models <slug> (ex: /models gpt-5.5)".into(),
                                     ));
                                 } else {
-                                    let removed = conversation
-                                        .lock()
-                                        .map(|msgs| count_encrypted_reasoning(&msgs[..]))
-                                        .unwrap_or_default();
+                                    let removed = count_encrypted_reasoning(&runtime.messages());
                                     if removed > 0
-                                        && let Err(e) = session.redact_encrypted_reasoning().await
+                                        && let Err(e) =
+                                            runtime.session().redact_encrypted_reasoning().await
                                     {
                                         state.blocks.push(Block::Error(format!(
                                             "models: redaction reasoning: {e}"
@@ -1143,7 +1087,8 @@ async fn event_loop(
                                         continue;
                                     }
                                     if removed > 0 {
-                                        let _ = conversation
+                                        let _ = runtime
+                                            .conversation()
                                             .lock()
                                             .map(|mut msgs| scrub_encrypted_reasoning(&mut msgs[..]));
                                     }
@@ -1181,6 +1126,7 @@ async fn event_loop(
                                         cfg.settings_path.as_deref(),
                                         next_effort.as_deref(),
                                     );
+                                    sync_settings(&cfg);
                                 }
                             }
                             "/effort" => {
@@ -1211,6 +1157,7 @@ async fn event_loop(
                                         cfg.settings_path.as_deref(),
                                         Some(&effort),
                                     );
+                                    sync_settings(&cfg);
                                 } else if supported.is_empty() {
                                     state.blocks.push(Block::Notice(format!(
                                         "No known reasoning efforts for model {}",
@@ -1245,6 +1192,7 @@ async fn event_loop(
                                             "settings: failed to save permission mode: {err}"
                                         )));
                                     }
+                                    sync_settings(&cfg);
                                     #[cfg(feature = "codex_tui_parity")]
                                     parity_surface.apply_update(parity_mapper.map_notice(message));
                                 } else {
@@ -1263,6 +1211,7 @@ async fn event_loop(
                                 })),
                                 "clear" => {
                                     cfg.goal = None;
+                                    sync_settings(&cfg);
                                     if let Err(e) = remove_if_exists(&goal_path) {
                                         state.blocks.push(Block::Error(format!("goal: {e}")));
                                     }
@@ -1274,6 +1223,7 @@ async fn event_loop(
                                 g => {
                                     // Sets the goal of this session and starts the work.
                                     cfg.goal = Some(g.to_string());
+                                    sync_settings(&cfg);
                                     if let Err(e) = std::fs::write(&goal_path, g) {
                                         state.blocks.push(Block::Error(format!("goal: {e}")));
                                     }
@@ -1281,201 +1231,197 @@ async fn event_loop(
                                         state.blocks.push(Block::Error(format!("goal: {e}")));
                                     }
                                     goal_iters = 0;
-                                    state.push_user(g);
-                                    #[cfg(feature = "codex_tui_parity")]
-                                    parity_surface
-                                        .apply_update(parity_mapper.map_user_message(g.to_string()));
-                                    active_turn.start(
-                                        &conversation,
-                                        &cfg,
-                                        &deps,
-                                        &agent_tx,
-                                        g,
-                                        true,
-                                        None,
-                                    );
-                                    running = true;
+                                    match runtime.submit(Submission::new(g)).await {
+                                        Ok(_) => {
+                                            state.push_user(g);
+                                            #[cfg(feature = "codex_tui_parity")]
+                                            parity_surface.apply_update(
+                                                parity_mapper.map_user_message(g.to_string()),
+                                            );
+                                        }
+                                        Err(err) => state
+                                            .blocks
+                                            .push(Block::Error(format!("goal refused: {err}"))),
+                                    }
+                                    status = runtime.status();
+                                    running = is_running(&status);
+                                    apply_runtime_status(&mut state, &status);
                                 }
                             },
-                            // resume / new / clear / fork during a turn: we wait
-                            // (the persistence file is being written by the stream).
-                            "/resume" | "/new" | "/clear" | "/fork" if running => {
+                            // A branch is cut at a TERMINAL turn boundary, so these
+                            // wait for the current turn rather than copying a moving
+                            // transcript (edge case #12).
+                            "/resume" | "/new" | "/clear" | "/fork" | "/rewind" if running => {
                                 state.blocks.push(Block::Notice(
                                     "Wait for the current turn to finish.".into(),
                                 ));
                             }
-                            // US-019: forking writes the CURRENT transcript into a new
-                            // file and keeps working there. The original file is closed
-                            // by `switch_file` and stays on disk exactly as it was: the
-                            // fork appends nothing to it.
-                            "/fork" => {
-                                let msgs =
-                                    conversation.lock().map(|g| g.clone()).unwrap_or_default();
-                                let path = new_session_path(&sessions_dir);
-                                if let Err(e) = session.switch_file(&path, 0) {
-                                    state.blocks.push(Block::Error(format!("fork: {e}")));
-                                } else {
-                                    current_session = path;
-                                    goal_path = goal_path_for_session(&current_session);
-                                    goal_iters_path =
-                                        goal_iters_path_for_session(&current_session);
-                                    deps.provider.set_prompt_cache_key(
-                                        &prompt_cache_key_for_session(&current_session),
-                                    );
-                                    // The copy starts from the current state, goal
-                                    // included: a fork that dropped it would not be
-                                    // the same session.
-                                    if let Some(goal) = cfg.goal.clone() {
-                                        if let Err(e) = std::fs::write(&goal_path, &goal) {
-                                            state
-                                                .blocks
-                                                .push(Block::Error(format!("fork: goal: {e}")));
-                                        }
-                                        if let Err(e) =
-                                            write_goal_iters(&goal_iters_path, goal_iters)
-                                        {
-                                            state
-                                                .blocks
-                                                .push(Block::Error(format!("fork: goal: {e}")));
-                                        }
-                                    }
-                                    // Writes the whole transcript into the fresh file:
-                                    // the cursor was reset to 0 by `switch_file`, so
-                                    // `sync` replays everything instead of a delta.
-                                    if let Err(e) = session.sync(&msgs).await {
-                                        state.blocks.push(Block::Error(format!("fork: {e}")));
-                                    } else {
-                                        state.blocks.push(Block::Notice(format!(
-                                            "Session forked ({} messages). The original stays \
-                                             on disk untouched.",
-                                            msgs.len()
-                                        )));
-                                    }
-                                    state.sessions =
-                                        load_sessions(&sessions_dir, &current_session);
-                                }
-                            }
-                            "/resume" => {
-                                let path = match crate::resolve_resume_path(&sessions_dir, arg) {
-                                    Ok(path) => path,
-                                    Err(e) => {
-                                        state.blocks.push(Block::Error(format!("{e}")));
+                            // US-017 AC2/AC3/AC4: the branch is asked of the RUNTIME,
+                            // at a named terminal boundary or at the last one. The
+                            // source thread is neither truncated, rewritten nor
+                            // deleted: it stays on disk exactly as it was, and the
+                            // client switches to the branch.
+                            "/fork" | "/rewind" => {
+                                let at = match parse_turn_argument(arg) {
+                                    Ok(at) => at,
+                                    Err(err) => {
+                                        state.blocks.push(Block::Error(err));
                                         continue;
                                     }
                                 };
-                                match agent_session::resume_file(&path) {
-                                    Ok(r) if !r.messages.is_empty() => {
-                                        let msgs = r.messages;
-                                        if let Err(e) = session.switch_file(&path, msgs.len()) {
-                                            state.blocks.push(Block::Error(format!("resume: {e}")));
-                                        } else {
-                                            current_session = path;
-                                            goal_path = goal_path_for_session(&current_session);
-                                            goal_iters_path =
-                                                goal_iters_path_for_session(&current_session);
-                                            cfg.goal = read_goal(&goal_path);
-                                            goal_iters = if cfg.goal.is_some() {
-                                                read_goal_iters(&goal_iters_path)
-                                            } else {
-                                                0
-                                            };
-                                            deps.provider.set_prompt_cache_key(
-                                                &prompt_cache_key_for_session(&current_session),
-                                            );
-                                            if let Ok(mut g) = conversation.lock() {
-                                                *g = msgs.clone();
-                                            }
-                                            deps.tools.seed_taint(recent_untrusted_content(
-                                                &msgs,
-                                                crate::RESUME_TAINT_SCAN_MESSAGES,
-                                            ));
-                                            state.blocks = blocks_from_messages(&msgs);
-                                            #[cfg(feature = "codex_tui_parity")]
-                                            {
-                                                parity_mapper = TranscriptMapper::new();
-                                                parity_surface = ChatSurface::from_messages(&msgs);
-                                            }
-                                            // Prompt history stays folder-wide.
-                                            state.blocks.push(Block::Notice(format!(
-                                                "Session resumed ({} messages).",
-                                                msgs.len()
-                                            )));
-                                            state.sessions =
-                                                load_sessions(&sessions_dir, &current_session);
-                                        }
+                                if cmd == "/rewind" && at.is_none() {
+                                    state.blocks.push(Block::Notice(
+                                        "Usage: /rewind <turn-id> (see /status for the current turn)"
+                                            .into(),
+                                    ));
+                                    continue;
+                                }
+                                let branch = match runtime.fork(at).await {
+                                    Ok(branch) => branch,
+                                    Err(err) => {
+                                        state
+                                            .blocks
+                                            .push(Block::Error(format!("{cmd}: {err}")));
+                                        continue;
                                     }
-                                    Ok(_) => {
-                                        if let Err(e) = session.switch_file(&path, 0) {
-                                            state.blocks.push(Block::Error(format!("resume: {e}")));
-                                            continue;
-                                        }
+                                };
+                                let Some(path) = branch.path.clone() else {
+                                    state.blocks.push(Block::Error(format!(
+                                        "{cmd}: this session persists nothing to branch from"
+                                    )));
+                                    continue;
+                                };
+                                runtime.shutdown().await;
+                                match open_session(&cfg, &path, root).await {
+                                    Ok(opened) => {
+                                        runtime = opened.runtime;
+                                        events = opened.events;
+                                        status = opened.status;
+                                        running = is_running(&status);
                                         current_session = path;
                                         goal_path = goal_path_for_session(&current_session);
                                         goal_iters_path =
                                             goal_iters_path_for_session(&current_session);
-                                        cfg.goal = read_goal(&goal_path);
+                                        // The branch starts from the current state,
+                                        // goal included: a branch that dropped it
+                                        // would not be the same session.
+                                        if let Some(goal) = cfg.goal.clone() {
+                                            if let Err(e) = std::fs::write(&goal_path, &goal) {
+                                                state.blocks.push(Block::Error(format!(
+                                                    "{cmd}: goal: {e}"
+                                                )));
+                                            }
+                                            if let Err(e) =
+                                                write_goal_iters(&goal_iters_path, goal_iters)
+                                            {
+                                                state.blocks.push(Block::Error(format!(
+                                                    "{cmd}: goal: {e}"
+                                                )));
+                                            }
+                                        }
+                                        let msgs = runtime.messages();
+                                        state.blocks = blocks_from_messages(&msgs);
+                                        #[cfg(feature = "codex_tui_parity")]
+                                        {
+                                            parity_mapper = TranscriptMapper::new();
+                                            parity_surface = ChatSurface::from_messages(&msgs);
+                                        }
+                                        state.blocks.push(Block::Notice(format!(
+                                            "Branch {} created at turn {} ({} messages). The \
+                                             source thread stays on disk untouched.",
+                                            branch.thread_id,
+                                            branch.fork_turn_id,
+                                            msgs.len()
+                                        )));
+                                        state.sessions =
+                                            load_sessions(&sessions_dir, &current_session);
+                                        apply_runtime_status(&mut state, &status);
+                                    }
+                                    Err(err) => {
+                                        runtime_failure =
+                                            Some(format!("{cmd}: branch unusable: {err}"));
+                                        state.should_quit = true;
+                                    }
+                                }
+                            }
+                            "/resume" | "/new" | "/clear" => {
+                                let path = if cmd == "/resume" {
+                                    match crate::resolve_resume_path(&sessions_dir, arg) {
+                                        Ok(path) => path,
+                                        Err(e) => {
+                                            state.blocks.push(Block::Error(format!("{e}")));
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    new_session_path(&sessions_dir)
+                                };
+                                runtime.shutdown().await;
+                                match open_session(&cfg, &path, root).await {
+                                    Ok(opened) => {
+                                        runtime = opened.runtime;
+                                        events = opened.events;
+                                        status = opened.status;
+                                        running = is_running(&status);
+                                        current_session = path;
+                                        goal_path = goal_path_for_session(&current_session);
+                                        goal_iters_path =
+                                            goal_iters_path_for_session(&current_session);
+                                        cfg.goal = if cmd == "/resume" {
+                                            read_goal(&goal_path)
+                                        } else {
+                                            None
+                                        };
+                                        sync_settings(&cfg);
                                         goal_iters = if cfg.goal.is_some() {
                                             read_goal_iters(&goal_iters_path)
                                         } else {
                                             0
                                         };
-                                        deps.provider.set_prompt_cache_key(
-                                            &prompt_cache_key_for_session(&current_session),
-                                        );
-                                        if let Ok(mut g) = conversation.lock() {
-                                            g.clear();
+                                        if cmd != "/resume" {
+                                            if let Err(e) = remove_if_exists(&goal_path) {
+                                                state
+                                                    .blocks
+                                                    .push(Block::Error(format!("goal: {e}")));
+                                            }
+                                            if let Err(e) = remove_if_exists(&goal_iters_path) {
+                                                state
+                                                    .blocks
+                                                    .push(Block::Error(format!("goal: {e}")));
+                                            }
                                         }
-                                        state.blocks.clear();
-                                        state
-                                            .blocks
-                                            .push(Block::Notice("Empty session.".into()));
+                                        let msgs = runtime.messages();
+                                        cfg.engine.tools.seed_taint(recent_untrusted_content(
+                                            &msgs,
+                                            crate::RESUME_TAINT_SCAN_MESSAGES,
+                                        ));
+                                        state.blocks = blocks_from_messages(&msgs);
                                         #[cfg(feature = "codex_tui_parity")]
                                         {
                                             parity_mapper = TranscriptMapper::new();
-                                            parity_surface = ChatSurface::new();
+                                            parity_surface = ChatSurface::from_messages(&msgs);
+                                        }
+                                        // A cleared transcript brings the welcome
+                                        // screen back, which is its own confirmation.
+                                        if !msgs.is_empty() {
+                                            state.blocks.push(Block::Notice(format!(
+                                                "Session resumed ({} messages).",
+                                                msgs.len()
+                                            )));
+                                        } else if cmd == "/resume" {
+                                            state
+                                                .blocks
+                                                .push(Block::Notice("Empty session.".into()));
                                         }
                                         state.sessions =
                                             load_sessions(&sessions_dir, &current_session);
+                                        apply_runtime_status(&mut state, &status);
                                     }
-                                    Err(e) => {
-                                        state.blocks.push(Block::Error(format!("resume: {e}")))
+                                    Err(err) => {
+                                        runtime_failure =
+                                            Some(format!("{cmd}: session unusable: {err}"));
+                                        state.should_quit = true;
                                     }
-                                }
-                            }
-                            // /clear is an alias of /new: same mechanics (new
-                            // session file + cleared context), only the label changes.
-                            "/new" | "/clear" => {
-                                let path = new_session_path(&sessions_dir);
-                                if let Err(e) = session.switch_file(&path, 0) {
-                                    state.blocks.push(Block::Error(format!("{cmd}: {e}")));
-                                } else {
-                                    current_session = path;
-                                    goal_path = goal_path_for_session(&current_session);
-                                    goal_iters_path = goal_iters_path_for_session(&current_session);
-                                    cfg.goal = None;
-                                    goal_iters = 0;
-                                    if let Err(e) = remove_if_exists(&goal_path) {
-                                        state.blocks.push(Block::Error(format!("goal: {e}")));
-                                    }
-                                    if let Err(e) = remove_if_exists(&goal_iters_path) {
-                                        state.blocks.push(Block::Error(format!("goal: {e}")));
-                                    }
-                                    deps.provider.set_prompt_cache_key(
-                                        &prompt_cache_key_for_session(&current_session),
-                                    );
-                                    if let Ok(mut g) = conversation.lock() {
-                                        g.clear();
-                                    }
-                                    // Transcript cleared -> the welcome screen comes back,
-                                    // which serves as visual confirmation (no Notice).
-                                    state.blocks.clear();
-                                    #[cfg(feature = "codex_tui_parity")]
-                                    {
-                                        parity_mapper = TranscriptMapper::new();
-                                        parity_surface = ChatSurface::new();
-                                    }
-                                    state.sessions =
-                                        load_sessions(&sessions_dir, &current_session);
                                 }
                             }
                             // US-005: purely local surfaces (no network call), pushed
@@ -1499,6 +1445,7 @@ async fn event_loop(
                                             sandbox: &cfg.sandbox_scope,
                                             config_sources: &sources,
                                             profile: cfg.profile.as_deref(),
+                                            runtime: runtime_facts(),
                                         },
                                     ),
                                 ));
@@ -1572,7 +1519,7 @@ async fn event_loop(
                             "/logout" if !state.provider_connected => state
                                 .blocks
                                 .push(Block::Notice("Already signed out.".into())),
-                            "/logout" => match sign_out(&deps).await {
+                            "/logout" => match sign_out(&cfg.provider).await {
                                 Ok(()) => {
                                     state.provider_connected = false;
                                     state.blocks.push(Block::Notice(format!(
@@ -1601,54 +1548,61 @@ async fn event_loop(
                                         )));
                                     }
                                     // The transcript keeps `/init`; the instructions
-                                    // travel as an ephemeral block, exactly like a
-                                    // skill body.
-                                    state.push_user(cmd);
-                                    #[cfg(feature = "codex_tui_parity")]
-                                    parity_surface.apply_update(
-                                        parity_mapper.map_user_message(cmd.to_string()),
-                                    );
-                                    active_turn.start(
-                                        &conversation,
-                                        &cfg,
-                                        &deps,
-                                        &agent_tx,
-                                        cmd,
-                                        true,
-                                        Some(INIT_PROMPT.to_string()),
-                                    );
-                                    running = true;
-                                    // AC1: the project context was read before this
-                                    // turn wrote the file, so it is re-read when the
-                                    // turn ends, no restart involved.
-                                    refresh_context = true;
+                                    // travel as a step section, exactly like a skill
+                                    // body, so they are never persisted.
+                                    cfg.steps.inject("init", INIT_PROMPT.to_string());
+                                    match runtime.submit(Submission::new(cmd)).await {
+                                        Ok(_) => {
+                                            state.push_user(cmd);
+                                            #[cfg(feature = "codex_tui_parity")]
+                                            parity_surface.apply_update(
+                                                parity_mapper.map_user_message(cmd.to_string()),
+                                            );
+                                            // AC1: the project context was read before
+                                            // this turn wrote the file, so it is
+                                            // re-read when the turn ends, no restart
+                                            // involved.
+                                            refresh_context = true;
+                                        }
+                                        Err(err) => {
+                                            cfg.steps.clear_injections();
+                                            state
+                                                .blocks
+                                                .push(Block::Error(format!("init refused: {err}")));
+                                        }
+                                    }
+                                    status = runtime.status();
+                                    running = is_running(&status);
+                                    apply_runtime_status(&mut state, &status);
                                 }
                             },
                             "/compact" if running => state.blocks.push(Block::Notice(
                                 "A turn is in progress.".into(),
                             )),
                             "/compact" => {
-                                let mut msgs =
-                                    conversation.lock().map(|g| g.clone()).unwrap_or_default();
+                                let mut msgs = runtime.messages();
                                 let before = msgs.len();
+                                let max_output_tokens =
+                                    cfg.settings.read(|s| s.run_config.max_output_tokens);
                                 match agent_core::compaction::full_compact(
                                     &mut msgs,
                                     &cfg.model,
-                                    deps.provider.as_ref(),
-                                    cfg.run_config.max_output_tokens,
+                                    cfg.provider.as_ref(),
+                                    max_output_tokens,
                                 )
                                 .await
                                 {
                                     // Persisted like an automatic compaction: same
                                     // checkpoint entry, hence replayable by `/resume`
                                     // without the session knowing it was manual.
-                                    Ok(_) => match session
+                                    Ok(_) => match runtime
+                                        .session()
                                         .checkpoint(agent_core::CompactKind::Auto, &msgs)
                                         .await
                                     {
                                         Ok(()) => {
                                             let after = msgs.len();
-                                            if let Ok(mut g) = conversation.lock() {
+                                            if let Ok(mut g) = runtime.conversation().lock() {
                                                 *g = msgs;
                                             }
                                             state.blocks.push(Block::Notice(format!(
@@ -1690,7 +1644,7 @@ async fn event_loop(
                                 // surfaces cannot promise different things.
                                 "subscription codex disconnect" => {
                                     if state.provider_connected {
-                                        match sign_out(&deps).await {
+                                        match sign_out(&cfg.provider).await {
                                             Ok(()) => {
                                                 state.provider_connected = false;
                                                 state.blocks.push(Block::Notice(format!(
@@ -1735,9 +1689,7 @@ async fn event_loop(
                             )),
                             "/quit" => show_shutdown_feedback(
                                 &mut state,
-                                &mut active_turn,
                                 &mut pending_resp,
-                                &mut running,
                                 &mut turn_start,
                             ),
                             other => state
@@ -1748,20 +1700,22 @@ async fn event_loop(
                     }
                     InputAction::Quit => show_shutdown_feedback(
                         &mut state,
-                        &mut active_turn,
                         &mut pending_resp,
-                        &mut running,
                         &mut turn_start,
                     ),
                     InputAction::Interrupt if running => {
                         if let Some(resp) = pending_resp.take() {
                             let _ = resp.send(agent_tools::permission::ApprovalResponse::DENY_ONCE);
                         }
-                        // US-001: no more brutal `abort()` nor fabricated `Interrupted`
-                        // here. We signal, and the turn closes when the
-                        // `Interrupted` emitted by the core arrives, transcript already reconciled
-                        // (`stop` branch below, as for an EndTurn).
-                        active_turn.request_cancel();
+                        // The runtime signals the turn's own cancellation node and
+                        // acknowledges at once; the terminal is written after the
+                        // model, the tools and their process trees have stopped and
+                        // the transcript was reconciled.
+                        if let Err(err) = runtime.interrupt(None).await {
+                            state
+                                .blocks
+                                .push(Block::Error(format!("interrupt: {err}")));
+                        }
                     }
                     InputAction::Interrupt => {}
                     InputAction::Permission { allow, remember } => {
@@ -1777,129 +1731,195 @@ async fn event_loop(
                     _ => {}
                 }
             }
-            ev = agent_rx.recv(), if running => {
-                if let Some(turn_event) = ev {
-                    if !active_turn.is_current(turn_event.turn_id) {
-                        continue;
-                    }
-                    let ev = turn_event.event;
-                    let endturn = matches!(ev, AgentEvent::EndTurn);
-                    let stop = matches!(
-                        ev,
-                        AgentEvent::EndTurn
-                            | AgentEvent::Interrupted
-                            | AgentEvent::Error(_)
-                            | AgentEvent::Exhausted(_)
-                    );
-                    // Calibration probe (US-002): in interactive mode the TUI owns
-                    // the terminal, so the line goes to the debug log, never to a
-                    // process output.
-                    if let AgentEvent::ModelTurn(view) = &ev
-                        && let Some(line) = crate::jsonl::usage_probe_line(view)
-                    {
-                        agent_tui::debug_log::log(&line);
-                    }
-                    state.apply(&ev);
-                    #[cfg(feature = "codex_tui_parity")]
-                    {
-                        for update in parity_mapper.map_event(&ev) {
-                            parity_surface.apply_update(update);
-                        }
-                    }
-                    if stop {
-                        active_turn.finish();
-                        // US-019 AC1: re-read BEFORE any continuation turn is
-                        // launched below, so the goal loop sees the fresh context too.
-                        if std::mem::take(&mut refresh_context) {
-                            cfg.context_messages = crate::context::project_messages(
-                                &cfg.workspace,
-                                &crate::context::today_utc(),
-                                &cfg.skills,
-                            );
-                            state.blocks.push(Block::Notice(
-                                match crate::context::instructions_file(&cfg.workspace) {
-                                    Some(name) => format!(
-                                        "{name} is part of the project context from the next \
-                                         turn on."
-                                    ),
-                                    None => "No instruction file written: the project context \
-                                             is unchanged."
-                                        .to_string(),
-                                },
-                            ));
-                        }
-                        // Goal loop: on a "clean" EndTurn with an active
-                        // goal, we re-prompt as long as the completion marker is
-                        // not emitted (the model does not decide alone to stop).
-                        if endturn && cfg.goal.is_some() && queued_prompts.is_empty() {
-                            if take_goal_done(&mut state) {
-                                cfg.goal = None;
-                                if let Err(e) = remove_if_exists(&goal_path) {
-                                    state.blocks.push(Block::Error(format!("goal: {e}")));
+            received = events.recv() => {
+                match received {
+                    Ok(event) => {
+                        match event.payload {
+                            // US-005 AC2: the engine event is forwarded with its
+                            // canonical content untouched; only its correlation is
+                            // added, and the frontend renders what it always did.
+                            RuntimeEventPayload::Engine(ev) => {
+                                // Calibration probe (US-002): in interactive mode the
+                                // TUI owns the terminal, so the line goes to the debug
+                                // log, never to a process output.
+                                if let AgentEvent::ModelTurn(view) = &ev
+                                    && let Some(line) = crate::jsonl::usage_probe_line(view)
+                                {
+                                    agent_tui::debug_log::log(&line);
                                 }
-                                if let Err(e) = remove_if_exists(&goal_iters_path) {
-                                    state.blocks.push(Block::Error(format!("goal: {e}")));
+                                state.apply(&ev);
+                                #[cfg(feature = "codex_tui_parity")]
+                                {
+                                    for update in parity_mapper.map_event(&ev) {
+                                        parity_surface.apply_update(update);
+                                    }
                                 }
-                                state
-                                    .blocks
-                                    .push(Block::Notice("Goal completed and cleared.".into()));
-                                running = false;
-                            } else if goal_iters < MAX_GOAL_ITERS {
-                                goal_iters += 1;
-                                if let Err(e) = write_goal_iters(&goal_iters_path, goal_iters) {
-                                    state.blocks.push(Block::Error(format!("goal: {e}")));
-                                    running = false;
-                                    continue;
-                                }
-                                state.blocks.push(Block::Notice(format!(
-                                    "Continuing goal ({goal_iters}/{MAX_GOAL_ITERS})..."
-                                )));
-                                turn_start = None;
-                                state.end_turn();
-                                active_turn.start(
-                                    &conversation,
-                                    &cfg,
-                                    &deps,
-                                    &agent_tx,
-                                    GOAL_CONTINUE_PROMPT,
-                                    false,
-                                    None,
-                                );
-                                // running stays true: a new turn is launched.
-                            } else {
-                                state.blocks.push(Block::Notice(format!(
-                                    "Goal not confirmed after {MAX_GOAL_ITERS} retries. \
-                                     Use /goal clear to abandon it."
-                                )));
-                                running = false;
                             }
-                        } else {
-                            running = false;
+                            RuntimeEventPayload::TurnStateChanged { to, .. } => {
+                                if to == TurnState::Running {
+                                    // Diff reference taken when the turn really
+                                    // starts, hence before its first tool write.
+                                    diff_tracker = Some(
+                                        agent_tools::turn_diff::TurnDiffTracker::begin(
+                                            &cfg.workspace,
+                                        )
+                                        .await,
+                                    );
+                                }
+                                if to.is_terminal() {
+                                    // Aggregated after the last tool write, including
+                                    // when the turn was interrupted.
+                                    if let Some(mut tracker) = diff_tracker.take() {
+                                        match tracker.turn_diff().await {
+                                            Ok(diff) if !diff.is_empty() => {
+                                                let ev = AgentEvent::TurnDiff(diff);
+                                                state.apply(&ev);
+                                                #[cfg(feature = "codex_tui_parity")]
+                                                {
+                                                    for update in parity_mapper.map_event(&ev) {
+                                                        parity_surface.apply_update(update);
+                                                    }
+                                                }
+                                            }
+                                            Ok(_) => {}
+                                            Err(err) => agent_tui::debug_log::log(&format!(
+                                                "turn diff: {err}"
+                                            )),
+                                        }
+                                    }
+                                    // US-019 AC1 of the harness PRD: re-read BEFORE any
+                                    // continuation turn, so the goal loop sees the
+                                    // fresh context too.
+                                    if std::mem::take(&mut refresh_context) {
+                                        cfg.steps.set_project(crate::context::project_messages(
+                                            &cfg.workspace,
+                                            &crate::context::today_utc(),
+                                            &cfg.skills,
+                                        ));
+                                        state.blocks.push(Block::Notice(
+                                            match crate::context::instructions_file(&cfg.workspace) {
+                                                Some(name) => format!(
+                                                    "{name} is part of the project context from \
+                                                     the next model request on."
+                                                ),
+                                                None => "No instruction file written: the project \
+                                                         context is unchanged."
+                                                    .to_string(),
+                                            },
+                                        ));
+                                    }
+                                    // The runtime may already have started the next
+                                    // queued input: what it says is what counts.
+                                    status = runtime.status();
+                                    running = is_running(&status);
+                                    // A body injected for a turn survives an input
+                                    // that opens the next one immediately, and is
+                                    // dropped when the thread goes quiet.
+                                    if !running {
+                                        cfg.steps.clear_injections();
+                                    }
+                                    // Goal loop: on a CLEAN end of turn with an active
+                                    // goal and nothing else queued, we re-prompt as
+                                    // long as the completion marker is not emitted.
+                                    if to == TurnState::Completed && cfg.goal.is_some() && !running {
+                                        if take_goal_done(&mut state) {
+                                            cfg.goal = None;
+                                            sync_settings(&cfg);
+                                            if let Err(e) = remove_if_exists(&goal_path) {
+                                                state
+                                                    .blocks
+                                                    .push(Block::Error(format!("goal: {e}")));
+                                            }
+                                            if let Err(e) = remove_if_exists(&goal_iters_path) {
+                                                state
+                                                    .blocks
+                                                    .push(Block::Error(format!("goal: {e}")));
+                                            }
+                                            state.blocks.push(Block::Notice(
+                                                "Goal completed and cleared.".into(),
+                                            ));
+                                        } else if goal_iters < MAX_GOAL_ITERS {
+                                            goal_iters += 1;
+                                            if let Err(e) =
+                                                write_goal_iters(&goal_iters_path, goal_iters)
+                                            {
+                                                state
+                                                    .blocks
+                                                    .push(Block::Error(format!("goal: {e}")));
+                                            } else {
+                                                state.blocks.push(Block::Notice(format!(
+                                                    "Continuing goal \
+                                                     ({goal_iters}/{MAX_GOAL_ITERS})..."
+                                                )));
+                                                turn_start = None;
+                                                state.end_turn();
+                                                // A continuation is an INPUT like any
+                                                // other: durable before it is
+                                                // acknowledged (FR-05), so the log
+                                                // says why the next turn exists.
+                                                if let Err(err) = runtime
+                                                    .submit(Submission::new(GOAL_CONTINUE_PROMPT))
+                                                    .await
+                                                {
+                                                    state.blocks.push(Block::Error(format!(
+                                                        "goal: continuation refused: {err}"
+                                                    )));
+                                                }
+                                            }
+                                        } else {
+                                            state.blocks.push(Block::Notice(format!(
+                                                "Goal not confirmed after {MAX_GOAL_ITERS} \
+                                                 retries. Use /goal clear to abandon it."
+                                            )));
+                                        }
+                                        status = runtime.status();
+                                        running = is_running(&status);
+                                    }
+                                    // `Stop` fires when the agent really stops, hence
+                                    // not when the goal loop or a queued input opens
+                                    // another turn right away.
+                                    if !running && cfg.hooks.watches(agent_tools::HookEvent::Stop) {
+                                        let hooks = Arc::clone(&cfg.hooks);
+                                        hooks.lifecycle(agent_tools::Lifecycle::Stop).await;
+                                    }
+                                }
+                            }
+                            // The input is already in the transcript: it was displayed
+                            // when it was accepted.
+                            RuntimeEventPayload::InputAccepted { .. }
+                            | RuntimeEventPayload::Forked { .. }
+                            | RuntimeEventPayload::ShuttingDown => {}
                         }
-                        if !running
-                            && let Some(next) = queued_prompts.pop_front()
-                        {
-                            goal_iters = 0;
-                            turn_start = None;
-                            state.end_turn();
-                            active_turn.start(
-                                &conversation,
-                                &cfg,
-                                &deps,
-                                &agent_tx,
-                                &next.text,
-                                true,
-                                next.skill,
+                        status = runtime.status();
+                        running = is_running(&status);
+                        apply_runtime_status(&mut state, &status);
+                        // AC8: the actor closed its admission without being asked
+                        // to. Nothing can run any more, so the session ends on a
+                        // named error rather than on a composer that accepts
+                        // input nobody will read.
+                        if status.shutting_down && !state.should_quit {
+                            runtime_failure = Some(
+                                "the thread runtime closed its admission: no further turn can run"
+                                    .into(),
                             );
-                            running = true;
+                            state.should_quit = true;
                         }
-                        // US-017: `Stop` fires when the agent really stops, hence
-                        // not when the goal loop or a queued prompt launches
-                        // another turn right away.
-                        if !running && cfg.hooks.watches(agent_tools::HookEvent::Stop) {
-                            let hooks = Arc::clone(&cfg.hooks);
-                            hooks.lifecycle(agent_tools::Lifecycle::Stop).await;
-                        }
+                    }
+                    // The durable state is the store, so a dropped LIVE event costs
+                    // the display a line, not the session (edge case #18).
+                    Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                        state.blocks.push(Block::Notice(format!(
+                            "{dropped} runtime event(s) dropped from the live stream; the \
+                             transcript on disk stays complete."
+                        )));
+                    }
+                    // AC8: the runtime went away. The terminal is restored by `run`,
+                    // and the session ends on a named error instead of a panic or a
+                    // silent freeze.
+                    Err(broadcast::error::RecvError::Closed) => {
+                        runtime_failure =
+                            Some("the thread runtime stopped: no further turn can run".into());
+                        state.should_quit = true;
                     }
                 }
             }
@@ -2014,8 +2034,14 @@ async fn event_loop(
             }
         }
     }
-    active_turn.abort();
-    Ok(())
+    // Closes admission, cancels the tree, drains the tasks, writes the terminal
+    // the running turn owes and closes the store. No task of this session
+    // outlives the loop.
+    runtime.shutdown().await;
+    match runtime_failure {
+        Some(reason) => Err(anyhow::anyhow!(reason)),
+        None => Ok(()),
+    }
 }
 
 /// Handles `/mcp [<server> <action>]`. Connections (spawn + handshake) are
@@ -2457,14 +2483,125 @@ pub(crate) fn new_session_path(dir: &Path) -> PathBuf {
 mod tests {
     use super::{
         CLIPBOARD_HELPERS, GOAL_DONE_MARKER, INIT_PROMPT, InitDecision, LOGOUT_SERVER_NOTE,
-        approvals_report, clipboard_failure, compose_system, count_encrypted_reasoning,
-        hooks_report, init_decision, last_assistant_text, mcp_requires_trust,
-        scrub_encrypted_reasoning, session_path_from_arg, take_goal_done, workspace_file_mentions,
+        apply_runtime_status, approvals_report, clipboard_failure, compose_system,
+        count_encrypted_reasoning, hooks_report, init_decision, is_running, last_assistant_text,
+        mcp_requires_trust, parse_turn_argument, runtime_facts, scrub_encrypted_reasoning,
+        session_path_from_arg, take_goal_done, workspace_file_mentions,
     };
     use agent_core::message::{ContentBlock, Message};
+    use agent_runtime::lifecycle::TurnState;
+    use agent_runtime::thread::{ThreadStatus, TurnStatus};
     use agent_tui::{AppState, Block};
     use std::path::Path;
     use std::time::SystemTime;
+
+    /// US-017 AC7: the legacy orchestration is GONE, not merely unused. A static
+    /// search is the acceptance criterion itself, so it is the test: leaving two
+    /// orchestrators alive is the epic's second risk, and a dormant one is still
+    /// a second one.
+    #[test]
+    fn no_client_side_turn_orchestration_survives_in_this_loop() {
+        let source = include_str!("interactive.rs");
+        // The needles are split so this very assertion does not match itself.
+        for banned in [
+            concat!("Active", "Turn"),
+            concat!("queued_", "prompts"),
+            concat!("Queued", "Prompt"),
+            concat!("launch_", "turn"),
+            concat!("JoinHandle", "<"),
+            concat!("handle", ".abort()"),
+        ] {
+            assert!(
+                !source.contains(banned),
+                "`{banned}` is back in the interactive loop: the runtime owns the turn lifecycle"
+            );
+        }
+        // And what replaced it is really what the loop drives.
+        assert!(source.contains("runtime.steer("));
+        assert!(source.contains("runtime.interrupt("));
+        assert!(source.contains("runtime.fork("));
+        assert!(source.contains("runtime.shutdown()"));
+    }
+
+    /// US-017 AC5: the frontend reads its thread, turn, state and queue depth
+    /// from the runtime's last-state signal.
+    #[test]
+    fn the_frontend_mirrors_the_runtime_state() {
+        let thread_id = agent_runtime::ThreadId::generate(&agent_runtime::RandomIds);
+        let turn_id = agent_runtime::TurnId::generate(&agent_runtime::RandomIds);
+        let mut state = AppState::new("gpt-5", false);
+
+        let idle = ThreadStatus {
+            thread_id,
+            turn: None,
+            pending_inputs: 0,
+            pending_steers: 0,
+            shutting_down: false,
+        };
+        apply_runtime_status(&mut state, &idle);
+        assert_eq!(state.thread_id, thread_id.to_string());
+        assert_eq!(state.turn_id, None);
+        assert_eq!(state.pending_inputs, 0);
+        assert!(!is_running(&idle), "a thread without a turn is not running");
+
+        let busy = ThreadStatus {
+            turn: Some(TurnStatus {
+                turn_id,
+                state: TurnState::Running,
+            }),
+            // One input waiting for a turn of its own, two steering the running
+            // turn: what the user typed and what is not consumed yet.
+            pending_inputs: 1,
+            pending_steers: 2,
+            ..idle
+        };
+        apply_runtime_status(&mut state, &busy);
+        assert_eq!(state.turn_id.as_deref(), Some(turn_id.to_string().as_str()));
+        assert_eq!(state.turn_state.as_deref(), Some("running"));
+        assert_eq!(state.pending_inputs, 3);
+        assert!(is_running(&busy));
+
+        let done = ThreadStatus {
+            turn: Some(TurnStatus {
+                turn_id,
+                state: TurnState::Completed,
+            }),
+            ..busy
+        };
+        assert!(!is_running(&done), "a terminal turn is not running");
+    }
+
+    /// US-017 AC3: a malformed `<turn-id>` is refused before the runtime is
+    /// asked for anything, and an empty argument means "the last boundary".
+    #[test]
+    fn a_branch_argument_is_a_turn_id_or_nothing() {
+        assert_eq!(parse_turn_argument("   ").unwrap(), None);
+        let turn_id = agent_runtime::TurnId::generate(&agent_runtime::RandomIds);
+        assert_eq!(
+            parse_turn_argument(&turn_id.to_string()).unwrap(),
+            Some(turn_id)
+        );
+        // A thread identifier is not a turn identifier: the prefix is what says so.
+        let thread_id = agent_runtime::ThreadId::generate(&agent_runtime::RandomIds);
+        assert!(parse_turn_argument(&thread_id.to_string()).is_err());
+        assert!(parse_turn_argument("nope").is_err());
+    }
+
+    /// US-019 AC3: `/status` reports the v1 bounds from the runtime CONSTANTS.
+    /// FR-20 forbids a configuration key for them, so a value read from anywhere
+    /// else would be describing a knob that does not exist.
+    #[test]
+    fn the_reported_limits_are_the_runtime_constants() {
+        let facts = runtime_facts();
+        assert_eq!(facts.max_active_agents, agent_runtime::MAX_ACTIVE_AGENTS);
+        assert_eq!(
+            facts.max_agents_per_root,
+            agent_runtime::MAX_AGENTS_PER_ROOT
+        );
+        assert_eq!(facts.max_agent_depth, agent_runtime::MAX_AGENT_DEPTH);
+        assert_eq!(facts.command_mailbox, agent_runtime::COMMAND_MAILBOX);
+        assert_eq!(facts.max_pending_inputs, agent_runtime::MAX_PENDING_INPUTS);
+    }
 
     /// US-013 AC5: the startup connection (US-012) and `/mcp connect` share this
     /// gate, so a repository-controlled declaration never earns a spawn on its own.

@@ -19,8 +19,8 @@ expression: "harness::frame(\"command_menu_filtered\", &s, W, H)"
     ╰──────────────────────────────────────────────────────────────────────╯
 
 
-
 › /resume   Resume a past conversation
+  /rewind   Branch at an earlier turn (/rewind <turn-id>) without touching this…
   ↑↓ navigate · enter run · tab complete · esc cancel
 ────────────────────────────────────────────────────────────────────────────────
 › /re

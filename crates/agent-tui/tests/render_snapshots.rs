@@ -637,3 +637,60 @@ fn parity_surface_pending_input() {
         harness::frame_parity("parity_surface_pending_input", &s, &surface, W, H)
     );
 }
+
+// ───────────────────────── Runtime state (EP-005) ─────────────────────────
+
+/// State of a thread the runtime is driving: identifiers, turn, state and the
+/// inputs waiting behind it.
+fn runtime_state() -> AppState {
+    let mut s = conversation();
+    s.thread_id = "th_9f2c4a17b3d84e0192cf5a7b6d3e8140".into();
+    s.turn_id = Some("tu_5b1e07d4c2a9f38610be4d27a95c0f3e".into());
+    s.turn_state = Some("running".into());
+    s.pending_inputs = 2;
+    s
+}
+
+/// US-017 AC9: the runtime status rendered on a 40-column terminal. The harness
+/// itself fails the test on any horizontal overflow, so the snapshot is the
+/// record of what the user reads and the check is mechanical.
+#[test]
+fn runtime_status_narrow() {
+    let mut s = runtime_state();
+    s.blocks
+        .push(agent_tui::Block::Notice(agent_tui::session_status_report(
+            &s,
+            agent_tui::SessionFacts {
+                session_id: "20260728-101112.jsonl",
+                sandbox: "enforced (workspace)",
+                config_sources: &[],
+                profile: None,
+                runtime: agent_tui::RuntimeFacts {
+                    active_agents: 0,
+                    max_active_agents: 4,
+                    max_agents_per_root: 8,
+                    max_agent_depth: 1,
+                    command_mailbox: 64,
+                    max_pending_inputs: 16,
+                },
+            },
+        )));
+    insta::assert_snapshot!(
+        "runtime_status_narrow",
+        harness::frame("runtime_status_narrow", &s, NARROW, 32)
+    );
+}
+
+/// US-017 AC5: a steer accepted while a turn runs is announced, and the pending
+/// count the runtime reports is what the state carries.
+#[test]
+fn runtime_steering_notice() {
+    let mut s = runtime_state();
+    s.blocks.push(agent_tui::Block::Notice(
+        "Steering the current turn.".into(),
+    ));
+    insta::assert_snapshot!(
+        "runtime_steering_notice",
+        harness::frame("runtime_steering_notice", &s, W, H)
+    );
+}

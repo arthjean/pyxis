@@ -1,32 +1,34 @@
-//! `SharedSession`: wraps `JsonlSession` (US-009 persistence) while exposing an
-//! **in-memory snapshot** of the transcript. Since the core calls
-//! `sync(&messages)` with the FULL transcript on every turn
-//! (transcript-before-response), the snapshot is always up to date: the interactive
-//! loop reads it back to chain the turns without reimplementing the core's
-//! message building.
+//! `SharedSession`: an **in-memory snapshot** of the transcript layered over the
+//! durable writer. Since the core calls `sync(&messages)` with the FULL
+//! transcript on every turn (transcript-before-response), the snapshot is always
+//! up to date: the runtime reads it back to chain the turns without
+//! reimplementing the core's message building.
+//!
+//! The writer underneath is the thread log itself (`JsonlThreadStore`, which
+//! implements `Session`). Since EP-005 a conversation has ONE durable file and
+//! ONE handle on it: switching session no longer moves a file under a live
+//! writer, it opens another thread runtime.
 
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agent_core::compaction::CompactKind;
 use agent_core::message::{ContentBlock, Message, Role};
 use agent_core::session::{FileSnapshot, Session, SessionError};
-use agent_session::JsonlSession;
 use async_trait::async_trait;
 
 pub struct SharedSession {
-    /// `None` under `--ephemeral` (US-020 AC4): the snapshot still feeds the
+    /// `None` under `--ephemeral` (US-018 AC4): the snapshot still feeds the
     /// turn chaining, but nothing reaches the disk. Modelled as an absent writer
     /// rather than a writer pointed at a throwaway file, because the guarantee
     /// asked for is that no file was written at all, not that one was cleaned up.
-    inner: Option<JsonlSession>,
+    inner: Option<Arc<dyn Session>>,
     snapshot: Arc<Mutex<Vec<Message>>>,
 }
 
 impl SharedSession {
-    /// Builds the shared session and also returns the snapshot handle that the
-    /// interactive loop reads back between turns.
-    pub fn new(inner: JsonlSession) -> (Arc<Self>, Arc<Mutex<Vec<Message>>>) {
+    /// Builds the shared session over a durable writer and returns the snapshot
+    /// handle the runtime reads back between turns.
+    pub fn over(inner: Arc<dyn Session>) -> (Arc<Self>, Arc<Mutex<Vec<Message>>>) {
         Self::build(Some(inner))
     }
 
@@ -35,7 +37,7 @@ impl SharedSession {
         Self::build(None)
     }
 
-    fn build(inner: Option<JsonlSession>) -> (Arc<Self>, Arc<Mutex<Vec<Message>>>) {
+    fn build(inner: Option<Arc<dyn Session>>) -> (Arc<Self>, Arc<Mutex<Vec<Message>>>) {
         let snapshot = Arc::new(Mutex::new(Vec::new()));
         (
             Arc::new(Self {
@@ -59,19 +61,6 @@ impl SharedSession {
                     .content
                     .retain(|block| !matches!(block, ContentBlock::EncryptedReasoning { .. }));
             }
-        }
-    }
-
-    /// Switches the persistence file to a resumed session (`/resume`).
-    /// `cursor` = number of messages already present in the session (the next
-    /// `sync` will only write what follows). The in-memory snapshot is updated separately
-    /// by the interactive loop (`conversation` handle).
-    pub fn switch_file(&self, path: &Path, cursor: usize) -> Result<(), SessionError> {
-        match &self.inner {
-            Some(inner) => inner.switch_to(path, cursor),
-            None => Err(SessionError::Io(
-                "this session is ephemeral: it persists nothing".into(),
-            )),
         }
     }
 }
@@ -181,38 +170,26 @@ mod tests {
         dir
     }
 
-    /// US-019 AC3: the fork mechanism. `switch_file(new, 0)` resets the cursor, so
-    /// the next `sync` replays the WHOLE transcript into the fresh file, and the
-    /// original one is closed with exactly the bytes it already had.
+    /// The snapshot layer writes THROUGH to the durable log and mirrors what it
+    /// wrote, which is what lets the runtime chain a turn on the transcript
+    /// without re-reading the file.
     #[tokio::test]
-    async fn forking_copies_the_transcript_and_leaves_the_original_intact() {
-        let dir = tmp_dir("fork");
-        let origin = dir.join("origin.jsonl");
-        let fork = dir.join("fork.jsonl");
+    async fn the_snapshot_mirrors_what_the_durable_writer_took() {
+        let dir = tmp_dir("over");
+        let path = dir.join("thread.jsonl");
+        let store = Arc::new(agent_session::JsonlThreadStore::open(&path).unwrap());
+        let (session, snapshot) = SharedSession::over(Arc::clone(&store) as Arc<dyn Session>);
+
         let messages = vec![Message::user("bonjour"), Message::assistant_text("salut")];
-
-        let (session, _snapshot) = SharedSession::new(JsonlSession::create_at(&origin).unwrap());
         session.sync(&messages).await.unwrap();
-        let origin_before = std::fs::read_to_string(&origin).unwrap();
 
-        session.switch_file(&fork, 0).unwrap();
-        session.sync(&messages).await.unwrap();
-        // One more turn: it lands in the fork alone.
-        let mut grown = messages.clone();
-        grown.push(Message::user("suite"));
-        session.sync(&grown).await.unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(&origin).unwrap(),
-            origin_before,
-            "l'originale ne bouge plus après le fork"
-        );
-        let resumed = agent_session::resume_file(&fork).unwrap();
-        assert_eq!(resumed.messages, grown, "la copie part de l'état courant");
+        assert_eq!(snapshot.lock().unwrap().len(), 2);
+        let resumed = agent_session::resume_file(&path).unwrap();
+        assert_eq!(resumed.messages, messages);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// US-020 AC4: an ephemeral session keeps feeding the turn chaining through
+    /// US-018 AC4: an ephemeral session keeps feeding the turn chaining through
     /// its snapshot, but touches no file at all.
     #[tokio::test]
     async fn an_ephemeral_session_writes_nothing() {
@@ -237,9 +214,6 @@ mod tests {
             0,
             "aucun fichier écrit"
         );
-        // Moving the persistence file of a session that has none is an error, not
-        // a silent no-op: `/fork` would otherwise claim a copy that does not exist.
-        assert!(session.switch_file(&dir.join("x.jsonl"), 0).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

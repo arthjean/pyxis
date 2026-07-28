@@ -76,7 +76,12 @@ pub const COMMANDS: &[(&str, &str, bool)] = &[
     ("/resume", "Resume a past conversation", true),
     (
         "/fork",
-        "Duplicate this session and continue in the copy",
+        "Branch at the last completed turn and continue in the branch",
+        false,
+    ),
+    (
+        "/rewind",
+        "Branch at an earlier turn (/rewind <turn-id>) without touching this one",
         false,
     ),
     (
@@ -633,6 +638,18 @@ pub struct AppState {
     pub model: String,
     /// Workspace name (current directory) shown in the status line; empty = hidden.
     pub workspace: String,
+    /// Durable identity of the conversation, as the runtime reports it
+    /// (US-017 AC5). Held HERE so the frontend answers "which thread, which
+    /// turn, in which state, with how many inputs waiting?" from its own state
+    /// and never by re-reading the store.
+    pub thread_id: String,
+    pub turn_id: Option<String>,
+    /// `queued`, `running`, `needs_input`, `completed`, `interrupted` or
+    /// `failed`. `None` before the first turn of the thread.
+    pub turn_state: Option<String>,
+    /// Inputs accepted and not consumed yet: queued turns plus the steering
+    /// inputs of the running turn.
+    pub pending_inputs: usize,
     /// Fraction of context consumed (0-100). `None` = unknown -> segment hidden.
     /// Fed by `AgentEvent::ModelTurn` (US-004), and only when the backend
     /// reported a usage AND the window of the active model is known: an
@@ -796,6 +813,10 @@ impl AppState {
             render_cache: RefCell::new(crate::cache::RenderCache::default()),
             model: model.into(),
             workspace: String::new(),
+            thread_id: String::new(),
+            turn_id: None,
+            turn_state: None,
+            pending_inputs: 0,
             context_pct: None,
             context_tokens: None,
             context_window: None,
@@ -2226,6 +2247,24 @@ pub struct SessionFacts<'a> {
     /// Profile applied to this session (US-006), when one was selected. A profile
     /// changes four keys at once and is otherwise invisible in the values.
     pub profile: Option<&'a str>,
+    /// Orchestration facts (US-019 AC3). Local by construction: they come from
+    /// the runtime's last-state signal and from its v1 constants, so `/status`
+    /// still answers without a single request.
+    pub runtime: RuntimeFacts,
+}
+
+/// The bounds a thread runs under, and how much of them it is using.
+///
+/// Every limit is a CONSTANT of the runtime: FR-20 forbids a configuration key
+/// for orchestration in v1, so showing them here is showing the whole truth.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RuntimeFacts {
+    pub active_agents: usize,
+    pub max_active_agents: usize,
+    pub max_agents_per_root: usize,
+    pub max_agent_depth: usize,
+    pub command_mailbox: usize,
+    pub max_pending_inputs: usize,
 }
 
 /// Keys of `SessionFacts::config_sources`. They are the configuration key names,
@@ -2302,6 +2341,36 @@ pub fn session_status_report(state: &AppState, facts: SessionFacts<'_>) -> Strin
     }
     report.push_str(&format!("\n  workspace: {workspace}"));
     report.push_str(&format!("\n  session: {session}"));
+
+    // US-019 AC3: thread, turn, state, queue depth, sub-agents and the fixed
+    // limits. Each on its own short line so a 40-column terminal wraps at most
+    // the identifier, never the label that explains it.
+    let thread = if state.thread_id.is_empty() {
+        UNAVAILABLE
+    } else {
+        &state.thread_id
+    };
+    report.push_str(&format!("\n  thread: {thread}"));
+    report.push_str(&format!(
+        "\n  turn: {}",
+        match (&state.turn_id, &state.turn_state) {
+            (Some(id), Some(turn_state)) => format!("{id} ({turn_state})"),
+            (Some(id), None) => id.clone(),
+            _ => "none yet".to_string(),
+        }
+    ));
+    let runtime = facts.runtime;
+    report.push_str(&format!(
+        "\n  pending inputs: {} (max {} per turn, mailbox {})",
+        state.pending_inputs, runtime.max_pending_inputs, runtime.command_mailbox
+    ));
+    report.push_str(&format!(
+        "\n  sub-agents: {} active (max {} active, {} created, depth {})",
+        runtime.active_agents,
+        runtime.max_active_agents,
+        runtime.max_agents_per_root,
+        runtime.max_agent_depth
+    ));
     report
 }
 
@@ -3529,6 +3598,7 @@ mod tests {
             sandbox: "enforced (workspace)",
             config_sources: &[],
             profile: None,
+            runtime: RuntimeFacts::default(),
         };
 
         let status = session_status_report(&s, facts);
@@ -3574,6 +3644,7 @@ mod tests {
                     (SOURCE_KEY_SANDBOX_MODE, "profile"),
                 ],
                 profile: Some("review"),
+                runtime: RuntimeFacts::default(),
             },
         );
 
@@ -3625,6 +3696,7 @@ mod tests {
                     sandbox: "off (writes not restricted)",
                     config_sources: &[],
                     profile: None,
+                    runtime: RuntimeFacts::default(),
                 }
             )
             .contains("reasoning effort: medium")
