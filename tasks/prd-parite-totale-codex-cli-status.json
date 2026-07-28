@@ -17,10 +17,10 @@
     {
       "id": "EP-002",
       "title": "Runtime Code Mode V8",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 5,
-      "stories_done": 0
+      "stories_done": 5
     },
     {
       "id": "EP-003",
@@ -114,73 +114,75 @@
       "id": "US-005",
       "title": "Valider l'enveloppe V8 et la frontière de sécurité",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-001"
       ],
-      "started_at": null,
-      "completed_at": null,
+      "started_at": "2026-07-28",
+      "completed_at": "2026-07-28",
       "reviewed_at": null
     },
     {
       "id": "US-006",
       "title": "Porter le protocole de session Code Mode",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-002",
         "US-005"
       ],
-      "started_at": null,
-      "completed_at": null,
+      "started_at": "2026-07-28",
+      "completed_at": "2026-07-28",
       "reviewed_at": null
     },
     {
       "id": "US-007",
       "title": "Implémenter l'isolate et le cycle de vie V8",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-006"
       ],
-      "started_at": null,
-      "completed_at": null,
+      "started_at": "2026-07-28",
+      "completed_at": "2026-07-28",
       "reviewed_at": null
     },
     {
       "id": "US-008",
       "title": "Exposer exec, wait et les outils imbriqués",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-003",
         "US-007"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-28",
+      "completed_at": "2026-07-28",
+      "reviewed_at": null,
+      "note": "exec (freeform + grammaire Lark baseline) et wait (fonction stricte) sont des outils du Registry: DynTool porte desormais un ToolKind, donc un outil a entree texte traverse le pipeline sans schema invente. Un appel imbrique passe par le ToolDispatchSnapshot du step (taint, hooks, approbation, cancellation partages). Le CHOIX du moment ou la paire est enregistree et le plan lie au step appartient a US-009."
     },
     {
       "id": "US-009",
       "title": "Intégrer Code Mode au ThreadRuntime",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-008"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-28",
+      "completed_at": "2026-07-28",
+      "reviewed_at": null,
+      "note": "Plan d'outils compose par mode: code_mode_only ne montre que exec et wait, code_mode garde en plus les outils directs, direct ne voit jamais la paire; la vue de dispatch et la vue visible coincident. La session suit le thread: open_session et le run headless appellent bind_thread, qui ferme la session precedente et en ouvre une vide, donc une reprise ne rejoue aucune cellule et l'appel exec orphelin d'un crash est referme par la reconciliation existante. Sans runtime V8 la paire n'est pas enregistree et le modele code mode reste refuse avant reseau en nommant le composant manquant."
     },
     {
       "id": "US-010",
