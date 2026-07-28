@@ -3,16 +3,16 @@
     "file": "tasks/prd-frontier-harness-runtime.md",
     "title": "Pyxis : contrats du runtime frontier et fiabilité agentique",
     "created_at": "2026-07-28",
-    "status": "READY"
+    "status": "IN_PROGRESS"
   },
   "epics": [
     {
       "id": "EP-001",
       "title": "Contrat runtime effectif du modèle",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 4,
-      "stories_done": 0
+      "stories_done": 4
     },
     {
       "id": "EP-002",
@@ -52,53 +52,53 @@
       "id": "US-001",
       "title": "Valider et ingérer le descriptor modèle riche",
       "epic": "EP-001",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-28T11:57:12+02:00",
+      "completed_at": "2026-07-28T12:39:02+02:00",
+      "reviewed_at": "2026-07-28T12:39:02+02:00"
     },
     {
       "id": "US-002",
       "title": "Résoudre et capturer ResolvedModelRuntime",
       "epic": "EP-001",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-001"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-28T11:57:12+02:00",
+      "completed_at": "2026-07-28T12:39:02+02:00",
+      "reviewed_at": "2026-07-28T12:39:02+02:00"
     },
     {
       "id": "US-003",
       "title": "Piloter le prompt, le wire et les budgets par le profil",
       "epic": "EP-001",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-002"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-28T11:57:12+02:00",
+      "completed_at": "2026-07-28T12:39:02+02:00",
+      "reviewed_at": "2026-07-28T12:39:02+02:00"
     },
     {
       "id": "US-004",
       "title": "Respecter end_turn et les terminaux incomplets",
       "epic": "EP-001",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-28T11:57:12+02:00",
+      "completed_at": "2026-07-28T12:39:02+02:00",
+      "reviewed_at": "2026-07-28T12:39:02+02:00"
     },
     {
       "id": "US-005",
