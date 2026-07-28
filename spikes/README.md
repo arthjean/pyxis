@@ -11,6 +11,7 @@ ne réutilisera pas ce code. Verdicts détaillés : [`../tasks/spike-verdicts.md
 | `s3-agent-loop` (lib `spike_loop`) | US-003 | boucle `Transition` : stream → Bash → réinjection → reboucle |
 | `s4-tui-stream` (lib `spike_tui`) | US-004 | tube `core → mpsc<AgentEvent> → Ratatui`, jamais d'ANSI |
 | `s5-sandbox` | US-005 | Landlock FS kernel + proxy réseau allow-list |
+| `s6-code-mode-v8` (lib `spike_v8`) | US-005 de `prd-parite-totale-codex-cli` | enveloppe V8 : interruption externe, plafonds heap/natif distincts, shutdown joint |
 
 ## Gates
 ```bash
@@ -21,6 +22,10 @@ cargo fmt --all --check
 
 ## Runs live
 ```bash
+# US-005 (parité Codex) — enveloppe V8 : mesures reproductibles
+cargo run --release -p s6-code-mode-v8 -- report          # texte
+cargo run --release -p s6-code-mode-v8 -- report --json   # même rapport, sérialisé
+
 # US-005 — sandbox (réel, Linux/Landlock)
 cargo run -p s5-sandbox -- landlock
 cargo run -p s5-sandbox -- proxy

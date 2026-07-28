@@ -163,3 +163,84 @@ Phase 1). Dégradation non-Linux : le binaire `cfg`-gate Landlock et avertit exp
 
 **GO Phase 1.** Aucune inconnue tueuse de projet ne subsiste. Code de Phase 0 à jeter (ne pas
 porter dans le workspace MVP `agent-*`).
+
+---
+
+# US-005 — Enveloppe V8 et frontière de sécurité — **PASSE (in-process retenu)**
+
+> Périmètre différent des cinq spikes ci-dessus : ce verdict appartient à
+> `tasks/prd-parite-totale-codex-cli.md` (EP-002, US-005) et conditionne US-006.
+> Le code de mesure vit dans `spikes/s6-code-mode-v8/` et reste jetable ; seul le
+> verdict est normatif.
+
+| Date | 2026-07-28 |
+|---|---|
+| Toolchain | rustc/cargo 1.97.1, edition 2024, Linux x86_64 |
+| Dépendances | `v8 = "=149.2.0"` (pin exact de la baseline Codex), `deno_core_icudata = "0.77.0"` |
+| V8 lié | `14.9.207.2-rusty`, binaires précompilés (pas de `V8_FROM_SOURCE`) |
+| Reproduction | `cargo test -p s6-code-mode-v8` (9 tests) et `cargo run --release -p s6-code-mode-v8 -- report [--json]` |
+
+**Hypothèse.** Un isolate in-process peut recevoir une enveloppe bornée :
+interruptible de l'extérieur en moins d'une seconde, plafonné sur le heap V8 **et**
+sur la mémoire native avec les deux dépassements distinguables, et joignable au
+shutdown.
+
+## Mesures (profil release, machine de référence)
+
+| Dimension | Mesure | Budget PRD | Verdict |
+|---|---|---|---|
+| Taille binaire | 71,1 MiB (binaire du spike, V8 statique) | non budgété | coût acté |
+| Init process (ICU + platform + `V8::initialize`) | 0,7 ms, une seule fois | non budgété | négligeable |
+| Session froide prête | p50 3,9 ms / **p95 4,1 ms** / max 5,4 ms sur 100 | < 1 000 ms p95 | **OK** (245x de marge) |
+| Cellule chaude | p50 3,2 ms / **p95 3,2 ms** / max 5,2 ms sur 1 000 | < 100 ms p95 | **OK** (31x de marge) |
+| Heap V8 après charge | 15,6 MiB utilisés / 31,0 MiB alloués / plafond 256,0 MiB honoré | plafond 256 MiB | **OK** |
+| Mémoire native | RSS 27,4 MiB, delta +22,5 MiB pour le run complet | non budgété | coût acté |
+| Interruption d'une boucle infinie | **201,9 ms** pour un budget de 200 ms (dépassement 1,9 ms) | < 1 000 ms | **OK** |
+| Runtime Tokio pendant le spin | 18 ticks de 10 ms observés | ne doit pas bloquer | **OK** |
+
+## Ce que le spike prouve
+
+- **Interruption externe.** `IsolateHandle::terminate_execution()` appelé depuis un
+  thread watchdog arrête `while (true) {}` en 1,9 ms au-delà du budget. L'isolate
+  vit sur un thread OS dédié, hors du runtime Tokio : une tâche Tokio de 10 ms a
+  continué de tourner pendant tout le spin. `cancel_terminate_execution()` après
+  la cellule rend la session réutilisable — la cellule suivante répond `2` à `1 + 1`.
+- **Deux plafonds mémoire distincts.** Heap V8 saturé par des chaînes retenues →
+  `v8 heap limit reached: 16777216 bytes`. Mémoire native saturée par des
+  `ArrayBuffer` → `native memory budget exceeded: 9437184 bytes requested,
+  8388608 bytes allowed`. Aucun processus n'est tué : rendre du headroom depuis le
+  `NearHeapLimitCallback` laisse V8 dérouler la pile au lieu d'appeler
+  `FatalProcessOutOfMemory`.
+- **Piège découvert, à porter en US-007.** V8 traite un refus d'allocation
+  d'`ArrayBuffer` comme une pression heap et **déclenche aussi** le
+  `NearHeapLimitCallback`. Classer sur le drapeau du heap d'abord donnerait
+  « heap » pour un dépassement natif. Le drapeau de l'allocateur est le seul non
+  ambigu et doit être testé en premier.
+- **Isolation.** Un contexte neuf par cellule : `globalThis.leaked` posé par une
+  cellule est `undefined` pour la suivante, dans le même isolate comme dans un
+  autre. L'état inter-cellules devra donc être un store explicite (US-008), jamais
+  l'objet global.
+- **Mode JIT figé au process.** V8 lit `--jitless` une fois. Une seconde
+  initialisation demandant l'autre mode échoue explicitement
+  (`v8 already initialized with jit=...`) au lieu de tourner silencieusement sous
+  le premier : c'est le comportement attendu par US-007 AC2.
+- **Shutdown borné.** Le worker est joint sous 2 s ; le cas non joint est
+  **retourné** au lieu d'être détaché, ce dont US-007 AC4 a besoin.
+
+## Verdict
+
+**Architecture in-process retenue.** Aucun seuil obligatoire n'est manqué, donc la
+clause de blocage d'US-005 AC4 ne s'applique pas : US-006 n'est pas bloquée et
+aucune recommandation process-owned n'est activée.
+
+Réserves consignées, non bloquantes :
+
+1. **71 MiB de binaire** et ~22 MiB de RSS supplémentaires sont le prix de V8
+   statique. La conséquence est architecturale, pas de perfomance : le moteur doit
+   rester dans une crate isolée pour que les consommateurs headless de Pyxis ne le
+   paient pas.
+2. **L'isolate n'est pas un bac à sable de capacités.** Il sépare l'état JavaScript
+   et borne CPU/heap/native ; il ne remplace ni les permissions, ni le taint, ni les
+   hooks. Tout pont natif reste une allowlist explicite (US-008).
+3. Les mesures sont faites sur **une** machine Linux x86_64. Elles bornent la
+   faisabilité, pas la performance de tout le parc.

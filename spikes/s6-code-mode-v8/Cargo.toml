@@ -1,0 +1,28 @@
+[package]
+name = "s6-code-mode-v8"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "spike_v8"
+path = "src/lib.rs"
+
+[[bin]]
+name = "s6-code-mode-v8"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# EXACT pin, like the Codex baseline (`codex-rs/Cargo.toml`: `v8 = "=149.2.0"`).
+# The measurements below only mean something against the version the port will use.
+v8 = "=149.2.0"
+# ICU data is NOT embedded in the prebuilt static library: V8 refuses `Intl`
+# without it, so the envelope has to be measured with the data actually loaded.
+deno_core_icudata = "0.77.0"

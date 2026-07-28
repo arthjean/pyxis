@@ -11,6 +11,7 @@ members = [
     "s3-agent-loop",
     "s4-tui-stream",
     "s5-sandbox",
+    "s6-code-mode-v8",
 ]
 
 [workspace.package]
