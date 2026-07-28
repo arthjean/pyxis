@@ -89,17 +89,40 @@ pub enum ProviderKind {
 pub enum StreamEvent {
     TextDelta      { text: String },
     ReasoningDelta { text: String },                       // thinking / reasoning
-    ToolCallStart  { id: ToolCallId, name: String },
-    ToolCallDelta  { id: ToolCallId, args_json: String },  // arguments incrémentaux
+    ToolCallStart  { id: ToolCallId, name: String, format: ToolCallFormat },
+    ToolCallDelta  { id: ToolCallId, input_delta: String }, // entrée incrémentale
     ToolCallEnd    { id: ToolCallId },                      // call complet & parseable
     Usage          { usage: TokenUsage },                  // peut ne jamais arriver selon provider
     Done           { stop: StopReason },
 }
 
-/// Invariant fort : à ToolCallEnd, args_json concaténé DOIT être un JSON
-/// complet et valide. Les adapters qui fragmentent (Gemini) ou bufferisent
-/// (OpenAI tool_calls par index) réassemblent AVANT d'émettre ToolCallEnd.
+/// Format d'entrée d'un appel, fixé au ToolCallStart (EP-001/US-003).
+pub enum ToolCallFormat { Json, Text }
+
+/// Invariant fort : à ToolCallEnd, `input_delta` concaténé DOIT être un JSON
+/// complet et valide pour un appel `Json`. Les adapters qui fragmentent
+/// (Gemini) ou bufferisent (OpenAI tool_calls par index) réassemblent AVANT
+/// d'émettre ToolCallEnd. Pour un appel `Text` (outil freeform), l'entrée est
+/// le texte du modèle tel quel : elle n'est jamais parsée en JSON.
 ```
+
+```rust
+/// Algèbre d'outils provider-neutral (EP-001/US-002). Un outil freeform ne
+/// porte AUCUN `input_schema` : aucun adapter ne peut en fabriquer un.
+pub struct ToolSpec { pub name: String, pub description: String, pub kind: ToolKind }
+
+pub enum ToolKind {
+    Function { input_schema: serde_json::Value },
+    Freeform { grammar: Option<ToolGrammar> },   // grammaire optionnelle (lark)
+}
+```
+
+Un provider qui ne sait pas sérialiser un outil freeform le déclare par
+`Capabilities.tool_calling.freeform_tools = false` et refuse le plan avec
+`ProviderError::UnsupportedTool` **avant tout appel réseau**. Projection wire
+du provider ChatGPT : `type: "function"` pour une fonction,
+`type: "custom"` plus `format: {grammar|text}` pour un outil freeform, avec le
+cycle `custom_tool_call` / `custom_tool_call_output` corrélé par `call_id`.
 
 ```rust
 /// Déclaré statiquement par chaque adapter. Lu par agent-core pour gater
@@ -218,7 +241,7 @@ if provider.capabilities().server_side_state {
 
 ### 4.2 Gemini : function calls fragmentées en stream
 
-Gemini **peut** émettre un function call en plusieurs morceaux sur le stream (le `name` et des parties de `args` arrivent séparément). Émettre un `ToolCallEnd` prématuré casserait l'invariant « `args_json` complet à `ToolCallEnd` ».
+Gemini **peut** émettre un function call en plusieurs morceaux sur le stream (le `name` et des parties de `args` arrivent séparément). Émettre un `ToolCallEnd` prématuré casserait l'invariant « `input_delta` complet à `ToolCallEnd` ».
 
 L'adapter Gemini **bufferise et réassemble** le function call complet avant d'émettre `ToolCallEnd` :
 
