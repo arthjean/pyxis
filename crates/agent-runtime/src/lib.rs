@@ -15,6 +15,7 @@
 //!   [`thread`] (FR-20).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod agent;
 pub mod context;
 pub mod event;
 pub mod id;
@@ -25,6 +26,10 @@ pub mod runner;
 pub mod store;
 pub mod thread;
 
+pub use agent::{
+    AGENT_WAIT_WINDOW, AgentAuthority, AgentError, AgentGraph, AgentRecord, AgentState,
+    MAX_ACTIVE_AGENTS, MAX_AGENT_DEPTH, MAX_AGENTS_PER_ROOT,
+};
 pub use context::{
     FixedTurnContext, MAX_SECTION_BYTES, MAX_STEP_CONTEXT_BYTES, StepContext, StepContexts,
     StepSection, StepSnapshot, StepSource, TurnContext, TurnContextSource, TurnLimits,

@@ -17,9 +17,10 @@ use std::collections::HashMap;
 
 use agent_core::message::{INTERRUPTED_TOOL_RESULT, Message, ToolErrorKind, unanswered_tool_calls};
 
+use crate::agent::{AgentRecord, AgentState};
 use crate::context::TurnContext;
 use crate::event::{ForkOrigin, ThreadEventPayload};
-use crate::id::{AgentId, ThreadId, TurnId};
+use crate::id::{ThreadId, TurnId};
 use crate::lifecycle::TurnState;
 use crate::store::ThreadSnapshot;
 use crate::thread::{Accepted, TurnStatus};
@@ -45,9 +46,11 @@ pub struct ResumedThread {
     pub accepted: HashMap<String, Accepted>,
     /// Branch this thread was cut from, when it is one.
     pub origin: Option<ForkOrigin>,
-    /// Children this thread declared, in log order. Rebuilt here so the graph
-    /// survives a restart; US-012 owns the leases that bound it.
-    pub agents: Vec<(AgentId, ThreadId)>,
+    /// Children this thread declared, in log order, with the last state each
+    /// one reached. A child the log left open is reported here as it was and
+    /// closed by [`crate::agent::AgentGraph::restore`]: the plan describes the
+    /// log, the graph decides what a restart makes of it (US-012 AC5).
+    pub agents: Vec<AgentRecord>,
 }
 
 impl ResumedThread {
@@ -74,7 +77,7 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
     // the log and not a hash order.
     let mut states: Vec<(TurnId, TurnState)> = Vec::new();
     let mut accepted: HashMap<String, Accepted> = HashMap::new();
-    let mut agents: Vec<(AgentId, ThreadId)> = Vec::new();
+    let mut agents: Vec<AgentRecord> = Vec::new();
     let mut turn_context: Option<TurnContext> = None;
     let mut thread_created = false;
 
@@ -115,7 +118,29 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
             ThreadEventPayload::AgentLinked {
                 agent_id,
                 child_thread_id,
-            } => agents.push((*agent_id, *child_thread_id)),
+                task,
+                authority,
+            } => agents.push(AgentRecord {
+                agent_id: *agent_id,
+                thread_id: *child_thread_id,
+                task: task.clone(),
+                state: AgentState::Running,
+                authority: authority.clone(),
+                started_at_ms: event.at_ms,
+                ended_at_ms: None,
+                cause: None,
+            }),
+            ThreadEventPayload::AgentStateChanged {
+                agent_id,
+                to,
+                cause,
+            } => {
+                if let Some(record) = agents.iter_mut().find(|r| r.agent_id == *agent_id) {
+                    record.state = *to;
+                    record.cause = cause.clone();
+                    record.ended_at_ms = (!to.is_active()).then_some(event.at_ms);
+                }
+            }
             ThreadEventPayload::Forked { .. } => {}
         }
     }

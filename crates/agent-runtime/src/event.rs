@@ -13,6 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::{AgentAuthority, AgentState};
 use crate::context::TurnContext;
 use crate::id::{AgentId, EventId, ThreadId, TurnId};
 use crate::lifecycle::TurnState;
@@ -58,7 +59,9 @@ impl ThreadEvent {
                 fork_turn_id: turn_id,
                 ..
             } => Some(*turn_id),
-            ThreadEventPayload::ThreadCreated | ThreadEventPayload::AgentLinked { .. } => None,
+            ThreadEventPayload::ThreadCreated
+            | ThreadEventPayload::AgentLinked { .. }
+            | ThreadEventPayload::AgentStateChanged { .. } => None,
         }
     }
 }
@@ -101,15 +104,31 @@ pub enum ThreadEventPayload {
         fork_event_id: EventId,
     },
     /// A parent-child agent relation was reserved (US-012).
+    ///
+    /// Durable BEFORE the child's thread exists: a filiation the log does not
+    /// carry is a child nobody can account for after a restart. The granted
+    /// authority travels with it, so an audit reads what a child was allowed to
+    /// do without replaying the tool pipeline.
     AgentLinked {
         agent_id: AgentId,
         child_thread_id: ThreadId,
+        task: String,
+        authority: AgentAuthority,
+    },
+    /// A sub-agent changed state (US-012 AC4, US-015 AC6). The one place a
+    /// terminal child, a failed spawn and its cause become durable.
+    AgentStateChanged {
+        agent_id: AgentId,
+        to: AgentState,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<String>,
     },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::AgentAuthority;
     use crate::id::SequentialIds;
 
     #[test]
@@ -187,6 +206,39 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// US-012: the filiation and every state a child went through survive the
+    /// file, authority included.
+    #[test]
+    fn agent_events_round_trip_with_their_authority() {
+        let ids = SequentialIds::new();
+        let thread_id = ThreadId::generate(&ids);
+        let agent_id = AgentId::generate(&ids);
+        for payload in [
+            ThreadEventPayload::AgentLinked {
+                agent_id,
+                child_thread_id: ThreadId::generate(&ids),
+                task: "explorer les tests".into(),
+                authority: AgentAuthority::read_only(),
+            },
+            ThreadEventPayload::AgentStateChanged {
+                agent_id,
+                to: AgentState::Failed,
+                cause: Some("provider indisponible".into()),
+            },
+        ] {
+            let event = ThreadEvent {
+                event_id: EventId::generate(&ids),
+                thread_id,
+                seq: 1,
+                at_ms: 0,
+                payload,
+            };
+            let line = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<ThreadEvent>(&line).unwrap(), event);
+            assert_eq!(event.turn_id(), None, "an agent event owns no turn");
+        }
     }
 
     #[test]
