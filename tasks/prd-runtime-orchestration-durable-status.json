@@ -3,7 +3,7 @@
     "file": "tasks/prd-runtime-orchestration-durable.md",
     "title": "Pyxis : runtime d'orchestration durable de niveau Codex",
     "created_at": "2026-07-27",
-    "status": "IN_PROGRESS"
+    "status": "DONE"
   },
   "epics": [
     {
@@ -41,10 +41,10 @@
     {
       "id": "EP-005",
       "title": "Clients et vérification",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 3,
-      "stories_done": 0
+      "stories_done": 3
     }
   ],
   "stories": [
@@ -286,7 +286,7 @@
       "id": "US-017",
       "title": "Migrer le TUI vers ThreadHandle",
       "epic": "EP-005",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
@@ -294,15 +294,16 @@
         "US-008",
         "US-009"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-28",
+      "completed_at": "2026-07-28",
+      "reviewed_at": null,
+      "note": "Le TUI pilote un `ThreadHandle` unique : chaque saisie est une opération soumise au runtime, un prompt tapé pendant un tour devient un steer (`expected_turn_id = None`, donc jamais perdu quelle que soit la branche de la course), et `/fork`, `/fork <turn-id>` et `/rewind <turn-id>` demandent la branche au runtime puis basculent dessus sans toucher au thread source. `ActiveTurn`, son compteur `u64`, le `JoinHandle` direct et la FIFO de prompts sont supprimés, ce que garde un test de recherche statique. Le fichier de session EST le journal du thread : un fichier, un writer, un curseur."
     },
     {
       "id": "US-018",
       "title": "Migrer le headless et le schéma machine",
       "epic": "EP-005",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
@@ -311,15 +312,16 @@
         "US-010",
         "US-011"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-28",
+      "completed_at": "2026-07-28",
+      "reviewed_at": null,
+      "note": "`pyxis -p` ouvre ou reprend un thread par `ThreadHandle` et attend son état terminal. Les lignes JSONL gagnent `thread_id`, `turn_id` et `event_id` de façon additive, `run_summary` reste la dernière ligne et gagne `end: \"interrupted\"` avec un code de sortie non nul. `--ephemeral` tourne sur l'adapter mémoire et n'ouvre aucun fichier ; Ctrl+C passe par le runtime, donc le tour réconcilie son transcript avant d'écrire son propre terminal."
     },
     {
       "id": "US-019",
       "title": "Prouver les invariants et rendre l'orchestration observable",
       "epic": "EP-005",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "L",
       "blocked_by": [
@@ -330,9 +332,10 @@
         "US-017",
         "US-018"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-28",
+      "completed_at": "2026-07-28",
+      "reviewed_at": null,
+      "note": "Quatre courses (steer-terminal, interrupt-tool, shutdown-mailbox, spawn-last-slot) répétées 1 000 fois chacune avec horloge et IDs déterministes (`crates/agent-runtime/tests/races.rs`, ~2,2 s). E2E full-wiring sur le store JSONL réel pour resume, recovery, fork, rewind, enfant en échec et parent annulé (`crates/agent-session/tests/e2e_thread.rs`). `/status` montre thread, tour, état, profondeur de file et bornes v1 lues sur les constantes. La confidentialité des traces est vérifiée mécaniquement par un scan des points d'émission. Réserve assumée : le binaire n'expose pas encore les outils de sous-agents, donc le compteur d'agents actifs vaut structurellement 0 ; c'est écrit dans `docs/CURRENT_STATUS.md` comme travail différé, ce que l'AC6 demande justement de distinguer."
     }
   ]
 }
