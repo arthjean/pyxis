@@ -23,3 +23,10 @@ tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }
+# EP-005 E2E: the full wiring (thread actor + real `run_agent` + JSONL store)
+# can only be assembled where the JSONL adapter lives, so the fakes of the
+# engine come here rather than the store going up into `agent-runtime`.
+agent-tokenizer.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+tokio-util.workspace = true

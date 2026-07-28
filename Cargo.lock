@@ -141,11 +141,14 @@ version = "0.0.0"
 dependencies = [
  "agent-core",
  "agent-runtime",
+ "agent-tokenizer",
  "async-trait",
+ "futures-util",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
