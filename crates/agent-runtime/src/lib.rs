@@ -25,6 +25,7 @@ pub mod lifecycle;
 pub mod resume;
 pub mod runner;
 pub mod store;
+pub mod supervisor;
 pub mod thread;
 
 pub use agent::{
@@ -48,6 +49,10 @@ pub use lifecycle::{LifecycleError, TurnLifecycle, TurnState};
 pub use resume::ResumedThread;
 pub use runner::{RunAgentRunner, TurnOutcome, TurnRequest, TurnRunner};
 pub use store::{ForkPoint, MemoryThreadStore, StoreError, ThreadSnapshot, ThreadStore};
+pub use supervisor::{
+    AgentJournal, AgentSent, AgentSpawned, AgentSpawner, AgentSupervisor, AgentView, ChildParts,
+    ChildRequest, MAX_AGENT_TASK, WaitOutcome,
+};
 pub use thread::{
     Accepted, COMMAND_MAILBOX, Fork, ForkError, LIVE_EVENT_BUFFER, MAX_PENDING_INPUTS,
     RuntimeError, RuntimeEvent, RuntimeEventPayload, SHUTDOWN_DEADLINE, STRAGGLER_ABORT_AFTER,

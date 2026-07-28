@@ -143,6 +143,7 @@ async fn open(log: &Log, thread_id: ThreadId, runner: Arc<dyn TurnRunner>) -> Th
         ids: Arc::new(RandomIds),
         clock: Arc::new(common::InstantClock),
         parent_cancel: CancellationToken::new(),
+        agents: None,
     })
     .await
     .expect("the thread opens")

@@ -24,6 +24,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::agent::AgentState;
 use crate::context::TurnContextSource;
 use crate::event::{ThreadEvent, ThreadEventPayload};
 use crate::id::{EventId, IdGenerator, ThreadId, TurnId};
@@ -32,6 +33,7 @@ use crate::lifecycle::{TurnLifecycle, TurnState};
 use crate::resume::{self, ResumedThread};
 use crate::runner::{TurnOutcome, TurnRequest, TurnRunner};
 use crate::store::{ForkPoint, StoreError, ThreadSnapshot, ThreadStore};
+use crate::supervisor::{AgentJournal, AgentSupervisor};
 
 /// Control mailbox depth. A producer that finds it full is refused, never
 /// blocked (edge case #2).
@@ -208,6 +210,9 @@ pub struct ThreadOptions {
     /// Cancellation domain the thread hangs from. The thread takes a CHILD of
     /// it: cancelling the thread never reaches the parent or a sibling.
     pub parent_cancel: CancellationToken,
+    /// Sub-agents this thread may own (EP-004). `None` = a thread that spawns
+    /// nothing, which is what every child gets: depth stays at 1.
+    pub agents: Option<Arc<AgentSupervisor>>,
 }
 
 enum Command {
@@ -228,6 +233,12 @@ enum Command {
         at: Option<TurnId>,
         reply: oneshot::Sender<Result<Fork, ForkError>>,
     },
+    /// Persists an orchestration event on behalf of something running outside
+    /// the actor (EP-004). The actor stays the single writer of its log.
+    Record {
+        payload: ThreadEventPayload,
+        reply: oneshot::Sender<Result<EventId, SubmitError>>,
+    },
 }
 
 impl Command {
@@ -241,10 +252,43 @@ impl Command {
             Self::Interrupt { reply, .. } => {
                 let _ = reply.send(Err(error));
             }
+            Self::Record { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
             Self::Fork { reply, .. } => {
                 let _ = reply.send(Err(error.into()));
             }
         }
+    }
+}
+
+/// [`AgentJournal`] served by the thread's own mailbox.
+///
+/// A sub-agent tool runs inside a turn task, never inside the actor, so it
+/// reaches the durable log the same way a client does: through a bounded
+/// mailbox, and with the same refusal when that mailbox is full.
+///
+/// The sender is WEAK on purpose. The actor owns the supervisor, the supervisor
+/// owns this journal: a strong sender here would keep the mailbox alive from
+/// inside the actor, and a thread whose every handle was dropped would never
+/// reach the "nothing can command me anymore" branch of its own loop.
+struct MailboxJournal {
+    commands: mpsc::WeakSender<Command>,
+}
+
+#[async_trait::async_trait]
+impl AgentJournal for MailboxJournal {
+    async fn record(&self, payload: ThreadEventPayload) -> Result<EventId, SubmitError> {
+        let Some(commands) = self.commands.upgrade() else {
+            return Err(SubmitError::Stopped);
+        };
+        let (reply, answer) = oneshot::channel();
+        match commands.try_send(Command::Record { payload, reply }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => return Err(SubmitError::QueueFull),
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(SubmitError::Stopped),
+        }
+        answer.await.map_err(|_| SubmitError::Stopped)?
     }
 }
 
@@ -292,6 +336,7 @@ impl ThreadHandle {
             ids,
             clock,
             parent_cancel,
+            agents,
         } = options;
 
         store.create(&thread_id).await?;
@@ -317,6 +362,7 @@ impl ThreadHandle {
             turn_contexts,
             ids,
             clock,
+            agents: agents.clone(),
             token: token.clone(),
             tracker: TaskTracker::new(),
             seq: snapshot.next_seq(),
@@ -366,6 +412,36 @@ impl ThreadHandle {
                 reconciled_calls = resumed.reconciled_calls,
                 "turns closed by resume"
             );
+        }
+
+        // US-012 AC5: a child the log left open belongs to a process that is
+        // gone. Closing it here, once, is what keeps a restart from inheriting
+        // a phantom slot.
+        for record in &mut resumed.agents {
+            if record.state.is_terminal() {
+                continue;
+            }
+            let cause = format!("interrupted: recovered from `{}` at resume", record.state);
+            actor
+                .commit(ThreadEventPayload::AgentStateChanged {
+                    agent_id: record.agent_id,
+                    to: AgentState::Interrupted,
+                    cause: Some(cause.clone()),
+                })
+                .await?;
+            record.state = AgentState::Interrupted;
+            record.cause = Some(cause);
+        }
+
+        if let Some(agents) = &agents {
+            agents.attach(
+                thread_id,
+                Arc::new(MailboxJournal {
+                    commands: command_tx.downgrade(),
+                }),
+                token.child_token(),
+            );
+            agents.restore(resumed.agents.clone());
         }
 
         let join = tokio::spawn(actor.run(command_rx));
@@ -494,6 +570,9 @@ struct ThreadActor {
     turn_contexts: Arc<dyn TurnContextSource>,
     ids: Arc<dyn IdGenerator>,
     clock: Arc<dyn Clock>,
+    /// Children this thread owns. Held by the actor so a shutdown cancels and
+    /// drains them BEFORE the thread writes its own terminal (US-013 AC5).
+    agents: Option<Arc<AgentSupervisor>>,
     token: CancellationToken,
     tracker: TaskTracker,
     seq: u64,
@@ -662,6 +741,14 @@ impl ThreadActor {
             }
             Command::Fork { at, reply } => {
                 let outcome = self.on_fork(at).await;
+                let _ = reply.send(outcome);
+            }
+            Command::Record { payload, reply } => {
+                let outcome = self
+                    .commit(payload)
+                    .await
+                    .map(|event| event.event_id)
+                    .map_err(SubmitError::from);
                 let _ = reply.send(outcome);
             }
         }
@@ -1165,9 +1252,20 @@ impl ThreadActor {
         self.token.cancel();
         self.tracker.close();
         let mut aborted = false;
-        if tokio::time::timeout(STRAGGLER_ABORT_AFTER, self.tracker.wait())
-            .await
-            .is_err()
+        // US-013 AC5: the children hang from a node of this thread's token, so
+        // the cancel above already reached them. They are drained HERE, next to
+        // the thread's own tasks and before any terminal is written, so no
+        // sub-agent outlives the parent that owns it.
+        let children = async {
+            if let Some(agents) = &self.agents {
+                agents.shutdown().await;
+            }
+        };
+        if tokio::time::timeout(STRAGGLER_ABORT_AFTER, async {
+            tokio::join!(self.tracker.wait(), children);
+        })
+        .await
+        .is_err()
         {
             aborted = true;
             tracing::warn!(
@@ -1182,6 +1280,17 @@ impl ThreadActor {
                 self.tracker.wait(),
             )
             .await;
+        }
+
+        // Children closed while the mailbox was shutting down could not go
+        // through it. The actor is still the writer, so it persists them here
+        // rather than leaving the next resume to repair the graph.
+        if let Some(agents) = self.agents.clone() {
+            for payload in agents.take_unrecorded() {
+                if let Err(err) = self.commit(payload).await {
+                    tracing::warn!(thread_id = %self.thread_id, error = %err, "sub-agent terminal not persisted");
+                }
+            }
         }
 
         // Terminals produced while cancelling are still owed to the log.

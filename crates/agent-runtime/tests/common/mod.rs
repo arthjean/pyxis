@@ -352,8 +352,29 @@ pub struct Harness {
 /// Starts a thread over a real `RunAgentRunner`, so every assertion below is
 /// made on the production seam and not on a scripted stand-in.
 pub async fn start(runner: Arc<dyn agent_runtime::runner::TurnRunner>) -> Harness {
-    let thread_id = ThreadId::generate(&RandomIds);
-    let store = Arc::new(MemoryThreadStore::new());
+    start_with(runner, None).await
+}
+
+/// Same, with the sub-agent supervisor this thread owns (EP-004).
+pub async fn start_with(
+    runner: Arc<dyn agent_runtime::runner::TurnRunner>,
+    agents: Option<Arc<agent_runtime::supervisor::AgentSupervisor>>,
+) -> Harness {
+    start_on(runner, agents, Arc::new(MemoryThreadStore::new())).await
+}
+
+/// Same, on a store a test pre-filled: what a resume replays.
+pub async fn start_on(
+    runner: Arc<dyn agent_runtime::runner::TurnRunner>,
+    agents: Option<Arc<agent_runtime::supervisor::AgentSupervisor>>,
+    store: Arc<MemoryThreadStore>,
+) -> Harness {
+    let thread_id = store
+        .read()
+        .await
+        .expect("the store reads")
+        .thread_id
+        .unwrap_or_else(|| ThreadId::generate(&RandomIds));
     let contexts = Arc::new(FixedTurnContext::new(turn_context(TurnId::generate(
         &RandomIds,
     ))));
@@ -366,6 +387,7 @@ pub async fn start(runner: Arc<dyn agent_runtime::runner::TurnRunner>) -> Harnes
         ids: Arc::new(RandomIds),
         clock: Arc::new(InstantClock),
         parent_cancel: root.clone(),
+        agents,
     })
     .await
     .expect("the thread starts");

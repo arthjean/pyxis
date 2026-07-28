@@ -169,6 +169,7 @@ async fn start(
         ids: Arc::new(RandomIds),
         clock: Arc::new(FixedClock),
         parent_cancel: root.clone(),
+        agents: None,
     })
     .await
     .expect("the thread starts");
