@@ -434,6 +434,33 @@ impl TranscriptMapper {
                 )]
             }
             AgentEvent::ReasoningReplayDisabled { .. } => Vec::new(),
+            AgentEvent::RetryScheduled(view) => vec![TranscriptUpdate::new(
+                TranscriptLifecycle::Completed,
+                TranscriptItem::new(
+                    Some(self.next_local("notice")),
+                    TranscriptRole::System,
+                    TranscriptItemKind::Notice,
+                    TranscriptItemStatus::Complete,
+                    TranscriptPayload::Notice {
+                        message: format!(
+                            "retry {}/{} in {} ms ({:?})",
+                            view.ordinal, view.max_attempts, view.delay_ms, view.cause
+                        ),
+                    },
+                ),
+            )],
+            AgentEvent::CredentialRefresh(view) => vec![TranscriptUpdate::new(
+                TranscriptLifecycle::Completed,
+                TranscriptItem::new(
+                    Some(self.next_local("notice")),
+                    TranscriptRole::System,
+                    TranscriptItemKind::Notice,
+                    TranscriptItemStatus::Complete,
+                    TranscriptPayload::Notice {
+                        message: format!("credential refresh: {:?}", view.outcome),
+                    },
+                ),
+            )],
             AgentEvent::ToolCall(view) => {
                 let mut updates = self.drain_active_streams();
                 if let Some(display) = exec_display_from_tool(&view.name, &view.input) {

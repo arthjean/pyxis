@@ -436,6 +436,11 @@ pub enum ProviderError {
     Decode(String),
     #[error("stream interrupted: {0}")]
     Stream(String),
+    /// Credential preparation or recovery already failed before a provider
+    /// request could be opened. The payload is typed and contains no backend
+    /// body or credential detail.
+    #[error("credential: {0:?}")]
+    Credential(AuthError),
     /// CONTEXT error (PTL / 413). It is NOT a transient class: it feeds
     /// withholding (ARCHITECTURE 3.4), not the backoff.
     #[error("context too long (PTL/413)")]
@@ -460,6 +465,12 @@ pub enum ErrorClass {
     Retryable,
     RateLimited,
     Overloaded(u16),
+    /// A context-limit failure may reopen only through the same total attempt
+    /// budget, after reactive compaction.
+    ContextLimit,
+    /// The request is valid without encrypted reasoning replay. The core owns
+    /// this reopening so it consumes the same sampling attempt budget.
+    ReasoningReplayRejected,
     Auth(AuthError),
     InvalidRequest,
 }
@@ -470,6 +481,8 @@ pub enum AuthError {
     Expired,
     ThirdPartyBlocked,
     Invalid,
+    /// Recovery is unavailable, rejected, or already consumed for this sampling.
+    ReconnectRequired,
 }
 
 /// Implemented by every adapter (in `agent-provider`). Object-safe through
@@ -580,7 +593,7 @@ mod tests {
                 limit: 1_000,
             },
             retry: ModelRetryPolicy {
-                max_retries: 1,
+                max_attempts: 2,
                 backoff_base_ms: 50,
             },
             max_output_tokens: 100,

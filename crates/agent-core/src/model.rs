@@ -54,10 +54,37 @@ pub struct TruncationPolicy {
     pub limit: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ModelRetryPolicy {
-    pub max_retries: u32,
+    /// Total provider openings allowed for one sampling, including the initial
+    /// request and reopenings after refresh, replay downgrade or model fallback.
+    pub max_attempts: u32,
     pub backoff_base_ms: u64,
+}
+
+impl<'de> Deserialize<'de> for ModelRetryPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            max_attempts: Option<u32>,
+            max_retries: Option<u32>,
+            backoff_base_ms: u64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let max_attempts = wire
+            .max_attempts
+            .or_else(|| wire.max_retries.map(|retries| retries.saturating_add(1)))
+            .ok_or_else(|| serde::de::Error::missing_field("max_attempts"))?;
+
+        Ok(Self {
+            max_attempts,
+            backoff_base_ms: wire.backoff_base_ms,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -284,6 +311,12 @@ impl ResolvedModelRuntime {
                 detail: "must be greater than zero and below the context window".into(),
             });
         }
+        if self.retry.max_attempts == 0 {
+            return Err(ModelRuntimeError::InvalidField {
+                field: "retry.max_attempts",
+                detail: "must be greater than zero".into(),
+            });
+        }
         if self.retry.backoff_base_ms == 0 {
             return Err(ModelRuntimeError::InvalidField {
                 field: "retry.backoff_base_ms",
@@ -392,5 +425,23 @@ mod tests {
         ));
         descriptor.truncation.limit = crate::tools::MIN_MODEL_TOOL_RESULT_TOKENS as u32;
         assert!(descriptor.validate().is_ok());
+    }
+
+    #[test]
+    fn legacy_retry_count_deserializes_as_total_attempts() {
+        let retry: ModelRetryPolicy = serde_json::from_value(serde_json::json!({
+            "max_retries": 3,
+            "backoff_base_ms": 50
+        }))
+        .unwrap();
+
+        assert_eq!(retry.max_attempts, 4);
+        assert_eq!(
+            serde_json::to_value(retry).unwrap(),
+            serde_json::json!({
+                "max_attempts": 4,
+                "backoff_base_ms": 50
+            })
+        );
     }
 }

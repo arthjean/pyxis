@@ -46,6 +46,9 @@ const TOOL_CALL_TURN: &str = include_str!("fixtures/turn_tool_call.sse");
 const FINAL_TURN: &str = include_str!("fixtures/turn_final.sse");
 const BLOCKING_TURN: &str = include_str!("fixtures/turn_blocking_tool.sse");
 const MALFORMED_TURN: &str = include_str!("fixtures/turn_malformed.sse");
+/// Recorded-shape fixture with a deliberate transport cut after one text
+/// delta. It contains no terminal event and never opens a socket.
+const RETRY_AFTER_DELTA: &str = include_str!("fixtures/turn_retry_after_delta.sse");
 
 // ───────────────────────── Temporary directory ─────────────────────────
 
@@ -176,10 +179,15 @@ impl Provider for ReplayProvider {
         ))
     }
 
-    fn classify_error(&self, _err: &ProviderError) -> ErrorClass {
-        // A recorded stream does not repair itself by retrying: the failure must be
-        // terminal and deterministic, otherwise a contract test would loop forever.
-        ErrorClass::InvalidRequest
+    fn classify_error(&self, err: &ProviderError) -> ErrorClass {
+        match err {
+            // A cut fixture is retryable and consumes the next recorded response.
+            ProviderError::Stream(message) if message == "missing terminal event" => {
+                ErrorClass::Retryable
+            }
+            // Malformed recorded events remain terminal contract failures.
+            _ => ErrorClass::InvalidRequest,
+        }
     }
 }
 
@@ -298,6 +306,7 @@ fn harness_with_hooks(
 
 fn context(prompt: &str, tools: Vec<agent_core::provider::ToolSpec>) -> AgentContext {
     AgentContext {
+        turn_id: Some("turn_e2e".to_string()),
         model: "gpt-5".to_string(),
         model_runtime: None,
         reasoning_effort: None,
@@ -475,9 +484,57 @@ async fn malformed_sse_surfaces_as_a_provider_contract_error() {
         other => format!("{other:?}"),
     };
     assert!(
-        outcome.contains("function_call done without active call id or name"),
-        "un flux malformé doit remonter comme erreur de contrat provider nommée, \
+        outcome.contains("provider response decode failed"),
+        "un flux malformé doit remonter comme erreur de decode provider nommée mais expurgée, \
          obtenu : {outcome}"
+    );
+}
+
+#[tokio::test]
+async fn retry_after_real_sse_delta_resets_and_preserves_correlated_fingerprints() {
+    let workspace = TempWorkspace::new("retry-after-delta");
+    let h = harness(&workspace, [RETRY_AFTER_DELTA, FINAL_TURN], None);
+    let observed = Arc::new(Mutex::new(Vec::<agent_core::AgentEvent>::new()));
+    let sink = Arc::clone(&observed);
+
+    let result = agent_core::run_headless_observed(
+        context("Réponds", Vec::new()),
+        h.deps.clone(),
+        move |event| sink.lock().unwrap().push(event.clone()),
+    )
+    .await;
+    let events = observed.lock().unwrap();
+
+    assert!(matches!(result.ended, HeadlessEnd::EndTurn));
+    assert_eq!(result.text, "Le fichier contient la phrase attendue.");
+    assert!(!result.text.contains("abandoned draft"));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, agent_core::AgentEvent::StreamReset))
+            .count(),
+        1
+    );
+    let retry = events
+        .iter()
+        .find_map(|event| match event {
+            agent_core::AgentEvent::RetryScheduled(view) => Some(view),
+            _ => None,
+        })
+        .expect("retry is observable");
+    assert_eq!(retry.turn_id.as_deref(), Some("turn_e2e"));
+    assert_eq!((retry.step, retry.ordinal), (1, 2));
+    assert_eq!(retry.cause, ErrorClass::Retryable);
+    assert_eq!(retry.prompt_fingerprint.len(), 64);
+    assert_eq!(retry.model_runtime_fingerprint.len(), 64);
+    assert_eq!(retry.tool_plan_fingerprint.len(), 64);
+    assert_eq!(
+        resumed_messages(&h.session_path),
+        vec![
+            Message::user("Réponds"),
+            Message::assistant_text("Le fichier contient la phrase attendue.")
+        ],
+        "the abandoned delta never enters the canonical transcript"
     );
 }
 

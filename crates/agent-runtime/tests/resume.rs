@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use agent_core::message::{ContentBlock, Message};
 use agent_runtime::context::{FixedTurnContext, TurnContextSource};
 use agent_runtime::event::{ThreadEvent, ThreadEventPayload};
-use agent_runtime::id::{EventId, RandomIds, ThreadId, TurnId};
+use agent_runtime::id::{EventId, IdGenerator, RandomIds, SequentialIds, ThreadId, TurnId};
 use agent_runtime::lifecycle::TurnState;
 use agent_runtime::runner::{RunAgentRunner, TurnRunner};
 use agent_runtime::store::{
@@ -52,19 +52,116 @@ impl Log {
     /// Appends without going through a store: how a previous process left the
     /// file behind.
     fn seed(&self, thread_id: ThreadId, payloads: Vec<ThreadEventPayload>) {
+        self.seed_with_ids(thread_id, payloads, &RandomIds);
+    }
+
+    fn seed_with_ids(
+        &self,
+        thread_id: ThreadId,
+        payloads: Vec<ThreadEventPayload>,
+        ids: &dyn IdGenerator,
+    ) {
         *self.thread_id.lock().unwrap() = Some(thread_id);
-        let ids = RandomIds;
         let mut events = self.events.lock().unwrap();
         for payload in payloads {
             let seq = events.len() as u64 + 1;
             events.push(ThreadEvent {
-                event_id: EventId::generate(&ids),
+                event_id: EventId::generate(ids),
                 thread_id,
                 seq,
                 at_ms: seq,
                 payload,
             });
         }
+    }
+}
+
+#[tokio::test]
+async fn crash_repair_crash_is_idempotent_across_1000_deterministic_replays() {
+    const REPETITIONS: u64 = 1_000;
+
+    for round in 0..REPETITIONS {
+        let log = Log::default();
+        let seed = 1_000_000 + round * 32;
+        let ids = SequentialIds::starting_at(seed);
+        let thread_id = ThreadId::generate(&ids);
+        let turn_id = TurnId::generate(&ids);
+        log.seed_with_ids(
+            thread_id,
+            vec![
+                ThreadEventPayload::ThreadCreated,
+                ThreadEventPayload::InputSubmitted {
+                    turn_id,
+                    client_message_id: None,
+                    text: "outil".into(),
+                },
+                ThreadEventPayload::TurnStateChanged {
+                    turn_id,
+                    from: Some(TurnState::Queued),
+                    to: TurnState::Running,
+                    cause: None,
+                    context: None,
+                },
+            ],
+            &ids,
+        );
+        *log.messages.lock().unwrap() = vec![Message::assistant(vec![ContentBlock::ToolUse {
+            id: "orphan".into(),
+            name: "bash".into(),
+            input: serde_json::json!({}),
+        }])];
+
+        let first = ThreadHandle::start(ThreadOptions {
+            ids: Arc::new(SequentialIds::starting_at(seed + 8)),
+            ..options(
+                thread_id,
+                SharedStore::open(&log) as Arc<dyn ThreadStore>,
+                echo_runner(1),
+            )
+        })
+        .await
+        .expect("first deterministic recovery must succeed");
+        let projected_after_repair = first.resumed().messages.clone();
+        first.shutdown().await;
+
+        let durable_len = log.events().len();
+        let second = ThreadHandle::start(ThreadOptions {
+            ids: Arc::new(SequentialIds::starting_at(seed + 16)),
+            ..options(
+                thread_id,
+                SharedStore::open(&log) as Arc<dyn ThreadStore>,
+                echo_runner(1),
+            )
+        })
+        .await
+        .expect("second deterministic recovery must succeed");
+
+        assert_eq!(log.repairs().len(), 1, "round {round}: duplicate repair");
+        assert_eq!(
+            log.events().len(),
+            durable_len,
+            "round {round}: second crash/replay appended a terminal"
+        );
+        assert_eq!(
+            second.resumed().messages,
+            projected_after_repair,
+            "round {round}: memory and replayed projections diverged"
+        );
+        assert_eq!(
+            log.events()
+                .iter()
+                .filter(|event| matches!(
+                    &event.payload,
+                    ThreadEventPayload::TurnStateChanged {
+                        to: TurnState::Interrupted,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "round {round}: recovery terminal was duplicated"
+        );
+        second.shutdown().await;
     }
 }
 

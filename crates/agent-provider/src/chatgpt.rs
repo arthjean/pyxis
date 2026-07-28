@@ -13,7 +13,6 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use agent_auth::OAuthCredential;
-use agent_auth::oauth::openai_chatgpt;
 use agent_core::message::ContentBlock;
 use agent_core::model::{
     ModelRetryPolicy, ModelRuntimeError, ResolvedModelRuntime, ResponsesDialect,
@@ -352,25 +351,6 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
-fn should_retry_with_originator_fallback(status: u16, message: &str) -> bool {
-    should_retry_with_originator_fallback_env(
-        status,
-        message,
-        std::env::var_os("PYXIS_ORIGINATOR").is_some(),
-    )
-}
-
-fn should_retry_with_originator_fallback_env(
-    status: u16,
-    message: &str,
-    originator_forced: bool,
-) -> bool {
-    if originator_forced {
-        return false;
-    }
-    matches!(status, 400 | 403) && message.to_ascii_lowercase().contains("originator")
-}
-
 fn should_retry_without_reasoning_replay(status: u16, message: &str) -> bool {
     if status != 400 {
         return false;
@@ -390,7 +370,7 @@ fn should_retry_without_reasoning_replay(status: u16, message: &str) -> bool {
 /// We only keep the UNAMBIGUOUS signals: Pi's bare substrings `"billing"`
 /// and `"available balance"` are ruled out (a transient 429 saying "rate limited;
 /// see billing dashboard" would be wrongly dropped). Deliberate bias toward false negatives:
-/// a missed terminal falls back to `RateLimited` -> BOUNDED retry (`max_retries` + 60 s cap),
+/// a missed terminal falls back to `RateLimited` -> BOUNDED retry (`max_attempts` + 60 s cap),
 /// a safe degradation; a false positive would kill the session with no recourse.
 const TERMINAL_RATE_LIMIT_MARKERS: &[&str] = &[
     "gousagelimiterror",
@@ -408,10 +388,6 @@ pub fn is_terminal_rate_limit(body: &str) -> bool {
     TERMINAL_RATE_LIMIT_MARKERS
         .iter()
         .any(|m| lower.contains(m))
-}
-
-fn is_auth_expired(body: &str) -> bool {
-    body.to_ascii_lowercase().contains("expired")
 }
 
 fn redact_bearer_tokens(input: &str) -> String {
@@ -624,7 +600,7 @@ impl Provider for OpenAiChatGptProvider {
             reasoning_effort.or(self.reasoning_effort.as_deref()),
             max_output_tokens,
             ModelRetryPolicy {
-                max_retries,
+                max_attempts: max_retries.saturating_add(1),
                 backoff_base_ms,
             },
         )
@@ -663,43 +639,34 @@ impl Provider for OpenAiChatGptProvider {
             .reasoning_effort
             .as_deref()
             .map(reasoning_effort_for_request);
-        let build_body = |replay: bool| {
-            build_responses_body(
-                &req,
-                ResponsesBodyOptions {
-                    reasoning_effort,
-                    include_encrypted_reasoning: replay && runtime.reasoning_effort.is_some(),
-                    parallel_tool_calls: runtime.supports_parallel_tool_calls,
-                    text_verbosity: if runtime.supports_verbosity {
-                        runtime.verbosity.as_deref()
-                    } else {
-                        None
-                    },
-                    dialect: runtime.responses_dialect,
+        let mut body = build_responses_body(
+            &req,
+            ResponsesBodyOptions {
+                reasoning_effort,
+                include_encrypted_reasoning: req.reasoning_replay
+                    && runtime.reasoning_effort.is_some(),
+                parallel_tool_calls: runtime.supports_parallel_tool_calls,
+                text_verbosity: if runtime.supports_verbosity {
+                    runtime.verbosity.as_deref()
+                } else {
+                    None
                 },
-            )
-        };
-        let mut replay = req.reasoning_replay;
-        let mut body = build_body(replay);
+                dialect: runtime.responses_dialect,
+            },
+        );
         // US-029: stable per-session cache key -> reuse of the backend cache.
         let prompt_cache_key = self.prompt_cache_key();
         inject_cache_key(&mut body, &prompt_cache_key);
 
         // 3. POST. `.json()` sets the content-type; we add the proprietary headers
         //    (Authorization, chatgpt-account-id, originator, OpenAI-Beta, accept).
-        let build_request = |body: &serde_json::Value, originator_override: Option<&str>| {
+        let build_request = |body: &serde_json::Value| {
             let mut rb = self.http.post(&spec.url).json(body);
             for (k, v) in &spec.headers {
                 if k.eq_ignore_ascii_case("content-type") {
                     continue;
                 }
-                if originator_override.is_some() && k.eq_ignore_ascii_case("originator") {
-                    continue;
-                }
                 rb = rb.header(k, v);
-            }
-            if let Some(originator) = originator_override {
-                rb = rb.header("originator", originator);
             }
             if runtime.responses_dialect == ResponsesDialect::Lite {
                 rb = rb.header("x-openai-internal-codex-responses-lite", "true");
@@ -712,54 +679,11 @@ impl Provider for OpenAiChatGptProvider {
         // handshakes then withholds its headers (blocked proxy, queue) would freeze the loop
         // without a signal. `send()` resolves when the headers are received -> this timeout
         // does NOT cut the long SSE stream that follows.
-        let mut resp =
-            send_with_header_timeout(build_request(&body, None), CONNECT_TIMEOUT).await?;
-        let mut replay_disabled_reason = None;
+        let resp = send_with_header_timeout(build_request(&body), CONNECT_TIMEOUT).await?;
 
         // 4. status. 413 -> context error (withholding/reactive compaction).
         if !resp.status().is_success() {
-            let first_err = http_error_from_response(resp).await;
-            if replay
-                && let ProviderError::Http {
-                    status, message, ..
-                } = &first_err
-                && should_retry_without_reasoning_replay(*status, message)
-            {
-                replay = false;
-                body = build_body(false);
-                inject_cache_key(&mut body, &prompt_cache_key);
-                let retry =
-                    send_with_header_timeout(build_request(&body, None), CONNECT_TIMEOUT).await?;
-                if retry.status().is_success() {
-                    resp = retry;
-                    replay_disabled_reason =
-                        Some("backend rejected encrypted reasoning replay".to_string());
-                } else {
-                    let _ = http_error_from_response(retry).await;
-                    return Err(ProviderError::Http {
-                        status: 400,
-                        message: "reasoning replay downgrade was rejected".into(),
-                        retry_after_ms: None,
-                    });
-                }
-            } else if let ProviderError::Http {
-                status, message, ..
-            } = &first_err
-                && should_retry_with_originator_fallback(*status, message)
-            {
-                let retry = send_with_header_timeout(
-                    build_request(&body, Some(openai_chatgpt::ORIGINATOR_FALLBACK)),
-                    CONNECT_TIMEOUT,
-                )
-                .await?;
-                if retry.status().is_success() {
-                    resp = retry;
-                } else {
-                    return Err(http_error_from_response(retry).await);
-                }
-            } else {
-                return Err(first_err);
-            }
+            return Err(http_error_from_response(resp).await);
         }
 
         // 5. SSE stream -> canonical StreamEvent (never ANSI, never a panic).
@@ -772,13 +696,10 @@ impl Provider for OpenAiChatGptProvider {
         let quota = crate::quota::parse_quota_headers(resp.headers());
         let mut es = resp.bytes_stream().eventsource();
         let mapped = async_stream::stream! {
-            if let Some(reason) = replay_disabled_reason {
-                yield Ok(StreamEvent::ReasoningReplayDisabled { reason });
-            }
             if let Some(snapshot) = quota {
                 yield Ok(StreamEvent::Quota { snapshot });
             }
-            let mut mapper = CodexEventMapper::with_replay(replay);
+            let mut mapper = CodexEventMapper::with_replay(req.reasoning_replay);
             let mut saw_terminal = false;
             while let Some(ev) = es.next().await {
                 match ev {
@@ -848,11 +769,18 @@ impl Provider for OpenAiChatGptProvider {
 
     fn classify_error(&self, err: &ProviderError) -> ErrorClass {
         match err {
+            ProviderError::Credential(error) => ErrorClass::Auth(*error),
             ProviderError::Http {
                 status, message, ..
             } => match *status {
-                401 | 403 if is_auth_expired(message) => ErrorClass::Auth(AuthError::Expired),
-                401 | 403 => ErrorClass::Auth(AuthError::Invalid),
+                // This adapter owns a refresh-capable credential manager. A 401
+                // therefore authorizes one sampling-scoped recovery regardless
+                // of backend body wording; the core enforces the bound.
+                401 => ErrorClass::Auth(AuthError::Expired),
+                403 => ErrorClass::Auth(AuthError::Invalid),
+                400 if should_retry_without_reasoning_replay(*status, message) => {
+                    ErrorClass::ReasoningReplayRejected
+                }
                 // 429 with an exhausted quota (GoUsageLimitError/billing/... body) -> TERMINAL:
                 // never retried (US-023). A transient 429 stays `RateLimited`.
                 429 if is_terminal_rate_limit(message) => ErrorClass::InvalidRequest,
@@ -970,35 +898,6 @@ mod tests {
     }
 
     #[test]
-    fn originator_fallback_only_retries_targeted_rejections() {
-        assert!(should_retry_with_originator_fallback_env(
-            400,
-            "unknown originator pyxis",
-            false
-        ));
-        assert!(should_retry_with_originator_fallback_env(
-            403,
-            "originator is not allowed",
-            false
-        ));
-        assert!(!should_retry_with_originator_fallback_env(
-            400,
-            "bad schema",
-            false
-        ));
-        assert!(!should_retry_with_originator_fallback_env(
-            500,
-            "originator",
-            false
-        ));
-        assert!(!should_retry_with_originator_fallback_env(
-            403,
-            "originator is not allowed",
-            true
-        ));
-    }
-
-    #[test]
     fn replay_downgrade_only_matches_attributable_bad_requests() {
         assert!(should_retry_without_reasoning_replay(
             400,
@@ -1013,6 +912,15 @@ mod tests {
             500,
             "encrypted_reasoning"
         ));
+        let p = provider();
+        assert_eq!(
+            p.classify_error(&ProviderError::Http {
+                status: 400,
+                message: "encrypted_reasoning is not supported".into(),
+                retry_after_ms: None,
+            }),
+            ErrorClass::ReasoningReplayRejected
+        );
     }
 
     // US-029: session_id = well-formed UUID v4, stable per instance, unique.
@@ -1050,7 +958,7 @@ mod tests {
         };
         assert!(matches!(
             p.classify_error(&http(401)),
-            ErrorClass::Auth(AuthError::Invalid)
+            ErrorClass::Auth(AuthError::Expired)
         ));
         assert!(matches!(
             p.classify_error(&http(429)),
@@ -1122,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_auth_is_classified_for_refresh() {
+    fn every_401_is_classified_for_one_refresh_without_body_heuristics() {
         let p = provider();
         assert!(matches!(
             p.classify_error(&ProviderError::Http {
@@ -1138,8 +1046,12 @@ mod tests {
                 message: "invalid token".into(),
                 retry_after_ms: None,
             }),
-            ErrorClass::Auth(AuthError::Invalid)
+            ErrorClass::Auth(AuthError::Expired)
         ));
+        assert_eq!(
+            p.classify_error(&ProviderError::Credential(AuthError::ReconnectRequired)),
+            ErrorClass::Auth(AuthError::ReconnectRequired)
+        );
     }
 
     #[test]
@@ -1166,11 +1078,27 @@ mod tests {
         let err = p.creds.request_spec().await.unwrap_err();
         assert!(matches!(
             err,
-            ProviderError::Http {
-                status: 401,
-                message,
-                ..
-            } if message == "auth disconnected"
+            ProviderError::Credential(AuthError::ReconnectRequired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn expiring_inference_credential_requests_one_visible_core_refresh() {
+        let p = OpenAiChatGptProvider::new(
+            OAuthCredential {
+                provider: agent_auth::ProviderId::OpenAiChatGpt,
+                access: agent_auth::Secret::new("AT"),
+                refresh: agent_auth::Secret::new("RT"),
+                expires_at: 0,
+                account_id: Some("acct".into()),
+            },
+            DEFAULT_MAX_CONTEXT,
+            None,
+        );
+
+        assert!(matches!(
+            p.creds.request_spec().await,
+            Err(ProviderError::Credential(AuthError::Expired))
         ));
     }
 

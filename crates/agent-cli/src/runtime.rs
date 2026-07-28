@@ -352,6 +352,7 @@ fn build_context(
         fallback_base.map(|base| crate::interactive::compose_system(&base, goal.as_deref()));
 
     AgentContext {
+        turn_id: None,
         model: captured.model.clone(),
         model_runtime: request.model_runtime.clone(),
         reasoning_effort: captured.reasoning_effort.clone(),

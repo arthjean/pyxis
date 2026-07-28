@@ -17,7 +17,10 @@ use crate::cancel::{Cancellable, guard};
 use crate::compaction::{CompactKind, CompactionState, full_compact, microcompact};
 use crate::deps::Deps;
 use crate::error::{AgentError, ProviderFailure};
-use crate::event::{AgentEvent, ToolCallView, ToolOutputDeltaView, ToolResultView};
+use crate::event::{
+    AgentEvent, CredentialRefreshOutcome, CredentialRefreshView, RetryScheduledView, ToolCallView,
+    ToolOutputDeltaView, ToolResultView,
+};
 use crate::guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget, batch_signature};
 use crate::input::InputQueue;
 use crate::message::{
@@ -85,6 +88,9 @@ impl Default for RunConfig {
 
 /// Context of an agent run (model, system, transcript, tools).
 pub struct AgentContext {
+    /// Durable turn identity when the loop is driven by `agent-runtime`.
+    /// Direct embedders may leave it absent.
+    pub turn_id: Option<String>,
     pub model: String,
     /// Immutable model contract captured before the turn starts.
     pub model_runtime: Option<ResolvedModelRuntime>,
@@ -116,6 +122,7 @@ pub struct AgentContext {
 impl AgentContext {
     pub fn new(model: impl Into<String>) -> Self {
         Self {
+            turn_id: None,
             model: model.into(),
             model_runtime: None,
             reasoning_effort: None,
@@ -171,14 +178,85 @@ async fn steer_ready(inputs: &Option<Arc<dyn InputQueue>>) {
     }
 }
 
-fn backoff(config: &RunConfig, attempt: u32) -> Duration {
+#[derive(Debug, Clone, Copy)]
+struct ResolvedAttemptPolicy {
+    max_attempts: u32,
+    backoff_base_ms: u64,
+}
+
+impl ResolvedAttemptPolicy {
+    fn resolve(config: &RunConfig, runtime: Option<&ResolvedModelRuntime>) -> Self {
+        match runtime {
+            Some(runtime) => Self {
+                max_attempts: runtime.retry.max_attempts.max(1),
+                backoff_base_ms: runtime.retry.backoff_base_ms,
+            },
+            None => Self {
+                max_attempts: config.max_retries.saturating_add(1).max(1),
+                backoff_base_ms: config.backoff_base_ms,
+            },
+        }
+    }
+
+    fn permits_after(self, current_ordinal: u32) -> bool {
+        current_ordinal < self.max_attempts
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AttemptContext {
+    turn_id: Option<String>,
+    step: u32,
+    prompt_fingerprint: String,
+    model_runtime_fingerprint: String,
+    tool_plan_fingerprint: String,
+}
+
+impl AttemptContext {
+    fn retry_scheduled(
+        &self,
+        ordinal: u32,
+        policy: ResolvedAttemptPolicy,
+        cause: ErrorClass,
+        delay: Duration,
+        fallback_model: Option<String>,
+    ) -> AgentEvent {
+        AgentEvent::RetryScheduled(RetryScheduledView {
+            turn_id: self.turn_id.clone(),
+            step: self.step,
+            ordinal,
+            max_attempts: policy.max_attempts,
+            cause,
+            delay_ms: delay.as_millis().min(u64::MAX as u128) as u64,
+            fallback_model,
+            prompt_fingerprint: self.prompt_fingerprint.clone(),
+            model_runtime_fingerprint: self.model_runtime_fingerprint.clone(),
+            tool_plan_fingerprint: self.tool_plan_fingerprint.clone(),
+        })
+    }
+
+    fn credential_refresh(
+        &self,
+        attempt_ordinal: u32,
+        outcome: CredentialRefreshOutcome,
+    ) -> AgentEvent {
+        AgentEvent::CredentialRefresh(CredentialRefreshView {
+            turn_id: self.turn_id.clone(),
+            step: self.step,
+            attempt_ordinal,
+            outcome,
+        })
+    }
+}
+
+fn backoff(policy: ResolvedAttemptPolicy, attempt: u32) -> Duration {
     let factor = 1u64 << attempt.min(5);
-    Duration::from_millis(config.backoff_base_ms.saturating_mul(factor))
+    Duration::from_millis(policy.backoff_base_ms.saturating_mul(factor))
 }
 
 /// Cap on the honored `Retry-After` delay (US-023). A server cannot freeze the
 /// loop forever: an absurd delay is bounded, we retry then give up according
-/// to `max_retries`. Same cap as Pi (60 s).
+/// to `max_attempts`. Same cap as Pi (60 s).
 const MAX_RETRY_AFTER_MS: u64 = 60_000;
 
 /// Effective retry delay (US-023): `max(exponential backoff, Retry-After)`, the
@@ -208,6 +286,8 @@ fn retry_jitter_ms(
         ErrorClass::Retryable => 1,
         ErrorClass::RateLimited => 2,
         ErrorClass::Overloaded(status) => status as u64,
+        ErrorClass::ContextLimit => 6,
+        ErrorClass::ReasoningReplayRejected => 5,
         ErrorClass::Auth(_) => 3,
         ErrorClass::InvalidRequest => 4,
     };
@@ -217,6 +297,7 @@ fn retry_jitter_ms(
         ProviderError::Decode(_) => 11,
         ProviderError::Stream(_) => 12,
         ProviderError::ContextLengthExceeded => 13,
+        ProviderError::Credential(_) => 14,
     };
     let mut x = now_ms
         ^ ((attempt as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15))
@@ -229,13 +310,13 @@ fn retry_jitter_ms(
 }
 
 fn transient_retry_delay(
-    config: &RunConfig,
+    policy: ResolvedAttemptPolicy,
     attempt: u32,
     class: ErrorClass,
     err: &ProviderError,
     now_ms: u64,
 ) -> Duration {
-    let mut base = backoff(config, attempt);
+    let mut base = backoff(policy, attempt);
     if matches!(class, ErrorClass::Overloaded(_)) {
         base = base.saturating_mul(3);
     }
@@ -254,6 +335,10 @@ fn transient_retry_delay(
     delay.saturating_add(Duration::from_millis(retry_jitter_ms(
         now_ms, attempt, class, err, jitter_cap,
     )))
+}
+
+fn classified_provider_error(class: ErrorClass, error: &ProviderError) -> AgentError {
+    AgentError::Provider(ProviderFailure::classified(error, class))
 }
 
 fn maybe_switch_to_overload_fallback(
@@ -441,8 +526,6 @@ fn maybe_switch_to_resolved_overload_fallback(
         .clone()
         .or_else(|| Some(fallback.instructions.clone()));
     config.max_output_tokens = fallback.max_output_tokens;
-    config.max_retries = fallback.retry.max_retries;
-    config.backoff_base_ms = fallback.retry.backoff_base_ms;
     *parallel_tools = fallback.supports_parallel_tool_calls;
     *tool_plan = tool_plan.with_parallel_allowed(*parallel_tools);
     let static_input_tokens = estimate_static_input(
@@ -475,6 +558,7 @@ fn maybe_switch_to_resolved_overload_fallback(
 pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent> + Send {
     async_stream::stream! {
         let AgentContext {
+            turn_id,
             mut model,
             mut model_runtime,
             mut reasoning_effort,
@@ -500,8 +584,6 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                 system = Some(runtime.instructions.clone());
             }
             config.max_output_tokens = runtime.max_output_tokens;
-            config.max_retries = runtime.retry.max_retries;
-            config.backoff_base_ms = runtime.retry.backoff_base_ms;
             config.overload_fallback_model = None;
         }
 
@@ -565,7 +647,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
         let mut compaction = CompactionState::default();
         let mut pending: Option<PendingError> = None;
         let mut model_turns: u32 = 0;
-        let mut transient_retries: u32 = 0;
+        let mut attempt_policy = ResolvedAttemptPolicy::resolve(&config, model_runtime.as_ref());
+        let mut attempt_ordinal: u32 = 1;
+        let mut credential_refresh_attempted = false;
         let mut overload_fallback_used = false;
         let mut iterations: u32 = 0;
         let iter_cap = config.max_turns.saturating_mul(4).saturating_add(32);
@@ -775,6 +859,19 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         yield AgentEvent::Error(AgentError::InvalidRequest(e.to_string()));
                         return;
                     }
+                    let attempt_context = AttemptContext {
+                        turn_id: turn_id.clone(),
+                        step: model_turns.saturating_add(1),
+                        prompt_fingerprint: snapshot.fingerprint().to_string(),
+                        model_runtime_fingerprint: snapshot
+                            .baseline()
+                            .profile_fingerprint
+                            .clone(),
+                        tool_plan_fingerprint: snapshot
+                            .baseline()
+                            .tool_plan_fingerprint
+                            .clone(),
+                    };
 
                     // US-001: opening the stream can block for several seconds
                     // (TLS + first byte); cancellation takes over without waiting.
@@ -785,6 +882,21 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     let mut stream = match opened {
                         Ok(s) => s,
                         Err(e) if e.is_context_error() => {
+                            if !attempt_policy.permits_after(attempt_ordinal) {
+                                yield AgentEvent::Error(classified_provider_error(
+                                    ErrorClass::ContextLimit,
+                                    &e,
+                                ));
+                                return;
+                            }
+                            attempt_ordinal += 1;
+                            yield attempt_context.retry_scheduled(
+                                attempt_ordinal,
+                                attempt_policy,
+                                ErrorClass::ContextLimit,
+                                Duration::ZERO,
+                                None,
+                            );
                             pending = Some(PendingError { kind: ContextErrorKind::PromptTooLong });
                             continue;
                         }
@@ -794,6 +906,11 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             ErrorClass::Retryable
                             | ErrorClass::RateLimited
                             | ErrorClass::Overloaded(_) => {
+                                if !attempt_policy.permits_after(attempt_ordinal) {
+                                    yield AgentEvent::Error(classified_provider_error(class, &e));
+                                    return;
+                                }
+                                let mut fallback_applied = false;
                                 if let Some(switched) =
                                     maybe_switch_to_resolved_overload_fallback(
                                         class,
@@ -827,16 +944,15 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                                     ContextTransitionCause::Compaction,
                                                 ]);
                                             }
+                                            fallback_applied = true;
                                         }
                                         Err(error) => {
                                             yield AgentEvent::Error(AgentError::InvalidRequest(error));
                                             return;
                                         }
                                     }
-                                    transient_retries = 0;
-                                    continue;
                                 }
-                                if maybe_switch_to_overload_fallback(
+                                if !fallback_applied && maybe_switch_to_overload_fallback(
                                     &mut model,
                                     &config,
                                     &mut overload_fallback_used,
@@ -855,50 +971,110 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                             return;
                                         }
                                     }
-                                    transient_retries = 0;
-                                    continue;
+                                    fallback_applied = true;
                                 }
-                                if transient_retries >= config.max_retries {
-                                    yield AgentEvent::Error((&e).into());
-                                    return;
-                                }
-                                transient_retries += 1;
-                                // attempt indexed from 0 -> delays 1x,2x,4x.
-                                // US-023: honors Retry-After (max(backoff, retry_after), bounded).
-                                // US-001: a backoff can last up to 60 s (bounded
-                                // Retry-After); cancellation cuts the wait short, the stop
-                                // boundary being the loop head.
-                                let _ = guard(
-                                    &deps.cancel,
-                                    deps.clock.sleep(transient_retry_delay(
-                                        &config,
-                                        transient_retries - 1,
+                                let delay = if fallback_applied {
+                                    Duration::ZERO
+                                } else {
+                                    transient_retry_delay(
+                                        attempt_policy,
+                                        attempt_ordinal - 1,
                                         class,
                                         &e,
                                         deps.clock.now_ms(),
-                                    )),
-                                )
-                                .await;
+                                    )
+                                };
+                                attempt_ordinal += 1;
+                                yield attempt_context.retry_scheduled(
+                                    attempt_ordinal,
+                                    attempt_policy,
+                                    class,
+                                    delay,
+                                    fallback_applied.then(|| model.clone()),
+                                );
+                                if !delay.is_zero() {
+                                    let _ = guard(&deps.cancel, deps.clock.sleep(delay)).await;
+                                }
                                 continue;
                             }
+                            ErrorClass::ReasoningReplayRejected => {
+                                if reasoning_replay
+                                    && !reasoning_replay_downgraded
+                                    && attempt_policy.permits_after(attempt_ordinal)
+                                {
+                                    reasoning_replay = false;
+                                    reasoning_replay_downgraded = true;
+                                    attempt_ordinal += 1;
+                                    yield AgentEvent::ReasoningReplayDisabled {
+                                        reason: "backend rejected encrypted reasoning replay".into(),
+                                    };
+                                    yield attempt_context.retry_scheduled(
+                                        attempt_ordinal,
+                                        attempt_policy,
+                                        class,
+                                        Duration::ZERO,
+                                        None,
+                                    );
+                                    continue;
+                                }
+                                yield AgentEvent::Error(classified_provider_error(class, &e));
+                                return;
+                            }
                             ErrorClass::Auth(AuthError::Expired) => {
-                                if transient_retries >= config.max_retries {
-                                    yield AgentEvent::Error(AgentError::Auth(AuthError::Expired));
+                                if credential_refresh_attempted
+                                    || !attempt_policy.permits_after(attempt_ordinal)
+                                {
+                                    yield AgentEvent::Error(AgentError::Auth(
+                                        AuthError::ReconnectRequired,
+                                    ));
                                     return;
                                 }
-                                transient_retries += 1;
-                                if let Err(refresh_err) = deps.provider.refresh_auth().await {
-                                    yield AgentEvent::Error((&refresh_err).into());
-                                    return;
+                                credential_refresh_attempted = true;
+                                yield attempt_context.credential_refresh(
+                                    attempt_ordinal,
+                                    CredentialRefreshOutcome::Started,
+                                );
+                                match guard(&deps.cancel, deps.provider.refresh_auth()).await {
+                                    Cancellable::Cancelled => {
+                                        yield attempt_context.credential_refresh(
+                                            attempt_ordinal,
+                                            CredentialRefreshOutcome::Cancelled,
+                                        );
+                                        continue;
+                                    }
+                                    Cancellable::Completed(Ok(())) => {
+                                        yield attempt_context.credential_refresh(
+                                            attempt_ordinal,
+                                            CredentialRefreshOutcome::Succeeded,
+                                        );
+                                    }
+                                    Cancellable::Completed(Err(_)) => {
+                                        yield attempt_context.credential_refresh(
+                                            attempt_ordinal,
+                                            CredentialRefreshOutcome::Rejected,
+                                        );
+                                        yield AgentEvent::Error(AgentError::Auth(
+                                            AuthError::ReconnectRequired,
+                                        ));
+                                        return;
+                                    }
                                 }
+                                attempt_ordinal += 1;
+                                yield attempt_context.retry_scheduled(
+                                    attempt_ordinal,
+                                    attempt_policy,
+                                    class,
+                                    Duration::ZERO,
+                                    None,
+                                );
                                 continue;
                             }
                             ErrorClass::Auth(a) => {
                                 yield AgentEvent::Error(AgentError::Auth(a));
                                 return;
                             }
-                            ErrorClass::InvalidRequest => {
-                                yield AgentEvent::Error((&e).into());
+                            ErrorClass::ContextLimit | ErrorClass::InvalidRequest => {
+                                yield AgentEvent::Error(classified_provider_error(class, &e));
                                 return;
                             }
                         }},
@@ -1023,14 +1199,37 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             if acc.has_visible_output() {
                                 yield AgentEvent::StreamReset;
                             }
+                            if !attempt_policy.permits_after(attempt_ordinal) {
+                                yield AgentEvent::Error(classified_provider_error(
+                                    ErrorClass::ContextLimit,
+                                    &e,
+                                ));
+                                return;
+                            }
+                            attempt_ordinal += 1;
+                            yield attempt_context.retry_scheduled(
+                                attempt_ordinal,
+                                attempt_policy,
+                                ErrorClass::ContextLimit,
+                                Duration::ZERO,
+                                None,
+                            );
                             pending = Some(PendingError { kind: ContextErrorKind::PromptTooLong });
                             continue;
                         }
                         let class = deps.provider.classify_error(&e);
+                        if acc.has_visible_output() {
+                            yield AgentEvent::StreamReset;
+                        }
                         match class {
                             ErrorClass::Retryable
                             | ErrorClass::RateLimited
                             | ErrorClass::Overloaded(_) => {
+                                if !attempt_policy.permits_after(attempt_ordinal) {
+                                    yield AgentEvent::Error(classified_provider_error(class, &e));
+                                    return;
+                                }
+                                let mut fallback_applied = false;
                                 if let Some(switched) =
                                     maybe_switch_to_resolved_overload_fallback(
                                         class,
@@ -1049,9 +1248,6 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                         &deps,
                                     )
                                 {
-                                    if acc.has_visible_output() {
-                                        yield AgentEvent::StreamReset;
-                                    }
                                     match switched {
                                         Ok(switched) => {
                                             budget = switched.budget;
@@ -1067,24 +1263,20 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                                     ContextTransitionCause::Compaction,
                                                 ]);
                                             }
+                                            fallback_applied = true;
                                         }
                                         Err(error) => {
                                             yield AgentEvent::Error(AgentError::InvalidRequest(error));
                                             return;
                                         }
                                     }
-                                    transient_retries = 0;
-                                    continue;
                                 }
-                                if maybe_switch_to_overload_fallback(
+                                if !fallback_applied && maybe_switch_to_overload_fallback(
                                     &mut model,
                                     &config,
                                     &mut overload_fallback_used,
                                     class,
                                 ) {
-                                    if acc.has_visible_output() {
-                                        yield AgentEvent::StreamReset;
-                                    }
                                     match rebuild_budget_after_model_switch(
                                         &model,
                                         &config,
@@ -1098,71 +1290,118 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                             return;
                                         }
                                     }
-                                    transient_retries = 0;
-                                    continue;
+                                    fallback_applied = true;
                                 }
-                                if transient_retries >= config.max_retries {
-                                    if acc.has_visible_output() {
-                                        yield AgentEvent::StreamReset;
-                                    }
-                                    yield AgentEvent::Error((&e).into());
-                                    return;
-                                }
-                                if acc.has_visible_output() {
-                                    yield AgentEvent::StreamReset;
-                                }
-                                transient_retries += 1;
-                                // attempt indexed from 0 -> delays 1x,2x,4x.
-                                // US-023: honors Retry-After (max(backoff, retry_after), bounded).
-                                // US-001: a backoff can last up to 60 s (bounded
-                                // Retry-After); cancellation cuts the wait short, the stop
-                                // boundary being the loop head.
-                                let _ = guard(
-                                    &deps.cancel,
-                                    deps.clock.sleep(transient_retry_delay(
-                                        &config,
-                                        transient_retries - 1,
+                                let delay = if fallback_applied {
+                                    Duration::ZERO
+                                } else {
+                                    transient_retry_delay(
+                                        attempt_policy,
+                                        attempt_ordinal - 1,
                                         class,
                                         &e,
                                         deps.clock.now_ms(),
-                                    )),
-                                )
-                                .await;
+                                    )
+                                };
+                                attempt_ordinal += 1;
+                                yield attempt_context.retry_scheduled(
+                                    attempt_ordinal,
+                                    attempt_policy,
+                                    class,
+                                    delay,
+                                    fallback_applied.then(|| model.clone()),
+                                );
+                                if !delay.is_zero() {
+                                    let _ = guard(&deps.cancel, deps.clock.sleep(delay)).await;
+                                }
                                 continue;
                             }
+                            ErrorClass::ReasoningReplayRejected => {
+                                if reasoning_replay
+                                    && !reasoning_replay_downgraded
+                                    && attempt_policy.permits_after(attempt_ordinal)
+                                {
+                                    reasoning_replay = false;
+                                    reasoning_replay_downgraded = true;
+                                    attempt_ordinal += 1;
+                                    yield AgentEvent::ReasoningReplayDisabled {
+                                        reason: "backend rejected encrypted reasoning replay".into(),
+                                    };
+                                    yield attempt_context.retry_scheduled(
+                                        attempt_ordinal,
+                                        attempt_policy,
+                                        class,
+                                        Duration::ZERO,
+                                        None,
+                                    );
+                                    continue;
+                                }
+                                yield AgentEvent::Error(classified_provider_error(class, &e));
+                                return;
+                            }
                             ErrorClass::Auth(AuthError::Expired) => {
-                                if acc.has_visible_output() {
-                                    yield AgentEvent::StreamReset;
-                                }
-                                if transient_retries >= config.max_retries {
-                                    yield AgentEvent::Error(AgentError::Auth(AuthError::Expired));
+                                if credential_refresh_attempted
+                                    || !attempt_policy.permits_after(attempt_ordinal)
+                                {
+                                    yield AgentEvent::Error(AgentError::Auth(
+                                        AuthError::ReconnectRequired,
+                                    ));
                                     return;
                                 }
-                                transient_retries += 1;
-                                if let Err(refresh_err) = deps.provider.refresh_auth().await {
-                                    yield AgentEvent::Error((&refresh_err).into());
-                                    return;
+                                credential_refresh_attempted = true;
+                                yield attempt_context.credential_refresh(
+                                    attempt_ordinal,
+                                    CredentialRefreshOutcome::Started,
+                                );
+                                match guard(&deps.cancel, deps.provider.refresh_auth()).await {
+                                    Cancellable::Cancelled => {
+                                        yield attempt_context.credential_refresh(
+                                            attempt_ordinal,
+                                            CredentialRefreshOutcome::Cancelled,
+                                        );
+                                        continue;
+                                    }
+                                    Cancellable::Completed(Ok(())) => {
+                                        yield attempt_context.credential_refresh(
+                                            attempt_ordinal,
+                                            CredentialRefreshOutcome::Succeeded,
+                                        );
+                                    }
+                                    Cancellable::Completed(Err(_)) => {
+                                        yield attempt_context.credential_refresh(
+                                            attempt_ordinal,
+                                            CredentialRefreshOutcome::Rejected,
+                                        );
+                                        yield AgentEvent::Error(AgentError::Auth(
+                                            AuthError::ReconnectRequired,
+                                        ));
+                                        return;
+                                    }
                                 }
+                                attempt_ordinal += 1;
+                                yield attempt_context.retry_scheduled(
+                                    attempt_ordinal,
+                                    attempt_policy,
+                                    class,
+                                    Duration::ZERO,
+                                    None,
+                                );
                                 continue;
                             }
                             ErrorClass::Auth(a) => {
-                                if acc.has_visible_output() {
-                                    yield AgentEvent::StreamReset;
-                                }
                                 yield AgentEvent::Error(AgentError::Auth(a));
                                 return;
                             }
-                            ErrorClass::InvalidRequest => {
-                                if acc.has_visible_output() {
-                                    yield AgentEvent::StreamReset;
-                                }
-                                yield AgentEvent::Error((&e).into());
+                            ErrorClass::ContextLimit | ErrorClass::InvalidRequest => {
+                                yield AgentEvent::Error(classified_provider_error(class, &e));
                                 return;
                             }
                         }
                     }
 
-                    transient_retries = 0;
+                    attempt_ordinal = 1;
+                    credential_refresh_attempted = false;
+                    attempt_policy = ResolvedAttemptPolicy::resolve(&config, model_runtime.as_ref());
                     model_turns += 1;
 
                     // Usage fallback: without an `usage` in the stream, estimate
@@ -1663,13 +1902,14 @@ mod tests {
             backoff_base_ms: 10,
             ..RunConfig::default()
         };
+        let policy = ResolvedAttemptPolicy::resolve(&cfg, None);
         let err = ProviderError::Http {
             status: 529,
             message: String::new(),
             retry_after_ms: None,
         };
-        let overloaded = transient_retry_delay(&cfg, 0, ErrorClass::Overloaded(529), &err, 0);
-        let retryable = transient_retry_delay(&cfg, 0, ErrorClass::Retryable, &err, 0);
+        let overloaded = transient_retry_delay(policy, 0, ErrorClass::Overloaded(529), &err, 0);
+        let retryable = transient_retry_delay(policy, 0, ErrorClass::Retryable, &err, 0);
         assert!(overloaded > Duration::from_millis(30));
         assert!(overloaded <= Duration::from_millis(36));
         assert!(retryable > Duration::from_millis(10));
@@ -1682,9 +1922,10 @@ mod tests {
             backoff_base_ms: 10,
             ..RunConfig::default()
         };
+        let policy = ResolvedAttemptPolicy::resolve(&cfg, None);
         let err = http(Some(3_600_000));
         assert_eq!(
-            transient_retry_delay(&cfg, 0, ErrorClass::RateLimited, &err, 0),
+            transient_retry_delay(policy, 0, ErrorClass::RateLimited, &err, 0),
             Duration::from_millis(MAX_RETRY_AFTER_MS)
         );
     }
@@ -1719,11 +1960,12 @@ mod tests {
             backoff_base_ms: 10,
             ..RunConfig::default()
         };
-        assert_eq!(backoff(&cfg, 0), Duration::from_millis(10));
-        assert_eq!(backoff(&cfg, 1), Duration::from_millis(20));
-        assert_eq!(backoff(&cfg, 2), Duration::from_millis(40));
+        let policy = ResolvedAttemptPolicy::resolve(&cfg, None);
+        assert_eq!(backoff(policy, 0), Duration::from_millis(10));
+        assert_eq!(backoff(policy, 1), Duration::from_millis(20));
+        assert_eq!(backoff(policy, 2), Duration::from_millis(40));
         // past 2^5 the factor is pinned at 32.
-        assert_eq!(backoff(&cfg, 5), Duration::from_millis(320));
-        assert_eq!(backoff(&cfg, 50), Duration::from_millis(320));
+        assert_eq!(backoff(policy, 5), Duration::from_millis(320));
+        assert_eq!(backoff(policy, 50), Duration::from_millis(320));
     }
 }

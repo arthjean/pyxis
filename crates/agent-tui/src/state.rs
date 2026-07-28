@@ -1183,6 +1183,18 @@ impl AppState {
                     "reasoning replay disabled: {reason}"
                 )));
             }
+            AgentEvent::RetryScheduled(view) => {
+                self.blocks.push(Block::Notice(format!(
+                    "retry {}/{} in {} ms ({:?})",
+                    view.ordinal, view.max_attempts, view.delay_ms, view.cause
+                )));
+            }
+            AgentEvent::CredentialRefresh(view) => {
+                self.blocks.push(Block::Notice(format!(
+                    "credential refresh: {:?}",
+                    view.outcome
+                )));
+            }
             AgentEvent::ToolCall(view) => {
                 self.finalize_streaming();
                 self.live_output = None;

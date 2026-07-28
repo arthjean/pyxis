@@ -303,9 +303,9 @@ async fn engine_events_cross_the_seam_without_reimplementing_retry_or_dispatch()
     let runner = RunAgentRunner::new(deps(provider, Arc::clone(&store)), context);
     let (tx, rx) = mpsc::channel(64);
     let observer = tokio::spawn(collect(rx));
-    let outcome = runner
-        .run_turn(request("salut"), tx, CancellationToken::new())
-        .await;
+    let request = request("salut");
+    let expected_turn_id = request.turn_id.to_string();
+    let outcome = runner.run_turn(request, tx, CancellationToken::new()).await;
     let events = observer.await.unwrap();
 
     assert_eq!(outcome, TurnOutcome::Completed);
@@ -314,6 +314,17 @@ async fn engine_events_cross_the_seam_without_reimplementing_retry_or_dispatch()
         events.iter().any(|e| matches!(e, AgentEvent::StreamReset)),
         "the retry of the engine crossed the seam: {events:?}"
     );
+    let retry = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::RetryScheduled(view) => Some(view),
+            _ => None,
+        })
+        .expect("the correlated retry crossed the seam");
+    assert_eq!(retry.turn_id.as_deref(), Some(expected_turn_id.as_str()));
+    assert_eq!(retry.step, 1);
+    assert_eq!(retry.ordinal, 2);
+    assert_eq!(retry.prompt_fingerprint.len(), 64);
     assert!(
         events.iter().any(|e| matches!(e, AgentEvent::ToolCall(_))),
         "the tool call crossed the seam"

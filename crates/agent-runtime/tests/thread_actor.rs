@@ -223,7 +223,7 @@ fn resolved_runtime() -> ResolvedModelRuntime {
             limit: 2_000,
         },
         retry: ModelRetryPolicy {
-            max_retries: 3,
+            max_attempts: 4,
             backoff_base_ms: 50,
         },
         max_output_tokens: 4096,

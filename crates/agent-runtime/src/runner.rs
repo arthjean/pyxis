@@ -133,6 +133,7 @@ where
         cancel: CancellationToken,
     ) -> TurnOutcome {
         let mut ctx = (self.context)(&request);
+        ctx.turn_id = Some(request.turn_id.to_string());
         // US-007: the queue the actor fills is the queue the engine drains. The
         // runner wires it rather than the factory, so no client can forget it and
         // silently turn every steer into a post-turn message.

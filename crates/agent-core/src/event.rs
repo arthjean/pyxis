@@ -5,6 +5,7 @@
 use crate::compaction::CompactKind;
 use crate::error::AgentError;
 use crate::message::{ToolCallId, ToolErrorKind};
+use crate::provider::ErrorClass;
 use crate::tools::{ToolExecution, ToolResultStatus, ToolResultTruncation};
 use crate::transition::ExhaustReason;
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,11 @@ pub enum AgentEvent {
     ReasoningReplayDisabled {
         reason: String,
     },
+    /// A provider reopening planned from the single sampling-scoped attempt
+    /// budget. It carries identifiers and allow-listed classifications only.
+    RetryScheduled(RetryScheduledView),
+    /// Lifecycle of the one credential recovery permitted for a sampling.
+    CredentialRefresh(CredentialRefreshView),
     /// A tool is about to run.
     ToolCall(ToolCallView),
     /// Output fragment of a tool still running (US-015). Purely
@@ -59,6 +65,43 @@ pub enum AgentEvent {
     Interrupted,
     Exhausted(ExhaustReason),
     Error(AgentError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetryScheduledView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    /// 1-based model sampling within the turn.
+    pub step: u32,
+    /// 1-based ordinal of the provider opening that will follow.
+    pub ordinal: u32,
+    pub max_attempts: u32,
+    pub cause: ErrorClass,
+    pub delay_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_model: Option<String>,
+    pub prompt_fingerprint: String,
+    pub model_runtime_fingerprint: String,
+    pub tool_plan_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialRefreshOutcome {
+    Started,
+    Succeeded,
+    Rejected,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialRefreshView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub step: u32,
+    /// Provider opening whose 401 triggered the recovery.
+    pub attempt_ordinal: u32,
+    pub outcome: CredentialRefreshOutcome,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

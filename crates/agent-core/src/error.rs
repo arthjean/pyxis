@@ -1,6 +1,6 @@
 //! High-level core error, propagated to clients through `AgentEvent::Error`.
 
-use crate::provider::{AuthError, ProviderError};
+use crate::provider::{AuthError, ErrorClass, ProviderError};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -10,6 +10,7 @@ pub enum ProviderFailureKind {
     Http,
     Decode,
     Stream,
+    Credential,
     ContextLengthExceeded,
     Contract,
 }
@@ -20,6 +21,8 @@ pub struct ProviderFailure {
     pub status: Option<u16>,
     pub message: String,
     pub retry_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<ErrorClass>,
 }
 
 impl ProviderFailure {
@@ -29,6 +32,14 @@ impl ProviderFailure {
             status: None,
             message: message.into(),
             retry_after_ms: None,
+            class: None,
+        }
+    }
+
+    pub fn classified(error: &ProviderError, class: ErrorClass) -> Self {
+        Self {
+            class: Some(class),
+            ..Self::from(error)
         }
     }
 }
@@ -81,39 +92,51 @@ impl From<ProviderError> for AgentError {
 impl From<&ProviderError> for ProviderFailure {
     fn from(e: &ProviderError) -> Self {
         match e {
-            ProviderError::Transport(message) => Self {
+            ProviderError::Transport(_) => Self {
                 kind: ProviderFailureKind::Transport,
                 status: None,
-                message: message.clone(),
+                message: "provider transport failed".to_string(),
                 retry_after_ms: None,
+                class: None,
             },
             ProviderError::Http {
                 status,
-                message,
                 retry_after_ms,
+                ..
             } => Self {
                 kind: ProviderFailureKind::Http,
                 status: Some(*status),
-                message: message.clone(),
+                message: "provider HTTP request failed".to_string(),
                 retry_after_ms: *retry_after_ms,
+                class: None,
             },
-            ProviderError::Decode(message) => Self {
+            ProviderError::Decode(_) => Self {
                 kind: ProviderFailureKind::Decode,
                 status: None,
-                message: message.clone(),
+                message: "provider response decode failed".to_string(),
                 retry_after_ms: None,
+                class: None,
             },
-            ProviderError::Stream(message) => Self {
+            ProviderError::Stream(_) => Self {
                 kind: ProviderFailureKind::Stream,
                 status: None,
-                message: message.clone(),
+                message: "provider stream failed".to_string(),
                 retry_after_ms: None,
+                class: None,
+            },
+            ProviderError::Credential(_) => Self {
+                kind: ProviderFailureKind::Credential,
+                status: None,
+                message: "credential recovery required".to_string(),
+                retry_after_ms: None,
+                class: None,
             },
             ProviderError::ContextLengthExceeded => Self {
                 kind: ProviderFailureKind::ContextLengthExceeded,
                 status: Some(413),
                 message: "context too long (PTL/413)".to_string(),
                 retry_after_ms: None,
+                class: None,
             },
         }
     }

@@ -5,9 +5,9 @@
 //! `Provider::stream` takes `&self` -> the credential lives behind a
 //! `tokio::sync::Mutex` (interior mutability; a network refresh can happen under the lock).
 
-use agent_auth::oauth::openai_chatgpt::{self, AuthError, RequestSpec};
+use agent_auth::oauth::openai_chatgpt::{self, AuthError as OAuthError, RequestSpec};
 use agent_auth::{Credential, OAuthCredential};
-use agent_core::provider::ProviderError;
+use agent_core::provider::{AuthError, ProviderError};
 
 /// Refresh margin: we refresh 60 s BEFORE expiry to avoid an
 /// expiry/request race (Pi aims at the exact edge; the margin is more robust).
@@ -41,21 +41,22 @@ impl CredentialManager {
         }
     }
 
-    /// Guarantees a fresh access token (refresh + keyring rewrite when needed)
-    /// and returns the inference request spec (URL + proprietary headers).
+    /// Builds an inference request spec. A locally expiring token is surfaced
+    /// to the core so its one refresh is observable and cancellation-guarded.
     pub async fn request_spec(&self) -> Result<RequestSpec, ProviderError> {
-        self.fresh_spec(openai_chatgpt::responses_request).await
+        self.fresh_spec(openai_chatgpt::responses_request, false)
+            .await
     }
 
-    /// Same as `request_spec` for the model catalog discovery (`/models`).
+    /// Catalog discovery runs outside a sampling and may refresh proactively.
     pub async fn models_spec(&self) -> Result<RequestSpec, ProviderError> {
-        self.fresh_spec(openai_chatgpt::models_request).await
+        self.fresh_spec(openai_chatgpt::models_request, true).await
     }
 
-    /// Guarantees a fresh access token then builds the spec through `build`.
     async fn fresh_spec(
         &self,
-        build: fn(&OAuthCredential) -> Result<RequestSpec, AuthError>,
+        build: fn(&OAuthCredential) -> Result<RequestSpec, OAuthError>,
+        refresh_expiring: bool,
     ) -> Result<RequestSpec, ProviderError> {
         let mut state = self.state.lock().await;
         let now = openai_chatgpt::now_ms();
@@ -69,6 +70,9 @@ impl CredentialManager {
         }
         let cred = state.cred.as_mut().ok_or_else(disconnected_error)?;
         if now.saturating_add(REFRESH_MARGIN_MS) >= cred.expires_at {
+            if !refresh_expiring {
+                return Err(ProviderError::Credential(AuthError::Expired));
+            }
             self.refresh_locked(&mut state, now).await?;
         }
         let cred = state.cred.as_ref().ok_or_else(disconnected_error)?;
@@ -107,7 +111,7 @@ impl CredentialManager {
             .to_string();
         let refreshed = openai_chatgpt::refresh(&self.http, &refresh_token, now)
             .await
-            .map_err(convert_auth_err)?;
+            .map_err(convert_refresh_err)?;
         state.cred = Some(refreshed.clone());
         state.persist_dirty = true;
         self.persist(&refreshed).await?;
@@ -128,24 +132,22 @@ impl CredentialManager {
 }
 
 fn disconnected_error() -> ProviderError {
-    ProviderError::Http {
-        status: 401,
-        message: "auth disconnected".to_string(),
-        retry_after_ms: None,
-    }
+    ProviderError::Credential(AuthError::ReconnectRequired)
 }
 
-/// Maps an auth error into a `ProviderError` while preserving the retry
-/// semantics: a refresh rejected with a 401/403 (revoked refresh / Codex client cut off) is
-/// **fatal** (`Http` -> `Auth` on the `classify_error` side), not a transient retry.
-fn convert_auth_err(e: AuthError) -> ProviderError {
+/// A refresh attempted by the credential manager is already the one recovery
+/// operation for this sampling. Its failure is typed terminal state, never a
+/// synthetic 401 that could trigger a second refresh in the core.
+fn convert_refresh_err(_error: OAuthError) -> ProviderError {
+    ProviderError::Credential(AuthError::ReconnectRequired)
+}
+
+fn convert_auth_err(e: OAuthError) -> ProviderError {
     match e {
-        AuthError::Http(re) => match re.status() {
-            Some(s) if s.as_u16() == 401 || s.as_u16() == 403 => ProviderError::Http {
-                status: s.as_u16(),
-                message: "OAuth refresh rejected (revoked token?)".to_string(),
-                retry_after_ms: None,
-            },
+        OAuthError::Http(re) => match re.status() {
+            Some(s) if s.as_u16() == 401 || s.as_u16() == 403 => {
+                ProviderError::Credential(AuthError::ReconnectRequired)
+            }
             Some(s) => ProviderError::Http {
                 status: s.as_u16(),
                 message: re.to_string(),

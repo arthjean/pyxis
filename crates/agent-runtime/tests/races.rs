@@ -115,6 +115,69 @@ fn assert_one_terminal_per_turn(terminals: &[(TurnId, TurnState)], context: &str
     }
 }
 
+/// EP-005 vertical race: the first sampling fails after a visible delta, the
+/// second opening races its terminal against cancellation. Every deterministic
+/// schedule must produce one terminal and two provider effects, never a third.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn terminal_retry_cancel_has_one_terminal_across_1000_schedules() {
+    for round in 0..REPETITIONS {
+        let provider = FakeProvider::new(vec![
+            Scripted::StreamThenErr(
+                vec![text("abandoned")],
+                agent_core::provider::ProviderError::Stream("cut".into()),
+            ),
+            Scripted::Stream(vec![text("final"), done_end_turn()]),
+        ]);
+        let second_opened = Arc::new(tokio::sync::Semaphore::new(0));
+        let signal = Arc::clone(&second_opened);
+        provider.on_open(Arc::new(move |index| {
+            if index == 2 {
+                signal.add_permits(1);
+            }
+        }));
+        let runner = Arc::new(RunAgentRunner::new(
+            deps(
+                Arc::clone(&provider),
+                FakeSession::new(),
+                Arc::new(common::EchoTools),
+            ),
+            agent_context,
+        ));
+        let race = start_race(runner, None, 500_000 + round as u64 * 16).await;
+
+        race.handle
+            .submit(Submission::new("retry puis termine"))
+            .await
+            .expect("the turn opens");
+        let permit = tokio::time::timeout(Duration::from_secs(5), second_opened.acquire())
+            .await
+            .expect("second attempt must open before the timeout")
+            .unwrap();
+        permit.forget();
+        jitter(round).await;
+        race.handle.interrupt(None).await.expect("interrupt");
+        let terminal = wait_for_terminal(&race.handle).await;
+        assert!(
+            matches!(
+                terminal.state,
+                TurnState::Completed | TurnState::Interrupted
+            ),
+            "round {round}: unexpected terminal {terminal:?}"
+        );
+        race.handle.shutdown().await;
+
+        assert_eq!(
+            provider.calls(),
+            2,
+            "round {round}: retry/cancel opened the provider more than twice"
+        );
+        let durable = terminals(&race.store).await;
+        assert_eq!(durable.len(), 1, "round {round}: {durable:?}");
+        assert_one_terminal_per_turn(&durable, &format!("round {round}"));
+        race.root.cancel();
+    }
+}
+
 // ───────── race 1: steer vs terminal ─────────
 
 /// A steer accepted while a turn is ending belongs to EXACTLY one of the two

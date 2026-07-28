@@ -778,7 +778,7 @@ mod tests {
                 Some("high"),
                 4096,
                 ModelRetryPolicy {
-                    max_retries: 3,
+                    max_attempts: 4,
                     backoff_base_ms: 50,
                 },
             )
@@ -812,7 +812,7 @@ mod tests {
                 None,
                 4096,
                 ModelRetryPolicy {
-                    max_retries: 3,
+                    max_attempts: 4,
                     backoff_base_ms: 50,
                 },
             )
@@ -833,7 +833,7 @@ mod tests {
                 None,
                 4096,
                 ModelRetryPolicy {
-                    max_retries: 3,
+                    max_attempts: 4,
                     backoff_base_ms: 50,
                 },
             )
@@ -869,7 +869,7 @@ mod tests {
                 None,
                 4096,
                 ModelRetryPolicy {
-                    max_retries: 3,
+                    max_attempts: 4,
                     backoff_base_ms: 50,
                 },
             )
@@ -899,7 +899,7 @@ mod tests {
                 None,
                 4096,
                 ModelRetryPolicy {
-                    max_retries: 3,
+                    max_attempts: 4,
                     backoff_base_ms: 50,
                 },
             )
@@ -935,7 +935,7 @@ mod tests {
                 None,
                 4096,
                 ModelRetryPolicy {
-                    max_retries: 3,
+                    max_attempts: 4,
                     backoff_base_ms: 50,
                 },
             )
@@ -973,7 +973,7 @@ mod tests {
                 None,
                 4096,
                 ModelRetryPolicy {
-                    max_retries: 3,
+                    max_attempts: 4,
                     backoff_base_ms: 50,
                 },
             )
@@ -997,7 +997,7 @@ mod tests {
                 None,
                 4096,
                 ModelRetryPolicy {
-                    max_retries: 3,
+                    max_attempts: 4,
                     backoff_base_ms: 50,
                 },
             )
@@ -1025,7 +1025,7 @@ mod tests {
                 None,
                 4096,
                 ModelRetryPolicy {
-                    max_retries: 3,
+                    max_attempts: 4,
                     backoff_base_ms: 50,
                 },
             )
@@ -1043,7 +1043,7 @@ mod tests {
                     Some("high"),
                     4096,
                     ModelRetryPolicy {
-                        max_retries: 3,
+                        max_attempts: 4,
                         backoff_base_ms: 50,
                     },
                 )
