@@ -420,3 +420,42 @@ Mesurées le 2026-07-27 sur la machine de référence, build release, adapter JS
 - **Fermeture des turns au resume.** Tout turn laissé non terminal par un arrêt (`queued`, `running`, `needs_input`) est fermé en `interrupted` par un unique événement de recovery, après réconciliation des tool calls sans résultat. Aucun turn ne reste ouvert pour toujours (FR-04), et un transcript repris ne porte jamais de `tool_use` orphelin.
 - **Configuration du turn durable.** Le `TurnContext` capturé voyage avec la transition qui démarre le turn, plutôt que dans un second événement : un thread repris sait sous quel modèle, quel mode de permission et quel sandbox son dernier turn a tourné, sans coût d'écriture supplémentaire.
 - **Idempotence.** La table `client_message_id -> (TurnId, EventId)` est reconstruite depuis le log au resume, donc un retry client qui traverse un redémarrage est toujours dédupliqué.
+
+---
+
+## ADR-13 — Sous-agent mutateur en worktree Git : **NO-GO v1**
+
+**Statut.** Accepté 2026-07-28. Conclusion du spike US-016 de `tasks/prd-runtime-orchestration-durable.md` (EP-004). N'altère ni ADR-12 (runtime de thread) ni la politique de confinement d'US-020. Aucune surface de production n'est exposée par cette décision.
+
+**Contexte.** EP-004 livre des sous-agents **lecture seule** : autorité = intersection parent ∩ demande, aucun outil mutant exposé par défaut. La question ouverte du PRD était de savoir si un enfant **mutateur** pouvait travailler dans un worktree Git temporaire sans élargir le sandbox global ni exposer `.git` au modèle. Le spike devait trancher avant qu'un PRD ultérieur ne s'appuie sur une hypothèse de sécurité non vérifiée.
+
+**Mesuré.** `crates/agent-sandbox/tests/worktree_spike.rs`, machine de référence, kernel avec Landlock actif (`SandboxStatus::Enforced`). Le process enfant applique `enforce_process(workspace = dépôt de fixture, writable_roots = [$TMPDIR])` puis manipule un worktree réel.
+
+| Question | Mesure |
+|---|---|
+| Création d'un worktree dans `$TMPDIR` sous confinement | **PASSE** |
+| Écriture de l'enfant dans sa copie sans toucher au worktree parent | **PASSE** |
+| Écritures internes exigées par `git worktree add` | `<dépôt>/.git/worktrees/<nom>/` (`gitdir`, `HEAD`, `commondir`) **et** `<worktree>/.git` (pointeur `gitdir:`) |
+| Suppression et nettoyage de l'administration | **PASSE** (`git worktree remove --force`) |
+| Confinement toujours effectif hors racines accordées | **PASSE** (écriture refusée par le noyau) |
+| **Isolation noyau parent ← enfant** | **ABSENTE** : depuis l'enfant, l'écriture dans le worktree parent réussit |
+
+Cas dégradés, chacun avec sa procédure :
+
+| Cas | Verdict | Récupération |
+|---|---|---|
+| Dépôt sale | PASSE | aucune ; la branche part du HEAD commité |
+| Worktree verrouillé | REFUS de `remove` | `git worktree unlock <chemin>` puis `remove` |
+| Répertoire effacé sous git (cleanup en échec) | administration orpheline persistante | `git worktree prune` |
+| Hors de tout dépôt Git | REFUS | refuser l'enfant mutateur |
+| Répertoire non-Git **imbriqué** dans un dépôt | `git` **remonte** jusqu'au dépôt englobant | ancrer l'enfant sur une racine de dépôt explicite, **jamais** sur un `cwd` |
+
+**Décision. NO-GO.** La capacité mutatrice n'est pas livrée et aucun PRD de suivi n'est ouvert comme livré.
+
+**Justification.** La mécanique n'est pas le blocage : elle passe intégralement, sans élargir Landlock d'un octet. Le blocage est structurel. Les sous-agents de Pyxis sont des **tâches du même process** que leur parent (ADR-12 : un `ThreadHandle` par enfant, pas un process par enfant), or `landlock::restrict_self` est **process-wide et irréversible**. Un enfant mutateur partagerait donc exactement le périmètre d'écriture de son parent : son isolation ne serait qu'une **convention d'outillage**, pas une garantie du noyau. Le spike le mesure directement, en écrivant depuis l'enfant dans le worktree parent avec succès.
+
+Deuxième raison, subordonnée à la première : créer puis nettoyer un worktree exige d'écrire dans `<dépôt>/.git/worktrees/`, c'est-à-dire précisément ce que `PROTECTED_SUBPATHS` soustrait au niveau des outils. C'est tenable **si le runtime le fait lui-même** et que le modèle ne reçoit jamais cette capacité, mais cela ne vaut d'être construit qu'une fois l'isolation réelle acquise.
+
+**Conditions d'un go ultérieur** (aucune n'est engagée ici) : un **process OS par enfant mutateur**, avec son propre `restrict_self` restreint à son worktree et une frontière d'événements entre parent et enfant. C'est une autre architecture que celle de ce PRD, et les non-goals en vigueur (pas d'app-server, pas de merge/commit automatique) restent applicables.
+
+**Ce qui est acquis malgré le no-go.** Le harnais de mesure reste dans l'arbre : il est ignoré par défaut pour sa moitié confinée, il ne crée aucune surface produit, et il rejoue le verdict en une commande le jour où l'architecture change. L'assertion `parent_writable` du spike est volontairement **positive** : si elle tombe, c'est que le modèle de confinement a changé et qu'ADR-13 doit être rejouée.
