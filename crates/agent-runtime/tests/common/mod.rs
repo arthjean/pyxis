@@ -350,15 +350,17 @@ pub fn agent_context(request: &TurnRequest) -> AgentContext {
         .push(Message::user(request.text.clone()));
     context.tools = ["bash", "bloquant", "echo", "lent", "read"]
         .into_iter()
-        .map(|name| ToolSpec {
-            name: name.into(),
-            description: "runtime test dispatcher".into(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "additionalProperties": false
-            }),
+        .map(|name| {
+            ToolSpec::function(
+                name,
+                "runtime test dispatcher",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+            )
         })
         .collect();
     context

@@ -1918,7 +1918,7 @@ async fn nullable_tool_schema_fields_are_required_for_strict_mode() {
         specs
             .iter()
             .find(|s| s.name == name)
-            .and_then(|s| s.input_schema.get("required"))
+            .and_then(|s| s.input_schema()?.get("required"))
             .and_then(|v| v.as_array())
             .map(|items| {
                 items

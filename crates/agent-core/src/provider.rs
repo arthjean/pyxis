@@ -120,6 +120,33 @@ pub struct Capabilities {
     pub cache: CacheCapabilities,
 }
 
+impl Capabilities {
+    /// Refuses a tool plan this provider cannot serialize, BEFORE any network
+    /// call. A freeform tool projected onto a function wire would either lose
+    /// its grammar or gain a fabricated schema; both are silent corruption, so
+    /// the incompatibility is typed and local.
+    pub fn ensure_tools_supported(&self, tools: &[ToolSpec]) -> Result<(), ProviderError> {
+        let Some(first) = tools.first() else {
+            return Ok(());
+        };
+        if !self.tools {
+            return Err(ProviderError::UnsupportedTool {
+                tool: first.name.clone(),
+                reason: "provider does not support tool calling".into(),
+            });
+        }
+        for tool in tools {
+            if tool.is_freeform() && !self.tool_calling.freeform_tools {
+                return Err(ProviderError::UnsupportedTool {
+                    tool: tool.name.clone(),
+                    reason: "provider does not support freeform tools".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CapabilityLimits {
     pub max_images_per_request: Option<u32>,
@@ -130,6 +157,11 @@ pub struct CapabilityLimits {
 pub struct ToolCallingCapabilities {
     pub parallel_tool_calls: bool,
     pub strict_json_schema: bool,
+    /// The adapter can serialize a freeform tool. Default `false`: a provider
+    /// that says nothing refuses the plan instead of silently degrading a
+    /// freeform tool into a function one.
+    #[serde(default)]
+    pub freeform_tools: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -142,7 +174,38 @@ pub struct CacheCapabilities {
     pub prompt_cache_key: bool,
 }
 
-/// Tool definition exposed to the model (input JSON Schema).
+/// Grammar syntax a freeform tool constrains its text input with. Kept as an
+/// enum, not a free string: an unknown syntax must fail to build rather than
+/// reach a backend that would reject the whole request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrammarSyntax {
+    Lark,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolGrammar {
+    pub syntax: GrammarSyntax,
+    pub definition: String,
+}
+
+/// How a tool receives its input. This is the provider-neutral algebra: a
+/// function takes JSON validated by a schema, a freeform tool takes text with
+/// an optional grammar. A freeform tool carries NO `input_schema`, so no
+/// adapter can invent one to fit a function-shaped wire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolKind {
+    Function {
+        input_schema: serde_json::Value,
+    },
+    Freeform {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grammar: Option<ToolGrammar>,
+    },
+}
+
+/// Tool definition exposed to the model.
 ///
 /// `PartialEq` is what lets US-006 decide that a step frame did not move: a
 /// catalog compared equal keeps its generation, hence its bytes and its cache
@@ -151,10 +214,48 @@ pub struct CacheCapabilities {
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
-    pub input_schema: serde_json::Value,
+    #[serde(flatten)]
+    pub kind: ToolKind,
 }
 
 impl ToolSpec {
+    pub fn function(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: serde_json::Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            kind: ToolKind::Function { input_schema },
+        }
+    }
+
+    pub fn freeform(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        grammar: Option<ToolGrammar>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            kind: ToolKind::Freeform { grammar },
+        }
+    }
+
+    /// `None` for a freeform tool: callers that need a schema must handle its
+    /// absence instead of receiving an empty object that looks like one.
+    pub fn input_schema(&self) -> Option<&serde_json::Value> {
+        match &self.kind {
+            ToolKind::Function { input_schema } => Some(input_schema),
+            ToolKind::Freeform { .. } => None,
+        }
+    }
+
+    pub fn is_freeform(&self) -> bool {
+        matches!(self.kind, ToolKind::Freeform { .. })
+    }
+
     pub fn validate(&self) -> Result<(), ToolSpecValidationError> {
         if self.name.trim().is_empty() {
             return Err(ToolSpecValidationError::EmptyName);
@@ -169,17 +270,30 @@ impl ToolSpec {
                 tool: self.name.clone(),
             });
         }
-        let Some(schema) = self.input_schema.as_object() else {
-            return Err(ToolSpecValidationError::SchemaMustBeObject {
-                tool: self.name.clone(),
-            });
-        };
-        if !schema_has_object_type(schema) {
-            return Err(ToolSpecValidationError::SchemaMustBeObject {
-                tool: self.name.clone(),
-            });
+        match &self.kind {
+            ToolKind::Function { input_schema } => {
+                let Some(schema) = input_schema.as_object() else {
+                    return Err(ToolSpecValidationError::SchemaMustBeObject {
+                        tool: self.name.clone(),
+                    });
+                };
+                if !schema_has_object_type(schema) {
+                    return Err(ToolSpecValidationError::SchemaMustBeObject {
+                        tool: self.name.clone(),
+                    });
+                }
+                validate_strict_schema_object(&self.name, input_schema)?;
+            }
+            ToolKind::Freeform { grammar } => {
+                if let Some(grammar) = grammar
+                    && grammar.definition.trim().is_empty()
+                {
+                    return Err(ToolSpecValidationError::EmptyGrammarDefinition {
+                        tool: self.name.clone(),
+                    });
+                }
+            }
         }
-        validate_strict_schema_object(&self.name, &self.input_schema)?;
         Ok(())
     }
 }
@@ -294,6 +408,8 @@ pub enum ToolSpecValidationError {
     SchemaRequiredMustBeStringArray { tool: String },
     #[error("tool {tool} required fields must include every property for strict schema mode")]
     RequiredMustMatchProperties { tool: String },
+    #[error("tool {tool} declares a grammar with an empty definition")]
+    EmptyGrammarDefinition { tool: String },
 }
 
 /// Canonical request (what `ctx.request()` produces). Client-side transcript.
@@ -441,6 +557,10 @@ pub enum ProviderError {
     /// body or credential detail.
     #[error("credential: {0:?}")]
     Credential(AuthError),
+    /// The plan contains a tool this provider cannot represent on its wire.
+    /// Raised before opening a request: no attempt, no backoff, no retry.
+    #[error("tool {tool} is unsupported: {reason}")]
+    UnsupportedTool { tool: String, reason: String },
     /// CONTEXT error (PTL / 413). It is NOT a transient class: it feeds
     /// withholding (ARCHITECTURE 3.4), not the backoff.
     #[error("context too long (PTL/413)")]
@@ -662,15 +782,15 @@ mod tests {
             reasoning_replay: false,
             system: None,
             messages: vec![Message::user("ok")],
-            tools: vec![ToolSpec {
-                name: "bad".into(),
-                description: String::new(),
-                input_schema: serde_json::json!({
+            tools: vec![ToolSpec::function(
+                "bad",
+                String::new(),
+                serde_json::json!({
                     "type": "string",
                     "additionalProperties": false,
                     "required": []
                 }),
-            }],
+            )],
             max_output_tokens: 100,
         };
         assert!(matches!(
@@ -714,15 +834,15 @@ mod tests {
             reasoning_replay: false,
             system: None,
             messages: vec![Message::user("ok")],
-            tools: vec![ToolSpec {
-                name: "read".into(),
-                description: "lit".into(),
-                input_schema: serde_json::json!({
+            tools: vec![ToolSpec::function(
+                "read",
+                "lit",
+                serde_json::json!({
                     "type": "object",
                     "properties": { "path": { "type": "string" } },
                     "required": ["path"]
                 }),
-            }],
+            )],
             max_output_tokens: 100,
         };
         assert!(matches!(
@@ -732,16 +852,16 @@ mod tests {
             ))
         ));
 
-        let strict_tool = ToolSpec {
-            name: "read".into(),
-            description: "lit".into(),
-            input_schema: serde_json::json!({
+        let strict_tool = ToolSpec::function(
+            "read",
+            "lit",
+            serde_json::json!({
                 "type": "object",
                 "properties": { "path": { "type": "string" } },
                 "required": ["path"],
                 "additionalProperties": false
             }),
-        };
+        );
         let req = CanonicalRequest {
             model: "gpt".into(),
             model_runtime: None,
@@ -760,10 +880,10 @@ mod tests {
 
     #[test]
     fn strict_tool_schema_requires_all_properties() {
-        let spec = ToolSpec {
-            name: "read".into(),
-            description: "lit".into(),
-            input_schema: serde_json::json!({
+        let spec = ToolSpec::function(
+            "read",
+            "lit",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
@@ -772,7 +892,7 @@ mod tests {
                 "required": ["path"],
                 "additionalProperties": false
             }),
-        };
+        );
         assert!(matches!(
             spec.validate(),
             Err(ToolSpecValidationError::RequiredMustMatchProperties { tool }) if tool == "read"
@@ -781,10 +901,10 @@ mod tests {
 
     #[test]
     fn strict_tool_schema_accepts_nullable_required_optionals() {
-        let spec = ToolSpec {
-            name: "read".into(),
-            description: "lit".into(),
-            input_schema: serde_json::json!({
+        let spec = ToolSpec::function(
+            "read",
+            "lit",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
@@ -793,7 +913,118 @@ mod tests {
                 "required": ["path", "offset"],
                 "additionalProperties": false
             }),
-        };
+        );
         spec.validate().unwrap();
+    }
+
+    fn exec_grammar() -> ToolGrammar {
+        ToolGrammar {
+            syntax: GrammarSyntax::Lark,
+            definition: "start: SOURCE\nSOURCE: /[\\s\\S]+/".into(),
+        }
+    }
+
+    #[test]
+    fn freeform_tool_carries_no_schema_and_survives_a_round_trip() {
+        let spec = ToolSpec::freeform("exec", "run javascript", Some(exec_grammar()));
+        spec.validate().unwrap();
+        assert!(spec.is_freeform());
+        assert!(
+            spec.input_schema().is_none(),
+            "a freeform tool must not expose a fabricated schema"
+        );
+
+        let encoded = serde_json::to_value(&spec).unwrap();
+        assert_eq!(encoded["kind"], "freeform");
+        assert!(encoded.get("input_schema").is_none());
+        assert_eq!(encoded["grammar"]["syntax"], "lark");
+        let decoded: ToolSpec = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, spec);
+
+        // A text-only freeform tool keeps no grammar at all.
+        let plain = ToolSpec::freeform("notes", "free text", None);
+        plain.validate().unwrap();
+        let encoded = serde_json::to_value(&plain).unwrap();
+        assert!(encoded.get("grammar").is_none());
+        assert_eq!(
+            serde_json::from_value::<ToolSpec>(encoded).unwrap(),
+            plain,
+            "an absent grammar round-trips as absent"
+        );
+    }
+
+    #[test]
+    fn function_tool_keeps_its_name_description_and_schema_through_the_algebra() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"],
+            "additionalProperties": false
+        });
+        let spec = ToolSpec::function("read", "reads a file", schema.clone());
+        spec.validate().unwrap();
+        assert_eq!(spec.name, "read");
+        assert_eq!(spec.description, "reads a file");
+        assert_eq!(spec.input_schema(), Some(&schema));
+        assert!(!spec.is_freeform());
+        let decoded: ToolSpec =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(decoded, spec);
+    }
+
+    #[test]
+    fn empty_grammar_definition_is_rejected_before_exposure() {
+        let spec = ToolSpec::freeform(
+            "exec",
+            "run",
+            Some(ToolGrammar {
+                syntax: GrammarSyntax::Lark,
+                definition: "   ".into(),
+            }),
+        );
+        assert!(matches!(
+            spec.validate(),
+            Err(ToolSpecValidationError::EmptyGrammarDefinition { tool }) if tool == "exec"
+        ));
+    }
+
+    #[test]
+    fn provider_without_freeform_support_refuses_the_plan_before_any_call() {
+        let mut capabilities = Capabilities {
+            tools: true,
+            ..Capabilities::default()
+        };
+        let plan = vec![
+            ToolSpec::function(
+                "read",
+                "reads",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }),
+            ),
+            ToolSpec::freeform("exec", "run javascript", Some(exec_grammar())),
+        ];
+        let error = capabilities
+            .ensure_tools_supported(&plan)
+            .expect_err("freeform is not supported by default");
+        assert!(matches!(
+            &error,
+            ProviderError::UnsupportedTool { tool, .. } if tool == "exec"
+        ));
+        assert!(error.to_string().contains("freeform"));
+
+        capabilities.tool_calling.freeform_tools = true;
+        capabilities.ensure_tools_supported(&plan).unwrap();
+
+        capabilities.tools = false;
+        assert!(matches!(
+            capabilities.ensure_tools_supported(&plan),
+            Err(ProviderError::UnsupportedTool { .. })
+        ));
+        // No tool at all stays valid on a provider without tool support.
+        capabilities.ensure_tools_supported(&[]).unwrap();
     }
 }

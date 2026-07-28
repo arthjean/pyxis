@@ -44,18 +44,18 @@ impl StepSource for Movable {
 }
 
 fn tool(name: &str) -> ToolSpec {
-    ToolSpec {
-        name: name.into(),
-        description: "outil de test".into(),
-        // The strict shape `CanonicalRequest::validate` demands: without it the
-        // turn would fail before ever reaching the provider.
-        input_schema: serde_json::json!({
+    // The strict shape `CanonicalRequest::validate` demands: without it the
+    // turn would fail before ever reaching the provider.
+    ToolSpec::function(
+        name,
+        "outil de test",
+        serde_json::json!({
             "type": "object",
             "properties": {},
             "required": [],
             "additionalProperties": false,
         }),
-    }
+    )
 }
 
 fn snapshot(tools: Vec<ToolSpec>, environment: &str) -> StepSnapshot {

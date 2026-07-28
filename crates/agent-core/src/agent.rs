@@ -298,6 +298,7 @@ fn retry_jitter_ms(
         ProviderError::Stream(_) => 12,
         ProviderError::ContextLengthExceeded => 13,
         ProviderError::Credential(_) => 14,
+        ProviderError::UnsupportedTool { .. } => 15,
     };
     let mut x = now_ms
         ^ ((attempt as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15))

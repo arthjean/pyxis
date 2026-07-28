@@ -427,11 +427,7 @@ mod tests {
     }
 
     fn tool(name: &str) -> ToolSpec {
-        ToolSpec {
-            name: name.into(),
-            description: "t".into(),
-            input_schema: serde_json::json!({"type": "object"}),
-        }
+        ToolSpec::function(name, "t", serde_json::json!({"type": "object"}))
     }
 
     #[test]

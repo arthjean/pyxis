@@ -505,6 +505,7 @@ mod loop_tests {
                 tool_calling: crate::provider::ToolCallingCapabilities {
                     parallel_tool_calls: true,
                     strict_json_schema: false,
+                    freeform_tools: false,
                 },
                 ..Capabilities::default()
             },
@@ -545,10 +546,10 @@ mod loop_tests {
 
     fn with_mock_tool(mut ctx: AgentContext) -> AgentContext {
         if ctx.tools.is_empty() {
-            ctx.tools.push(ToolSpec {
-                name: "bash".into(),
-                description: "mock shell".into(),
-                input_schema: serde_json::json!({
+            ctx.tools.push(ToolSpec::function(
+                "bash",
+                "mock shell",
+                serde_json::json!({
                     "type": "object",
                     "properties": {
                         "cmd": { "type": "string" }
@@ -556,7 +557,7 @@ mod loop_tests {
                     "required": ["cmd"],
                     "additionalProperties": false
                 }),
-            });
+            ));
         }
         ctx
     }

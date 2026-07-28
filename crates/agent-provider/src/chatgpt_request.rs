@@ -29,7 +29,7 @@ use agent_core::message::{
     ContentBlock, INTERRUPTED_TOOL_RESULT, Message, Role, unanswered_tool_calls,
 };
 use agent_core::model::ResponsesDialect;
-use agent_core::provider::{CanonicalRequest, ToolSpec};
+use agent_core::provider::{CanonicalRequest, GrammarSyntax, ToolKind, ToolSpec};
 use serde_json::{Value, json};
 
 const DEFAULT_INSTRUCTIONS: &str = "You are a helpful assistant.";
@@ -346,19 +346,36 @@ fn untrusted_tool_output_payload(
     .to_string()
 }
 
-/// Canonical `ToolSpec` -> flat `function` tool of the Responses API. The schemas
-/// are strictly validated on the `agent-core` side before exposure.
+/// Canonical `ToolSpec` -> Responses API tool. A function becomes the flat
+/// `function` wire (schemas are strictly validated on the `agent-core` side
+/// before exposure); a freeform tool becomes `type: "custom"` and carries its
+/// grammar, never a fabricated `parameters` object.
 fn build_tools(tools: &[ToolSpec]) -> Value {
     let arr: Vec<Value> = tools
         .iter()
-        .map(|t| {
-            json!({
+        .map(|t| match &t.kind {
+            ToolKind::Function { input_schema } => json!({
                 "type": "function",
                 "name": t.name,
                 "description": t.description,
-                "parameters": t.input_schema,
+                "parameters": input_schema,
                 "strict": true,
-            })
+            }),
+            ToolKind::Freeform { grammar } => json!({
+                "type": "custom",
+                "name": t.name,
+                "description": t.description,
+                "format": match grammar {
+                    Some(grammar) => json!({
+                        "type": "grammar",
+                        "syntax": match grammar.syntax {
+                            GrammarSyntax::Lark => "lark",
+                        },
+                        "definition": grammar.definition,
+                    }),
+                    None => json!({ "type": "text" }),
+                },
+            }),
         })
         .collect();
     Value::Array(arr)
@@ -427,16 +444,16 @@ mod tests {
 
     #[test]
     fn responses_lite_moves_instructions_and_tools_into_input() {
-        let spec = ToolSpec {
-            name: "read".into(),
-            description: "read a file".into(),
-            input_schema: json!({
+        let spec = ToolSpec::function(
+            "read",
+            "read a file",
+            json!({
                 "type": "object",
                 "properties": {},
                 "required": [],
                 "additionalProperties": false
             }),
-        };
+        );
         let body = request_body_with_options(
             &req(
                 vec![Message::user("hi")],
@@ -578,16 +595,16 @@ mod tests {
 
     #[test]
     fn tools_map_to_flat_function_with_strict_schema() {
-        let spec = ToolSpec {
-            name: "read".into(),
-            description: "reads a file".into(),
-            input_schema: json!({
+        let spec = ToolSpec::function(
+            "read",
+            "reads a file",
+            json!({
                 "type": "object",
                 "properties": { "path": {"type":"string"} },
                 "required": ["path"],
                 "additionalProperties": false
             }),
-        };
+        );
         let body = request_body(&req(vec![Message::user("x")], vec![spec], None));
         let tool = &body["tools"][0];
         assert_eq!(tool["type"], "function");
@@ -856,5 +873,62 @@ mod tests {
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["type"], "message");
         assert_eq!(input[1]["type"], "function_call");
+    }
+
+    fn exec_tool() -> ToolSpec {
+        ToolSpec::freeform(
+            "exec",
+            "run javascript",
+            Some(agent_core::provider::ToolGrammar {
+                syntax: GrammarSyntax::Lark,
+                definition: "start: SOURCE".into(),
+            }),
+        )
+    }
+
+    #[test]
+    fn freeform_tool_maps_to_a_custom_tool_with_its_grammar() {
+        let body = request_body(&req(vec![Message::user("x")], vec![exec_tool()], None));
+        let tool = &body["tools"][0];
+        assert_eq!(tool["type"], "custom");
+        assert_eq!(tool["name"], "exec");
+        assert_eq!(tool["description"], "run javascript");
+        assert_eq!(
+            tool["format"],
+            json!({ "type": "grammar", "syntax": "lark", "definition": "start: SOURCE" })
+        );
+        assert!(
+            tool.get("parameters").is_none() && tool.get("strict").is_none(),
+            "no fabricated function fields on a custom tool"
+        );
+
+        let plain = request_body(&req(
+            vec![Message::user("x")],
+            vec![ToolSpec::freeform("notes", "free text", None)],
+            None,
+        ));
+        assert_eq!(plain["tools"][0]["format"], json!({ "type": "text" }));
+    }
+
+    #[test]
+    fn function_and_freeform_tools_coexist_on_the_wire() {
+        let function = ToolSpec::function(
+            "read",
+            "reads a file",
+            json!({
+                "type": "object",
+                "properties": { "path": {"type":"string"} },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        );
+        let body = request_body(&req(
+            vec![Message::user("x")],
+            vec![function, exec_tool()],
+            None,
+        ));
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["strict"], true);
+        assert_eq!(body["tools"][1]["type"], "custom");
     }
 }

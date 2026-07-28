@@ -678,16 +678,16 @@ mod tests {
     use super::*;
 
     fn spec(name: &str) -> ToolSpec {
-        ToolSpec {
-            name: name.to_string(),
-            description: "test".to_string(),
-            input_schema: serde_json::json!({
+        ToolSpec::function(
+            name.to_string(),
+            "test".to_string(),
+            serde_json::json!({
                 "type": "object",
                 "properties": {},
                 "required": [],
                 "additionalProperties": false
             }),
-        }
+        )
     }
 
     #[test]

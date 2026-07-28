@@ -449,16 +449,16 @@ mod tests {
     }
 
     fn plan() -> StepToolPlan {
-        let spec = ToolSpec {
-            name: "read".into(),
-            description: "read a file".into(),
-            input_schema: serde_json::json!({
+        let spec = ToolSpec::function(
+            "read",
+            "read a file",
+            serde_json::json!({
                 "type": "object",
                 "properties": { "path": { "type": "string" } },
                 "required": ["path"],
                 "additionalProperties": false
             }),
-        };
+        );
         StepToolPlan::capture(
             ToolDispatchSnapshot::new(1, vec![spec], Arc::new(NoTools)),
             false,

@@ -201,16 +201,16 @@ fn context(request: &TurnRequest) -> AgentContext {
             ..RunConfig::default()
         })
         .push(Message::user(request.text.clone()));
-    context.tools.push(ToolSpec {
-        name: "echo".into(),
-        description: "test dispatcher".into(),
-        input_schema: serde_json::json!({
+    context.tools.push(ToolSpec::function(
+        "echo",
+        "test dispatcher",
+        serde_json::json!({
             "type": "object",
             "properties": {},
             "required": [],
             "additionalProperties": false
         }),
-    });
+    ));
     context
 }
 

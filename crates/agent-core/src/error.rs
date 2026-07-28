@@ -131,6 +131,16 @@ impl From<&ProviderError> for ProviderFailure {
                 retry_after_ms: None,
                 class: None,
             },
+            // Local incompatibility decided before any request: it is a
+            // contract failure, never a transient one, and it names the tool so
+            // the cause survives to every surface.
+            ProviderError::UnsupportedTool { tool, reason } => Self {
+                kind: ProviderFailureKind::Contract,
+                status: None,
+                message: format!("tool {tool} is unsupported: {reason}"),
+                retry_after_ms: None,
+                class: Some(ErrorClass::InvalidRequest),
+            },
             ProviderError::ContextLengthExceeded => Self {
                 kind: ProviderFailureKind::ContextLengthExceeded,
                 status: Some(413),

@@ -331,11 +331,7 @@ pub fn plan_tools(
         // Last safety net: the spec is the exact object the provider will send.
         // A tool that still fails validation is dropped here rather than making
         // the whole turn fail (`CanonicalRequest::validate`).
-        let spec = ToolSpec {
-            name: name.clone(),
-            description: description.clone(),
-            input_schema: schema.clone(),
-        };
+        let spec = ToolSpec::function(name.clone(), description.clone(), schema.clone());
         if let Err(err) = spec.validate() {
             skipped.push(skip(&err.to_string()));
             continue;
@@ -712,11 +708,7 @@ mod tests {
     #[test]
     fn normalized_schemas_pass_the_provider_validation() {
         let schema = strict_input_schema(&object_schema()).unwrap();
-        let spec = ToolSpec {
-            name: "mcp__files__read".to_string(),
-            description: "d".to_string(),
-            input_schema: schema,
-        };
+        let spec = ToolSpec::function("mcp__files__read".to_string(), "d".to_string(), schema);
         spec.validate().unwrap();
     }
 

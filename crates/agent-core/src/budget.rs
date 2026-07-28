@@ -211,7 +211,16 @@ pub fn estimate_static_input(
         total = total
             .saturating_add(counter.count_text(&tool.name))
             .saturating_add(counter.count_text(&tool.description))
-            .saturating_add(counter.count_text(&tool.input_schema.to_string()));
+            .saturating_add(match &tool.kind {
+                crate::provider::ToolKind::Function { input_schema } => {
+                    counter.count_text(&input_schema.to_string())
+                }
+                // A freeform tool spends its budget on the grammar it ships,
+                // not on a schema it does not have.
+                crate::provider::ToolKind::Freeform { grammar } => grammar
+                    .as_ref()
+                    .map_or(0, |grammar| counter.count_text(&grammar.definition)),
+            });
     }
     u32::try_from(total).unwrap_or(u32::MAX)
 }
@@ -332,16 +341,16 @@ mod tests {
 
     #[test]
     fn estimate_static_input_counts_system_context_and_tools() {
-        let tools = vec![ToolSpec {
-            name: "read".into(),
-            description: "lit".into(),
-            input_schema: serde_json::json!({
+        let tools = vec![ToolSpec::function(
+            "read",
+            "lit",
+            serde_json::json!({
                 "type": "object",
                 "properties": { "path": { "type": "string" } },
                 "required": ["path"],
                 "additionalProperties": false
             }),
-        }];
+        )];
         let est = estimate_static_input(
             &Some("system prompt".into()),
             &[Message::user("ctxctxctxctx")],

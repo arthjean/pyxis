@@ -155,6 +155,9 @@ impl OpenAiChatGptProvider {
                 tool_calling: ToolCallingCapabilities {
                     parallel_tool_calls: true,
                     strict_json_schema: true,
+                    // The Responses wire carries `type: "custom"` tools, so a
+                    // freeform plan reaches the backend intact.
+                    freeform_tools: true,
                 },
                 reasoning_options: ReasoningCapabilities {
                     encrypted_replay: true,
@@ -612,6 +615,9 @@ impl Provider for OpenAiChatGptProvider {
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
         req.validate()
             .map_err(|error| ProviderError::Decode(error.to_string()))?;
+        // A tool this adapter cannot serialize is refused here, before the
+        // credential is read and before any socket is opened.
+        self.capabilities.ensure_tools_supported(&req.tools)?;
         let runtime = match req.model_runtime.clone() {
             Some(runtime) => runtime,
             None => self
@@ -795,6 +801,8 @@ impl Provider for OpenAiChatGptProvider {
             }
             // Does not reach classify (is_context_error handled upstream); fail-safe.
             ProviderError::ContextLengthExceeded => ErrorClass::InvalidRequest,
+            // Decided locally before any request: retrying cannot change it.
+            ProviderError::UnsupportedTool { .. } => ErrorClass::InvalidRequest,
         }
     }
 }
