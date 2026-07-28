@@ -17,7 +17,8 @@ sur **stderr** et ne polluent jamais le flux JSONL.
 ## Forme d'une ligne
 
 ```json
-{"schema":1,"type":"text","data":"bonjour"}
+{"schema":1,"type":"text","data":"bonjour",
+ "thread_id":"th_…","turn_id":"tu_…","event_id":"ev_…"}
 ```
 
 | Champ | Type | Rôle |
@@ -25,6 +26,17 @@ sur **stderr** et ne polluent jamais le flux JSONL.
 | `schema` | entier | Version du schéma. `1` aujourd'hui. |
 | `type` | chaîne | Discriminant en `snake_case`. |
 | `data` | variable | Charge utile, absente pour les événements sans donnée. |
+| `thread_id` | chaîne | Identité durable de la conversation. Ajout additif d'EP-005 de `tasks/prd-runtime-orchestration-durable.md`. |
+| `turn_id` | chaîne | Tour auquel l'événement est corrélé. |
+| `event_id` | chaîne | Identité de cette ligne dans le journal durable du thread. |
+
+Les trois identifiants sont ajoutés **à côté** des champs existants, jamais à la
+place de l'un d'eux : une ligne lue par un consommateur qui les ignore est
+identique à ce qu'elle était avant. Ils sont omis quand le run n'a pas d'identité
+runtime à rapporter, plutôt qu'émis à `null`. Ce sont les mêmes identifiants que
+ceux du journal `.pyxis/sessions/<session>.jsonl` et que ceux qu'affiche
+`/status` : un appelant peut donc rejouer, forker ou reprendre exactement le tour
+qu'il a observé.
 
 `schema` est incrémenté seulement si une ligne **déjà émise change de forme**.
 Ajouter un type d'événement ou un champ optionnel ne casse pas un consommateur qui
@@ -122,7 +134,9 @@ le code de sortie sont des faits de processus.
   "input_tokens":18422,
   "output_tokens":1290,
   "end":"end_turn",
-  "exit_code":0
+  "exit_code":0,
+  "thread_id":"th_…",
+  "turn_id":"tu_…"
 }}
 ```
 
@@ -131,16 +145,24 @@ le code de sortie sont des faits de processus.
 | `session_id` | Nom du fichier de session sous `.pyxis/sessions/`, reprenable par `--resume`. |
 | `model_turns` | Nombre d'allers-retours modèle. |
 | `input_tokens`, `output_tokens` | Consommation cumulée du run. |
-| `end` | `end_turn`, `exhausted` ou `error`. |
-| `end_detail` | Présent pour `exhausted` et `error` : la cause précise. |
+| `end` | `end_turn`, `interrupted`, `exhausted` ou `error`. |
+| `end_detail` | Présent pour `interrupted`, `exhausted` et `error` : la cause précise. |
 | `exit_code` | Code que le processus rendra. `0` en cas de succès. |
+| `thread_id`, `turn_id` | Thread et tour du run, mêmes identifiants que sur les lignes d'événement. |
+
+`end: "interrupted"` est apparu avec EP-005 : avant lui, rien ne pouvait
+interrompre un run `-p`, donc le cas n'était pas observable. Ctrl+C passe
+désormais par le runtime, le tour s'arrête coopérativement, réconcilie son
+transcript et écrit son propre terminal. Un consommateur strict qui n'aurait
+connu que trois valeurs de `end` doit traiter une valeur inconnue comme un échec,
+ce que le `exit_code` dit déjà.
 
 ## Codes de sortie
 
 | Code | Sens |
 |---|---|
 | `0` | Le tour s'est terminé normalement. |
-| `1` | Échec : erreur d'agent, arrêt par budget, ou erreur de démarrage (arguments, credential absente). |
+| `1` | Échec : erreur d'agent, interruption, arrêt par budget, ou erreur de démarrage (arguments, credential absente, journal de session corrompu). |
 
 Un appelant qui distingue les causes lit `end` et `end_detail` du `run_summary`
 plutôt que d'interpréter le code de sortie.

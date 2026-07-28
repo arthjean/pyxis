@@ -66,7 +66,8 @@ Le projet est un workspace Cargo. Chaque crate a une responsabilité unique et u
 | `agent-tools` | `Registry`, trait `Tool`, dispatch concurrent/série, permissions, hooks, taint. | — |
 | `agent-mcp` | Wrapper autour de `rmcp` (SDK MCP Rust officiel). Charge la config, suit le lifecycle stdio, liste les outils et les expose au modèle comme `DynTool` (nommage sûr, schéma strict, taint intégral). | — |
 | `agent-tui` | Frontend Ratatui + crossterm. **Découplé du core via canaux.** | **Jamais importé par le core.** |
-| `agent-session` | Persistance JSONL append-only, compaction, resume. | — |
+| `agent-runtime` | Runtime de thread durable : identité (`ThreadId`/`TurnId`/`StepId`/`EventId`/`AgentId`), cycle de vie des tours, mailbox bornée, steering, annulation hiérarchique, forks, superviseur de sous-agents. Contrat `ThreadStore` + adapter mémoire. | Aucun accès disque, aucun HTTP, aucune TUI. Ne dépend jamais de `agent-tools` ni de `agent-session`. |
+| `agent-session` | Persistance JSONL append-only, compaction, resume. Porte l'adapter JSONL de `ThreadStore`, qui est AUSSI l'implémentation de `Session` : un thread a un fichier, un writer et un curseur. | — |
 | `agent-sandbox` | Landlock FS + proxy réseau local + `PolicyEngine`. | — |
 | `agent-auth` | Stockage de credentials (Secret Service / keyring), OAuth PKCE ChatGPT, refresh token. Les futurs flows BYOK/OAuth provider restent isolés ici. | — |
 | `agent-tokenizer` | Comptage de tokens local (tiktoken-rs / tokenizers). Indispensable pour la compaction sur les providers sans usage fiable en stream. Headless. | Aucune dépendance TUI / HTTP. |
@@ -90,9 +91,10 @@ n'est pas une I/O : l'invariant 1 (cœur headless) reste tenu.
  │ (Ratatui) │ │provider│ │ tools  │ │ session │ │sandbox │ │  auth    │
  └─────┬─────┘ └───┬────┘ └───┬────┘ └────┬────┘ └───┬────┘ └────┬─────┘
        │           │          │           │          │           │
-       │           │     ┌────┴────┐      │          │           │
-       │           │     │agent-mcp│      │          │           │
-       │           │     └────┬────┘      │          │           │
+       │           │     ┌────┴────┐ ┌────┴─────┐    │           │
+       │           │     │agent-mcp│ │  agent-  │    │           │
+       │           │     └────┬────┘ │ runtime  │    │           │
+       │           │          │      └────┬─────┘    │           │
        └───────────┴──────────┴───────────┴──────────┴───────────┘
                               ▼
                         ┌───────────┐        ┌─────────────────┐
@@ -102,6 +104,13 @@ n'est pas une I/O : l'invariant 1 (cœur headless) reste tenu.
 ```
 
 `agent-core` est en bas du graphe : tout le monde le connaît, il ne connaît personne **sauf** `agent-tokenizer` (lui-même headless, sans I/O), dont il dépend pour le fallback de comptage de tokens (§3.3). Les dépendances I/O (`agent-provider`, `agent-tui`) sont **injectées** dans le cœur via des traits (`injectable deps`, §3.2), jamais référencées en dur. `agent-mcp` dépend de `agent-tools` pour réutiliser le trait `Tool`/`DynTool` ; `agent-cli` est le seul à dépendre de l'ensemble.
+
+`agent-runtime` s'intercale entre `agent-core` et les clients (ADR-12, §7bis). Les
+flèches vers lui sont à sens unique et le restent : `agent-session` et
+`agent-tools` en dépendent (pour l'adapter JSONL du store et pour les cinq outils
+de sous-agents), lui ne dépend d'aucun des deux. C'est ce qui garde sa politique
+d'autorité testable sans registre d'outils, et son cycle de vie testable sans
+disque.
 
 ---
 
@@ -449,28 +458,84 @@ enum SessionEntry {
 
 - **Append durable par entrée** : chaque entry réussie est écrite puis `flush` + `sync_data`. Un crash peut laisser une queue partielle ; au resume elle est ignorée, et avant tout nouvel append elle est tronquée au dernier offset valide.
 - **Resume** = on **rejoue le log** et on **reconstruit l'état** (messages, frontières de compaction, snapshots fichiers). Couplé au transcript-before-response (§3.2), une session interrompue en plein stream se rouvre proprement. `schema_version` protège les futurs formats incompatibles.
+- **Deux lignes de plus depuis EP-005** (`tasks/prd-runtime-orchestration-durable.md`), additives : `thread_meta` lie le fichier à un `ThreadId` (et, pour une branche, à sa provenance), `thread_event` porte les événements d'orchestration (entrée soumise, transition de tour, fork, filiation d'agent). Une session v1 reste lisible et poursuivable : son préfixe n'est jamais réécrit, son `ThreadId` est dérivé une fois puis matérialisé au premier append. Un fork **copie** le préfixe durable jusqu'à la frontière du tour visé dans un fichier indépendant, ce qui fait qu'une branche survit à la suppression de sa source.
 
 ---
 
+## 7bis. Runtime de thread — `agent-runtime` (ADR-12)
+
+`run_agent` reste le moteur d'UN tour. Ce qu'il ne possède délibérément pas —
+l'identité durable, l'ordre des commandes, le cycle de vie, l'annulation, les
+branches — appartient à un **actor local par conversation**.
+
+```
+client (TUI ou headless)
+      │ submit / steer / interrupt / fork / shutdown   (mailbox bornée, 64)
+      ▼
+ ThreadHandle ──▶ ThreadActor ──TurnRunner──▶ run_agent  (le SEUL moteur)
+      │                │
+      │                ├── ThreadStore   (JSONL local | mémoire)
+      │                ├── TurnContext   (figé au démarrage du tour)
+      │                ├── StepContext   (reconstruit avant CHAQUE requête)
+      │                └── AgentSupervisor (enfants parent-owned)
+      ├── watch<ThreadStatus>            (dernier état, jamais un backlog)
+      └── broadcast<RuntimeEvent>        (flux live, borné à 256)
+```
+
+Quatre règles portent tout le reste :
+
+- **Un seul propriétaire.** L'ordre d'acceptation est décidé dans l'actor, pas
+  dans le client. C'est ce qui rend la course steer/terminal arbitrable : une
+  entrée appartient soit au tour qu'elle visait, soit à un tour neuf après son
+  terminal. Jamais les deux, jamais aucun.
+- **Durable avant acquittement.** Une opération acceptée est dans le journal
+  avant que le client n'apprenne qu'elle est acceptée. Un `client_message_id`
+  déjà accepté rend les identifiants d'origine, sans réexécuter quoi que ce soit.
+- **Un arbre d'annulation.** `tokio_util::sync::CancellationToken` : le runtime,
+  le thread, le tour, l'outil et chaque enfant sont des nœuds enfants du
+  précédent. Annuler descend, jamais ne remonte. `TaskTracker` compte les tâches
+  dynamiques, donc un shutdown ferme l'admission, annule, attend, **puis**
+  aborte les récalcitrants.
+- **Zéro clé de configuration.** Toutes les limites v1 sont des constantes du
+  crate (mailbox 64, flux live 256, entrées en attente 16, 4 enfants actifs,
+  8 créés, profondeur 1). `/status` les affiche ; `settings.toml` ne les connaît
+  pas.
+
+Le store et la session sont **le même fichier** : l'adapter JSONL implémente
+`ThreadStore` et `Session`. Deux writers sur un fichier de session se
+disputeraient son verrou et s'entrelaceraient sans curseur commun.
+
 ## 8. Sous-agents
 
-Un sous-agent est lancé via `tokio::spawn(run_agent(...))` avec un **transcript séparé**. La communication parent ↔ enfant se fait par **`mpsc`** : l'enfant yield ses `AgentEvent`, le parent les agrège.
-
-Variante **InProcessTeammate** : implémentée via `tokio::task_local`, pour partager du contexte ambiant (config, session root) sans le passer explicitement à chaque appel.
+Un sous-agent **est un thread** : son propre `ThreadHandle`, son propre journal
+durable, son propre cycle de vie. Ce que le superviseur ajoute est le côté parent
+de la relation : la comptabilité du graphe, le nœud d'annulation dont les enfants
+pendent, le handoff borné que produit chaque terminal, et les refus qui empêchent
+un parent d'atteindre l'enfant d'un autre.
 
 ```
-        run_agent (parent)
-              │ tokio::spawn
+        thread parent (ThreadHandle)
+              │ AgentSupervisor : lease atomique, puis création
    ┌──────────┼──────────┐
    ▼          ▼          ▼
-sous-agent  sous-agent  sous-agent     ← transcripts séparés
-   │ mpsc     │ mpsc     │ mpsc
+ enfant     enfant     enfant       ← journal, mailbox et tours propres
+   │          │          │
    └──────────┴──────────┘
               ▼
-        agrégation des AgentEvent côté parent
+    handoff borné, marqué untrusted, injecté une seule fois
 ```
 
-Chaque sous-agent réutilise la **même** `run_agent` (§3) : un sous-agent est un agent comme un autre, avec son propre budget et son propre transcript.
+Bornes v1, constantes : 4 enfants actifs, 8 créés par thread racine, profondeur 1.
+L'autorité d'un enfant est l'**intersection** de celle du parent et de la demande
+de spawn, jamais plus large ; par défaut, lecture seule. Un enfant mutateur n'est
+pas livré (`docs/DECISIONS.md`, no-go mesuré).
+
+État livré : le runtime, les bornes, l'autorité, le handoff et les cinq outils
+(`spawn_agent`, `list_agents`, `wait_agent`, `send_agent`, `interrupt_agent`) sont
+écrits et testés. Le binaire, lui, ne les enregistre pas encore et démarre son
+thread sans superviseur : exposer un enfant demande un spawner côté client
+capable de construire un registre d'outils restreint à son autorité, ce qui reste
+à livrer (voir `docs/CURRENT_STATUS.md`, section *Deferred*).
 
 ---
 
@@ -548,3 +613,9 @@ Tant que Phase 2 n'est pas ouverte, la mémoire vectorielle est **explicitement 
 7. La compaction se cassera sur tout provider sans `Usage` fiable si le fallback `agent-tokenizer` n'est pas branché : `update_budget` lit le `Usage` du stream **sinon** compte en local.
 8. **Withholding ≠ retry.** Seules les erreurs de contexte (PTL / max-tokens / `413`) alimentent `PendingError` et la compaction réactive ; les transitoires (`Retryable` / `Overloaded` / `RateLimited`) sont absorbées par le backoff transverse et n'entrent jamais dans `PendingError`.
 9. Le type d'erreur classifiée est **`ErrorClass`** (5 variantes), nommé identiquement dans tout le code et toute la doc — jamais `ErrClass`.
+10. `run_agent` est le **seul** moteur modèle-outils. `agent-runtime` l'atteint par `TurnRunner` et ne réimplémente jamais retry, compaction ni dispatch. Le jour où le seam a besoin d'une boucle à lui, l'architecture est fausse (ADR-12, §7bis).
+11. Un tour produit **exactement un** état terminal, persisté avant d'être publié, et une seconde transition terminale est refusée par une erreur typée.
+12. Une opération acceptée est **durable avant son acquittement**, et une resoumission portant un `client_message_id` déjà accepté rend les identifiants d'origine sans rien réexécuter.
+13. Un seul arbre d'annulation : chaque thread, tour, outil et enfant est un nœud ENFANT du précédent. Annuler descend, jamais ne remonte, et un `JoinHandle::abort` côté client est interdit — il couperait le futur entre un `tool_use` et son résultat.
+14. Les deux clients passent par la **même** interface de runtime. Aucune sémantique de tour ne vit dans un client.
+15. Aucune clé de configuration publique pour l'orchestration : chaque limite v1 est une constante du crate.
