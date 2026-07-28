@@ -47,6 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         model,
         model_runtime: None,
         reasoning_effort: None,
+        reasoning_replay: false,
         system: Some("Tu es Pyxis, un agent de codage concis.".to_string()),
         messages: vec![Message::user(prompt)],
         tools: vec![],

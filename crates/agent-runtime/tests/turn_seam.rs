@@ -21,7 +21,9 @@ use agent_core::provider::{
 };
 use agent_core::session::{FileSnapshot, Session, SessionError};
 use agent_core::tools::{ToolDispatch, ToolEventSink, ToolInvocation, ToolOutcome};
-use agent_core::{AgentContext, CancellationToken as CoreCancel, Deps, RunConfig};
+use agent_core::{
+    AgentContext, CancellationToken as CoreCancel, ContextTransition, Deps, RunConfig,
+};
 use agent_runtime::context::{TurnContext, TurnLimits};
 use agent_runtime::id::{SequentialIds, TurnId};
 use agent_runtime::inputs::TurnInputs;
@@ -118,6 +120,12 @@ impl Session for FakeStore {
         messages: &[Message],
     ) -> Result<(), SessionError> {
         *self.synced.lock().unwrap() = messages.to_vec();
+        Ok(())
+    }
+    async fn record_context_transition(
+        &self,
+        _transition: ContextTransition,
+    ) -> Result<(), SessionError> {
         Ok(())
     }
     async fn redact_encrypted_reasoning(&self) -> Result<(), SessionError> {
@@ -230,6 +238,7 @@ fn request(text: &str) -> TurnRequest {
             },
         },
         model_runtime: None,
+        overload_fallback_runtime: None,
         inputs: Arc::new(TurnInputs::new()),
     }
 }

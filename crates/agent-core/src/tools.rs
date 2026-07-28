@@ -560,6 +560,16 @@ impl StepToolPlan {
         &self.specs
     }
 
+    pub fn with_parallel_allowed(&self, parallel_allowed: bool) -> Self {
+        Self {
+            generation: self.generation,
+            fingerprint: tool_plan_fingerprint(&self.specs, parallel_allowed),
+            specs: self.specs.clone(),
+            parallel_allowed,
+            dispatcher: Arc::clone(&self.dispatcher),
+        }
+    }
+
     /// Validates membership against the visible catalog before touching the
     /// captured dispatcher. Unknown calls receive one correlated rejection.
     pub async fn dispatch(

@@ -35,6 +35,7 @@ pub struct TurnRequest {
     pub context: TurnContext,
     /// In-memory body referenced by `context.model_runtime_fingerprint`.
     pub model_runtime: Option<ResolvedModelRuntime>,
+    pub overload_fallback_runtime: Option<ResolvedModelRuntime>,
     /// Steering inputs accepted for THIS turn (US-007). Owned by the actor,
     /// consumed by the engine at its safe points.
     pub inputs: Arc<TurnInputs>,

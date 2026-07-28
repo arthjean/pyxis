@@ -15,6 +15,13 @@ use crate::message::Message;
 use crate::provider::ToolSpec;
 use crate::tools::ToolDispatchSnapshot;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ContextFragmentKind {
+    #[default]
+    Project,
+    Skill,
+}
+
 /// Model-visible context of exactly one model request.
 ///
 /// Two frames sharing a `generation` are byte-identical, which is what lets the
@@ -25,6 +32,9 @@ pub struct StepFrame {
     pub generation: u64,
     pub tools: Vec<ToolSpec>,
     pub context_messages: Vec<Message>,
+    /// Parallel classification of `context_messages`, used only for baseline
+    /// identity. A missing legacy classification is treated as project context.
+    pub context_kinds: Vec<ContextFragmentKind>,
     /// Immutable dispatch view captured with `tools`. `None` is reserved for
     /// static/test sources, where the injected dispatcher is already frozen.
     pub tool_dispatch: Option<ToolDispatchSnapshot>,

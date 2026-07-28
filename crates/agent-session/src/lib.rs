@@ -28,6 +28,7 @@ use agent_core::CompactKind;
 use agent_core::compaction::is_summary_message;
 use agent_core::message::{ContentBlock, Message, Role};
 use agent_core::session::{FileSnapshot, Session, SessionEntry, SessionError};
+use agent_core::{ContextBaseline, ContextTransition};
 use agent_runtime::event::{
     ForkOrigin, RECOVERY_COMMIT_ENTRY, THREAD_EVENT_ENTRY, THREAD_META_ENTRY, ThreadEvent,
 };
@@ -134,6 +135,7 @@ pub(crate) struct WriterState {
     file: File,
     cursor: usize,
     poisoned: bool,
+    last_context_baseline: Option<ContextBaseline>,
 }
 
 impl WriterState {
@@ -182,11 +184,13 @@ pub(crate) fn open_prepared(
         .map(|m| m.len() == 0)
         .unwrap_or(true);
     let cursor = resumed.messages.len();
+    let last_context_baseline = resumed.last_context_baseline.clone();
     Ok((
         WriterState {
             file,
             cursor,
             poisoned: false,
+            last_context_baseline,
         },
         is_empty,
         resumed,
@@ -306,6 +310,13 @@ impl JsonlSession {
 
 #[async_trait::async_trait]
 impl Session for JsonlSession {
+    fn context_baseline(&self) -> Option<ContextBaseline> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.last_context_baseline.clone())
+    }
+
     async fn sync(&self, messages: &[Message]) -> Result<(), SessionError> {
         let mut state = self
             .state
@@ -341,6 +352,28 @@ impl Session for JsonlSession {
             },
         )?;
         state.cursor = messages.len();
+        state.last_context_baseline = None;
+        Ok(())
+    }
+
+    async fn record_context_transition(
+        &self,
+        transition: ContextTransition,
+    ) -> Result<(), SessionError> {
+        transition
+            .validate()
+            .map_err(|error| invalid_session(error.to_string()))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SessionError::Io("poisoned session lock".into()))?;
+        write_entry_locked(
+            &mut state,
+            &SessionEntry::ContextTransition {
+                transition: Box::new(transition.clone()),
+            },
+        )?;
+        state.last_context_baseline = Some(transition.to);
         Ok(())
     }
 
@@ -359,6 +392,9 @@ pub struct ResumedSession {
     pub messages: Vec<Message>,
     pub file_snapshots: Vec<FileSnapshot>,
     pub compactions: usize,
+    /// Last durable model-visible baseline. `None` for legacy logs and after a
+    /// compaction that has not yet opened another provider sampling.
+    pub last_context_baseline: Option<ContextBaseline>,
     /// True when a partial last line (crash mid-write) was ignored.
     pub skipped_partial: bool,
     /// Schema version declared by the first `Meta` entry, when present.
@@ -410,6 +446,7 @@ fn apply_entry(
         SessionEntry::Message(m) => {
             if *pending_clear {
                 out.messages.clear();
+                out.last_context_baseline = None;
                 *pending_clear = false;
             }
             out.messages.push(m);
@@ -421,8 +458,15 @@ fn apply_entry(
         SessionEntry::CompactCheckpoint { messages, .. } => {
             validate_checkpoint(&messages)?;
             out.messages = messages;
+            out.last_context_baseline = None;
             *pending_clear = false;
             out.compactions += 1;
+        }
+        SessionEntry::ContextTransition { transition } => {
+            transition
+                .validate()
+                .map_err(|error| invalid_session(error.to_string()))?;
+            out.last_context_baseline = Some(transition.to.clone());
         }
         SessionEntry::EncryptedReasoningRedacted => {
             redact_encrypted_reasoning(&mut out.messages);
@@ -639,6 +683,11 @@ fn apply_scan_entry(
             for message in &messages {
                 scan_push_message(scan, message);
             }
+        }
+        SessionEntry::ContextTransition { transition } => {
+            transition
+                .validate()
+                .map_err(|error| invalid_session(error.to_string()))?;
         }
         SessionEntry::Meta { schema_version } => {
             if schema_version > SESSION_SCHEMA_VERSION {

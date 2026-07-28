@@ -1178,6 +1178,11 @@ impl AppState {
                     _ => self.blocks.push(Block::Reasoning(t.clone())),
                 }
             }
+            AgentEvent::ReasoningReplayDisabled { reason } => {
+                self.blocks.push(Block::Notice(format!(
+                    "reasoning replay disabled: {reason}"
+                )));
+            }
             AgentEvent::ToolCall(view) => {
                 self.finalize_streaming();
                 self.live_output = None;

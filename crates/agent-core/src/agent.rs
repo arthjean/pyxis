@@ -20,11 +20,12 @@ use crate::error::{AgentError, ProviderFailure};
 use crate::event::{AgentEvent, ToolCallView, ToolOutputDeltaView, ToolResultView};
 use crate::guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget, batch_signature};
 use crate::input::InputQueue;
-use crate::message::{INTERRUPTED_TOOL_RESULT, Message, ToolCallId, unanswered_tool_calls};
-use crate::model::{ResolvedModelRuntime, TruncationMode};
-use crate::provider::{
-    AuthError, CanonicalRequest, ErrorClass, ProviderError, StreamEvent, TokenUsage, ToolSpec,
+use crate::message::{
+    ContentBlock, INTERRUPTED_TOOL_RESULT, Message, ToolCallId, unanswered_tool_calls,
 };
+use crate::model::{ResolvedModelRuntime, TruncationMode};
+use crate::prompt::{ContextTransitionCause, PromptSnapshot, replay_enabled, transition_between};
+use crate::provider::{AuthError, ErrorClass, ProviderError, StreamEvent, TokenUsage, ToolSpec};
 use crate::step::StepContextSource;
 use crate::tools::{
     MAX_MODEL_TOOL_RESULT_BYTES, ModelToolResult, StepToolPlan, ToolDispatchEvent,
@@ -53,6 +54,9 @@ pub struct RunConfig {
     pub cost_budget: Option<CostBudget>,
     /// Optional fallback model after a provider overload.
     pub overload_fallback_model: Option<String>,
+    /// Fully resolved fallback contract. Required when the primary turn already
+    /// carries a resolved runtime; a bare slug is accepted only on legacy paths.
+    pub overload_fallback_runtime: Option<ResolvedModelRuntime>,
     /// Calibration probe (US-002): when enabled, every model round-trip carries
     /// the local estimate of its input next to the backend measure, so a client
     /// can compare them. Off by default: the estimate costs a tokenizer pass
@@ -73,6 +77,7 @@ impl Default for RunConfig {
             token_budget: None,
             cost_budget: None,
             overload_fallback_model: None,
+            overload_fallback_runtime: None,
             usage_probe: false,
         }
     }
@@ -85,6 +90,9 @@ pub struct AgentContext {
     pub model_runtime: Option<ResolvedModelRuntime>,
     pub reasoning_effort: Option<String>,
     pub system: Option<String>,
+    /// Effective instructions precomposed for the resolved overload fallback.
+    /// Kept beside the runtime so a switch never reuses the primary contract.
+    pub overload_fallback_system: Option<String>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub config: RunConfig,
@@ -112,6 +120,7 @@ impl AgentContext {
             model_runtime: None,
             reasoning_effort: None,
             system: None,
+            overload_fallback_system: None,
             messages: Vec::new(),
             tools: Vec::new(),
             config: RunConfig::default(),
@@ -159,37 +168,6 @@ async fn steer_ready(inputs: &Option<Arc<dyn InputQueue>>) {
     match inputs {
         Some(queue) => queue.ready().await,
         None => std::future::pending().await,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn make_request(
-    model: &str,
-    model_runtime: &Option<ResolvedModelRuntime>,
-    reasoning_effort: &Option<String>,
-    system: &Option<String>,
-    context_messages: &[Message],
-    messages: &[Message],
-    ephemeral_messages: &[Message],
-    tools: &[ToolSpec],
-    max_output: u32,
-) -> CanonicalRequest {
-    // US-028: EPHEMERAL prefix (AGENTS.md + env). Stable before volatile to
-    // preserve the cacheable prefix; never persisted (the transcript stays
-    // `messages` alone).
-    let mut all =
-        Vec::with_capacity(context_messages.len() + messages.len() + ephemeral_messages.len());
-    all.extend_from_slice(context_messages);
-    all.extend_from_slice(messages);
-    all.extend_from_slice(ephemeral_messages);
-    CanonicalRequest {
-        model: model.to_string(),
-        model_runtime: model_runtime.clone(),
-        reasoning_effort: reasoning_effort.clone(),
-        system: system.clone(),
-        messages: all,
-        tools: tools.to_vec(),
-        max_output_tokens: max_output,
     }
 }
 
@@ -375,6 +353,18 @@ fn estimate_current_input(messages: &[Message], static_input_tokens: u32, deps: 
     estimate_input(messages, deps.tokenizer.as_ref()).saturating_add(static_input_tokens)
 }
 
+fn invalidate_reasoning(messages: &mut [Message]) -> bool {
+    let mut removed = false;
+    for message in messages {
+        message.content.retain(|block| {
+            let keep = !matches!(block, ContentBlock::EncryptedReasoning { .. });
+            removed |= !keep;
+            keep
+        });
+    }
+    removed
+}
+
 fn record_attempt_usage(
     usage_budget: &mut UsageBudget,
     budget: &mut ContextBudget,
@@ -409,14 +399,87 @@ fn rebuild_budget_after_model_switch(
     Ok(budget)
 }
 
+struct ResolvedFallback {
+    budget: ContextBudget,
+    static_input_tokens: u32,
+    compact_with: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_switch_to_resolved_overload_fallback(
+    class: ErrorClass,
+    fallback_used: &mut bool,
+    model: &mut String,
+    model_runtime: &mut Option<ResolvedModelRuntime>,
+    reasoning_effort: &mut Option<String>,
+    system: &mut Option<String>,
+    overload_fallback_system: &Option<String>,
+    config: &mut RunConfig,
+    parallel_tools: &mut bool,
+    tool_plan: &mut StepToolPlan,
+    context_messages: &[Message],
+    ephemeral_messages: &[Message],
+    messages: &[Message],
+    deps: &Deps,
+) -> Option<Result<ResolvedFallback, String>> {
+    if !matches!(class, ErrorClass::Overloaded(_)) || *fallback_used {
+        return None;
+    }
+    let previous = model_runtime.as_ref()?.clone();
+    let fallback = config
+        .overload_fallback_runtime
+        .as_ref()
+        .filter(|fallback| fallback.fingerprint != previous.fingerprint)?
+        .clone();
+    if let Err(error) = fallback.validate() {
+        return Some(Err(error.to_string()));
+    }
+
+    *model = fallback.slug.clone();
+    *reasoning_effort = fallback.reasoning_effort.clone();
+    *system = overload_fallback_system
+        .clone()
+        .or_else(|| Some(fallback.instructions.clone()));
+    config.max_output_tokens = fallback.max_output_tokens;
+    config.max_retries = fallback.retry.max_retries;
+    config.backoff_base_ms = fallback.retry.backoff_base_ms;
+    *parallel_tools = fallback.supports_parallel_tool_calls;
+    *tool_plan = tool_plan.with_parallel_allowed(*parallel_tools);
+    let static_input_tokens = estimate_static_input(
+        system,
+        context_messages,
+        tool_plan.specs(),
+        deps.tokenizer.as_ref(),
+    )
+    .saturating_add(estimate_input(ephemeral_messages, deps.tokenizer.as_ref()));
+    let mut budget = match ContextBudget::try_for_model_with_auto_limit(
+        fallback.context_window,
+        fallback.max_output_tokens,
+        Some(fallback.auto_compact_token_limit),
+    ) {
+        Ok(budget) => budget,
+        Err(error) => return Some(Err(error)),
+    };
+    budget.observe_estimated(estimate_current_input(messages, static_input_tokens, deps));
+    let compact_with = (previous.comp_hash != fallback.comp_hash).then_some(previous.slug.clone());
+    *model_runtime = Some(fallback);
+    *fallback_used = true;
+    Some(Ok(ResolvedFallback {
+        budget,
+        static_input_tokens,
+        compact_with,
+    }))
+}
+
 /// Starts the agent. Returns a `Stream<AgentEvent>` to consume (TUI, `-p`).
 pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent> + Send {
     async_stream::stream! {
         let AgentContext {
             mut model,
-            model_runtime,
+            mut model_runtime,
             mut reasoning_effort,
-            system,
+            mut system,
+            overload_fallback_system,
             mut messages,
             tools,
             mut config,
@@ -433,19 +496,23 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
             }
             model = runtime.slug.clone();
             reasoning_effort = runtime.reasoning_effort.clone();
+            if system.is_none() {
+                system = Some(runtime.instructions.clone());
+            }
             config.max_output_tokens = runtime.max_output_tokens;
             config.max_retries = runtime.retry.max_retries;
             config.backoff_base_ms = runtime.retry.backoff_base_ms;
             config.overload_fallback_model = None;
         }
 
-        let parallel_tools = model_runtime
+        let mut parallel_tools = model_runtime
             .as_ref()
             .is_none_or(|runtime| runtime.supports_parallel_tool_calls);
         let mut tool_plan = StepToolPlan::capture(
             ToolDispatchSnapshot::new(0, tools, Arc::clone(&deps.tools)),
             parallel_tools,
         );
+        let mut active_tool_plan = tool_plan.clone();
 
         // ContextBudget computed for the active model (recomputed on overload fallback).
         let max_context = model_runtime
@@ -479,6 +546,22 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
         // US-006: generation of the step frame currently installed. `None` until
         // the first frame, so a source whose first generation is 0 is still read.
         let mut step_generation: Option<u64> = None;
+        let mut context_kinds = Vec::new();
+        let mut context_baseline = deps.session.context_baseline();
+        let mut transition_causes = Vec::new();
+        let mut reasoning_replay = replay_enabled(model_runtime.as_ref());
+        let mut reasoning_replay_downgraded = false;
+        let mut required_profile_compaction = context_baseline.as_ref().and_then(|previous| {
+            model_runtime.as_ref().and_then(|runtime| {
+                (previous.comp_hash != runtime.comp_hash).then(|| previous.model_slug.clone())
+            })
+        });
+        if required_profile_compaction.is_some() {
+            transition_causes.extend([
+                ContextTransitionCause::CompHashChanged,
+                ContextTransitionCause::Compaction,
+            ]);
+        }
         let mut compaction = CompactionState::default();
         let mut pending: Option<PendingError> = None;
         let mut model_turns: u32 = 0;
@@ -519,6 +602,8 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                 // US-001: SINGLE stop boundary, every deep cancellation point loops
                 // back here, where the transcript is in a known state.
                 Transition::Interrupted
+            } else if required_profile_compaction.is_some() && pending.is_none() {
+                Transition::Compact(CompactKind::Auto)
             } else if force_compact && pending.is_none() {
                 // US-030 MidTurn: compaction forced by a long tool_result on the
                 // previous turn. Withholding (`pending`) stays PRIORITY: if a
@@ -574,6 +659,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             };
                             tool_plan = StepToolPlan::capture(dispatch, parallel_tools);
                             context_messages = frame.context_messages;
+                            context_kinds = frame.context_kinds;
                             static_input_tokens = estimate_static_input(
                                 &system,
                                 &context_messages,
@@ -607,31 +693,84 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         }
                     }
 
-                    // US-014: pre-turn estimate, stop BEFORE a turn whose
-                    // projection (estimated context + max output) would cross
-                    // the budget (edge case #3, "before a big turn").
+                    let model_switch_from = context_baseline.as_ref().filter(|previous| {
+                        model_runtime.as_ref().is_some_and(|runtime| {
+                            previous.profile_fingerprint != runtime.fingerprint
+                        })
+                    });
+                    if model_switch_from.is_some()
+                        && invalidate_reasoning(&mut messages)
+                        && let Err(error) = deps.session.redact_encrypted_reasoning().await
+                    {
+                        yield AgentEvent::Error(AgentError::Session(error.to_string()));
+                        return;
+                    }
+                    let snapshot = match PromptSnapshot::capture(
+                        model.clone(),
+                        model_runtime.clone(),
+                        reasoning_effort.clone(),
+                        system.clone(),
+                        context_messages.clone(),
+                        context_kinds.clone(),
+                        &messages,
+                        ephemeral_messages.clone(),
+                        tool_plan.clone(),
+                        config.max_output_tokens,
+                        reasoning_replay,
+                        model_switch_from,
+                    ) {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            yield AgentEvent::Error(AgentError::InvalidRequest(error.to_string()));
+                            return;
+                        }
+                    };
+                    for diagnostic in snapshot.diagnostics() {
+                        tracing::warn!(
+                            target: "pyxis::prompt",
+                            prompt_fingerprint = snapshot.fingerprint(),
+                            "{diagnostic}"
+                        );
+                    }
+                    static_input_tokens = snapshot.static_input_tokens(deps.tokenizer.as_ref());
+                    // The kill-switch consumes the immutable snapshot's bounded
+                    // static input, not the live source values used to build it.
                     if usage_budget.is_active() {
-                        let est_in = estimate_current_input(&messages, static_input_tokens, &deps) as u64;
-                        if let Some(reason) =
-                            usage_budget.would_exceed(est_in, config.max_output_tokens as u64)
+                        let estimated_input =
+                            estimate_current_input(&messages, static_input_tokens, &deps) as u64;
+                        if let Some(reason) = usage_budget
+                            .would_exceed(estimated_input, config.max_output_tokens as u64)
                         {
                             yield AgentEvent::Exhausted(reason);
                             return;
                         }
                     }
-
                     budget.begin_turn();
-                    let req = make_request(
-                        &model,
-                        &model_runtime,
-                        &reasoning_effort,
-                        &system,
-                        &context_messages,
-                        &messages,
-                        &ephemeral_messages,
-                        tool_plan.specs(),
-                        config.max_output_tokens,
+                    active_tool_plan = snapshot.tool_plan().clone();
+                    let next_baseline = snapshot.baseline().clone();
+                    if let Some(context_transition) = transition_between(
+                        context_baseline.as_ref(),
+                        &next_baseline,
+                        std::mem::take(&mut transition_causes),
+                    ) {
+                        if let Err(error) = deps
+                            .session
+                            .record_context_transition(context_transition)
+                            .await
+                        {
+                            yield AgentEvent::Error(AgentError::Session(error.to_string()));
+                            return;
+                        }
+                        context_baseline = Some(next_baseline);
+                    }
+                    tracing::debug!(
+                        target: "pyxis::prompt",
+                        prompt_fingerprint = snapshot.fingerprint(),
+                        stable_prefix_fingerprint = snapshot.stable_prefix_fingerprint(),
+                        reasoning_replay = snapshot.reasoning_replay(),
+                        "prompt snapshot opened"
                     );
+                    let req = snapshot.request();
                     if let Err(e) = req.validate() {
                         yield AgentEvent::Error(AgentError::InvalidRequest(e.to_string()));
                         return;
@@ -655,6 +794,48 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             ErrorClass::Retryable
                             | ErrorClass::RateLimited
                             | ErrorClass::Overloaded(_) => {
+                                if let Some(switched) =
+                                    maybe_switch_to_resolved_overload_fallback(
+                                        class,
+                                        &mut overload_fallback_used,
+                                        &mut model,
+                                        &mut model_runtime,
+                                        &mut reasoning_effort,
+                                        &mut system,
+                                        &overload_fallback_system,
+                                        &mut config,
+                                        &mut parallel_tools,
+                                        &mut tool_plan,
+                                        &context_messages,
+                                        &ephemeral_messages,
+                                        &messages,
+                                        &deps,
+                                    )
+                                {
+                                    match switched {
+                                        Ok(switched) => {
+                                            budget = switched.budget;
+                                            static_input_tokens = switched.static_input_tokens;
+                                            reasoning_replay = !reasoning_replay_downgraded
+                                                && replay_enabled(model_runtime.as_ref());
+                                            transition_causes
+                                                .push(ContextTransitionCause::OverloadFallback);
+                                            if let Some(compact_with) = switched.compact_with {
+                                                required_profile_compaction = Some(compact_with);
+                                                transition_causes.extend([
+                                                    ContextTransitionCause::CompHashChanged,
+                                                    ContextTransitionCause::Compaction,
+                                                ]);
+                                            }
+                                        }
+                                        Err(error) => {
+                                            yield AgentEvent::Error(AgentError::InvalidRequest(error));
+                                            return;
+                                        }
+                                    }
+                                    transient_retries = 0;
+                                    continue;
+                                }
                                 if maybe_switch_to_overload_fallback(
                                     &mut model,
                                     &config,
@@ -785,6 +966,11 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     yield AgentEvent::Quota(snapshot);
                                 }
                             }
+                            Ok(StreamEvent::ReasoningReplayDisabled { reason }) => {
+                                reasoning_replay_downgraded = true;
+                                reasoning_replay = false;
+                                yield AgentEvent::ReasoningReplayDisabled { reason };
+                            }
                             Ok(other) => {
                                 if let Err(e) = acc.push(other) {
                                     yield AgentEvent::Error(e);
@@ -845,6 +1031,51 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             ErrorClass::Retryable
                             | ErrorClass::RateLimited
                             | ErrorClass::Overloaded(_) => {
+                                if let Some(switched) =
+                                    maybe_switch_to_resolved_overload_fallback(
+                                        class,
+                                        &mut overload_fallback_used,
+                                        &mut model,
+                                        &mut model_runtime,
+                                        &mut reasoning_effort,
+                                        &mut system,
+                                        &overload_fallback_system,
+                                        &mut config,
+                                        &mut parallel_tools,
+                                        &mut tool_plan,
+                                        &context_messages,
+                                        &ephemeral_messages,
+                                        &messages,
+                                        &deps,
+                                    )
+                                {
+                                    if acc.has_visible_output() {
+                                        yield AgentEvent::StreamReset;
+                                    }
+                                    match switched {
+                                        Ok(switched) => {
+                                            budget = switched.budget;
+                                            static_input_tokens = switched.static_input_tokens;
+                                            reasoning_replay = !reasoning_replay_downgraded
+                                                && replay_enabled(model_runtime.as_ref());
+                                            transition_causes
+                                                .push(ContextTransitionCause::OverloadFallback);
+                                            if let Some(compact_with) = switched.compact_with {
+                                                required_profile_compaction = Some(compact_with);
+                                                transition_causes.extend([
+                                                    ContextTransitionCause::CompHashChanged,
+                                                    ContextTransitionCause::Compaction,
+                                                ]);
+                                            }
+                                        }
+                                        Err(error) => {
+                                            yield AgentEvent::Error(AgentError::InvalidRequest(error));
+                                            return;
+                                        }
+                                    }
+                                    transient_retries = 0;
+                                    continue;
+                                }
                                 if maybe_switch_to_overload_fallback(
                                     &mut model,
                                     &config,
@@ -1073,8 +1304,8 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 tokio::sync::mpsc::unbounded_channel();
                             let expected_ids: Vec<ToolCallId> =
                                 calls.iter().map(|c| c.id.clone()).collect();
-                            let dispatch =
-                                tool_plan.dispatch(calls, ToolEventSink::new(tool_event_tx));
+                            let dispatch = active_tool_plan
+                                .dispatch(calls, ToolEventSink::new(tool_event_tx));
                             tokio::pin!(dispatch);
                             let mut tool_events_open = true;
                             // US-001: `biased` with the dispatch FIRST. A batch that just
@@ -1175,6 +1406,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     }
                 }
                 Transition::Compact(kind) => {
+                    let compact_model = required_profile_compaction
+                        .as_deref()
+                        .unwrap_or(model.as_str());
                     // US-001: compaction is a full model call; cancellation does not
                     // wait for it. The transcript is not modified until
                     // `full_compact` has handed back control.
@@ -1182,7 +1416,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         &deps.cancel,
                         full_compact(
                             &mut messages,
-                            &model,
+                            compact_model,
                             deps.provider.as_ref(),
                             config.max_output_tokens,
                         ),
@@ -1203,6 +1437,10 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 yield AgentEvent::Error(AgentError::Session(e.to_string()));
                                 return;
                             }
+                            if required_profile_compaction.take().is_none() {
+                                context_baseline = None;
+                                transition_causes.push(ContextTransitionCause::Compaction);
+                            }
                             // US-030: anchors the baseline on the NEXT real usage
                             // (guards against an immediate double compaction).
                             let compacted_input = estimate_current_input(&messages, static_input_tokens, &deps);
@@ -1210,6 +1448,14 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             yield AgentEvent::Compacted(kind);
                         }
                         Err(_) => {
+                            if required_profile_compaction.is_some() {
+                                yield AgentEvent::Error(AgentError::Provider(
+                                    ProviderFailure::contract(
+                                        "required comp_hash compaction failed before model switch",
+                                    ),
+                                ));
+                                return;
+                            }
                             let n = compaction.record_failure();
                             if compaction.tripped(config.compaction_breaker_limit) {
                                 yield AgentEvent::Error(AgentError::CompactionCircuitBreaker(n));
@@ -1252,6 +1498,8 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 yield AgentEvent::Error(AgentError::Session(e.to_string()));
                                 return;
                             }
+                            context_baseline = None;
+                            transition_causes.push(ContextTransitionCause::Compaction);
                             let compacted_input = estimate_current_input(&messages, static_input_tokens, &deps);
                             budget.mark_compacted(compacted_input);
                             yield AgentEvent::Compacted(CompactKind::Reactive);

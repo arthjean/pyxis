@@ -162,6 +162,7 @@ pub async fn full_compact(
         model: model.to_string(),
         model_runtime: None,
         reasoning_effort: None,
+        reasoning_replay: false,
         system: Some(SUMMARY_SYSTEM.to_string()),
         messages: to_summarize,
         tools: Vec::new(),

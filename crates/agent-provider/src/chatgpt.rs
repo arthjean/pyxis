@@ -90,8 +90,6 @@ pub struct OpenAiChatGptProvider {
     /// STABLE session identifier (UUID v4), sent as `prompt_cache_key` on
     /// every request (US-029) -> the backend reuses its prefix cache.
     session_id: RwLock<String>,
-    /// US-031: reinject the encrypted reasoning items in stateless mode.
-    reasoning_replay: bool,
     /// Last valid remote catalog layered over the versioned embedded fallback.
     /// Shared by interactive discovery and headless turn resolution.
     catalog: RwLock<ModelCatalog>,
@@ -160,7 +158,7 @@ impl OpenAiChatGptProvider {
                     strict_json_schema: true,
                 },
                 reasoning_options: ReasoningCapabilities {
-                    encrypted_replay: false,
+                    encrypted_replay: true,
                 },
                 cache: CacheCapabilities {
                     prompt_cache_key: true,
@@ -169,7 +167,6 @@ impl OpenAiChatGptProvider {
             reasoning_effort,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             session_id: RwLock::new(new_session_id()),
-            reasoning_replay: false,
             catalog: RwLock::new(ModelCatalog::embedded()),
         }
     }
@@ -189,13 +186,6 @@ impl OpenAiChatGptProvider {
         if !idle.is_zero() {
             self.idle_timeout = idle;
         }
-        self
-    }
-
-    /// Enables/disables the replay of encrypted reasoning items (US-031).
-    pub fn with_reasoning_replay(mut self, on: bool) -> Self {
-        self.reasoning_replay = on;
-        self.capabilities.reasoning_options.encrypted_replay = on;
         self
     }
 
@@ -379,6 +369,16 @@ fn should_retry_with_originator_fallback_env(
         return false;
     }
     matches!(status, 400 | 403) && message.to_ascii_lowercase().contains("originator")
+}
+
+fn should_retry_without_reasoning_replay(status: u16, message: &str) -> bool {
+    if status != 400 {
+        return false;
+    }
+    let message = message.to_ascii_lowercase();
+    message.contains("encrypted_reasoning")
+        || message.contains("encrypted reasoning")
+        || message.contains("reasoning replay")
 }
 
 /// Markers of a TERMINAL 429 (subscription quota exhausted), derived from Pi
@@ -663,29 +663,32 @@ impl Provider for OpenAiChatGptProvider {
             .reasoning_effort
             .as_deref()
             .map(reasoning_effort_for_request);
-        let mut body = build_responses_body(
-            &req,
-            ResponsesBodyOptions {
-                reasoning_effort,
-                include_encrypted_reasoning: self.reasoning_replay
-                    && runtime.reasoning_effort.is_some(),
-                parallel_tool_calls: runtime.supports_parallel_tool_calls,
-                text_verbosity: if runtime.supports_verbosity {
-                    runtime.verbosity.as_deref()
-                } else {
-                    None
+        let build_body = |replay: bool| {
+            build_responses_body(
+                &req,
+                ResponsesBodyOptions {
+                    reasoning_effort,
+                    include_encrypted_reasoning: replay && runtime.reasoning_effort.is_some(),
+                    parallel_tool_calls: runtime.supports_parallel_tool_calls,
+                    text_verbosity: if runtime.supports_verbosity {
+                        runtime.verbosity.as_deref()
+                    } else {
+                        None
+                    },
+                    dialect: runtime.responses_dialect,
                 },
-                dialect: runtime.responses_dialect,
-            },
-        );
+            )
+        };
+        let mut replay = req.reasoning_replay;
+        let mut body = build_body(replay);
         // US-029: stable per-session cache key -> reuse of the backend cache.
         let prompt_cache_key = self.prompt_cache_key();
         inject_cache_key(&mut body, &prompt_cache_key);
 
         // 3. POST. `.json()` sets the content-type; we add the proprietary headers
         //    (Authorization, chatgpt-account-id, originator, OpenAI-Beta, accept).
-        let build_request = |originator_override: Option<&str>| {
-            let mut rb = self.http.post(&spec.url).json(&body);
+        let build_request = |body: &serde_json::Value, originator_override: Option<&str>| {
+            let mut rb = self.http.post(&spec.url).json(body);
             for (k, v) in &spec.headers {
                 if k.eq_ignore_ascii_case("content-type") {
                     continue;
@@ -709,18 +712,43 @@ impl Provider for OpenAiChatGptProvider {
         // handshakes then withholds its headers (blocked proxy, queue) would freeze the loop
         // without a signal. `send()` resolves when the headers are received -> this timeout
         // does NOT cut the long SSE stream that follows.
-        let mut resp = send_with_header_timeout(build_request(None), CONNECT_TIMEOUT).await?;
+        let mut resp =
+            send_with_header_timeout(build_request(&body, None), CONNECT_TIMEOUT).await?;
+        let mut replay_disabled_reason = None;
 
         // 4. status. 413 -> context error (withholding/reactive compaction).
         if !resp.status().is_success() {
             let first_err = http_error_from_response(resp).await;
-            if let ProviderError::Http {
+            if replay
+                && let ProviderError::Http {
+                    status, message, ..
+                } = &first_err
+                && should_retry_without_reasoning_replay(*status, message)
+            {
+                replay = false;
+                body = build_body(false);
+                inject_cache_key(&mut body, &prompt_cache_key);
+                let retry =
+                    send_with_header_timeout(build_request(&body, None), CONNECT_TIMEOUT).await?;
+                if retry.status().is_success() {
+                    resp = retry;
+                    replay_disabled_reason =
+                        Some("backend rejected encrypted reasoning replay".to_string());
+                } else {
+                    let _ = http_error_from_response(retry).await;
+                    return Err(ProviderError::Http {
+                        status: 400,
+                        message: "reasoning replay downgrade was rejected".into(),
+                        retry_after_ms: None,
+                    });
+                }
+            } else if let ProviderError::Http {
                 status, message, ..
             } = &first_err
                 && should_retry_with_originator_fallback(*status, message)
             {
                 let retry = send_with_header_timeout(
-                    build_request(Some(openai_chatgpt::ORIGINATOR_FALLBACK)),
+                    build_request(&body, Some(openai_chatgpt::ORIGINATOR_FALLBACK)),
                     CONNECT_TIMEOUT,
                 )
                 .await?;
@@ -743,8 +771,10 @@ impl Provider for OpenAiChatGptProvider {
         //    here, before the body is consumed, and emitted first.
         let quota = crate::quota::parse_quota_headers(resp.headers());
         let mut es = resp.bytes_stream().eventsource();
-        let replay = self.reasoning_replay; // Copy -> captured in the 'static stream.
         let mapped = async_stream::stream! {
+            if let Some(reason) = replay_disabled_reason {
+                yield Ok(StreamEvent::ReasoningReplayDisabled { reason });
+            }
             if let Some(snapshot) = quota {
                 yield Ok(StreamEvent::Quota { snapshot });
             }
@@ -865,7 +895,7 @@ mod tests {
         let c = p.capabilities();
         assert!(!c.server_side_state, "SSE stateless → mappe le canonique");
         assert!(c.tools && c.reasoning);
-        assert!(!c.reasoning_options.encrypted_replay);
+        assert!(c.reasoning_options.encrypted_replay);
         assert_eq!(p.kind(), ProviderKind::OpenAiChatGpt);
     }
 
@@ -876,6 +906,7 @@ mod tests {
             model: String::new(),
             model_runtime: None,
             reasoning_effort: None,
+            reasoning_replay: false,
             system: None,
             messages: Vec::new(),
             tools: Vec::new(),
@@ -891,10 +922,8 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_replay_flag_updates_capabilities() {
+    fn encrypted_reasoning_transport_is_available_but_descriptor_gated() {
         let p = provider();
-        assert!(!p.capabilities().reasoning_options.encrypted_replay);
-        let p = p.with_reasoning_replay(true);
         assert!(p.capabilities().reasoning_options.encrypted_replay);
     }
 
@@ -966,6 +995,23 @@ mod tests {
             403,
             "originator is not allowed",
             true
+        ));
+    }
+
+    #[test]
+    fn replay_downgrade_only_matches_attributable_bad_requests() {
+        assert!(should_retry_without_reasoning_replay(
+            400,
+            "encrypted_reasoning item is incompatible"
+        ));
+        assert!(should_retry_without_reasoning_replay(
+            400,
+            "reasoning replay is unsupported"
+        ));
+        assert!(!should_retry_without_reasoning_replay(400, "invalid image"));
+        assert!(!should_retry_without_reasoning_replay(
+            500,
+            "encrypted_reasoning"
         ));
     }
 

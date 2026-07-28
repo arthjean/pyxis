@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::compaction::CompactKind;
 use crate::message::Message;
+use crate::prompt::{ContextBaseline, ContextTransition};
 
 /// Discriminated log entry (ARCHITECTURE section 7). Serialized one per JSONL line.
 /// `CompactBoundary` stays readable for older logs; new compaction
@@ -23,6 +24,9 @@ pub enum SessionEntry {
     CompactCheckpoint {
         kind: CompactKind,
         messages: Vec<Message>,
+    },
+    ContextTransition {
+        transition: Box<ContextTransition>,
     },
     EncryptedReasoningRedacted,
     FileHistorySnapshot(FileSnapshot),
@@ -51,6 +55,12 @@ pub enum SessionError {
 
 #[async_trait::async_trait]
 pub trait Session: Send + Sync {
+    /// Last durable prompt baseline reconstructed by this writer. Legacy and
+    /// ephemeral sessions start without one.
+    fn context_baseline(&self) -> Option<ContextBaseline> {
+        None
+    }
+
     /// Persists the messages not yet written (transcript-before-response,
     /// invariant 6). MUST be idempotent: it only writes the delta since the
     /// last `sync` (the implementation holds a cursor).
@@ -62,6 +72,12 @@ pub trait Session: Send + Sync {
     /// does NOT call this.
     async fn checkpoint(&self, kind: CompactKind, messages: &[Message])
     -> Result<(), SessionError>;
+
+    /// Persists a baseline transition before the provider is opened.
+    async fn record_context_transition(
+        &self,
+        transition: ContextTransition,
+    ) -> Result<(), SessionError>;
 
     /// Records a durable redaction of the already persisted encrypted reasoning
     /// blocks. Replay applies that redaction to the rebuilt messages.

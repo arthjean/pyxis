@@ -215,6 +215,7 @@ fn resolved_runtime() -> ResolvedModelRuntime {
         supports_verbosity: true,
         verbosity: Some("low".into()),
         supports_parallel_tool_calls: true,
+        reasoning_replay: agent_core::model::ReasoningReplaySupport::Enabled,
         responses_dialect: ResponsesDialect::Standard,
         tool_mode: ModelToolMode::Direct,
         truncation: TruncationPolicy {

@@ -63,6 +63,11 @@ pub enum StreamEvent {
         id: String,
         encrypted_content: String,
     },
+    /// The backend rejected replay once, so the adapter retried the same
+    /// sampling without it and the core disables replay for the rest of the turn.
+    ReasoningReplayDisabled {
+        reason: String,
+    },
     /// Subscription quota state read by the adapter (US-003). Purely
     /// informational, emitted at most once per round-trip and only when the
     /// backend serves something usable: an adapter that knows nothing about
@@ -299,6 +304,8 @@ pub struct CanonicalRequest {
     pub model_runtime: Option<ResolvedModelRuntime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reasoning_replay: bool,
     pub system: Option<String>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
@@ -333,6 +340,15 @@ impl CanonicalRequest {
                 return Err(CanonicalRequestValidationError::InvalidModelRuntime {
                     detail: "runtime reasoning effort does not match request".into(),
                 });
+            }
+            if self.reasoning_replay
+                && runtime.reasoning_replay != crate::model::ReasoningReplaySupport::Enabled
+            {
+                return Err(
+                    CanonicalRequestValidationError::UnsupportedReasoningReplay {
+                        model: runtime.slug.clone(),
+                    },
+                );
             }
             if !runtime.accepts_images()
                 && self.messages.iter().any(|message| {
@@ -381,12 +397,18 @@ pub enum CanonicalRequestValidationError {
     InvalidModelRuntime { detail: String },
     #[error("model {model} does not accept image input")]
     UnsupportedImageModality { model: String },
+    #[error("model {model} does not support encrypted stateless reasoning replay")]
+    UnsupportedReasoningReplay { model: String },
     #[error("message {index} is invalid: {detail}")]
     InvalidMessage { index: usize, detail: String },
     #[error("tool spec is invalid: {0}")]
     InvalidTool(#[from] ToolSpecValidationError),
     #[error("duplicate tool name: {tool}")]
     DuplicateToolName { tool: String },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Non-stream response (utility: titles, compaction summaries).
@@ -550,6 +572,7 @@ mod tests {
             supports_verbosity: false,
             verbosity: None,
             supports_parallel_tool_calls: false,
+            reasoning_replay: crate::model::ReasoningReplaySupport::Disabled,
             responses_dialect: ResponsesDialect::Standard,
             tool_mode: ModelToolMode::Direct,
             truncation: TruncationPolicy {
@@ -608,6 +631,7 @@ mod tests {
             model: "gpt".into(),
             model_runtime: None,
             reasoning_effort: None,
+            reasoning_replay: false,
             system: None,
             messages: vec![invalid_message],
             tools: vec![],
@@ -622,6 +646,7 @@ mod tests {
             model: "gpt".into(),
             model_runtime: None,
             reasoning_effort: None,
+            reasoning_replay: false,
             system: None,
             messages: vec![Message::user("ok")],
             tools: vec![ToolSpec {
@@ -649,6 +674,7 @@ mod tests {
             model: "text-model".into(),
             model_runtime: Some(text_only_runtime()),
             reasoning_effort: None,
+            reasoning_replay: false,
             system: Some("test".into()),
             messages: vec![Message {
                 role: Role::User,
@@ -672,6 +698,7 @@ mod tests {
             model: "gpt".into(),
             model_runtime: None,
             reasoning_effort: None,
+            reasoning_replay: false,
             system: None,
             messages: vec![Message::user("ok")],
             tools: vec![ToolSpec {
@@ -706,6 +733,7 @@ mod tests {
             model: "gpt".into(),
             model_runtime: None,
             reasoning_effort: None,
+            reasoning_replay: false,
             system: None,
             messages: vec![Message::user("ok")],
             tools: vec![strict_tool.clone(), strict_tool],

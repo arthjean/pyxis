@@ -19,6 +19,11 @@ pub enum AgentEvent {
     Text(String),
     /// Reasoning delta (when the provider emits any).
     Reasoning(String),
+    /// A replay rejection forced the current turn onto the byte-identical
+    /// no-replay request path.
+    ReasoningReplayDisabled {
+        reason: String,
+    },
     /// A tool is about to run.
     ToolCall(ToolCallView),
     /// Output fragment of a tool still running (US-015). Purely

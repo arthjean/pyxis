@@ -60,6 +60,14 @@ pub struct ModelRetryPolicy {
     pub backoff_base_ms: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningReplaySupport {
+    #[default]
+    Disabled,
+    Enabled,
+}
+
 /// One complete catalog entry before session configuration is applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelDescriptor {
@@ -75,6 +83,8 @@ pub struct ModelDescriptor {
     pub supports_verbosity: bool,
     pub default_verbosity: Option<String>,
     pub supports_parallel_tool_calls: bool,
+    #[serde(default)]
+    pub reasoning_replay: ReasoningReplaySupport,
     pub responses_dialect: ResponsesDialect,
     pub tool_mode: ModelToolMode,
     pub truncation: TruncationPolicy,
@@ -225,6 +235,8 @@ pub struct ResolvedModelRuntime {
     pub supports_verbosity: bool,
     pub verbosity: Option<String>,
     pub supports_parallel_tool_calls: bool,
+    #[serde(default)]
+    pub reasoning_replay: ReasoningReplaySupport,
     pub responses_dialect: ResponsesDialect,
     pub tool_mode: ModelToolMode,
     pub truncation: TruncationPolicy,
@@ -248,6 +260,7 @@ impl ResolvedModelRuntime {
             supports_verbosity: self.supports_verbosity,
             default_verbosity: self.verbosity.clone(),
             supports_parallel_tool_calls: self.supports_parallel_tool_calls,
+            reasoning_replay: self.reasoning_replay,
             responses_dialect: self.responses_dialect,
             tool_mode: self.tool_mode,
             truncation: self.truncation,
@@ -277,11 +290,24 @@ impl ResolvedModelRuntime {
                 detail: "must be greater than zero".into(),
             });
         }
+        if self.reasoning_replay == ReasoningReplaySupport::Enabled
+            && self.reasoning_effort.is_none()
+        {
+            return Err(ModelRuntimeError::InvalidField {
+                field: "reasoning_replay",
+                detail: "requires an active reasoning effort".into(),
+            });
+        }
         Ok(())
     }
 
     pub fn accepts_images(&self) -> bool {
         self.input_modalities.contains(&InputModality::Image)
+    }
+
+    pub fn reasoning_replay_disabled_reason(&self) -> Option<&'static str> {
+        (self.reasoning_replay == ReasoningReplaySupport::Disabled)
+            .then_some("descriptor does not prove encrypted stateless reasoning replay")
     }
 }
 
@@ -318,6 +344,7 @@ mod tests {
             supports_verbosity: false,
             default_verbosity: None,
             supports_parallel_tool_calls: false,
+            reasoning_replay: ReasoningReplaySupport::Disabled,
             responses_dialect: ResponsesDialect::Standard,
             tool_mode: ModelToolMode::Direct,
             truncation: TruncationPolicy {
@@ -347,6 +374,7 @@ mod tests {
             supports_verbosity: false,
             default_verbosity: None,
             supports_parallel_tool_calls: false,
+            reasoning_replay: ReasoningReplaySupport::Disabled,
             responses_dialect: ResponsesDialect::Standard,
             tool_mode: ModelToolMode::Direct,
             truncation: TruncationPolicy {

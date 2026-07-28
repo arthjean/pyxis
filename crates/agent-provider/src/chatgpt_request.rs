@@ -373,6 +373,7 @@ mod tests {
             model: "gpt-5.4".into(),
             model_runtime: None,
             reasoning_effort: None,
+            reasoning_replay: false,
             system: system.map(String::from),
             messages,
             tools,

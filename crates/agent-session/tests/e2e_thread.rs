@@ -231,6 +231,10 @@ struct MirroredSession {
 
 #[async_trait::async_trait]
 impl Session for MirroredSession {
+    fn context_baseline(&self) -> Option<agent_core::ContextBaseline> {
+        self.inner.context_baseline()
+    }
+
     async fn sync(&self, messages: &[Message]) -> Result<(), agent_core::session::SessionError> {
         if let Ok(mut held) = self.snapshot.lock() {
             *held = messages.to_vec();
@@ -246,6 +250,12 @@ impl Session for MirroredSession {
             *held = messages.to_vec();
         }
         self.inner.checkpoint(kind, messages).await
+    }
+    async fn record_context_transition(
+        &self,
+        transition: agent_core::ContextTransition,
+    ) -> Result<(), agent_core::session::SessionError> {
+        self.inner.record_context_transition(transition).await
     }
     async fn redact_encrypted_reasoning(&self) -> Result<(), agent_core::session::SessionError> {
         self.inner.redact_encrypted_reasoning().await

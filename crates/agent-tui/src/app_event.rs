@@ -433,6 +433,7 @@ impl TranscriptMapper {
                     ),
                 )]
             }
+            AgentEvent::ReasoningReplayDisabled { .. } => Vec::new(),
             AgentEvent::ToolCall(view) => {
                 let mut updates = self.drain_active_streams();
                 if let Some(display) = exec_display_from_tool(&view.name, &view.input) {

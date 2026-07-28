@@ -119,6 +119,23 @@ impl TurnContextSource for SettingsCell {
             })
             .transpose()
             .map_err(|error| TurnContextError(error.to_string()))?;
+        let overload_fallback_runtime = match (
+            self.provider.as_ref(),
+            settings.run_config.overload_fallback_model.as_deref(),
+        ) {
+            (Some(provider), Some(fallback)) if fallback != settings.model => Some(
+                provider
+                    .resolve_model_runtime(
+                        fallback,
+                        settings.reasoning_effort.as_deref(),
+                        settings.run_config.max_output_tokens,
+                        settings.run_config.max_retries,
+                        settings.run_config.backoff_base_ms,
+                    )
+                    .map_err(|error| TurnContextError(error.to_string()))?,
+            ),
+            _ => None,
+        };
         let effective_model = model_runtime
             .as_ref()
             .map(|runtime| runtime.slug.clone())
@@ -145,6 +162,7 @@ impl TurnContextSource for SettingsCell {
                 },
             },
             model_runtime,
+            overload_fallback_runtime,
         })
     }
 }
@@ -242,7 +260,7 @@ impl StepSource for CliStepSource {
             });
         }
         for (name, body) in &state.injections {
-            sections.push(StepSection::stable(
+            sections.push(StepSection::skill(
                 format!("injected:{name}"),
                 Some(body.clone()),
             ));
@@ -307,7 +325,7 @@ fn build_context(
     messages.push(Message::user(request.text.clone()));
 
     let captured = &request.context;
-    let (base, goal, mut config) = settings.read(|settings| {
+    let (base, fallback_base, goal, mut config) = settings.read(|settings| {
         (
             crate::interactive::with_tool_guidelines(
                 request
@@ -317,18 +335,28 @@ fn build_context(
                     .unwrap_or("You are a helpful assistant."),
                 &settings.tool_guidelines,
             ),
+            request.overload_fallback_runtime.as_ref().map(|runtime| {
+                crate::interactive::with_tool_guidelines(
+                    crate::prompt::select_system_prompt(runtime),
+                    &settings.tool_guidelines,
+                )
+            }),
             settings.goal.clone(),
             settings.run_config.clone(),
         )
     });
     config.max_turns = captured.limits.max_turns;
     config.max_output_tokens = captured.limits.max_output_tokens;
+    config.overload_fallback_runtime = request.overload_fallback_runtime.clone();
+    let overload_fallback_system =
+        fallback_base.map(|base| crate::interactive::compose_system(&base, goal.as_deref()));
 
     AgentContext {
         model: captured.model.clone(),
         model_runtime: request.model_runtime.clone(),
         reasoning_effort: captured.reasoning_effort.clone(),
         system: Some(crate::interactive::compose_system(&base, goal.as_deref())),
+        overload_fallback_system,
         messages,
         // Replaced by the first step frame; kept coherent so an estimate made
         // before that frame is not made on an empty catalog.

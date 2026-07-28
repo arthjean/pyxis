@@ -17,6 +17,7 @@ pub mod guardrail;
 pub mod input;
 pub mod message;
 pub mod model;
+pub mod prompt;
 pub mod provider;
 pub mod quota;
 pub mod sandbox;
@@ -43,6 +44,9 @@ pub use input::InputQueue;
 pub use message::{
     ContentBlock, INTERRUPTED_TOOL_RESULT, Message, Role, ToolErrorKind, unanswered_tool_calls,
 };
+pub use prompt::{
+    ContextBaseline, ContextTransition, ContextTransitionCause, PromptSnapshot, PromptSnapshotError,
+};
 pub use provider::{
     AuthError, CacheCapabilities, Capabilities, CapabilityLimits, ErrorClass, Provider,
     ProviderError, ProviderKind, ReasoningCapabilities, StopReason, StreamEvent, TokenUsage,
@@ -51,7 +55,7 @@ pub use provider::{
 pub use quota::{QuotaSnapshot, QuotaWindow, format_unix_utc};
 pub use sandbox::{SandboxPolicy, WritableRoot, WriteRefusal};
 pub use session::{Session, SessionEntry, SessionError};
-pub use step::{StepContextSource, StepFrame};
+pub use step::{ContextFragmentKind, StepContextSource, StepFrame};
 pub use tools::{
     MAX_MODEL_TOOL_RESULT_BYTES, ModelToolResult, StepToolPlan, ToolDispatch, ToolDispatchEvent,
     ToolDispatchSnapshot, ToolEventSink, ToolExecution, ToolImage, ToolInvocation, ToolOutcome,
@@ -105,6 +109,8 @@ mod loop_tests {
         /// injection without touching the persisted transcript).
         requests: Arc<Mutex<Vec<Vec<Message>>>>,
         request_models: Arc<Mutex<Vec<String>>>,
+        request_replays: Arc<Mutex<Vec<bool>>>,
+        complete_models: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -134,6 +140,10 @@ mod loop_tests {
         ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
             self.log.lock().unwrap().push("stream");
             self.request_models.lock().unwrap().push(req.model.clone());
+            self.request_replays
+                .lock()
+                .unwrap()
+                .push(req.reasoning_replay);
             self.requests.lock().unwrap().push(req.messages.clone());
             match self.turns.lock().unwrap().pop_front() {
                 Some(MockTurn::Stream(evs)) => Ok(Box::pin(futures_util::stream::iter(
@@ -167,9 +177,10 @@ mod loop_tests {
         }
         async fn complete(
             &self,
-            _req: CanonicalRequest,
+            req: CanonicalRequest,
         ) -> Result<CanonicalResponse, ProviderError> {
             self.log.lock().unwrap().push("complete");
+            self.complete_models.lock().unwrap().push(req.model);
             if self.summary_fails {
                 return Err(ProviderError::Transport("summary failed".into()));
             }
@@ -206,10 +217,17 @@ mod loop_tests {
         cursor: Mutex<usize>,
         boundaries: Mutex<Vec<CompactKind>>,
         log: Arc<Mutex<Vec<&'static str>>>,
+        fail_context_transition: Mutex<bool>,
+        baseline: Mutex<Option<crate::ContextBaseline>>,
+        context_transitions: Mutex<Vec<crate::ContextTransition>>,
     }
 
     #[async_trait::async_trait]
     impl Session for InMemorySession {
+        fn context_baseline(&self) -> Option<crate::ContextBaseline> {
+            self.baseline.lock().unwrap().clone()
+        }
+
         async fn sync(&self, messages: &[Message]) -> Result<(), SessionError> {
             self.log.lock().unwrap().push("sync");
             let mut cur = self.cursor.lock().unwrap();
@@ -232,6 +250,20 @@ mod loop_tests {
             s.clear();
             s.extend_from_slice(messages);
             *self.cursor.lock().unwrap() = messages.len();
+            *self.baseline.lock().unwrap() = None;
+            Ok(())
+        }
+        async fn record_context_transition(
+            &self,
+            transition: crate::ContextTransition,
+        ) -> Result<(), SessionError> {
+            if *self.fail_context_transition.lock().unwrap() {
+                return Err(SessionError::Io(
+                    "injected context transition failure".into(),
+                ));
+            }
+            *self.baseline.lock().unwrap() = Some(transition.to.clone());
+            self.context_transitions.lock().unwrap().push(transition);
             Ok(())
         }
         async fn redact_encrypted_reasoning(&self) -> Result<(), SessionError> {
@@ -391,6 +423,8 @@ mod loop_tests {
         boundaries: Arc<InMemorySession>,
         requests: Arc<Mutex<Vec<Vec<Message>>>>,
         request_models: Arc<Mutex<Vec<String>>>,
+        request_replays: Arc<Mutex<Vec<bool>>>,
+        complete_models: Arc<Mutex<Vec<String>>>,
         deps: Deps,
     }
 
@@ -408,11 +442,16 @@ mod loop_tests {
         let refreshes = Arc::new(Mutex::new(0));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let request_models = Arc::new(Mutex::new(Vec::new()));
+        let request_replays = Arc::new(Mutex::new(Vec::new()));
+        let complete_models = Arc::new(Mutex::new(Vec::new()));
         let session = Arc::new(InMemorySession {
             synced: Mutex::new(Vec::new()),
             cursor: Mutex::new(0),
             boundaries: Mutex::new(Vec::new()),
             log: Arc::clone(&log),
+            fail_context_transition: Mutex::new(false),
+            baseline: Mutex::new(None),
+            context_transitions: Mutex::new(Vec::new()),
         });
         let provider = Arc::new(MockProvider {
             caps: Capabilities {
@@ -436,6 +475,8 @@ mod loop_tests {
             refreshes: Arc::clone(&refreshes),
             requests: Arc::clone(&requests),
             request_models: Arc::clone(&request_models),
+            request_replays: Arc::clone(&request_replays),
+            complete_models: Arc::clone(&complete_models),
         });
         let deps = Deps {
             provider,
@@ -451,6 +492,8 @@ mod loop_tests {
             boundaries: session,
             requests,
             request_models,
+            request_replays,
+            complete_models,
             deps,
         }
     }
@@ -524,6 +567,54 @@ mod loop_tests {
         ])
     }
 
+    fn resolved_runtime(
+        slug: &str,
+        fingerprint: char,
+        comp_hash: &str,
+        replay: crate::model::ReasoningReplaySupport,
+    ) -> crate::model::ResolvedModelRuntime {
+        crate::model::ResolvedModelRuntime {
+            slug: slug.into(),
+            source: crate::model::ModelRuntimeSource::Embedded {
+                version: "test".into(),
+            },
+            instructions: format!("{slug} instructions"),
+            fingerprint: fingerprint.to_string().repeat(64),
+            context_window: 100_000,
+            auto_compact_token_limit: 90_000,
+            input_modalities: vec![crate::model::InputModality::Text],
+            reasoning_effort: Some("medium".into()),
+            supports_verbosity: true,
+            verbosity: Some("low".into()),
+            supports_parallel_tool_calls: false,
+            reasoning_replay: replay,
+            responses_dialect: crate::model::ResponsesDialect::Standard,
+            tool_mode: crate::model::ModelToolMode::Direct,
+            truncation: crate::model::TruncationPolicy {
+                mode: crate::model::TruncationMode::Tokens,
+                limit: 1_000,
+            },
+            retry: crate::model::ModelRetryPolicy {
+                max_retries: 1,
+                backoff_base_ms: 1,
+            },
+            max_output_tokens: 1_024,
+            comp_hash: Some(comp_hash.into()),
+        }
+    }
+
+    fn baseline(runtime: &crate::model::ResolvedModelRuntime) -> crate::ContextBaseline {
+        crate::ContextBaseline {
+            profile_fingerprint: runtime.fingerprint.clone(),
+            model_slug: runtime.slug.clone(),
+            comp_hash: runtime.comp_hash.clone(),
+            instructions_fingerprint: "1".repeat(64),
+            project_context_fingerprint: "2".repeat(64),
+            skills_fingerprint: "3".repeat(64),
+            tool_plan_fingerprint: "4".repeat(64),
+        }
+    }
+
     fn has_compacted(events: &[AgentEvent], kind: CompactKind) -> bool {
         events
             .iter()
@@ -553,6 +644,184 @@ mod loop_tests {
         let stream_at = log.iter().position(|e| *e == "stream");
         assert!(sync_at.is_some() && stream_at.is_some());
         assert!(sync_at < stream_at, "sync should precede stream: {log:?}");
+    }
+
+    #[tokio::test]
+    async fn failed_context_transition_prevents_provider_open() {
+        let h = harness(vec![text_turn("must not run")], false, 100_000);
+        *h.boundaries.fail_context_transition.lock().unwrap() = true;
+        let events = drive(
+            AgentContext::new("mock").push(Message::user("question")),
+            h.deps,
+        )
+        .await;
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Error(crate::AgentError::Session(detail)))
+                if detail.contains("context transition")
+        ));
+        assert!(h.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_descriptor_gates_reasoning_replay_for_the_turn() {
+        let enabled = harness(
+            vec![
+                MockTurn::Stream(vec![
+                    StreamEvent::ReasoningReplayDisabled {
+                        reason: "rejected once".into(),
+                    },
+                    StreamEvent::Done {
+                        stop: StopReason::Continue,
+                    },
+                ]),
+                text_turn("done"),
+            ],
+            false,
+            100_000,
+        );
+        let mut enabled_ctx = AgentContext::new("ignored").push(Message::user("task"));
+        enabled_ctx.model_runtime = Some(resolved_runtime(
+            "enabled",
+            'a',
+            "same",
+            crate::model::ReasoningReplaySupport::Enabled,
+        ));
+        let events = drive(enabled_ctx, enabled.deps).await;
+        assert_eq!(*enabled.request_replays.lock().unwrap(), vec![true, false]);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ReasoningReplayDisabled { .. }))
+        );
+
+        let disabled = harness(vec![text_turn("done")], false, 100_000);
+        let mut disabled_ctx = AgentContext::new("ignored").push(Message::user("task"));
+        disabled_ctx.model_runtime = Some(resolved_runtime(
+            "disabled",
+            'b',
+            "same",
+            crate::model::ReasoningReplaySupport::Disabled,
+        ));
+        let _ = drive(disabled_ctx, disabled.deps).await;
+        assert_eq!(*disabled.request_replays.lock().unwrap(), vec![false]);
+    }
+
+    #[tokio::test]
+    async fn comp_hash_change_compacts_with_old_model_before_new_sampling() {
+        let old = resolved_runtime(
+            "old-model",
+            'a',
+            "old-hash",
+            crate::model::ReasoningReplaySupport::Enabled,
+        );
+        let new = resolved_runtime(
+            "new-model",
+            'b',
+            "new-hash",
+            crate::model::ReasoningReplaySupport::Enabled,
+        );
+        let h = harness(vec![text_turn("done")], false, 100_000);
+        *h.boundaries.baseline.lock().unwrap() = Some(baseline(&old));
+        let mut ctx = AgentContext::new("ignored")
+            .push(Message::user("first"))
+            .push(Message::assistant_text("answer"))
+            .push(Message::user("next"));
+        ctx.model_runtime = Some(new.clone());
+
+        let events = drive(ctx, h.deps).await;
+        assert!(has_compacted(&events, CompactKind::Auto));
+        assert_eq!(*h.complete_models.lock().unwrap(), vec!["old-model"]);
+        assert_eq!(*h.request_models.lock().unwrap(), vec!["new-model"]);
+        let transitions = h.boundaries.context_transitions.lock().unwrap();
+        let switch = transitions.last().expect("new baseline persisted");
+        assert_eq!(
+            switch
+                .from
+                .as_ref()
+                .map(|from| from.profile_fingerprint.as_str()),
+            Some(old.fingerprint.as_str())
+        );
+        assert_eq!(switch.to.profile_fingerprint, new.fingerprint);
+        assert!(
+            switch
+                .causes
+                .contains(&crate::ContextTransitionCause::CompHashChanged)
+        );
+    }
+
+    #[tokio::test]
+    async fn overload_fallback_installs_the_resolved_contract() {
+        let primary = resolved_runtime(
+            "primary",
+            'a',
+            "compatible",
+            crate::model::ReasoningReplaySupport::Enabled,
+        );
+        let mut fallback = resolved_runtime(
+            "fallback",
+            'b',
+            "compatible",
+            crate::model::ReasoningReplaySupport::Enabled,
+        );
+        fallback.supports_parallel_tool_calls = true;
+        fallback.context_window = 50_000;
+        fallback.auto_compact_token_limit = 40_000;
+        fallback.fingerprint = "c".repeat(64);
+        let h = harness(
+            vec![
+                MockTurn::Stream(vec![
+                    StreamEvent::ReasoningReplayDisabled {
+                        reason: "rejected once".into(),
+                    },
+                    StreamEvent::Done {
+                        stop: StopReason::Continue,
+                    },
+                ]),
+                MockTurn::Err(ProviderError::Http {
+                    status: 529,
+                    message: "overloaded".into(),
+                    retry_after_ms: None,
+                }),
+                text_turn("fallback answer"),
+            ],
+            false,
+            100_000,
+        );
+        let mut ctx = AgentContext::new("ignored")
+            .push(Message::user("task"))
+            .with_config(RunConfig {
+                overload_fallback_model: Some("fallback".into()),
+                overload_fallback_runtime: Some(fallback.clone()),
+                ..RunConfig::default()
+            });
+        ctx.model_runtime = Some(primary);
+
+        let events = drive(ctx, h.deps).await;
+        assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
+        assert_eq!(
+            *h.request_models.lock().unwrap(),
+            vec!["primary", "primary", "fallback"]
+        );
+        assert_eq!(
+            *h.request_replays.lock().unwrap(),
+            vec![true, false, false],
+            "a replay downgrade is latched for the whole turn, including fallback"
+        );
+        assert!(
+            h.requests.lock().unwrap()[2]
+                .iter()
+                .any(|message| message.text().contains("<model_switch"))
+        );
+        assert_eq!(
+            h.boundaries
+                .context_transitions
+                .lock()
+                .unwrap()
+                .last()
+                .map(|transition| transition.to.profile_fingerprint.clone()),
+            Some(fallback.fingerprint)
+        );
     }
 
     // US-024: the LAST assistant message is synced BEFORE EndTurn, otherwise

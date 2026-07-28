@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use agent_core::message::Message;
 use agent_core::model::ResolvedModelRuntime;
 use agent_core::provider::ToolSpec;
-use agent_core::step::{StepContextSource, StepFrame};
+use agent_core::step::{ContextFragmentKind, StepContextSource, StepFrame};
 use agent_core::tools::ToolDispatchSnapshot;
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +73,7 @@ pub struct TurnContext {
 pub struct CapturedTurnContext {
     pub context: TurnContext,
     pub model_runtime: Option<ResolvedModelRuntime>,
+    pub overload_fallback_runtime: Option<ResolvedModelRuntime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -144,6 +145,7 @@ impl TurnContextSource for FixedTurnContext {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
+            overload_fallback_runtime: None,
         })
     }
 }
@@ -159,6 +161,13 @@ pub struct StepSection {
     /// A volatile section changes on its own (the date). Volatile sections are
     /// injected AFTER every stable one, so the cacheable prefix keeps its bytes.
     pub volatile: bool,
+    pub kind: StepSectionKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepSectionKind {
+    Project,
+    Skill,
 }
 
 impl StepSection {
@@ -167,6 +176,7 @@ impl StepSection {
             name: name.into(),
             content,
             volatile: false,
+            kind: StepSectionKind::Project,
         }
     }
 
@@ -175,6 +185,16 @@ impl StepSection {
             name: name.into(),
             content,
             volatile: true,
+            kind: StepSectionKind::Project,
+        }
+    }
+
+    pub fn skill(name: impl Into<String>, content: Option<String>) -> Self {
+        Self {
+            name: name.into(),
+            content,
+            volatile: false,
+            kind: StepSectionKind::Skill,
         }
     }
 }
@@ -204,6 +224,7 @@ pub struct StepContext {
     pub tools: Vec<ToolSpec>,
     pub tool_dispatch: Option<ToolDispatchSnapshot>,
     pub context_messages: Vec<Message>,
+    pub context_kinds: Vec<ContextFragmentKind>,
     /// Bounded notes about what was truncated, reused or omitted. Section names
     /// and byte counts ONLY: no fragment of context ever lands in a diagnostic,
     /// which is what keeps them safe to trace at `warn` (confidentiality NFR).
@@ -260,8 +281,8 @@ impl StepContexts {
 
         // 1. Resolve each section against the memo, and bound it on its own so
         //    no single injected item can exceed the per-section budget.
-        let mut stable: Vec<(String, String)> = Vec::new();
-        let mut volatile: Vec<(String, String)> = Vec::new();
+        let mut stable: Vec<(String, String, StepSectionKind)> = Vec::new();
+        let mut volatile: Vec<(String, String, StepSectionKind)> = Vec::new();
         for section in &snapshot.sections {
             let resolved = match &section.content {
                 Some(raw) => {
@@ -288,9 +309,9 @@ impl StepContexts {
             };
             let Some(text) = resolved else { continue };
             if section.volatile {
-                volatile.push((section.name.clone(), text));
+                volatile.push((section.name.clone(), text, section.kind));
             } else {
-                stable.push((section.name.clone(), text));
+                stable.push((section.name.clone(), text, section.kind));
             }
         }
 
@@ -298,7 +319,8 @@ impl StepContexts {
         //    cache must not move because the date did.
         let mut total = 0usize;
         let mut context_messages = Vec::with_capacity(stable.len() + volatile.len());
-        for (name, text) in stable.into_iter().chain(volatile) {
+        let mut context_kinds = Vec::with_capacity(stable.len() + volatile.len());
+        for (name, text, kind) in stable.into_iter().chain(volatile) {
             if total.saturating_add(text.len()) > MAX_STEP_CONTEXT_BYTES {
                 diagnostics.push(format!(
                     "section `{name}` dropped, step context budget of {MAX_STEP_CONTEXT_BYTES} bytes reached"
@@ -306,6 +328,10 @@ impl StepContexts {
                 continue;
             }
             total += text.len();
+            context_kinds.push(match kind {
+                StepSectionKind::Project => ContextFragmentKind::Project,
+                StepSectionKind::Skill => ContextFragmentKind::Skill,
+            });
             context_messages.push(Message::user(text));
         }
 
@@ -315,6 +341,7 @@ impl StepContexts {
         let moved = state.last.as_ref().is_none_or(|last| {
             last.tools != snapshot.tools
                 || last.context_messages != context_messages
+                || last.context_kinds != context_kinds
                 || last
                     .tool_dispatch
                     .as_ref()
@@ -338,6 +365,7 @@ impl StepContexts {
             tools: snapshot.tools,
             tool_dispatch: snapshot.tool_dispatch,
             context_messages,
+            context_kinds,
             diagnostics,
         };
         state.last = Some(context.clone());
@@ -352,6 +380,7 @@ impl StepContextSource for StepContexts {
             generation: context.generation,
             tools: context.tools,
             context_messages: context.context_messages,
+            context_kinds: context.context_kinds,
             tool_dispatch: context.tool_dispatch,
         }
     }

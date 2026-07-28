@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use agent_core::compaction::CompactKind;
 use agent_core::message::Message;
 use agent_core::session::{FileSnapshot, Session, SessionEntry, SessionError};
+use agent_core::{ContextBaseline, ContextTransition};
 use agent_runtime::event::{THREAD_RUNTIME_VERSION, ThreadEvent};
 use agent_runtime::id::{EventId, ID_BYTES, ThreadId};
 use agent_runtime::store::{ForkPoint, RecoveryCommit, StoreError, ThreadSnapshot, ThreadStore};
@@ -382,6 +383,7 @@ impl ThreadStore for JsonlThreadStore {
             schema_version: resumed.schema_version,
             skipped_partial: resumed.skipped_partial,
             origin: resumed.origin,
+            context_baseline: resumed.last_context_baseline,
         })
     }
 
@@ -431,6 +433,12 @@ impl ThreadStore for JsonlThreadStore {
 /// transition is therefore the ordering the log shows.
 #[async_trait::async_trait]
 impl Session for JsonlThreadStore {
+    fn context_baseline(&self) -> Option<ContextBaseline> {
+        self.lock()
+            .ok()
+            .and_then(|state| state.writer.as_ref()?.last_context_baseline.clone())
+    }
+
     async fn sync(&self, messages: &[Message]) -> Result<(), SessionError> {
         let mut state = self.lock().map_err(map_store_error)?;
         let Some(writer) = state.writer.as_mut() else {
@@ -469,6 +477,28 @@ impl Session for JsonlThreadStore {
             },
         )?;
         writer.cursor = messages.len();
+        writer.last_context_baseline = None;
+        Ok(())
+    }
+
+    async fn record_context_transition(
+        &self,
+        transition: ContextTransition,
+    ) -> Result<(), SessionError> {
+        transition
+            .validate()
+            .map_err(|error| SessionError::Serde(error.to_string()))?;
+        let mut state = self.lock().map_err(map_store_error)?;
+        let Some(writer) = state.writer.as_mut() else {
+            return Err(SessionError::Io("thread store is closed".into()));
+        };
+        write_entry_locked(
+            writer,
+            &SessionEntry::ContextTransition {
+                transition: Box::new(transition.clone()),
+            },
+        )?;
+        writer.last_context_baseline = Some(transition.to);
         Ok(())
     }
 
@@ -501,6 +531,18 @@ mod tests {
 
     use super::*;
 
+    fn context_baseline(profile: &str) -> ContextBaseline {
+        ContextBaseline {
+            profile_fingerprint: profile.repeat(64),
+            model_slug: "test-model".into(),
+            comp_hash: Some("compat-1".into()),
+            instructions_fingerprint: "b".repeat(64),
+            project_context_fingerprint: "c".repeat(64),
+            skills_fingerprint: "d".repeat(64),
+            tool_plan_fingerprint: "e".repeat(64),
+        }
+    }
+
     fn tmp(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("pyxis_thread_{}_{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -512,6 +554,33 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = std::fs::remove_dir_all(parent);
         }
+    }
+
+    #[tokio::test]
+    async fn context_transition_is_durable_and_rebuilds_without_prompt_content() {
+        let path = tmp("context_baseline");
+        let store = JsonlThreadStore::open(&path).unwrap();
+        let baseline = context_baseline("a");
+        store
+            .record_context_transition(ContextTransition {
+                from: None,
+                to: baseline.clone(),
+                causes: vec![agent_core::ContextTransitionCause::Initial],
+            })
+            .await
+            .unwrap();
+
+        let snapshot = store.read().await.unwrap();
+        assert_eq!(snapshot.context_baseline, Some(baseline.clone()));
+        let line = std::fs::read_to_string(&path).unwrap();
+        assert!(line.contains("\"entry\":\"context_transition\""));
+        assert!(!line.contains("\"messages\""));
+        assert!(!line.contains("\"instructions\""));
+
+        store.close().await.unwrap();
+        let reopened = JsonlThreadStore::open(&path).unwrap();
+        assert_eq!(reopened.context_baseline(), Some(baseline));
+        cleanup(&path);
     }
 
     fn event(ids: &SequentialIds, thread_id: ThreadId, seq: u64) -> ThreadEvent {

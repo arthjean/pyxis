@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use agent_core::ContextBaseline;
 use agent_core::message::Message;
 use serde::{Deserialize, Serialize};
 
@@ -118,6 +119,7 @@ pub struct ThreadSnapshot {
     pub skipped_partial: bool,
     /// Branch this log was cut from, when it is one (US-010 AC2).
     pub origin: Option<ForkOrigin>,
+    pub context_baseline: Option<ContextBaseline>,
 }
 
 impl ThreadSnapshot {
@@ -378,6 +380,7 @@ impl ThreadStore for MemoryThreadStore {
             schema_version: None,
             skipped_partial: false,
             origin: state.origin,
+            context_baseline: None,
         })
     }
 

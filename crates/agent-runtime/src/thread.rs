@@ -1237,6 +1237,7 @@ impl ThreadActor {
         };
         let context = captured.context;
         let model_runtime = captured.model_runtime;
+        let overload_fallback_runtime = captured.overload_fallback_runtime;
         if let Some(runtime) = &model_runtime
             && !self.resolved_runtimes.contains(&runtime.fingerprint)
         {
@@ -1256,6 +1257,17 @@ impl ThreadActor {
                 );
                 return Err(error);
             }
+            self.resolved_runtimes.insert(fingerprint);
+        }
+        if let Some(runtime) = &overload_fallback_runtime
+            && !self.resolved_runtimes.contains(&runtime.fingerprint)
+        {
+            let fingerprint = runtime.fingerprint.clone();
+            self.commit(ThreadEventPayload::ModelRuntimeResolved {
+                fingerprint: fingerprint.clone(),
+                runtime: runtime.clone(),
+            })
+            .await?;
             self.resolved_runtimes.insert(fingerprint);
         }
         let mut lifecycle = TurnLifecycle::queued(turn_id);
@@ -1304,6 +1316,7 @@ impl ThreadActor {
             text: submission.text.clone(),
             context,
             model_runtime,
+            overload_fallback_runtime,
             inputs: Arc::clone(&inputs),
         };
 

@@ -19,7 +19,9 @@ use agent_core::provider::{
 };
 use agent_core::session::{FileSnapshot, Session, SessionError};
 use agent_core::tools::{ToolDispatch, ToolEventSink, ToolInvocation, ToolOutcome};
-use agent_core::{AgentContext, CancellationToken as CoreCancel, Deps, RunConfig};
+use agent_core::{
+    AgentContext, CancellationToken as CoreCancel, ContextTransition, Deps, RunConfig,
+};
 use agent_runtime::context::{FixedTurnContext, TurnContext, TurnLimits};
 use agent_runtime::id::{RandomIds, ThreadId, TurnId};
 use agent_runtime::runner::TurnRequest;
@@ -197,6 +199,12 @@ impl Session for FakeSession {
         messages: &[Message],
     ) -> Result<(), SessionError> {
         self.syncs.lock().unwrap().push(messages.to_vec());
+        Ok(())
+    }
+    async fn record_context_transition(
+        &self,
+        _transition: ContextTransition,
+    ) -> Result<(), SessionError> {
         Ok(())
     }
     async fn redact_encrypted_reasoning(&self) -> Result<(), SessionError> {

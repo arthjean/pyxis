@@ -9,7 +9,8 @@ use std::collections::HashMap;
 
 use agent_core::model::{
     InputModality, ModelDescriptor, ModelRetryPolicy, ModelRuntimeError, ModelRuntimeSource,
-    ModelToolMode, ResolvedModelRuntime, ResponsesDialect, TruncationMode, TruncationPolicy,
+    ModelToolMode, ReasoningReplaySupport, ResolvedModelRuntime, ResponsesDialect, TruncationMode,
+    TruncationPolicy,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -222,6 +223,7 @@ impl ModelCatalog {
             supports_verbosity: descriptor.supports_verbosity,
             verbosity: descriptor.default_verbosity.clone(),
             supports_parallel_tool_calls: descriptor.supports_parallel_tool_calls,
+            reasoning_replay: descriptor.reasoning_replay,
             responses_dialect: descriptor.responses_dialect,
             tool_mode: descriptor.tool_mode,
             truncation: descriptor.truncation,
@@ -385,6 +387,10 @@ struct WireModel {
     #[serde(default)]
     supports_parallel_tool_calls: Option<bool>,
     #[serde(default)]
+    supports_encrypted_reasoning: Option<bool>,
+    #[serde(default)]
+    supports_reasoning_replay: Option<bool>,
+    #[serde(default)]
     context_window: Option<u32>,
     #[serde(default)]
     auto_compact_token_limit: Option<u32>,
@@ -545,6 +551,13 @@ fn descriptor_from_wire(
         supports_verbosity,
         default_verbosity: model.default_verbosity,
         supports_parallel_tool_calls: parallel,
+        reasoning_replay: if model.supports_encrypted_reasoning == Some(true)
+            && model.supports_reasoning_replay == Some(true)
+        {
+            ReasoningReplaySupport::Enabled
+        } else {
+            ReasoningReplaySupport::Disabled
+        },
         responses_dialect: if lite {
             ResponsesDialect::Lite
         } else {
@@ -639,6 +652,7 @@ fn descriptor(
         supports_verbosity: true,
         default_verbosity: Some(verbosity.into()),
         supports_parallel_tool_calls: true,
+        reasoning_replay: ReasoningReplaySupport::Enabled,
         responses_dialect: dialect,
         tool_mode,
         truncation: TruncationPolicy {
@@ -778,6 +792,33 @@ mod tests {
         assert_eq!(runtime.comp_hash.as_deref(), Some("fixture-1"));
         assert!(runtime.supports_parallel_tool_calls);
         assert!(runtime.accepts_images());
+        assert_eq!(runtime.reasoning_replay, ReasoningReplaySupport::Disabled);
+        assert!(runtime.reasoning_replay_disabled_reason().is_some());
+    }
+
+    #[test]
+    fn remote_replay_requires_both_encrypted_and_stateless_proofs() {
+        let body = RICH_FIXTURE.replace(
+            r#""supports_parallel_tool_calls": true,"#,
+            r#""supports_parallel_tool_calls": true,
+      "supports_encrypted_reasoning": true,
+      "supports_reasoning_replay": true,"#,
+        );
+        let mut catalog = ModelCatalog::embedded();
+        catalog.install_remote(&body, "2026-07-28").unwrap();
+        let runtime = catalog
+            .resolve(
+                "fixture-lite",
+                None,
+                4096,
+                ModelRetryPolicy {
+                    max_retries: 3,
+                    backoff_base_ms: 50,
+                },
+            )
+            .unwrap();
+        assert_eq!(runtime.reasoning_replay, ReasoningReplaySupport::Enabled);
+        assert!(runtime.reasoning_replay_disabled_reason().is_none());
     }
 
     #[test]

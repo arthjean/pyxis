@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use agent_core::compaction::CompactKind;
 use agent_core::message::{ContentBlock, Message, Role};
 use agent_core::session::{FileSnapshot, Session, SessionError};
+use agent_core::{ContextBaseline, ContextTransition};
 use async_trait::async_trait;
 
 pub struct SharedSession {
@@ -23,6 +24,7 @@ pub struct SharedSession {
     /// asked for is that no file was written at all, not that one was cleaned up.
     inner: Option<Arc<dyn Session>>,
     snapshot: Arc<Mutex<Vec<Message>>>,
+    baseline: Mutex<Option<ContextBaseline>>,
 }
 
 impl SharedSession {
@@ -39,10 +41,14 @@ impl SharedSession {
 
     fn build(inner: Option<Arc<dyn Session>>) -> (Arc<Self>, Arc<Mutex<Vec<Message>>>) {
         let snapshot = Arc::new(Mutex::new(Vec::new()));
+        let baseline = inner
+            .as_ref()
+            .and_then(|session| session.context_baseline());
         (
             Arc::new(Self {
                 inner,
                 snapshot: Arc::clone(&snapshot),
+                baseline: Mutex::new(baseline),
             }),
             snapshot,
         )
@@ -98,6 +104,13 @@ fn sanitize_messages(messages: &[Message]) -> Vec<Message> {
 
 #[async_trait]
 impl Session for SharedSession {
+    fn context_baseline(&self) -> Option<ContextBaseline> {
+        self.baseline
+            .lock()
+            .ok()
+            .and_then(|baseline| baseline.clone())
+    }
+
     async fn sync(&self, messages: &[Message]) -> Result<(), SessionError> {
         let messages = sanitize_messages(messages);
         self.capture(&messages);
@@ -114,10 +127,26 @@ impl Session for SharedSession {
     ) -> Result<(), SessionError> {
         let messages = sanitize_messages(messages);
         self.capture(&messages);
-        match &self.inner {
-            Some(inner) => inner.checkpoint(kind, &messages).await,
-            None => Ok(()),
+        if let Some(inner) = &self.inner {
+            inner.checkpoint(kind, &messages).await?;
         }
+        if let Ok(mut baseline) = self.baseline.lock() {
+            *baseline = None;
+        }
+        Ok(())
+    }
+
+    async fn record_context_transition(
+        &self,
+        transition: ContextTransition,
+    ) -> Result<(), SessionError> {
+        if let Some(inner) = &self.inner {
+            inner.record_context_transition(transition.clone()).await?;
+        }
+        if let Ok(mut baseline) = self.baseline.lock() {
+            *baseline = Some(transition.to);
+        }
+        Ok(())
     }
 
     async fn redact_encrypted_reasoning(&self) -> Result<(), SessionError> {
