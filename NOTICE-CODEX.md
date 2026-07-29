@@ -41,4 +41,26 @@ Structurally derived, written against Pyxis types:
   `codex-rs/code-mode/src/{v8_init,runtime/mod,runtime/globals}.rs`.
 - `spikes/s6-code-mode-v8/**`, from `codex-rs/v8-poc/src/lib.rs`.
 
+As of EP-003 of the same PRD (2026-07-29), the multi-agent v2 work adds one
+verbatim element and one structurally derived boundary, against the same
+baseline commit.
+
+Verbatim reuse:
+
+- The six v2 tool NAMES and their argument names (`spawn_agent(task_name,
+  message)`, `send_message(target, message)`, `followup_task(target, message)`,
+  `list_agents(path_prefix)`, `wait_agent(timeout_ms)`,
+  `interrupt_agent(target)`), in `crates/agent-tools/src/agent.rs`, from
+  `codex-rs/core/src/tools/handlers/multi_agents_spec.rs`. Reused unchanged ON
+  PURPOSE: they are the surface a Codex-trained model calls, so renaming them
+  would break interoperability. The descriptions, the schemas and every
+  behaviour behind them are Pyxis's own.
+
+Structurally derived, written against Pyxis types:
+
+- `crates/agent-runtime/src/path.rs` (canonical task names), from
+  `codex-rs/protocol/src/agent_path.rs`: the `/root/<name>` shape and the
+  segment validation rules are the baseline's, the type and its bounds are
+  written here.
+
 Reference source inventory: `docs/codex-port-inventory.md`.
