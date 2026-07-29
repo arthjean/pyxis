@@ -15,6 +15,16 @@
 //! - **Silence by default.** Without `PYXIS_LOG` no subscriber is installed, so
 //!   every `tracing` macro of the workspace collapses to an atomic level check
 //!   and produces not one byte (AC4).
+//!
+//! **Remote observability (US-019 AC4 of `prd-parite-totale-codex-cli`).** There
+//! is none, on purpose, and the absence is what the criterion asks for: Pyxis
+//! must open zero observability connection when OTLP is unconfigured, which a
+//! build carrying no exporter satisfies by construction rather than by a
+//! runtime guard nobody re-checks. The trace has exactly ONE sink, a local file
+//! under the state root, so a missing or unreachable collector cannot cost a
+//! local diagnostic. `no_observability_exporter_is_linked_into_the_build`
+//! enforces it against the resolved dependency graph: adding an exporter later
+//! is then a deliberate change to that test, with the opt-in it implies.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -489,6 +499,69 @@ mod tests {
             inspected >= 10,
             "only {inspected} trace call sites were inspected: the scan is not reaching the sources"
         );
+    }
+
+    /// US-019 AC4: no observability EXPORTER is linked in, so an unconfigured or
+    /// unreachable OTLP collector cannot cost a connection nor a local error.
+    ///
+    /// Checked against the resolved graph rather than the manifests: a
+    /// transitive dependency would open sockets just as well as a direct one,
+    /// and the lock file is the only place that lists both.
+    #[test]
+    fn no_observability_exporter_is_linked_into_the_build() {
+        let lock = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
+        let body = std::fs::read_to_string(&lock).unwrap_or_default();
+        assert!(
+            !body.is_empty(),
+            "{} must be readable for this check to mean anything",
+            lock.display()
+        );
+        // Crate names, as they appear in `name = "..."` entries of the lock.
+        const EXPORTERS: &[&str] = &[
+            "opentelemetry",
+            "opentelemetry_sdk",
+            "opentelemetry-otlp",
+            "opentelemetry-proto",
+            "tracing-opentelemetry",
+            "sentry",
+            "datadog-tracing",
+            "minitrace",
+        ];
+        let linked: Vec<&str> = EXPORTERS
+            .iter()
+            .copied()
+            .filter(|crate_name| body.contains(&format!("name = \"{crate_name}\"")))
+            .collect();
+        assert!(
+            linked.is_empty(),
+            "a remote observability exporter entered the graph ({linked:?}); \
+             remote export is opt-in by DESIGN and needs an explicit decision"
+        );
+    }
+
+    /// The only sink of the trace is a file under the state root. Proven by
+    /// writing through the real subscriber and reading the bytes back: a
+    /// subscriber that also shipped events elsewhere would still pass a manifest
+    /// scan, so the two tests are not the same check.
+    #[test]
+    fn the_trace_has_exactly_one_sink_and_it_is_a_local_file() {
+        let home = TempHome::new("sink");
+        let path = home.0.join(LOG_DIR).join("trace-test.log");
+        touch(&path).unwrap();
+
+        {
+            let subscriber = build_subscriber(Level::DEBUG, &path).unwrap();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            tracing::debug!(target: "pyxis::test", "one sink");
+        }
+
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("one sink"),
+            "the file sink received the event"
+        );
+        // The trace file is inside the state root, hence inside what the sandbox
+        // granted: nothing left the machine to carry it.
+        assert!(path.starts_with(&home.0));
     }
 
     /// Without a home directory nothing is prepared, and the startup goes on.
