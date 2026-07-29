@@ -3,7 +3,7 @@
     "file": "tasks/prd-parite-totale-codex-cli.md",
     "title": "Parité comportementale totale avec Codex CLI",
     "created_at": "2026-07-28",
-    "status": "IN_PROGRESS"
+    "status": "DONE"
   },
   "epics": [
     {
@@ -49,10 +49,10 @@
     {
       "id": "EP-006",
       "title": "Observabilité et preuve de parité",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 2,
-      "stories_done": 0
+      "stories_done": 2
     }
   ],
   "stories": [
@@ -327,7 +327,7 @@
       "id": "US-019",
       "title": "Projeter causes, cellules et traces sur toutes les surfaces",
       "epic": "EP-006",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
@@ -336,15 +336,16 @@
         "US-015",
         "US-017"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-29",
+      "completed_at": "2026-07-29",
+      "reviewed_at": null,
+      "note": "Une cause terminale est lue UNE fois, par agent_runtime::TurnFailure, et les quatre surfaces rendent la meme categorie, la meme phrase actionnable et les memes identifiants (thread, turn): bloc de transcript en TUI, ligne stderr de -p, cause_category/cause_guidance du run_summary, causeCategory/causeGuidance de turn/completed. Neuf categories fermees, chacune avec son PROPRE prochain pas; une cause non reconnue sort en unknown avec son texte intact plutot que rangee dans une categorie devinee. Le format durable n'a pas bouge: cause reste la chaine qu'elle etait, donc toute session anterieure reste lisible et aucune migration ne touche un journal utilisateur. Une cellule Code Mode dit running/yielded/completed/failed en MOTS, y compris quand elle echoue, la ou la teinte rouge etait seule porteuse; l'etat est retire du message pour ne pas s'imprimer deux fois. La correlation de trace vient de spans imbriques et non de champs repetes a chaque site: span turn (thread, turn) dans le runtime, span tool (tool, call) dans le registre, et une cellule qui tourne sur son propre thread OS re-attache le span ET le collecteur de son appelant (ni l'un ni l'autre ne traverse cette frontiere seul). L'observabilite distante est absente PAR CONSTRUCTION, verifie contre Cargo.lock: aucun exportateur dans le graphe, donc zero connexion par defaut et un collecteur injoignable ne coute aucun diagnostic local."
     },
     {
       "id": "US-020",
       "title": "Prouver et maintenir la parité baseline",
       "epic": "EP-006",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
@@ -354,9 +355,10 @@
         "US-018",
         "US-019"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-29",
+      "completed_at": "2026-07-29",
+      "reviewed_at": null,
+      "note": "La suite offline couvre les neuf domaines (catalogue, wire function/custom, Code Mode, terminal, multi-agent v2, reprise, app-server, MCP, erreurs) et docs/parity/offline-suite.md est PARSE par crates/agent-parity/tests/offline_suite.rs, donc un test renomme ou un domaine qui perd sa preuve fait echouer la suite au lieu de laisser un paragraphe mentir. agent-parity drift lit le clone a n'importe quel commit, ignore le numero de commit et dit si le CONTRAT a bouge, sans rien ecrire nulle part (verifie sur le HEAD reel fe01054a: aucune derive de contrat). SCENARIO LIVE EXECUTE le 2026-07-29 sur gpt-5.6-sol: verdict passed, une cellule Code Mode, tour termine, transcript reprenable. Il a trouve un defaut reel que l'offline ne pouvait pas voir: un item reasoning rejoue sans summary, tolere en dialecte standard et REFUSE en Responses Lite (missing_required_parameter input[n].summary). La baseline serialise toujours summary; correction dans agent-provider/src/chatgpt_request.rs avec assertion de fixture. Le scenario a aussi montre qu'un prompt laissant le modele appeler tools.bash echoue sur le taint puis l'absence d'approbateur en headless: comportement fail-closed correct, prompt corrige pour exercer la CELLULE. Le verdict tri-etat reste dans target/parity/live-verdict.json et c'est lui qui fait foi."
     }
   ]
 }
