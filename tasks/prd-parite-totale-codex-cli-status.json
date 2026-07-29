@@ -33,10 +33,10 @@
     {
       "id": "EP-004",
       "title": "Exécution terminale et sessions unifiées",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 2,
-      "stories_done": 0
+      "stories_done": 2
     },
     {
       "id": "EP-005",
@@ -249,29 +249,31 @@
       "id": "US-014",
       "title": "Aligner exec_command et le support PTY",
       "epic": "EP-004",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-004"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-29",
+      "completed_at": "2026-07-29",
+      "reviewed_at": null,
+      "note": "Le wire est celui de la baseline: cmd/workdir/shell/tty/yield_time_ms/max_output_tokens en entree, chunk_id/wall_time_seconds/exit_code/session_id/original_token_count/output en sortie, rendus dans le texte que les modeles Codex ont appris a lire. tty: true ouvre un vrai pseudo-terminal (openpty + setsid + TIOCSCTTY dans crates/agent-tools/src/pty.rs, sans portable-pty), donc un programme qui teste isatty prend la meme branche que sous Codex; tty: false garde la session a tubes. Une commande issue de contenu untrusted reste soumise aux hooks, au taint, au sandbox et a l'approbation, prouve outil par outil. Les trois refus d'AC4 (cwd absent, shell non POSIX, cinquieme session) precedent le spawn: le slot est reserve avant l'existence du processus, donc un refus ne laisse rien derriere."
     },
     {
       "id": "US-015",
       "title": "Garantir yield, wait, limites et nettoyage",
       "epic": "EP-004",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-014"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-29",
+      "completed_at": "2026-07-29",
+      "reviewed_at": null,
+      "note": "Un sondage vide ne rend que les octets posterieurs au chunk precedent, avec un chunk_id MONOTONE par session (divergence assumee: Codex tire 6 chiffres hexadecimaux aleatoires). Un yield qui expire laisse la session pilotable; terminate amene le groupe de processus a un etat terminal en SIGTERM puis SIGKILL, sous les 2 secondes exigees. La sortie est bornee au plafond de chunk et ce que la troncature abandonne est compte EXACTEMENT (omis + garde = produit, verifie sur 12 MiB), avec le marqueur ... N bytes omitted ... de la baseline; le budget max_output_tokens est applique en dernier pour que ce qu'il coupe entre dans le meme compte. Session inconnue, expiree et deja terminee sont trois phrases differentes, portees par des pierres tombales bornees, et aucune n'ecrit dans un autre processus."
     },
     {
       "id": "US-016",
