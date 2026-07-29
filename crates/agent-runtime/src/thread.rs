@@ -1322,8 +1322,20 @@ impl ThreadActor {
             inputs: Arc::clone(&inputs),
         };
 
+        // US-019 AC3: ONE span carries the correlation for everything the turn
+        // touches. The provider, the tools, a Code Mode cell and a sub-agent all
+        // run inside this future, so their own traces inherit `thread_id` and
+        // `turn_id` instead of each emission site having to carry them. Adding
+        // the fields per site is what let a failure trace ship without them.
+        let turn_span = tracing::info_span!(
+            target: "pyxis::runtime",
+            "turn",
+            thread_id = %thread_id,
+            turn_id = %turn_id
+        );
         let task = self.tracker.spawn({
             let turn_token = turn_token.clone();
+            use tracing::Instrument as _;
             async move {
                 let forward = async {
                     while let Some(event) = engine_rx.recv().await {
@@ -1340,6 +1352,7 @@ impl ThreadActor {
                     tokio::join!(runner.run_turn(request, engine_tx, turn_token), forward);
                 let _ = finished_tx.send(TurnFinished { turn_id, outcome }).await;
             }
+            .instrument(turn_span)
         });
 
         self.turn = Some(RunningTurn {
@@ -1493,6 +1506,21 @@ impl ThreadActor {
         {
             Ok(event) => {
                 self.last_turn = Some(TurnStatus { turn_id, state: to });
+                // US-019 AC3: the terminal is traced with its CATEGORY, next to
+                // the identifiers, so a trace read after the fact says which
+                // diagnostic follows without re-reading the session file. The
+                // cause is bounded and carries no prompt, tool output or token.
+                if let Some(failure) = crate::failure::TurnFailure::classify(to, cause.as_deref()) {
+                    tracing::warn!(
+                        target: "pyxis::runtime",
+                        thread_id = %self.thread_id,
+                        turn_id = %turn_id,
+                        event_id = %event.event_id,
+                        category = failure.category.label(),
+                        cause = %failure.message,
+                        "turn reached a terminal failure"
+                    );
+                }
                 self.publish(
                     event.event_id,
                     Some(turn_id),

@@ -32,3 +32,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 agent-tokenizer.workspace = true
+# Collects what the runtime emits through the facade, in-process, for the
+# US-019 correlation test. Test-only: the binary stays the only crate that
+# installs a subscriber for real (FR-15).
+tracing-subscriber.workspace = true

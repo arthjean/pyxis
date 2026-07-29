@@ -352,6 +352,25 @@ async fn http_error_from_response(resp: reqwest::Response) -> ProviderError {
             crate::quota::quota_refusal_message(quota.as_ref())
         );
     }
+    // US-019 AC3: a provider failure used to leave NOTHING on the trace. The
+    // turn-level line names `http <code>` and stops there, because the failure
+    // that crosses into `agent-core` deliberately drops the body (it is backend
+    // text and may echo the request). So the status and the retry hint go at
+    // `debug`, inside the turn/tool span that already carries thread and turn,
+    // and the sanitized body at `trace` where content is allowed — which is the
+    // only place that says WHY a 400 is a 400.
+    tracing::warn!(
+        target: "pyxis::provider",
+        status = code,
+        retry_after_ms,
+        "provider request failed"
+    );
+    tracing::trace!(
+        target: "pyxis::provider",
+        status = code,
+        body = %text,
+        "provider error body"
+    );
     ProviderError::Http {
         status: code,
         message: text,

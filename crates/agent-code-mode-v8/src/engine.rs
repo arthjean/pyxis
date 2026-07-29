@@ -156,6 +156,13 @@ impl CellEngine for IsolateEngine {
         let dispatcher = self.nested.get();
         let worker_control = Arc::clone(&control);
         let cell_for_thread = cell.clone();
+        // US-019 AC3: a cell runs on its OWN OS thread, where NEITHER the span
+        // nor the collector is inherited (both are thread-local). Captured here,
+        // inside the `exec` call, so what the cell traces is still correlated
+        // thread -> turn -> call -> cell instead of arriving as an orphan line
+        // or not arriving at all.
+        let caller = tracing::Span::current();
+        let collector = tracing::dispatcher::get_default(Clone::clone);
         let thread = std::thread::Builder::new()
             .name(format!("pyxis-cell-{}", cell.as_str()))
             .spawn(move || {
@@ -168,6 +175,8 @@ impl CellEngine for IsolateEngine {
                     control: worker_control,
                     limits,
                     store,
+                    caller,
+                    collector,
                 });
             })
             .map_err(|error| format!("cannot spawn the cell thread: {error}"))?;
@@ -335,6 +344,13 @@ struct CellJob {
     control: Arc<CellControl>,
     limits: EngineLimits,
     store: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    /// Span of the `exec` call that opened this cell, carried across the thread
+    /// boundary so the cell's traces keep their correlation.
+    caller: tracing::Span,
+    /// Collector in force where the cell was requested. A worker thread starts
+    /// with none, so without this a cell's traces would be dropped instead of
+    /// reaching the file the binary opened.
+    collector: tracing::Dispatch,
 }
 
 fn run_cell(job: CellJob) {
@@ -347,7 +363,20 @@ fn run_cell(job: CellJob) {
         control,
         limits,
         store,
+        caller,
+        collector,
     } = job;
+    // Both guards live for the whole cell: `run_cell` is synchronous, so neither
+    // crosses an await point. Order matters, the span has to be created under
+    // the collector that will receive it.
+    let _collecting = tracing::dispatcher::set_default(&collector);
+    let span = tracing::info_span!(
+        target: "pyxis::code_mode",
+        parent: &caller,
+        "cell",
+        cell_id = %cell
+    );
+    let _entered = span.enter();
     if control.is_cancelled() {
         sink.finish(Some(CellFailure::interrupted(
             "cell interrupted before it started",
@@ -421,9 +450,18 @@ fn run_cell(job: CellJob) {
             stored.insert(key.clone(), value.clone());
         }
     }
+    // A cell that failed says so at `warn`, with its KIND: that is the line a
+    // user reaches for when a Code Mode turn produced nothing (US-019 AC3). The
+    // script source and its output never appear.
+    match &failure {
+        Some(failure) => tracing::warn!(
+            target: "pyxis::code_mode",
+            kind = failure.kind.label(),
+            "code mode cell failed"
+        ),
+        None => tracing::debug!(target: "pyxis::code_mode", "code mode cell finished"),
+    }
     sink.finish(failure);
-
-    tracing::debug!(cell = %cell, "code mode cell finished");
     // Order matters: the isolate has to go first, because a callback of its
     // teardown could still reach the quotas box.
     drop(isolate);

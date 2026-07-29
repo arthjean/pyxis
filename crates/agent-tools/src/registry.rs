@@ -257,9 +257,38 @@ impl Registry {
     /// `ToolOutcome` correlated by `id`.
     async fn run_one(&self, call: ToolInvocation, events: ToolEventSink) -> ToolOutcome {
         let started = tokio::time::Instant::now();
-        self.run_one_inner(call, events)
+        // US-019 AC3: the call span nests inside the turn span the runtime
+        // opened, so anything the tool traces (including a nested Code Mode
+        // dispatch and a sub-agent) is correlated thread -> turn -> call without
+        // a single emission site repeating those identifiers. Names only; the
+        // arguments stay at `trace` where they already were.
+        let span = tracing::info_span!(
+            target: "pyxis::tools",
+            "tool",
+            tool = %call.name,
+            call_id = %call.id
+        );
+        use tracing::Instrument as _;
+        let outcome = self
+            .run_one_inner(call, events)
+            .instrument(span.clone())
             .await
-            .with_duration(started.elapsed())
+            .with_duration(started.elapsed());
+        if outcome.is_error {
+            // Emitted INSIDE the span, so the line already carries tool, call,
+            // turn and thread. `in_scope` rather than a guard: it makes it
+            // structural that nothing awaits while the span is entered. The KIND
+            // is what a trace adds over the transcript; the content is not
+            // repeated here, it belongs to the result.
+            span.in_scope(|| {
+                tracing::warn!(
+                    target: "pyxis::tools",
+                    kind = ?outcome.error_kind,
+                    "tool call failed"
+                );
+            });
+        }
+        outcome
     }
 
     async fn run_one_inner(&self, call: ToolInvocation, events: ToolEventSink) -> ToolOutcome {

@@ -145,6 +145,99 @@ async fn call_content_appears_only_at_the_highest_verbosity() {
     assert!(full.contains("hunter2"), "attendu au niveau trace: {full}");
 }
 
+/// A tool that always fails: what a correlation trace has to name.
+struct Broken;
+
+#[async_trait]
+impl Tool for Broken {
+    type Input = serde_json::Value;
+    fn name(&self) -> &str {
+        "broken"
+    }
+    fn description(&self) -> String {
+        "always fails".into()
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    fn is_sensitive(&self) -> bool {
+        false
+    }
+    fn permission(&self, _i: &Self::Input, _c: &agent_tools::PermCtx) -> PermissionDecision {
+        PermissionDecision::Allow
+    }
+    async fn call(
+        &self,
+        _i: Self::Input,
+        _c: &ToolCtx,
+    ) -> Result<ToolOutput, agent_tools::ToolError> {
+        Err(agent_tools::ToolError::Rejected("nope".into()))
+    }
+}
+
+/// US-019 AC3: a failing tool call is traced INSIDE a span that names the tool
+/// and the call, itself nested in the span the caller opened.
+///
+/// The parent span here stands in for the `turn` span the thread runtime opens:
+/// what is proven is that the dispatch does not start a detached root, so a real
+/// run correlates thread -> turn -> call without any emission site repeating
+/// those identifiers.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_failing_call_is_traced_under_the_span_of_its_caller() {
+    let _serialized = match TRACE_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = Arc::clone(&buffer);
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .with_writer(move || SharedBuffer(Arc::clone(&sink)))
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
+
+    let registry = Registry::builder("/tmp")
+        .mode(PermissionMode::DontAsk)
+        .approver(Arc::new(AutoApprove::including_tainted()))
+        .register(Broken)
+        .build();
+    let caller = tracing::info_span!("turn", thread_id = "th_1", turn_id = "tn_2");
+    {
+        use tracing::Instrument as _;
+        let _ = registry
+            .dispatch(vec![ToolInvocation::json(
+                "call_7",
+                "broken",
+                serde_json::json!({}),
+            )])
+            .instrument(caller)
+            .await;
+    }
+
+    let bytes = buffer.lock().unwrap().clone();
+    let trace = String::from_utf8_lossy(&bytes).into_owned();
+
+    assert!(trace.contains("tool call failed"), "{trace}");
+    // One line carrying the whole chain: caller fields, tool and call id.
+    let line = trace
+        .lines()
+        .find(|line| line.contains("tool call failed"))
+        .unwrap_or_default();
+    assert!(line.contains("thread_id=\"th_1\""), "{line}");
+    assert!(line.contains("turn_id=\"tn_2\""), "{line}");
+    assert!(line.contains("tool=broken"), "{line}");
+    assert!(line.contains("call_id=call_7"), "{line}");
+}
+
 /// US-020 AC4: without a subscriber, an emission produces nothing. Proven by
 /// running the same dispatch outside any collection and observing that the tools
 /// keep working, at the same cost as before the instrumentation.
