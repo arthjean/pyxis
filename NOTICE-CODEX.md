@@ -63,4 +63,27 @@ Structurally derived, written against Pyxis types:
   segment validation rules are the baseline's, the type and its bounds are
   written here.
 
+As of EP-005 of the same PRD (2026-07-29), the app-server adds verbatim wire
+NAMES and no code, against the same baseline commit.
+
+Verbatim reuse:
+
+- The JSON-RPC method and notification NAMES of the P0 subset, in
+  `crates/agent-app-server/src/protocol.rs`, from
+  `codex-rs/app-server-protocol/src/protocol/common.rs`: `initialize`,
+  `thread/start`, `thread/resume`, `thread/unsubscribe`, `thread/items/list`,
+  `turn/start`, `turn/steer`, `turn/interrupt`, `thread/started`,
+  `thread/closed`, `turn/started`, `turn/completed`, `item/started`,
+  `item/completed`, `item/agentMessage/delta`,
+  `item/commandExecution/outputDelta`, `serverRequest/resolved`, `error`,
+  `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`
+  and `item/tool/call`. Reused unchanged ON PURPOSE: they are the contract a
+  Codex-compatible client speaks. The payloads, the dispatcher, the item
+  projection, the ownership rules, the back-pressure and both transports are
+  Pyxis's own.
+
+Nothing structural is derived: `agent-app-server` was written against the
+acceptance criteria of EP-005 and the method table the US-001 verifier extracts
+from the read-only clone, not against the upstream implementation.
+
 Reference source inventory: `docs/codex-port-inventory.md`.
