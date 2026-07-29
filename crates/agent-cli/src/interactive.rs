@@ -1764,7 +1764,7 @@ async fn event_loop(
                                     }
                                 }
                             }
-                            RuntimeEventPayload::TurnStateChanged { to, .. } => {
+                            RuntimeEventPayload::TurnStateChanged { to, ref cause, .. } => {
                                 if to == TurnState::Running {
                                     // Diff reference taken when the turn really
                                     // starts, hence before its first tool write.
@@ -1795,6 +1795,33 @@ async fn event_loop(
                                                 "turn diff: {err}"
                                             )),
                                         }
+                                    }
+                                    // US-019 AC1: a terminal cause reaches the
+                                    // transcript with the SAME category, the
+                                    // same next step and the same identifiers
+                                    // the other three surfaces show. Dropping it
+                                    // here is what used to make a failed turn
+                                    // look like no reaction at all.
+                                    if let Some(failure) =
+                                        agent_runtime::TurnFailure::classify(to, cause.as_deref())
+                                    {
+                                        let line = crate::failure_line::render(
+                                            &failure,
+                                            event.thread_id,
+                                            event.turn_id,
+                                        );
+                                        // A cancellation or a shutdown is not a
+                                        // fault: it says so in words either way,
+                                        // but tinting it red would report a
+                                        // failure the user caused on purpose.
+                                        state.blocks.push(
+                                            match failure.category {
+                                                agent_runtime::FailureCategory::Interrupted => {
+                                                    Block::Notice(line)
+                                                }
+                                                _ => Block::Error(line),
+                                            },
+                                        );
                                     }
                                     // US-019 AC1 of the harness PRD: re-read BEFORE any
                                     // continuation turn, so the goal loop sees the

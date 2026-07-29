@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"turn_failure_cause\", &s, W, H)"
+---
+› Résume le dépôt
+
+  ✗ provider: stream closed before the terminal — retry the turn; check
+    connectivity if it repeats (thread th_01k9, turn tn_03m2)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+• Working (0s • esc to interrupt)
+
+────────────────────────────────────────────────────────────────────────────────
+›
+────────────────────────────────────────────────────────────────────────────────
+gpt-5 · pyxis · Ask for approval               ctrl+j newline · ctrl+c interrupt

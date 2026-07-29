@@ -170,8 +170,29 @@ le code de sortie sont des faits de processus.
 | `input_tokens`, `output_tokens` | Consommation cumulée du run. |
 | `end` | `end_turn`, `interrupted`, `exhausted` ou `error`. |
 | `end_detail` | Présent pour `interrupted`, `exhausted` et `error` : la cause précise. |
+| `cause_category` | Catégorie lue dans la cause par le classificateur partagé. Absente sur une fin propre. |
+| `cause_guidance` | Prochain pas de diagnostic pour cette catégorie, phrase identique sur toutes les surfaces. |
 | `exit_code` | Code que le processus rendra. `0` en cas de succès. |
 | `thread_id`, `turn_id` | Thread et tour du run, mêmes identifiants que sur les lignes d'événement. |
+
+`cause_category` et `cause_guidance` sont additifs (EP-006/US-019 AC1) : un
+consommateur qui les ignore lit la ligne qu'il lisait avant. Ils viennent
+d'`agent_runtime::TurnFailure`, le même classificateur qui alimente la TUI, la
+sortie stderr de `-p` et le champ `causeCategory` de `turn/completed` côté
+app-server, donc les quatre surfaces ne peuvent pas nommer deux catégories
+différentes pour la même cause.
+
+| `cause_category` | Sens | Prochain pas |
+|---|---|---|
+| `provider` | Le fournisseur n'a pas rendu de tour utilisable. | Relancer ; vérifier la connectivité si cela se répète. |
+| `auth` | Credential refusée ou non renouvelable. | Reconnecter l'abonnement ChatGPT. |
+| `context` | Le transcript ne rentre plus dans le budget de contexte. | Nouveau thread, ou `/rewind`. |
+| `invalid_request` | La requête ne pouvait pas porter ce que le modèle a demandé. | Rapporter ; le tour n'est pas rejouable tel quel. |
+| `model_runtime` | Capacité refusée localement, avant tout appel réseau. | Choisir un modèle supporté, ou installer le composant manquant. |
+| `guardrail` | Un garde-fou a arrêté la boucle ; le travail n'est pas fini. | Relever la limite nommée, ou découper la tâche. |
+| `interrupted` | Annulation, arrêt du processus ou réparation à la reprise. | Reprendre le thread et resoumettre. |
+| `store` | Le journal durable est illisible ou non écrivable. | Vérifier le fichier de session et l'espace disque. |
+| `unknown` | Cause non reconnue, reportée comme telle plutôt que devinée. | Lire `end_detail` et la trace sous `PYXIS_LOG=debug`. |
 
 `end: "interrupted"` est apparu avec EP-005 : avant lui, rien ne pouvait
 interrompre un run `-p`, donc le cas n'était pas observable. Ctrl+C passe

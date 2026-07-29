@@ -546,6 +546,25 @@ fn interrupted_turn() {
     );
 }
 
+/// US-019 AC1: the terminal cause of a failed turn is IN the transcript, with
+/// its category, its next step and the identifiers that find the same turn in a
+/// session file or an app-server stream. The line the binary builds is frozen
+/// here; the classification itself is proven in `agent-runtime`.
+#[test]
+fn turn_failure_cause() {
+    let mut s = state();
+    s.push_user("Résume le dépôt");
+    s.blocks.push(agent_tui::state::Block::Error(
+        "provider: stream closed before the terminal — retry the turn; check \
+         connectivity if it repeats (thread th_01k9, turn tn_03m2)"
+            .to_string(),
+    ));
+    insta::assert_snapshot!(
+        "turn_failure_cause",
+        harness::frame("turn_failure_cause", &s, W, H)
+    );
+}
+
 #[test]
 fn error_block() {
     let mut s = state();

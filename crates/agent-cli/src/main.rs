@@ -10,6 +10,7 @@ mod app_server;
 mod approver;
 mod code_mode;
 mod context;
+mod failure_line;
 mod headless;
 mod interactive;
 mod jsonl;

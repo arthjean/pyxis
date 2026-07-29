@@ -200,11 +200,20 @@ pub async fn run(run: HeadlessRun<'_>) -> anyhow::Result<()> {
             .map_err(|err| anyhow::anyhow!("--output-last-message {path}: {err}"))
     });
 
+    // US-019 AC1: the stderr line of a headless run names the same category and
+    // the same next step the TUI shows, followed by the identifiers that tie it
+    // to the session file. `interrupted` without a cause stays the bare word: a
+    // user who pressed Ctrl+C is not asking why.
     match &ended {
         RunEnd::EndTurn => {}
-        RunEnd::Interrupted(_) => anyhow::bail!("interrupted"),
-        RunEnd::Exhausted(reason) => anyhow::bail!("stopped: {reason}"),
-        RunEnd::Error(err) => anyhow::bail!("{err}"),
+        RunEnd::Interrupted(None) => anyhow::bail!("interrupted"),
+        other => {
+            let detail = match other.failure() {
+                Some(failure) => crate::failure_line::render(&failure, &thread_id, Some(turn_id)),
+                None => "the turn failed without a recorded cause".to_string(),
+            };
+            anyhow::bail!("{detail}");
+        }
     }
     if let Some(written) = last_message_write {
         written?;

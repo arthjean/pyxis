@@ -135,6 +135,26 @@ impl RunEnd {
             Self::Error(err) => ("error", Some(err.clone()), 1),
         }
     }
+
+    /// The failure this end carries, read through the SAME classifier the TUI
+    /// and the app-server use (US-019 AC1). `end` says which terminal was
+    /// reached; the category says which diagnostic follows, and the two are not
+    /// the same question: `error` covers a provider outage and a revoked
+    /// credential alike.
+    pub fn failure(&self) -> Option<agent_runtime::TurnFailure> {
+        match self {
+            Self::EndTurn => None,
+            Self::Interrupted(cause) => {
+                cause.as_deref().map(agent_runtime::TurnFailure::from_cause)
+            }
+            // `from_terminal` stripped the prefix the log carried; the cause is
+            // rebuilt so one classifier keeps deciding, not two.
+            Self::Exhausted(reason) => Some(agent_runtime::TurnFailure::from_cause(&format!(
+                "exhausted: {reason}"
+            ))),
+            Self::Error(err) => Some(agent_runtime::TurnFailure::from_cause(err)),
+        }
+    }
 }
 
 /// End-of-run summary (AC3). This is NOT an `AgentEvent`: the session identifier
@@ -159,6 +179,14 @@ struct RunSummary<'a> {
     /// Detail of the cause when there is one.
     #[serde(skip_serializing_if = "Option::is_none")]
     end_detail: Option<String>,
+    /// Category the shared classifier read out of the cause, in the same
+    /// vocabulary the app-server publishes (US-019 AC1). Absent on a clean end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cause_category: Option<&'static str>,
+    /// The next diagnostic step for that category, so a log read after the fact
+    /// says what to do and not only what broke.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cause_guidance: Option<&'static str>,
     exit_code: i32,
     #[serde(flatten)]
     identity: &'a EventIdentity,
@@ -253,6 +281,7 @@ impl EventWriter {
             return;
         }
         let (end, end_detail, exit_code) = ended.parts();
+        let failure = ended.failure();
         let line = SummaryLine {
             schema: SCHEMA_VERSION,
             r#type: "run_summary",
@@ -263,6 +292,8 @@ impl EventWriter {
                 output_tokens: self.output_tokens,
                 end,
                 end_detail,
+                cause_category: failure.as_ref().map(|f| f.category.label()),
+                cause_guidance: failure.as_ref().map(|f| f.category.guidance()),
                 exit_code,
                 identity,
             },
@@ -534,5 +565,74 @@ mod tests {
             RunEnd::from_terminal(TurnState::Failed, None),
             RunEnd::Error(_)
         ));
+    }
+
+    /// US-019 AC1: the summary line names the CATEGORY and the next step, in the
+    /// vocabulary the TUI prints and the app-server publishes. `end` says which
+    /// terminal was reached, `cause_category` says which diagnostic follows, and
+    /// a pipeline needs both.
+    #[test]
+    fn the_summary_names_the_category_and_the_next_step() {
+        use agent_runtime::{FailureCategory, TurnState};
+
+        let failed = RunEnd::from_terminal(TurnState::Failed, Some("auth: Expired".into()));
+        let failure = failed.failure().expect("a failed run carries a failure");
+        assert_eq!(failure.category, FailureCategory::Auth);
+        assert_eq!(failure.category.label(), "auth");
+        assert!(failure.category.guidance().contains("/login"));
+
+        // A guardrail stop is a failure of its own kind, not a provider one:
+        // `from_terminal` strips the prefix and `failure()` rebuilds it, so one
+        // classifier keeps deciding.
+        let exhausted =
+            RunEnd::from_terminal(TurnState::Failed, Some("exhausted: MaxTurns(50)".into()));
+        assert_eq!(
+            exhausted.failure().map(|f| f.category),
+            Some(FailureCategory::Guardrail)
+        );
+
+        // A clean end has nothing to categorize, so the fields stay absent.
+        assert!(RunEnd::EndTurn.failure().is_none());
+        assert!(RunEnd::Interrupted(None).failure().is_none());
+    }
+
+    /// The two fields are ADDITIVE: a consumer that ignores them reads the same
+    /// line it read before, and a clean run gets neither.
+    #[test]
+    fn the_category_fields_are_additive_and_absent_on_a_clean_run() {
+        let clean = summary_value(&RunEnd::EndTurn);
+        assert_eq!(clean["data"]["end"], "end_turn");
+        assert!(clean["data"].get("cause_category").is_none(), "{clean}");
+        assert!(clean["data"].get("cause_guidance").is_none(), "{clean}");
+
+        let failed = summary_value(&RunEnd::Error("provider: 503".into()));
+        assert_eq!(failed["data"]["end"], "error");
+        assert_eq!(failed["data"]["end_detail"], "provider: 503");
+        assert_eq!(failed["data"]["cause_category"], "provider");
+        assert_eq!(failed["data"]["exit_code"], 1);
+    }
+
+    /// The summary line as it is serialized, without going through stdout.
+    fn summary_value(ended: &RunEnd) -> serde_json::Value {
+        let (end, end_detail, exit_code) = ended.parts();
+        let failure = ended.failure();
+        let identity = EventIdentity::default();
+        serde_json::to_value(SummaryLine {
+            schema: SCHEMA_VERSION,
+            r#type: "run_summary",
+            data: RunSummary {
+                session_id: "s.jsonl",
+                model_turns: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                end,
+                end_detail,
+                cause_category: failure.as_ref().map(|f| f.category.label()),
+                cause_guidance: failure.as_ref().map(|f| f.category.guidance()),
+                exit_code,
+                identity: &identity,
+            },
+        })
+        .expect("the summary serializes")
     }
 }
