@@ -18,6 +18,7 @@ mod runtime;
 mod session;
 mod settings;
 mod skills;
+mod subagents;
 
 use std::sync::Arc;
 
@@ -1457,6 +1458,31 @@ async fn run(
     // Pyxis (AC4).
     let exec_sessions = ExecSessions::new();
 
+    // EP-003/US-011: the multi-agent v2 surface. The spawner is the binary's
+    // half of the contract (it builds a child's registry from its authority);
+    // the handle is what the six tools address, and `SessionRuntime` binds it to
+    // the supervisor of whichever thread is open. Both exist before the registry
+    // because the tools are registered into it.
+    let subagent_spawner = subagents::SubAgentSpawner::new(
+        Arc::clone(&provider),
+        Arc::new(HeuristicCounter),
+        Arc::new(SystemClock),
+        workspace.clone(),
+        sandbox.policy.clone(),
+        sandbox.enforced,
+        Arc::clone(&hooks),
+        Arc::clone(&harden),
+        (!args.ephemeral).then(|| current_session.clone()),
+    );
+    let agent_handle = Arc::new(agent_tools::AgentHandle::new());
+    let agents = runtime::AgentWiring {
+        spawner: Arc::clone(&subagent_spawner) as Arc<dyn agent_runtime::supervisor::AgentSpawner>,
+        handle: Arc::clone(&agent_handle),
+        // The root thread is the user's: the tool pipeline bounds it, not this
+        // type. A child never gets more than the intersection with it (FR-11).
+        authority: agent_runtime::AgentAuthority::unrestricted(),
+    };
+
     let mut builder = Registry::builder(&workspace)
         .mode_state(permission_mode.clone())
         .approver(approver)
@@ -1494,6 +1520,16 @@ async fn run(
             .register(agent_tools::ExecTool::new(Arc::clone(handle)))
             .register(agent_tools::WaitTool::new(Arc::clone(handle)));
     }
+    // US-011 AC1: the six baseline v2 tools, pointing at a real supervisor and a
+    // real spawner. Which models actually SEE them is decided per step from the
+    // catalog's `multi_agent_version`, not here.
+    builder = builder
+        .register(agent_tools::SpawnAgent::new(Arc::clone(&agent_handle)))
+        .register(agent_tools::SendMessage::new(Arc::clone(&agent_handle)))
+        .register(agent_tools::FollowupTask::new(Arc::clone(&agent_handle)))
+        .register(agent_tools::ListAgents::new(Arc::clone(&agent_handle)))
+        .register(agent_tools::WaitAgent::new(Arc::clone(&agent_handle)))
+        .register(agent_tools::InterruptAgent::new(Arc::clone(&agent_handle)));
     for tool in mcp_startup.tools {
         builder = builder.register_dyn(tool);
     }
@@ -1530,6 +1566,8 @@ async fn run(
         },
         Arc::clone(&provider),
     );
+    // A child inherits the model and effort in force, read at spawn time.
+    subagent_spawner.bind_settings(Arc::clone(&settings));
     // The catalog only stops refusing a code-mode model once a runtime really
     // exists in this process.
 
@@ -1546,6 +1584,7 @@ async fn run(
     let outcome: anyhow::Result<()> = async {
         if let Some(prompt) = args.prompt {
             let outcome = headless::run(headless::HeadlessRun {
+                agents: Some(agents.clone()),
                 prompt,
                 session_path: (!args.ephemeral).then(|| current_session.clone()),
                 session_id: session_id.clone(),
@@ -1568,6 +1607,7 @@ async fn run(
             outcome?;
         } else {
             let cfg = InteractiveConfig {
+                agents: Some(agents.clone()),
                 model: args.model,
                 reasoning_effort: initial_reasoning_effort,
                 goal,

@@ -97,6 +97,9 @@ pub struct InteractiveConfig {
     /// exactly these names back out, and the union is what keeps a name handed out
     /// once from ever being handed out twice.
     pub mcp_tool_names: BTreeMap<String, BTreeSet<String>>,
+    /// Sub-agent wiring: the spawner and the handle the six multi-agent tools
+    /// address. `None` when the build has no spawner.
+    pub agents: Option<crate::runtime::AgentWiring>,
     /// Mutable permission mode, shared with the tool registry.
     pub permission_mode: PermissionModeState,
     /// Answers remembered this session, shared with the tool registry
@@ -650,6 +653,7 @@ async fn open_session(
         Arc::clone(&cfg.settings),
         Arc::clone(&cfg.steps),
         root,
+        cfg.agents.as_ref(),
     )
     .await?;
     // Every way into a thread goes through here, `/fork` and `/rewind`

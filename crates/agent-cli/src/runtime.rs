@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use agent_core::clock::{Clock, SystemClock};
 use agent_core::message::Message;
-use agent_core::model::ModelToolMode;
+use agent_core::model::{ModelToolMode, MultiAgentVersion};
 use agent_core::provider::{Provider, ToolSpec};
 use agent_core::session::Session;
 use agent_core::step::StepContextSource;
@@ -42,6 +42,20 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::session::SharedSession;
+
+/// What the binary needs to give a thread its own sub-agent supervisor.
+///
+/// A supervisor belongs to ONE thread, so it cannot be built once and shared:
+/// `/fork`, `/rewind` and a resume each open another thread and each get a
+/// fresh one. What IS shared is the spawner (how a child is built) and the
+/// handle the six tools address (see [`agent_tools::AgentHandle`]).
+#[derive(Clone)]
+pub struct AgentWiring {
+    pub spawner: Arc<dyn agent_runtime::supervisor::AgentSpawner>,
+    pub handle: Arc<agent_tools::AgentHandle>,
+    /// Authority of the ROOT thread. A child never gets more (FR-11).
+    pub authority: agent_runtime::AgentAuthority,
+}
 
 /// Everything a turn is committed to, plus what the prompt is composed from.
 ///
@@ -103,6 +117,17 @@ impl SettingsCell {
         };
         let model = self.lock().model.clone();
         provider.tool_mode(&model)
+    }
+
+    /// Multi-agent protocol of the model in force. `Disabled` without a
+    /// provider: a model whose orchestration contract is unknown must not be
+    /// handed orchestration tools (US-010 AC3).
+    pub fn multi_agent_version(&self) -> MultiAgentVersion {
+        let Some(provider) = &self.provider else {
+            return MultiAgentVersion::Disabled;
+        };
+        let model = self.lock().model.clone();
+        provider.multi_agent_version(&model)
     }
 
     pub fn read<T>(&self, f: impl FnOnce(&TurnSettings) -> T) -> T {
@@ -267,6 +292,13 @@ impl CliStepSource {
         settings.tool_mode()
     }
 
+    fn multi_agent_version(&self) -> MultiAgentVersion {
+        let Some(settings) = &self.settings else {
+            return MultiAgentVersion::Disabled;
+        };
+        settings.multi_agent_version()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, StepState> {
         self.state
             .lock()
@@ -319,6 +351,21 @@ impl CliStepSource {
         captured: ToolDispatchSnapshot,
     ) -> (Vec<ToolSpec>, Option<ToolDispatchSnapshot>) {
         let mode = self.tool_mode();
+        // A model that does not drive the v2 protocol loses the six tools from
+        // BOTH views, not just from what it sees: a nested call must not reach
+        // an orchestration surface the model was never trained on, and a
+        // historical direct model must keep exactly the plan it had (US-010 AC4).
+        let captured = if self.multi_agent_version().drives_v2() {
+            captured
+        } else {
+            let kept: Vec<ToolSpec> = captured
+                .specs()
+                .iter()
+                .filter(|spec| !is_multi_agent_tool(spec))
+                .cloned()
+                .collect();
+            captured.with_specs(kept)
+        };
         let all = captured.specs().to_vec();
         let visible: Vec<ToolSpec> = match (&self.code_mode, mode.needs_code_mode()) {
             (Some(handle), true) => {
@@ -362,6 +409,10 @@ const CODE_MODE_TOOLS: [&str; 2] = [
 
 fn is_code_mode_tool(spec: &ToolSpec) -> bool {
     CODE_MODE_TOOLS.contains(&spec.name.as_str())
+}
+
+fn is_multi_agent_tool(spec: &ToolSpec) -> bool {
+    agent_tools::MULTI_AGENT_V2_TOOLS.contains(&spec.name.as_str())
 }
 
 impl StepSource for CliStepSource {
@@ -511,6 +562,7 @@ impl SessionRuntime {
         settings: Arc<SettingsCell>,
         steps: Arc<CliStepSource>,
         parent_cancel: &CancellationToken,
+        agents: Option<&AgentWiring>,
     ) -> anyhow::Result<Self> {
         let ids: Arc<dyn IdGenerator> = Arc::new(RandomIds);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -569,6 +621,19 @@ impl SessionRuntime {
             }))
         };
 
+        // One supervisor per thread, bound to the tools right away: a call
+        // arriving between two threads is refused instead of reaching the
+        // previous conversation's children (US-011 AC3).
+        let supervisor = agents.map(|wiring| {
+            let supervisor = agent_runtime::supervisor::AgentSupervisor::new(
+                Arc::clone(&wiring.spawner),
+                Arc::clone(&ids),
+                Arc::clone(&clock),
+                wiring.authority.clone(),
+            );
+            wiring.handle.bind(Arc::clone(&supervisor));
+            supervisor
+        });
         let handle = ThreadHandle::start(ThreadOptions {
             thread_id,
             store,
@@ -577,9 +642,7 @@ impl SessionRuntime {
             ids,
             clock,
             parent_cancel: parent_cancel.clone(),
-            // EP-004 built the supervisor and its five tools; exposing them in
-            // the binary is not part of EP-005 and is tracked in CURRENT_STATUS.
-            agents: None,
+            agents: supervisor,
         })
         .await
         .map_err(|err| anyhow::anyhow!("thread: {err}"))?;
@@ -863,6 +926,7 @@ mod tests {
             settings(&dir),
             steps,
             &root,
+            None,
         )
         .await
         .expect("an in-memory thread opens");
@@ -925,6 +989,7 @@ mod tests {
                 settings(&dir),
                 CliStepSource::new(Arc::clone(&registry), Vec::new()),
                 &root,
+                None,
             )
             .await
             .expect("the thread opens");
@@ -953,6 +1018,7 @@ mod tests {
             settings(&dir),
             CliStepSource::new(Arc::clone(&registry), Vec::new()),
             &root,
+            None,
         )
         .await
         .expect("the thread resumes");
@@ -1058,10 +1124,12 @@ mod code_mode_plan_tests {
 
     use super::*;
 
-    /// Declares the tool mode of every slug it is asked about.
+    /// Declares the tool mode and the orchestration protocol of every slug it
+    /// is asked about.
     struct ModeProvider {
         caps: Capabilities,
         mode: ModelToolMode,
+        multi_agent: agent_core::model::MultiAgentVersion,
     }
 
     #[async_trait::async_trait]
@@ -1074,6 +1142,9 @@ mod code_mode_plan_tests {
         }
         fn tool_mode(&self, _slug: &str) -> ModelToolMode {
             self.mode
+        }
+        fn multi_agent_version(&self, _slug: &str) -> agent_core::model::MultiAgentVersion {
+            self.multi_agent
         }
         async fn stream(
             &self,
@@ -1133,15 +1204,29 @@ mod code_mode_plan_tests {
     }
 
     fn source(mode: ModelToolMode) -> Arc<CliStepSource> {
+        source_with(mode, agent_core::model::MultiAgentVersion::Disabled)
+    }
+
+    fn source_with(
+        mode: ModelToolMode,
+        multi_agent: agent_core::model::MultiAgentVersion,
+    ) -> Arc<CliStepSource> {
         let handle = Arc::new(CodeModeHandle::new(
             Arc::new(NoEngineFactory),
             NestedToolBinding::default(),
         ));
+        let agents = Arc::new(agent_tools::AgentHandle::new());
         let registry = Arc::new(
             agent_tools::Registry::builder(std::env::temp_dir())
                 .register(agent_tools::read::Read)
                 .register(ExecTool::new(Arc::clone(&handle)))
                 .register(WaitTool::new(Arc::clone(&handle)))
+                .register(agent_tools::SpawnAgent::new(Arc::clone(&agents)))
+                .register(agent_tools::SendMessage::new(Arc::clone(&agents)))
+                .register(agent_tools::FollowupTask::new(Arc::clone(&agents)))
+                .register(agent_tools::ListAgents::new(Arc::clone(&agents)))
+                .register(agent_tools::WaitAgent::new(Arc::clone(&agents)))
+                .register(agent_tools::InterruptAgent::new(agents))
                 .build(),
         );
         let settings = SettingsCell::with_provider(
@@ -1158,20 +1243,20 @@ mod code_mode_plan_tests {
             Arc::new(ModeProvider {
                 caps: Capabilities::default(),
                 mode,
+                multi_agent,
             }),
         );
         CliStepSource::with_code_mode(registry, Vec::new(), Some(handle), settings)
     }
 
-    fn visible(mode: ModelToolMode) -> Vec<String> {
-        let mut names: Vec<String> = source(mode)
-            .snapshot()
-            .tools
-            .into_iter()
-            .map(|spec| spec.name)
-            .collect();
+    fn names_of(specs: &[ToolSpec]) -> Vec<String> {
+        let mut names: Vec<String> = specs.iter().map(|spec| spec.name.clone()).collect();
         names.sort();
         names
+    }
+
+    fn visible(mode: ModelToolMode) -> Vec<String> {
+        names_of(&source(mode).snapshot().tools)
     }
 
     /// AC1: a `code_mode_only` model sees `exec` and `wait` and nothing else.
@@ -1196,6 +1281,67 @@ mod code_mode_plan_tests {
     #[tokio::test]
     async fn a_direct_model_never_sees_the_orchestration_pair() {
         assert_eq!(visible(ModelToolMode::Direct), vec!["read".to_string()]);
+    }
+
+    /// US-010 AC4 / US-011 AC1: the six v2 tools appear only for a model whose
+    /// catalog entry says `v2`. A direct model on `disabled` keeps exactly the
+    /// plan it had before this epic.
+    #[tokio::test]
+    async fn only_a_v2_model_is_handed_the_multi_agent_tools() {
+        use agent_core::model::MultiAgentVersion;
+
+        let disabled = source_with(ModelToolMode::Direct, MultiAgentVersion::Disabled).snapshot();
+        assert_eq!(names_of(&disabled.tools), vec!["read".to_string()]);
+
+        // v1 is a DIFFERENT baseline surface: it gets nothing rather than a
+        // contract Pyxis invented.
+        let v1 = source_with(ModelToolMode::Direct, MultiAgentVersion::V1).snapshot();
+        assert_eq!(names_of(&v1.tools), vec!["read".to_string()]);
+
+        let v2 = source_with(ModelToolMode::Direct, MultiAgentVersion::V2).snapshot();
+        let mut expected = agent_tools::MULTI_AGENT_V2_TOOLS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        expected.push("read".to_string());
+        expected.sort();
+        assert_eq!(names_of(&v2.tools), expected);
+    }
+
+    /// US-013 AC1: a `code_mode_only` v2 model sees only `exec` and `wait`, and
+    /// the six tools stay DISPATCHABLE from a cell. Hiding them from the model
+    /// must not remove them from the nested plan, or orchestration would exist
+    /// in direct mode only.
+    #[tokio::test]
+    async fn a_code_mode_only_v2_model_keeps_the_tools_nested_dispatchable() {
+        let source = source_with(
+            ModelToolMode::CodeModeOnly,
+            agent_core::model::MultiAgentVersion::V2,
+        );
+        let snapshot = source.snapshot();
+        assert_eq!(
+            names_of(&snapshot.tools),
+            vec!["exec".to_string(), "wait".to_string()]
+        );
+
+        // What a cell may call: everything but the pair that would recurse.
+        let runtime = tokio::runtime::Handle::current();
+        let nested = agent_code_mode::PlanDispatcher::new(
+            &source.registry.step_snapshot(),
+            &super::CODE_MODE_TOOLS,
+            agent_core::tools::ToolEventSink::default(),
+            runtime,
+        );
+        let callable = names_of(&agent_code_mode::nested::NestedToolDispatcher::catalog(
+            &nested,
+        ));
+        for tool in agent_tools::MULTI_AGENT_V2_TOOLS {
+            assert!(
+                callable.contains(&tool.to_string()),
+                "a cell must still reach `{tool}`: {callable:?}"
+            );
+        }
+        assert!(!callable.contains(&"exec".to_string()));
     }
 
     /// The dispatch view and the visible view agree, so the model can never

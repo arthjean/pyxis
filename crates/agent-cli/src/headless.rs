@@ -35,6 +35,9 @@ pub struct HeadlessRun<'a> {
     pub engine: EngineDeps,
     pub settings: Arc<SettingsCell>,
     pub steps: Arc<CliStepSource>,
+    /// Sub-agent wiring, `None` when the model in force drives no multi-agent
+    /// protocol or the build has no spawner.
+    pub agents: Option<crate::runtime::AgentWiring>,
 }
 
 /// Runs the turn and returns once its terminal state is durable.
@@ -52,6 +55,7 @@ pub async fn run(run: HeadlessRun<'_>) -> anyhow::Result<()> {
         engine,
         settings,
         steps,
+        agents,
     } = run;
 
     // US-017 AC2 of the harness PRD: the prompt is submitted to the hooks before
@@ -81,6 +85,7 @@ pub async fn run(run: HeadlessRun<'_>) -> anyhow::Result<()> {
         settings,
         Arc::clone(&steps),
         &cancel,
+        agents.as_ref(),
     )
     .await?;
     // US-009: the Code Mode session follows the thread, so it opens with it.
