@@ -79,7 +79,11 @@ impl CodeModeHandle {
     /// shut down first: every open cell reaches a terminal state, and no cell
     /// keeps running for a conversation the user has left.
     pub async fn bind_thread(&self, thread: &str) -> Result<(), String> {
-        if let Some(previous) = lock(&self.session).take() {
+        // Taken in a statement of its own: a guard held across the await would
+        // make every caller's future `!Send`, and the app-server drives this
+        // from a spawned task.
+        let previous = lock(&self.session).take();
+        if let Some(previous) = previous {
             previous.shutdown(SESSION_SHUTDOWN_DEADLINE).await;
         }
         let session = self.factory.open(SessionId::new(thread))?;
