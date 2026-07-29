@@ -58,6 +58,46 @@ impl ModelToolMode {
     }
 }
 
+/// Multi-agent protocol a model was trained to drive.
+///
+/// The three values are the baseline's own (`multi_agent_versions` of the
+/// parity matrix). `Disabled` is what an entry omitting the field means, which
+/// is how Codex reads it and why it is the `Default`: a model that says nothing
+/// about orchestration must never be handed orchestration tools.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MultiAgentVersion {
+    #[default]
+    Disabled,
+    V1,
+    V2,
+}
+
+impl MultiAgentVersion {
+    /// Does this model drive the v2 surface Pyxis implements?
+    ///
+    /// `V1` deliberately answers `false`: the baseline v1 surface is a
+    /// different tool set (`send_input`, `close_agent`, `resume_agent`), and
+    /// exposing v2 tools to a v1 model would be a contract Pyxis invented.
+    pub fn drives_v2(self) -> bool {
+        matches!(self, Self::V2)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+}
+
+impl std::fmt::Display for MultiAgentVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TruncationMode {
@@ -131,6 +171,10 @@ pub struct ModelDescriptor {
     pub reasoning_replay: ReasoningReplaySupport,
     pub responses_dialect: ResponsesDialect,
     pub tool_mode: ModelToolMode,
+    /// Orchestration protocol the model drives. Defaulted so a catalog entry
+    /// (and a log line) written before the field existed still loads.
+    #[serde(default)]
+    pub multi_agent_version: MultiAgentVersion,
     pub truncation: TruncationPolicy,
     pub comp_hash: Option<String>,
 }
@@ -283,6 +327,8 @@ pub struct ResolvedModelRuntime {
     pub reasoning_replay: ReasoningReplaySupport,
     pub responses_dialect: ResponsesDialect,
     pub tool_mode: ModelToolMode,
+    #[serde(default)]
+    pub multi_agent_version: MultiAgentVersion,
     pub truncation: TruncationPolicy,
     pub retry: ModelRetryPolicy,
     pub max_output_tokens: u32,
@@ -307,6 +353,7 @@ impl ResolvedModelRuntime {
             reasoning_replay: self.reasoning_replay,
             responses_dialect: self.responses_dialect,
             tool_mode: self.tool_mode,
+            multi_agent_version: self.multi_agent_version,
             truncation: self.truncation,
             comp_hash: self.comp_hash.clone(),
         }
@@ -355,6 +402,13 @@ impl ResolvedModelRuntime {
         self.input_modalities.contains(&InputModality::Image)
     }
 
+    /// The baseline's `use_responses_lite`, read back from the dialect it was
+    /// resolved into. Kept as a named question so a caller never has to know
+    /// that "lite" and "standard" are what the flag became.
+    pub fn uses_responses_lite(&self) -> bool {
+        self.responses_dialect == ResponsesDialect::Lite
+    }
+
     pub fn reasoning_replay_disabled_reason(&self) -> Option<&'static str> {
         (self.reasoning_replay == ReasoningReplaySupport::Disabled)
             .then_some("descriptor does not prove encrypted stateless reasoning replay")
@@ -397,6 +451,7 @@ mod tests {
             reasoning_replay: ReasoningReplaySupport::Disabled,
             responses_dialect: ResponsesDialect::Standard,
             tool_mode: ModelToolMode::Direct,
+            multi_agent_version: MultiAgentVersion::Disabled,
             truncation: TruncationPolicy {
                 mode: TruncationMode::Tokens,
                 limit: 1_000,
@@ -427,6 +482,7 @@ mod tests {
             reasoning_replay: ReasoningReplaySupport::Disabled,
             responses_dialect: ResponsesDialect::Standard,
             tool_mode: ModelToolMode::Direct,
+            multi_agent_version: MultiAgentVersion::Disabled,
             truncation: TruncationPolicy {
                 mode: TruncationMode::Tokens,
                 limit: 1,
@@ -442,6 +498,54 @@ mod tests {
         ));
         descriptor.truncation.limit = crate::tools::MIN_MODEL_TOOL_RESULT_TOKENS as u32;
         assert!(descriptor.validate().is_ok());
+    }
+
+    /// US-010: a descriptor written before the field existed loads as
+    /// `disabled`, and the three baseline values round-trip under their wire
+    /// spelling. A silent `v2` on a legacy entry would hand orchestration tools
+    /// to a model that never asked for them.
+    #[test]
+    fn an_absent_multi_agent_version_reads_as_disabled_and_the_wire_names_round_trip() {
+        let descriptor = ModelDescriptor {
+            slug: "model".into(),
+            display_name: "Model".into(),
+            instructions: "instructions".into(),
+            context_window: 10_000,
+            auto_compact_token_limit: 8_000,
+            input_modalities: vec![InputModality::Text],
+            supports_reasoning: false,
+            default_reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_verbosity: false,
+            default_verbosity: None,
+            supports_parallel_tool_calls: false,
+            reasoning_replay: ReasoningReplaySupport::Disabled,
+            responses_dialect: ResponsesDialect::Standard,
+            tool_mode: ModelToolMode::Direct,
+            multi_agent_version: MultiAgentVersion::Disabled,
+            truncation: TruncationPolicy {
+                mode: TruncationMode::Tokens,
+                limit: crate::tools::MIN_MODEL_TOOL_RESULT_TOKENS as u32,
+            },
+            comp_hash: None,
+        };
+        let mut wire = serde_json::to_value(&descriptor).unwrap();
+        wire.as_object_mut().unwrap().remove("multi_agent_version");
+        let legacy: ModelDescriptor = serde_json::from_value(wire).unwrap();
+        assert_eq!(legacy.multi_agent_version, MultiAgentVersion::Disabled);
+        assert!(!legacy.multi_agent_version.drives_v2());
+
+        for (version, wire) in [
+            (MultiAgentVersion::Disabled, "disabled"),
+            (MultiAgentVersion::V1, "v1"),
+            (MultiAgentVersion::V2, "v2"),
+        ] {
+            assert_eq!(serde_json::to_value(version).unwrap(), wire);
+            assert_eq!(version.as_str(), wire);
+        }
+        // Only v2 is a surface Pyxis implements.
+        assert!(MultiAgentVersion::V2.drives_v2());
+        assert!(!MultiAgentVersion::V1.drives_v2());
     }
 
     #[test]

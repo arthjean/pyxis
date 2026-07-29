@@ -630,6 +630,7 @@ mod loop_tests {
             reasoning_replay: replay,
             responses_dialect: crate::model::ResponsesDialect::Standard,
             tool_mode: crate::model::ModelToolMode::Direct,
+            multi_agent_version: crate::model::MultiAgentVersion::Disabled,
             truncation: crate::model::TruncationPolicy {
                 mode: crate::model::TruncationMode::Tokens,
                 limit: 1_000,

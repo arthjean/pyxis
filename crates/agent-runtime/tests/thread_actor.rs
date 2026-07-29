@@ -218,6 +218,7 @@ fn resolved_runtime() -> ResolvedModelRuntime {
         reasoning_replay: agent_core::model::ReasoningReplaySupport::Enabled,
         responses_dialect: ResponsesDialect::Standard,
         tool_mode: ModelToolMode::Direct,
+        multi_agent_version: Default::default(),
         truncation: TruncationPolicy {
             mode: TruncationMode::Tokens,
             limit: 2_000,

@@ -9,8 +9,8 @@ use std::collections::HashMap;
 
 use agent_core::model::{
     InputModality, ModelDescriptor, ModelRetryPolicy, ModelRuntimeError, ModelRuntimeSource,
-    ModelToolMode, ReasoningReplaySupport, ResolvedModelRuntime, ResponsesDialect, TruncationMode,
-    TruncationPolicy,
+    ModelToolMode, MultiAgentVersion, ReasoningReplaySupport, ResolvedModelRuntime,
+    ResponsesDialect, TruncationMode, TruncationPolicy,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -196,6 +196,14 @@ impl ModelCatalog {
             .map(|(descriptor, _)| descriptor.tool_mode)
     }
 
+    /// Orchestration protocol of a slug, without resolving a runtime. Read at
+    /// the same step boundary as [`Self::tool_mode`], for the same reason.
+    pub fn multi_agent_version(&self, slug: &str) -> Option<MultiAgentVersion> {
+        self.descriptor(slug)
+            .ok()
+            .map(|(descriptor, _)| descriptor.multi_agent_version)
+    }
+
     pub fn context_window(&self, slug: &str) -> Option<u32> {
         self.descriptor(slug)
             .ok()
@@ -250,6 +258,7 @@ impl ModelCatalog {
             reasoning_replay: descriptor.reasoning_replay,
             responses_dialect: descriptor.responses_dialect,
             tool_mode: descriptor.tool_mode,
+            multi_agent_version: descriptor.multi_agent_version,
             truncation: descriptor.truncation,
             retry,
             max_output_tokens,
@@ -428,6 +437,8 @@ struct WireModel {
     use_responses_lite: Option<bool>,
     #[serde(default)]
     tool_mode: Option<serde_json::Value>,
+    #[serde(default)]
+    multi_agent_version: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -482,6 +493,24 @@ fn descriptor_from_wire(
                 display_name,
                 reason: format!(
                     "unknown required tool_mode {}",
+                    bounded_wire_text(&value.to_string(), 128)
+                ),
+                source,
+            });
+        }
+    };
+    let multi_agent_version = match model.multi_agent_version {
+        None | Some(serde_json::Value::Null) => MultiAgentVersion::Disabled,
+        Some(serde_json::Value::String(ref version)) if version == "disabled" => {
+            MultiAgentVersion::Disabled
+        }
+        Some(serde_json::Value::String(ref version)) if version == "v1" => MultiAgentVersion::V1,
+        Some(serde_json::Value::String(ref version)) if version == "v2" => MultiAgentVersion::V2,
+        Some(value) => {
+            return Ok(RemoteEntry::Incompatible {
+                display_name,
+                reason: format!(
+                    "unknown required multi_agent_version {}",
                     bounded_wire_text(&value.to_string(), 128)
                 ),
                 source,
@@ -591,6 +620,7 @@ fn descriptor_from_wire(
             ResponsesDialect::Standard
         },
         tool_mode,
+        multi_agent_version,
         truncation: TruncationPolicy {
             mode: truncation_mode,
             limit: truncation.limit,
@@ -674,6 +704,7 @@ fn descriptor(
     verbosity: &str,
     dialect: ResponsesDialect,
     tool_mode: ModelToolMode,
+    multi_agent_version: MultiAgentVersion,
     comp_hash: &str,
 ) -> ModelDescriptor {
     ModelDescriptor {
@@ -695,6 +726,7 @@ fn descriptor(
         reasoning_replay: ReasoningReplaySupport::Enabled,
         responses_dialect: dialect,
         tool_mode,
+        multi_agent_version,
         truncation: TruncationPolicy {
             mode: TruncationMode::Tokens,
             limit: 10_000,
@@ -716,6 +748,7 @@ fn embedded_descriptors() -> Vec<ModelDescriptor> {
             "low",
             ResponsesDialect::Lite,
             ModelToolMode::CodeModeOnly,
+            MultiAgentVersion::V2,
             "3000",
         ),
         descriptor(
@@ -727,6 +760,7 @@ fn embedded_descriptors() -> Vec<ModelDescriptor> {
             "low",
             ResponsesDialect::Lite,
             ModelToolMode::CodeModeOnly,
+            MultiAgentVersion::V2,
             "3000",
         ),
         descriptor(
@@ -738,6 +772,7 @@ fn embedded_descriptors() -> Vec<ModelDescriptor> {
             "low",
             ResponsesDialect::Lite,
             ModelToolMode::CodeModeOnly,
+            MultiAgentVersion::V1,
             "3000",
         ),
         descriptor(
@@ -749,6 +784,7 @@ fn embedded_descriptors() -> Vec<ModelDescriptor> {
             "low",
             ResponsesDialect::Standard,
             ModelToolMode::Direct,
+            MultiAgentVersion::Disabled,
             "2911",
         ),
         descriptor(
@@ -760,6 +796,7 @@ fn embedded_descriptors() -> Vec<ModelDescriptor> {
             "low",
             ResponsesDialect::Standard,
             ModelToolMode::Direct,
+            MultiAgentVersion::Disabled,
             "2911",
         ),
         descriptor(
@@ -771,6 +808,7 @@ fn embedded_descriptors() -> Vec<ModelDescriptor> {
             "medium",
             ResponsesDialect::Standard,
             ModelToolMode::Direct,
+            MultiAgentVersion::Disabled,
             "2911",
         ),
         descriptor(
@@ -782,6 +820,7 @@ fn embedded_descriptors() -> Vec<ModelDescriptor> {
             "low",
             ResponsesDialect::Standard,
             ModelToolMode::Direct,
+            MultiAgentVersion::Disabled,
             "2026-07-24",
         ),
     ]
@@ -1124,6 +1163,148 @@ mod tests {
                 .expect("a direct model always resolves");
             assert_eq!(runtime.tool_mode, ModelToolMode::Direct);
         }
+    }
+
+    /// US-010 AC1: the three capabilities the frontier catalog carries survive
+    /// resolution together. A runtime that keeps the tool mode but drops the
+    /// orchestration version would compose a plan the model was not trained on.
+    #[test]
+    fn the_frontier_capabilities_survive_resolution_together() {
+        let mut catalog = ModelCatalog::embedded();
+        catalog.set_code_mode(true);
+        let runtime = catalog
+            .resolve(
+                "gpt-5.6-sol",
+                None,
+                4096,
+                ModelRetryPolicy {
+                    max_attempts: 4,
+                    backoff_base_ms: 50,
+                },
+            )
+            .expect("the frontier model resolves");
+        assert_eq!(runtime.tool_mode, ModelToolMode::CodeModeOnly);
+        assert_eq!(runtime.multi_agent_version, MultiAgentVersion::V2);
+        assert!(runtime.uses_responses_lite());
+        assert!(runtime.multi_agent_version.drives_v2());
+        runtime.validate().expect("the resolved runtime is valid");
+    }
+
+    /// The embedded catalog answers the same three values as the committed
+    /// baseline matrix, per slug. `luna` is the case that matters: it is a code
+    /// mode model on v1, so "code mode" and "v2" must not be read as one
+    /// capability.
+    #[test]
+    fn the_embedded_catalog_matches_the_baseline_rows() {
+        let mut catalog = ModelCatalog::embedded();
+        catalog.set_code_mode(true);
+        for (slug, tool_mode, version, lite) in [
+            (
+                "gpt-5.6-sol",
+                ModelToolMode::CodeModeOnly,
+                MultiAgentVersion::V2,
+                true,
+            ),
+            (
+                "gpt-5.6-terra",
+                ModelToolMode::CodeModeOnly,
+                MultiAgentVersion::V2,
+                true,
+            ),
+            (
+                "gpt-5.6-luna",
+                ModelToolMode::CodeModeOnly,
+                MultiAgentVersion::V1,
+                true,
+            ),
+            (
+                "gpt-5.5",
+                ModelToolMode::Direct,
+                MultiAgentVersion::Disabled,
+                false,
+            ),
+            (
+                "gpt-5.4",
+                ModelToolMode::Direct,
+                MultiAgentVersion::Disabled,
+                false,
+            ),
+        ] {
+            assert_eq!(catalog.tool_mode(slug), Some(tool_mode), "{slug}");
+            assert_eq!(catalog.multi_agent_version(slug), Some(version), "{slug}");
+            let runtime = catalog
+                .resolve(
+                    slug,
+                    None,
+                    4096,
+                    ModelRetryPolicy {
+                        max_attempts: 4,
+                        backoff_base_ms: 50,
+                    },
+                )
+                .expect("the embedded catalog resolves every slug it lists");
+            assert_eq!(runtime.uses_responses_lite(), lite, "{slug}");
+        }
+    }
+
+    /// US-010 AC3: an unknown orchestration version is refused with the faulty
+    /// field, never degraded to `disabled`. Silently dropping it would make a
+    /// frontier model run without the tools it expects and look merely lazy.
+    #[test]
+    fn an_unknown_multi_agent_version_is_incompatible_and_names_the_field() {
+        let mut catalog = ModelCatalog::embedded();
+        catalog
+            .install_remote(
+                &RICH_FIXTURE.replace(
+                    r#""use_responses_lite": true,"#,
+                    r#""use_responses_lite": true,
+      "multi_agent_version": "v3","#,
+                ),
+                "2026-07-28",
+            )
+            .expect("catalog shape remains valid");
+        let error = catalog
+            .resolve(
+                "fixture-lite",
+                None,
+                4096,
+                ModelRetryPolicy {
+                    max_attempts: 4,
+                    backoff_base_ms: 50,
+                },
+            )
+            .expect_err("an unknown required capability must fail closed");
+        let rendered = error.to_string();
+        assert!(rendered.contains("multi_agent_version"), "{rendered}");
+        assert!(rendered.contains("v3"), "{rendered}");
+    }
+
+    /// US-010 AC4: a remote entry that says nothing about orchestration stays
+    /// `disabled`, so a historical direct model keeps the exact contract the
+    /// earlier fixtures pinned.
+    #[test]
+    fn a_remote_entry_without_the_field_stays_disabled() {
+        let mut catalog = ModelCatalog::embedded();
+        catalog
+            .install_remote(RICH_FIXTURE, "2026-07-28")
+            .expect("fixture parses");
+        assert_eq!(
+            catalog.multi_agent_version("fixture-lite"),
+            Some(MultiAgentVersion::Disabled)
+        );
+        let runtime = catalog
+            .resolve(
+                "fixture-lite",
+                None,
+                4096,
+                ModelRetryPolicy {
+                    max_attempts: 4,
+                    backoff_base_ms: 50,
+                },
+            )
+            .expect("runtime resolves");
+        assert_eq!(runtime.multi_agent_version, MultiAgentVersion::Disabled);
+        assert_eq!(runtime.tool_mode, ModelToolMode::Direct);
     }
 
     #[test]

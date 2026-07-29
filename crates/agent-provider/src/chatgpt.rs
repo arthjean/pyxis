@@ -626,6 +626,14 @@ impl Provider for OpenAiChatGptProvider {
             .unwrap_or(agent_core::model::ModelToolMode::Direct)
     }
 
+    fn multi_agent_version(&self, slug: &str) -> agent_core::model::MultiAgentVersion {
+        self.catalog
+            .read()
+            .ok()
+            .and_then(|catalog| catalog.multi_agent_version(slug))
+            .unwrap_or_default()
+    }
+
     async fn stream(
         &self,
         req: CanonicalRequest,

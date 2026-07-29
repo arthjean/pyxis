@@ -645,6 +645,13 @@ pub trait Provider: Send + Sync {
         crate::model::ModelToolMode::Direct
     }
 
+    /// Multi-agent protocol of `slug`, read at the same step boundary as
+    /// [`Provider::tool_mode`]. `Disabled` by default: an adapter that knows
+    /// nothing about orchestration must not hand a model orchestration tools.
+    fn multi_agent_version(&self, _slug: &str) -> crate::model::MultiAgentVersion {
+        crate::model::MultiAgentVersion::Disabled
+    }
+
     /// Context window to use for a precise slug. Providers without a per-model
     /// table can keep the global capabilities value.
     fn max_context_for_model(&self, model: &str) -> u32 {
@@ -741,6 +748,7 @@ mod tests {
             reasoning_replay: crate::model::ReasoningReplaySupport::Disabled,
             responses_dialect: ResponsesDialect::Standard,
             tool_mode: ModelToolMode::Direct,
+            multi_agent_version: crate::model::MultiAgentVersion::Disabled,
             truncation: TruncationPolicy {
                 mode: TruncationMode::Tokens,
                 limit: 1_000,
