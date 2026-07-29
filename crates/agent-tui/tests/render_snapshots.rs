@@ -565,6 +565,46 @@ fn turn_failure_cause() {
     );
 }
 
+/// US-019 AC2: the three states a Code Mode cell can be observed in, as WORDS.
+/// A reader of this snapshot knows whether to wait, whether it is done and
+/// whether it broke, without a single colour.
+#[test]
+fn code_mode_cell_states() {
+    let mut s = state();
+    s.push_user("Compte les crates du workspace");
+    s.apply(&tool_call(
+        "call_1",
+        "exec",
+        serde_json::json!({ "input": "text(await tools.glob({pattern: 'crates/*'}));" }),
+    ));
+    s.apply(&tool_result(
+        "call_1",
+        "Script running with cell ID cell_1. Call `wait` with this cell_id to resume.",
+        false,
+    ));
+    s.apply(&tool_call(
+        "call_2",
+        "wait",
+        serde_json::json!({ "cell_id": "cell_1" }),
+    ));
+    s.apply(&tool_result("call_2", "15\nCell cell_1 completed.", false));
+    s.apply(&tool_call(
+        "call_3",
+        "exec",
+        serde_json::json!({ "input": "throw new Error('boom');" }),
+    ));
+    s.apply(&tool_result(
+        "call_3",
+        "Cell cell_2 failed.\nscript_error: Error: boom",
+        true,
+    ));
+    s.apply(&AgentEvent::EndTurn);
+    insta::assert_snapshot!(
+        "code_mode_cell_states",
+        harness::frame("code_mode_cell_states", &s, W, H)
+    );
+}
+
 #[test]
 fn error_block() {
     let mut s = state();

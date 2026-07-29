@@ -911,6 +911,9 @@ fn push_block<'a>(
             error_kind,
             ..
         } => {
+            let call = calls
+                .get(call_id.as_str())
+                .map(|(name, input, _)| (*name, *input));
             if *is_error {
                 if matches!(error_kind, Some(ToolErrorKind::PermissionDenied))
                     || tool::is_user_rejection(content)
@@ -925,16 +928,37 @@ fn push_block<'a>(
                         width,
                     );
                 } else {
+                    // US-019 AC2: a failed Code Mode cell states `failed` in
+                    // words BEFORE the message. Red is what a screen reader and
+                    // a monochrome terminal do not get; the word is what both
+                    // do. The state is then REMOVED from the message so it is
+                    // not printed a second time as the error's first line.
+                    let split = call
+                        .filter(|(name, _)| matches!(*name, "exec" | "wait"))
+                        .and_then(|_| tool::cell_state_split(content));
+                    let detail = match &split {
+                        Some((state, rest)) => {
+                            push_wrapped(
+                                lines,
+                                vec![Span::styled(state.clone(), theme.error())],
+                                Span::styled(format!("{INDENT}⎿ "), theme.error()),
+                                Span::styled(format!("{INDENT}  "), theme.error()),
+                                width,
+                            );
+                            rest.as_str()
+                        }
+                        None => content.as_str(),
+                    };
                     // Tool error: connector + red message, bounded to 1 line
                     // + indicator of the rest (US-036).
                     push_wrapped(
                         lines,
-                        vec![Span::styled(tool::error_summary(content), theme.error())],
+                        vec![Span::styled(tool::error_summary(detail), theme.error())],
                         Span::styled(format!("{INDENT}⎿ "), theme.error()),
                         Span::styled(format!("{INDENT}  "), theme.error()),
                         width,
                     );
-                    let extra = tool::extra_lines(content);
+                    let extra = tool::extra_lines(detail);
                     if extra > 0 {
                         push_wrapped(
                             lines,
@@ -946,9 +970,6 @@ fn push_block<'a>(
                     }
                 }
             } else {
-                let call = calls
-                    .get(call_id.as_str())
-                    .map(|(name, input, _)| (*name, *input));
                 // Secondary `⎿` summary (numbers highlighted) paired with the call.
                 push_wrapped(
                     lines,

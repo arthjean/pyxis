@@ -97,6 +97,13 @@ pub fn result_summary(
             s.push(Span::styled(unit(removed, " line", " lines"), dim));
             s
         }
+        // US-019 AC2: a Code Mode cell reports its STATE, not the first line of
+        // whatever the script printed. `yielded` is the one a model must react
+        // to, and a user reading a transcript needs the same fact.
+        "exec" | "wait" if cell_state_line(content).is_some() => match cell_state_line(content) {
+            Some(state) => vec![Span::styled(state, dim)],
+            None => vec![Span::styled(first_line_trunc(&sanitize(content), 80), dim)],
+        },
         "glob" => count("Found ", listed(content), "file", "files", dim, num),
         "grep" => count("Found ", listed(content), "match", "matches", dim, num),
         "bash" => {
@@ -109,6 +116,40 @@ pub fn result_summary(
         }
         _ => vec![Span::styled(first_line_trunc(&sanitize(content), 80), dim)],
     }
+}
+
+/// State line a Code Mode cell result always ends with (`exec` / `wait`),
+/// or `None` for a result that carries none.
+///
+/// Anchored on the two sentences `agent-tools::code_mode` appends last, the same
+/// way [`is_user_rejection`] is anchored on the Registry messages: the TUI must
+/// not depend on `agent-code-mode` to stay a rendering crate, and the state is
+/// exactly what a transcript would otherwise lose. Read from the END because the
+/// script's own output comes first and can say anything.
+pub fn cell_state_line(content: &str) -> Option<String> {
+    cell_state_split(content).map(|(state, _)| state)
+}
+
+/// The state line and everything else, for a surface that shows the two
+/// separately. Without the split, a failed cell prints its state twice: once as
+/// the state and once as the "first line" of its own error.
+pub fn cell_state_split(content: &str) -> Option<(String, String)> {
+    let clean = sanitize(content);
+    let state = clean
+        .lines()
+        .map(str::trim)
+        .rfind(|line| is_cell_state(line))?
+        .to_string();
+    let rest = clean
+        .lines()
+        .filter(|line| !is_cell_state(line.trim()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some((trunc(&state, 100), rest))
+}
+
+fn is_cell_state(line: &str) -> bool {
+    line.starts_with("Script running with cell ID ") || line.starts_with("Cell ")
 }
 
 /// Error message of a tool result, on one line prefixed with `Error:`, ANSI
@@ -275,6 +316,52 @@ mod tests {
             spans.iter().map(|s| s.content.as_ref()).collect::<String>(),
             "Read 2 lines"
         );
+    }
+
+    /// US-019 AC2: the summary of a Code Mode result is the cell STATE, not the
+    /// first line the script happened to print. `yielded` is what tells a reader
+    /// the work is still running.
+    #[test]
+    fn a_code_mode_result_summarizes_the_cell_state() {
+        let theme = Theme::new(false);
+        let input = json!({ "input": "text(1);" });
+        let yielded = result_summary(
+            Some(("exec", &input)),
+            "42\nScript running with cell ID cell_1. Call `wait` with this cell_id to resume.",
+            &theme,
+        );
+        assert_eq!(
+            yielded
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "Script running with cell ID cell_1. Call `wait` with this cell_id to resume."
+        );
+
+        let completed =
+            result_summary(Some(("wait", &input)), "42\nCell cell_1 completed.", &theme);
+        assert_eq!(
+            completed
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "Cell cell_1 completed."
+        );
+    }
+
+    /// The split is what keeps a failed cell from printing its state twice: once
+    /// as the state, once as the first line of its own error.
+    #[test]
+    fn the_cell_state_is_separated_from_the_rest_of_the_result() {
+        let (state, rest) =
+            cell_state_split("boom happened\nCell cell_2 failed.\nscript_error: Error: boom")
+                .expect("a cell result carries its state");
+        assert_eq!(state, "Cell cell_2 failed.");
+        assert_eq!(rest, "boom happened\nscript_error: Error: boom");
+        assert!(!rest.contains("Cell cell_2 failed."));
+
+        // A result that is not a cell has no state to lift out.
+        assert!(cell_state_split("Compiling agent-core\nFinished").is_none());
     }
 
     #[test]
