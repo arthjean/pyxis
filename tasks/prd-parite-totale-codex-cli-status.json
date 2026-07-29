@@ -41,10 +41,10 @@
     {
       "id": "EP-005",
       "title": "App-server et contrat client externe",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 3,
-      "stories_done": 0
+      "stories_done": 3
     },
     {
       "id": "EP-006",
@@ -279,7 +279,7 @@
       "id": "US-016",
       "title": "Exposer le cycle thread/turn/item sur stdio",
       "epic": "EP-005",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
@@ -287,38 +287,41 @@
         "US-012",
         "US-015"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-29",
+      "completed_at": "2026-07-29",
+      "reviewed_at": null,
+      "note": "pyxis --app-server sert huit methodes JSON-RPC sous les noms de la baseline. initialize precede toute mutation (-32000 sinon) et negocie la version (-32001 avec la liste servie); il publie methodes, notifications, requetes serveur et bornes de file AVANT qu'un thread existe. Un tour rend turn/started, des items ordonnes sous identifiants item_<n> derives du RANG DURABLE (un message abandonne avant commit rend son numero, un rapport d'erreur moteur est nomme error_<n>), puis turn/completed avec sa cause. UN thread ouvert par processus: le registre d'outils, la session Code Mode et le handle multi-agent appartiennent au thread ouvert, donc un deuxieme client recoit -32002 nommant le thread detenu, et une ecriture sur un thread non detenu -32003, sans mutation. Message JSON invalide, methode inconnue et version incompatible repondent chacun leur code et la connexion sert la requete suivante."
     },
     {
       "id": "US-017",
       "title": "Corréler approvals, outils dynamiques et interruptions",
       "epic": "EP-005",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-016"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-29",
+      "completed_at": "2026-07-29",
+      "reviewed_at": null,
+      "note": "Une approbation traverse le pipeline Pyxis inchange (BridgeApprover) et porte threadId, turnId, itemId et callId plus l'id JSON-RPC. Le pompe sonde les evenements runtime AVANT sa file de commandes, donc l'item qu'un appel ouvre est TOUJOURS projete avant l'approbation que cet appel leve: la correlation est deterministe, pas chanceuse. Fail-closed partout: pas de client attache, client muet, reponse illisible ou requete annulee valent DENY_ONCE. Une reponse tardive, dupliquee ou liee a un tour termine est refusee et signalee sans rouvrir l'item ni executer l'outil. Un outil declare par le client entre dans le MEME registre (Ask par defaut, sensible, sortie untrusted, jamais memorisable) et son execution repart au client par item/tool/call. Une interruption ferme chaque item ouvert exactement une fois et libere chaque requete pendante avec serverRequest/resolved cancelled. L'elicitation MCP reste differee (US-013 de prd-harness-capabilities): le mecanisme de correlation est generique et l'accueillera sans nouveau chemin."
     },
     {
       "id": "US-018",
       "title": "Ajouter historique paginé, WebSocket et schémas",
       "epic": "EP-005",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "L",
       "blocked_by": [
         "US-016",
         "US-017"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-29",
+      "completed_at": "2026-07-29",
+      "reviewed_at": null,
+      "note": "thread/items/list pagine le journal durable par curseur OPAQUE et lie a son thread (un curseur d'ailleurs est refuse); 120 items sur 25 par page sortent exactement une fois, dans l'ordre persistant. Le transport WebSocket sert le meme actor protocolaire: memes methodes, memes identifiants, meme arbitrage d'ownership entre transports (verifie en live: 101 avec jeton valide, 401 sans, -32002 pour le second client). Boucle locale obligatoire et jeton porteur aleatoire imprime sur stderr, parce qu'une socket locale est joignable par tout processus de la machine. JSON Schema 2020-12 et TypeScript sont DERIVES des types Rust (schemars) puis emis tries: la generation couvre 100% des methodes et notifications par construction (les tables du dispatcher sont celles du schema) et un test compare les artefacts publies octet a octet. La file d'une connexion est bornee a 1024 messages ou 16 MiB en vol; au-dela, cause nommee puis fermeture, sans rien perdre de commite."
     },
     {
       "id": "US-019",
