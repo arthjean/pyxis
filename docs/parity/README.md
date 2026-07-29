@@ -14,7 +14,18 @@ ils décrivent des instantanés antérieurs et n'arbitrent plus une divergence.
 ```bash
 cargo run -p agent-parity -- check      # échoue avec un diff lisible si la matrice a dérivé
 cargo run -p agent-parity -- generate   # régénère la matrice après une décision de baseline
+cargo run -p agent-parity -- drift      # compare le HEAD amont à la baseline, sans rien modifier
 ```
+
+`drift` est le guetteur amont (EP-006/US-020 AC4) : c'est le SEUL mode qui
+accepte un clone hors du commit épinglé, parce que son travail est justement de
+dire ce qui a bougé. Il n'écrit rien, ni dans Pyxis ni dans Codex, et il ignore
+le numéro de commit dans sa comparaison : ce qui compte est de savoir si le
+CONTRAT a bougé, pas si le clone a avancé. Il sort non nul quand une ligne de
+contrat diffère, pour qu'un run planifié signale au lieu de défiler.
+
+La recette de preuve offline complète, domaine par domaine, est dans
+[`offline-suite.md`](offline-suite.md).
 
 Le clone est résolu par `$PYXIS_CODEX_BASELINE`, sinon `/home/arthur/dev/codex`.
 Un clone absent, non versionné ou sur un autre commit fait échouer le

@@ -108,6 +108,26 @@ impl CodexBaseline {
         Self::open_at_commit(root, BASELINE_COMMIT)
     }
 
+    /// Opens the clone at WHATEVER commit it is on, for the drift report
+    /// (EP-006/US-020 AC4).
+    ///
+    /// This is the one entry point that does not pin, and it exists so a
+    /// maintainer can read what moved upstream WITHOUT moving the baseline: the
+    /// matrix it extracts is printed and diffed, never written. Pinning stays
+    /// the rule for `check` and `generate`, which is what keeps a campaign
+    /// anchored to one commit.
+    pub fn open_unpinned(root: impl AsRef<Path>) -> Result<Self, BaselineError> {
+        let root = root.as_ref().to_path_buf();
+        if !root.is_dir() {
+            return Err(BaselineError::MissingClone {
+                path: root,
+                expected_commit: BASELINE_COMMIT.to_string(),
+            });
+        }
+        let commit = head_of(&root, BASELINE_COMMIT)?;
+        Ok(Self { root, commit })
+    }
+
     pub fn open_at_commit(
         root: impl AsRef<Path>,
         expected_commit: &str,
@@ -119,24 +139,7 @@ impl CodexBaseline {
                 expected_commit: expected_commit.to_string(),
             });
         }
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .map_err(|error| BaselineError::NotAGitRepository {
-                path: root.clone(),
-                expected_commit: expected_commit.to_string(),
-                detail: error.to_string(),
-            })?;
-        if !output.status.success() {
-            return Err(BaselineError::NotAGitRepository {
-                path: root,
-                expected_commit: expected_commit.to_string(),
-                detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            });
-        }
-        let actual_commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let actual_commit = head_of(&root, expected_commit)?;
         if actual_commit != expected_commit {
             return Err(BaselineError::CommitMismatch {
                 path: root,
@@ -201,6 +204,29 @@ impl CodexBaseline {
         files.sort_by(|left, right| left.0.cmp(&right.0));
         Ok(files)
     }
+}
+
+/// HEAD of a clone, read-only. The clone is never written: `rev-parse` is a
+/// query, and it is the only git invocation this crate makes.
+fn head_of(root: &Path, expected_commit: &str) -> Result<String, BaselineError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|error| BaselineError::NotAGitRepository {
+            path: root.to_path_buf(),
+            expected_commit: expected_commit.to_string(),
+            detail: error.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(BaselineError::NotAGitRepository {
+            path: root.to_path_buf(),
+            expected_commit: expected_commit.to_string(),
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// One model row of the contract matrix.
@@ -736,6 +762,33 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains(BASELINE_COMMIT), "{rendered}");
         assert!(matches!(error, BaselineError::CommitMismatch { .. }));
+    }
+
+    /// US-020 AC4: the drift report reads a clone at ANY commit, so an upstream
+    /// HEAD can be compared without moving the baseline. `open` still refuses
+    /// the same clone, which is what keeps the two modes from collapsing into
+    /// one.
+    #[test]
+    fn the_drift_entry_point_accepts_a_clone_at_another_commit() {
+        // The Pyxis repository is a valid clone at a commit that is not the
+        // Codex baseline.
+        let root = env!("CARGO_MANIFEST_DIR");
+        let unpinned = CodexBaseline::open_unpinned(root).expect("an unpinned clone opens");
+        assert_ne!(unpinned.commit(), BASELINE_COMMIT);
+        assert!(!unpinned.commit().is_empty());
+        assert!(matches!(
+            CodexBaseline::open(root),
+            Err(BaselineError::CommitMismatch { .. })
+        ));
+    }
+
+    /// A missing clone is still a missing clone, drift or not: the report names
+    /// the path and the baseline it was going to compare against.
+    #[test]
+    fn the_drift_entry_point_still_reports_a_missing_clone() {
+        let error = CodexBaseline::open_unpinned("/nonexistent/codex-baseline").unwrap_err();
+        assert!(matches!(error, BaselineError::MissingClone { .. }));
+        assert!(error.to_string().contains(BASELINE_COMMIT));
     }
 
     #[test]
