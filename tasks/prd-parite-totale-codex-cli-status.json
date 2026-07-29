@@ -25,10 +25,10 @@
     {
       "id": "EP-003",
       "title": "Modèles frontier et orchestration multi-agent v2",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 4,
-      "stories_done": 0
+      "stories_done": 4
     },
     {
       "id": "EP-004",
@@ -188,58 +188,62 @@
       "id": "US-010",
       "title": "Aligner le catalogue et la résolution des capacités",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-001"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-29",
+      "completed_at": "2026-07-29",
+      "reviewed_at": null,
+      "note": "MultiAgentVersion (disabled/v1/v2) vit dans agent-core a cote de ModelToolMode et traverse descriptor -> runtime resolu; une valeur inconnue rend l'entree incompatible en nommant le champ, une entree muette reste disabled. Le catalogue embarque colle aux lignes de la matrice baseline (sol/terra v2, luna v1, direct disabled) et le provider expose multi_agent_version() au meme titre que tool_mode(), donc un plan d'outils se compose sans resoudre un runtime complet."
     },
     {
       "id": "US-011",
       "title": "Câbler les outils multi-agent v2 dans le binaire",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-010"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-29",
+      "completed_at": "2026-07-29",
+      "reviewed_at": null,
+      "note": "Les six outils v2 (spawn_agent, send_message, followup_task, list_agents, wait_agent, interrupt_agent) sont enregistres dans le binaire et pointent vers un AgentHandle rebinde par SessionRuntime sur le superviseur du thread ouvert; un superviseur appartient a UN thread, donc /fork et /rewind en obtiennent un neuf. Le spawner CLI construit le registre d'un enfant depuis son autorite, tool par tool, sans approbateur humain et sans outil multi-agent, ce qui rend la limite de profondeur structurelle. Un enfant porte un nom canonique /root/<task_name> persiste dans AgentLinked, et un runtime enfant indisponible echoue en typed error avec un noeud failed et zero slot retenu."
     },
     {
       "id": "US-012",
       "title": "Rendre le cycle multi-agent durable et interruptible",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-011"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-29",
+      "completed_at": "2026-07-29",
+      "reviewed_at": null,
+      "note": "send_message met en file durable sans ouvrir de tour, followup_task ouvre un tour sur un enfant idle ou rejoint le tour en cours d'un enfant running (jamais un second tour concurrent). Une reprise reconstruit le graphe, les noms et le courrier non delivre: ce qui tournait est ferme avec la cause du redemarrage, ce qui etait idle reste adressable et sa prochaine relance rouvre son propre journal. Un journal enfant illisible rend CET enfant failed avec cause visible et laisse ses freres pilotables. Un shutdown parent persiste une cause terminale par descendant actif, timeout compris, dans l'ordre causal du journal."
     },
     {
       "id": "US-013",
       "title": "Unifier multi-agent direct et Code Mode",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-008",
         "US-012"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-07-29",
+      "completed_at": "2026-07-29",
+      "reviewed_at": null,
+      "note": "Les six outils restent dispatchables depuis une cellule quand un modele code_mode_only les cache de sa surface: le PlanDispatcher est construit sur le meme ToolDispatchSnapshot, donc les deux chemins rendent le meme contenu, le meme etat et la meme erreur normalisee (prouve outil par outil). Un handoff reveille uniquement l'attente qui l'a demande et ne traverse qu'une fois. Un cycle (nom deja pris), un nom invalide et une escalade d'autorite sont refuses avant creation, sans bruler ni slot ni creation. list_agents nomme le thread proprietaire et l'etat d'attachement, donc le devenir d'un enfant dont l'appelant a disparu est lisible."
     },
     {
       "id": "US-014",
