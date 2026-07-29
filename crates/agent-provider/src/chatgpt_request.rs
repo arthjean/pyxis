@@ -250,6 +250,14 @@ fn assistant_items(blocks: &[ContentBlock], orphan_calls: &HashSet<&str>, input:
                 input.push(json!({
                     "type": "reasoning",
                     "id": id,
+                    // ALWAYS present, empty when the turn replayed no summary.
+                    // The baseline declares it as a plain `Vec` with no
+                    // `skip_serializing_if`, so Codex never omits it, and
+                    // Responses Lite REJECTS an item that lacks it
+                    // (`missing_required_parameter: input[n].summary`). The
+                    // standard dialect tolerates the omission, which is why this
+                    // only ever surfaced on a `use_responses_lite` model.
+                    "summary": [],
                     "encrypted_content": encrypted_content,
                 }));
             }
@@ -737,6 +745,10 @@ mod tests {
         assert!(rs < fc, "reasoning before function_call");
         assert_eq!(input[rs]["id"], "rs_1");
         assert_eq!(input[rs]["encrypted_content"], "ENC");
+        // The baseline never omits `summary`, and Responses Lite refuses the
+        // request outright when it is missing. Found live on `gpt-5.6-sol`:
+        // `missing_required_parameter: input[n].summary`.
+        assert_eq!(input[rs]["summary"], json!([]), "summary is always emitted");
 
         // ORPHAN reasoning (message without tool_use) -> skipped (no 400).
         let orphan = Message::assistant(vec![
