@@ -86,6 +86,48 @@ pub fn resolve_from(login_shell: Option<&std::ffi::OsStr>) -> ShellChoice {
     }
 }
 
+/// Shell explicitly requested by a call (`exec_command.shell`, US-014). Unlike
+/// [`resolve`], an unusable request is REFUSED instead of being silently
+/// downgraded: a command written for one shell does not mean the same thing in
+/// another, and the refusal has to land before the process is spawned (AC4).
+#[cfg(not(windows))]
+pub fn select_requested(requested: &str) -> Result<ShellChoice, String> {
+    let path = PathBuf::from(requested);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if !POSIX_SHELLS.contains(&name) {
+        return Err(format!(
+            "shell `{requested}` refused: Pyxis runs POSIX shells only ({})",
+            POSIX_SHELLS.join(", ")
+        ));
+    }
+    // A bare name is left to PATH resolution at spawn time; a PATH given
+    // explicitly must designate an executable, which we can check right now.
+    if path.parent().is_some_and(|p| !p.as_os_str().is_empty()) && !is_executable(&path) {
+        return Err(format!(
+            "shell `{requested}` refused: not an executable file"
+        ));
+    }
+    Ok(ShellChoice {
+        program: path,
+        label: requested.to_string(),
+    })
+}
+
+#[cfg(windows)]
+pub fn select_requested(requested: &str) -> Result<ShellChoice, String> {
+    let choice = resolve();
+    if requested.eq_ignore_ascii_case(&choice.label) {
+        return Ok(choice);
+    }
+    Err(format!(
+        "shell `{requested}` refused: this host only runs {}",
+        choice.label
+    ))
+}
+
 /// Reports that the login shell refused to start: subsequent calls,
 /// including what is announced to the model, fall back on `sh`.
 pub fn mark_login_shell_unusable() {
@@ -135,6 +177,21 @@ mod tests {
         let choice = resolve_from(Some(OsStr::new("/bin/sh")));
         assert_eq!(choice.program, PathBuf::from("/bin/sh"));
         assert_eq!(choice.label, "/bin/sh");
+    }
+
+    // US-014 AC4: an explicit request is honored or REFUSED, never downgraded.
+    #[test]
+    fn an_explicit_shell_request_is_honored_or_named_in_the_refusal() {
+        assert_eq!(select_requested("bash").unwrap().label, "bash");
+        assert_eq!(
+            select_requested("/bin/sh").unwrap().program,
+            PathBuf::from("/bin/sh")
+        );
+        let refused = select_requested("/usr/bin/fish").unwrap_err();
+        assert!(refused.contains("fish"), "{refused}");
+        let missing = select_requested("/nonexistent/bin/bash").unwrap_err();
+        assert!(missing.contains("executable"), "{missing}");
+        assert!(select_requested("").is_err());
     }
 
     #[test]
