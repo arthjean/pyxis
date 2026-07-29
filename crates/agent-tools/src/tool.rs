@@ -78,6 +78,11 @@ pub struct ToolCtx {
     /// Progressive output of the current call (US-015). `None` = no
     /// consumer: tools then emit nothing.
     pub output: Option<OutputSink>,
+    /// Identifier the current call was dispatched under (EP-005). `None`
+    /// outside a dispatch. A tool that must be correlated with what the CLIENT
+    /// is showing (an app-server dynamic tool) reads it here rather than
+    /// guessing from its own arguments.
+    pub call_id: Option<agent_core::message::ToolCallId>,
 }
 
 impl std::fmt::Debug for ToolCtx {
@@ -114,6 +119,7 @@ impl ToolCtx {
             sessions: crate::exec_session::ExecSessions::new(),
             harden: None,
             output: None,
+            call_id: None,
         }
     }
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -139,9 +145,11 @@ impl ToolCtx {
         self.sandbox_observer = Some(observer);
         self
     }
-    /// Context derived for ONE call, equipped with its output emitter (US-015).
-    pub fn with_output_sink(&self, output: OutputSink) -> Self {
+    /// Context derived for ONE call: its identifier and its output emitter
+    /// (US-015). Both are per-call facts, so they are set in one place.
+    pub fn for_call(&self, call_id: agent_core::message::ToolCallId, output: OutputSink) -> Self {
         let mut ctx = self.clone();
+        ctx.call_id = Some(call_id);
         ctx.output = Some(output);
         ctx
     }

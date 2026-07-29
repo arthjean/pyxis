@@ -434,7 +434,7 @@ impl Registry {
             .hooks
             .intercepts(HookEvent::PostToolUse, &call.name)
             .then(|| call.input.clone());
-        let ctx = self.ctx.with_output_sink({
+        let ctx = self.ctx.for_call(id.clone(), {
             let events = events.clone();
             let id = id.clone();
             std::sync::Arc::new(move |chunk: String| {
