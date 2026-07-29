@@ -25,6 +25,8 @@ pub mod patch;
 pub mod path;
 pub mod permission;
 pub mod plan;
+#[cfg(unix)]
+pub mod pty;
 pub mod read;
 pub mod registry;
 pub mod sandbox;
