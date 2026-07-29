@@ -213,6 +213,7 @@ dependencies = [
  "base64",
  "futures-util",
  "globset",
+ "nix",
  "regex",
  "serde",
  "serde_json",

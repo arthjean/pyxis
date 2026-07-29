@@ -40,6 +40,12 @@ similar.workspace = true
 base64.workspace = true
 tracing.workspace = true
 
+# EP-004/US-014: PTY sessions. Unix-only by construction (`openpty`), which is
+# also the platform this version targets; the `tty: true` request is refused
+# before spawn everywhere else.
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 # US-020: proves what the trace carries per level, without a real subscriber

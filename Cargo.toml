@@ -52,6 +52,12 @@ async-trait = "0.1"
 async-stream = "0.3"
 futures-util = "0.3"
 eventsource-stream = "0.2"
+# EP-004: `exec_command` allocates a PTY when the model asks for `tty: true`.
+# Three syscalls need it and nothing else does: `openpty`, `setsid` (the child
+# owns its session, so the group can be signalled without touching Pyxis) and
+# `killpg`. The crate is ALREADY in the graph (keyring/secret-service), so this
+# promotes a transitive dependency instead of adding one.
+nix = { version = "0.31", features = ["term", "process", "fs", "signal"] }
 # FS tools (Glob/Grep): standard, lightweight, already in the registry cache.
 regex = "1"
 globset = "0.4"
