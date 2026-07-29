@@ -29,13 +29,15 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::agent::{
-    AGENT_WAIT_WINDOW, AgentAuthority, AgentError, AgentGraph, AgentRecord, AgentState,
+    AGENT_WAIT_WINDOW, AgentAuthority, AgentError, AgentGraph, AgentMessage, AgentRecord,
+    AgentState,
 };
 use crate::context::TurnContextSource;
 use crate::event::ThreadEventPayload;
 use crate::handoff::{AgentHandoff, HandoffDraft};
 use crate::id::{AgentId, EventId, IdGenerator, ThreadId};
 use crate::lifecycle::TurnState;
+use crate::path::AgentPath;
 use crate::runner::TurnRunner;
 use crate::store::ThreadStore;
 use crate::thread::{
@@ -65,10 +67,17 @@ pub trait AgentJournal: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ChildRequest {
     pub agent_id: AgentId,
+    /// Canonical task name of the child. A client may use it to name what it
+    /// builds; it must never widen anything from it.
+    pub name: AgentPath,
     pub parent_thread_id: ThreadId,
     pub child_thread_id: ThreadId,
     pub task: String,
     pub authority: AgentAuthority,
+    /// `true` when the child's thread already exists and is being reopened
+    /// after a restart. An implementation must then resume the SAME durable
+    /// log instead of creating a second one (US-012 AC1).
+    pub resumed: bool,
 }
 
 /// The three pieces a child thread runs on. Same triple as a root thread: a
@@ -93,22 +102,47 @@ pub trait AgentSpawner: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSpawned {
     pub agent_id: AgentId,
+    pub name: AgentPath,
     pub thread_id: ThreadId,
     pub authority: AgentAuthority,
+}
+
+/// What became of a message the parent addressed to a child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentDelivery {
+    /// Delivered into the turn the child was already running. It reaches the
+    /// child at its next safe point; no second turn is opened (US-012 AC2).
+    Steered,
+    /// Opened a new turn on an idle child.
+    Started,
+    /// Durably queued on an idle child WITHOUT opening a turn. Handed over the
+    /// next time one of its turns starts.
+    Queued,
+}
+
+impl AgentDelivery {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Steered => "steered",
+            Self::Started => "started",
+            Self::Queued => "queued",
+        }
+    }
 }
 
 /// Identity handed back for an accepted parent message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentSent {
     pub agent_id: AgentId,
-    /// True when the message steered a running turn instead of opening one.
-    pub steered: bool,
+    pub delivery: AgentDelivery,
 }
 
 /// What a listing shows. Deliberately NOT the transcript (US-013 AC3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentView {
     pub agent_id: AgentId,
+    /// Canonical task name, the handle a v2 model addresses.
+    pub name: AgentPath,
     pub parent_thread_id: ThreadId,
     pub thread_id: ThreadId,
     pub task: String,
@@ -117,6 +151,12 @@ pub struct AgentView {
     pub authority: String,
     /// Turn the child is on, when it is running one.
     pub turn: Option<TurnStatus>,
+    /// Messages queued on this child and not taken yet.
+    pub pending_messages: usize,
+    /// `true` while this process holds the child's live thread. `false` for a
+    /// child restored from a log and not reopened yet: its fate is the parent
+    /// thread's, never a cell's (US-013 AC4).
+    pub attached: bool,
     pub elapsed_ms: u64,
 }
 
@@ -165,6 +205,9 @@ pub struct AgentSupervisor {
     handoffs: Mutex<HashMap<AgentId, Pending>>,
     /// Parent messages already accepted, by idempotency key (US-014 AC5).
     accepted: Mutex<HashMap<String, AgentSent>>,
+    /// Messages queued on a child and not taken yet, in acceptance order. The
+    /// durable half lives in the parent's log; this is the live view of it.
+    pending: Mutex<Vec<AgentMessage>>,
     /// Transitions the parent's log refused while it was closing. Handed back
     /// at shutdown so the actor, which is still the writer, can persist them
     /// itself instead of leaving the graph to be repaired at the next resume.
@@ -203,6 +246,7 @@ impl AgentSupervisor {
             children: Mutex::new(HashMap::new()),
             handoffs: Mutex::new(HashMap::new()),
             accepted: Mutex::new(HashMap::new()),
+            pending: Mutex::new(Vec::new()),
             unrecorded: Mutex::new(Vec::new()),
             finished: Notify::new(),
             tracker: TaskTracker::new(),
@@ -267,6 +311,12 @@ impl AgentSupervisor {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    fn lock_pending(&self) -> std::sync::MutexGuard<'_, Vec<AgentMessage>> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Records a transition through the parent's log, or keeps it for the
     /// actor when the mailbox is already closed.
     async fn journal(&self, payload: ThreadEventPayload) {
@@ -291,9 +341,11 @@ impl AgentSupervisor {
         )
     }
 
-    /// Restores the graph of a resumed thread (US-012 AC5).
-    pub(crate) fn restore(&self, records: Vec<AgentRecord>) {
+    /// Restores the graph and the undelivered mail of a resumed thread
+    /// (US-012 AC1).
+    pub(crate) fn restore(&self, records: Vec<AgentRecord>, messages: Vec<AgentMessage>) {
         self.graph.restore(records);
+        *self.lock_pending() = messages;
         // A restored handoff is already history: marking it delivered is what
         // keeps a replayed terminal from being injected twice (US-015 AC6).
         let mut handoffs = self.lock_handoffs();
@@ -322,10 +374,14 @@ impl AgentSupervisor {
     /// behind (US-012 AC1/AC4).
     pub async fn spawn(
         self: &Arc<Self>,
+        task_name: &str,
         task: impl Into<String>,
         request: &AgentAuthority,
     ) -> Result<AgentSpawned, AgentError> {
         let link = self.link()?;
+        // The name is validated FIRST, before a slot and before a creation is
+        // burned: a malformed `task_name` must cost nothing (US-013 AC3).
+        let name = self.graph.canonical_name(task_name)?;
         let task = bounded_task(task.into());
         let authority = self.authority.grant(request);
         let agent_id = AgentId::generate(self.ids.as_ref());
@@ -333,6 +389,7 @@ impl AgentSupervisor {
 
         self.graph.reserve(
             agent_id,
+            name.clone(),
             child_thread_id,
             task.clone(),
             authority.clone(),
@@ -345,6 +402,7 @@ impl AgentSupervisor {
             .journal
             .record(ThreadEventPayload::AgentLinked {
                 agent_id,
+                name: Some(name.clone()),
                 child_thread_id,
                 task: task.clone(),
                 authority: authority.clone(),
@@ -360,12 +418,57 @@ impl AgentSupervisor {
             return Err(err.into());
         }
 
+        let handle = self
+            .attach_child(agent_id, &name, child_thread_id, &task, &authority, false)
+            .await?;
+
+        if let Err(err) = handle.submit(Submission::new(task)).await {
+            handle.shutdown().await;
+            return Err(self.fail(agent_id, err.to_string()).await);
+        }
+
+        tracing::debug!(
+            target: "pyxis::runtime",
+            thread_id = %link.thread_id,
+            agent_id = %agent_id,
+            name = %name,
+            child_thread_id = %child_thread_id,
+            authority = %authority.label(),
+            "sub-agent spawned"
+        );
+        Ok(AgentSpawned {
+            agent_id,
+            name,
+            thread_id: child_thread_id,
+            authority,
+        })
+    }
+
+    /// Builds the child's thread and starts watching it. Shared by a spawn and
+    /// by a reopening, which differ only in whether the log already exists and
+    /// whether a first turn is submitted.
+    ///
+    /// The event subscription is taken BEFORE the caller can submit anything: a
+    /// broadcast delivers nothing that predates its receiver, and a child that
+    /// answers instantly would otherwise hand back an empty summary.
+    async fn attach_child(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        name: &AgentPath,
+        child_thread_id: ThreadId,
+        task: &str,
+        authority: &AgentAuthority,
+        resumed: bool,
+    ) -> Result<Arc<ThreadHandle>, AgentError> {
+        let link = self.link()?;
         let request = ChildRequest {
             agent_id,
+            name: name.clone(),
             parent_thread_id: link.thread_id,
             child_thread_id,
-            task: task.clone(),
+            task: task.to_string(),
             authority: authority.clone(),
+            resumed,
         };
         let parts = match self.spawner.spawn(&request).await {
             Ok(parts) => parts,
@@ -389,15 +492,17 @@ impl AgentSupervisor {
             Err(err) => return Err(self.fail(agent_id, err.to_string()).await),
         };
 
-        // Subscribed BEFORE the first turn opens: a broadcast delivers nothing
-        // that predates its receiver, and a child that answers instantly would
-        // otherwise hand back an empty summary.
         let events = handle.subscribe();
-        if let Err(err) = handle.submit(Submission::new(task)).await {
-            handle.shutdown().await;
-            return Err(self.fail(agent_id, err.to_string()).await);
-        }
-
+        // A reopened child comes back with the terminal of the turn it ran
+        // BEFORE the restart. That handoff was already delivered, so the
+        // watcher starts with it marked as published: without this, the mere
+        // act of reopening a child would hand its parent a second, empty
+        // result for a turn that ended in another process (US-012 AC1).
+        let already_published = handle
+            .resumed()
+            .turn
+            .filter(|turn| turn.state.is_terminal())
+            .map(|turn| turn.turn_id);
         self.lock_children().insert(
             agent_id,
             Child {
@@ -406,22 +511,44 @@ impl AgentSupervisor {
             },
         );
         let supervisor = Arc::downgrade(self);
-        self.tracker
-            .spawn(async move { watch(supervisor, agent_id, handle, cancel, events).await });
+        let watched = Arc::clone(&handle);
+        self.tracker.spawn(async move {
+            watch(
+                supervisor,
+                agent_id,
+                watched,
+                cancel,
+                events,
+                already_published,
+            )
+            .await
+        });
+        Ok(handle)
+    }
 
-        tracing::debug!(
-            target: "pyxis::runtime",
-            thread_id = %link.thread_id,
-            agent_id = %agent_id,
-            child_thread_id = %child_thread_id,
-            authority = %authority.label(),
-            "sub-agent spawned"
-        );
-        Ok(AgentSpawned {
-            agent_id,
-            thread_id: child_thread_id,
-            authority,
-        })
+    /// Reopens the durable thread of a child this process does not hold
+    /// (US-012 AC1).
+    ///
+    /// A restart leaves the graph and the log, not the actors. The first
+    /// operation addressed to a restored child rebuilds it from its own log; a
+    /// log that is missing or unreadable makes THAT child `failed` with a
+    /// visible cause and leaves its siblings drivable (US-012 AC4).
+    async fn reopen(
+        self: &Arc<Self>,
+        record: &AgentRecord,
+    ) -> Result<Arc<ThreadHandle>, AgentError> {
+        if let Some(handle) = self.lock_children().get(&record.agent_id) {
+            return Ok(Arc::clone(&handle.handle));
+        }
+        self.attach_child(
+            record.agent_id,
+            &record.name,
+            record.thread_id,
+            &record.task,
+            &record.authority,
+            true,
+        )
+        .await
     }
 
     /// Frees the slot of a spawn that could not be created and records why
@@ -448,12 +575,14 @@ impl AgentSupervisor {
     pub fn list(&self) -> Vec<AgentView> {
         let parent_thread_id = self.parent.get().map(|link| link.thread_id);
         let children = self.lock_children();
+        let pending = self.lock_pending();
         let now = self.clock.now_ms();
         self.graph
             .records()
             .into_iter()
             .map(|record| AgentView {
                 agent_id: record.agent_id,
+                name: record.name.clone(),
                 parent_thread_id: parent_thread_id.unwrap_or(record.thread_id),
                 thread_id: record.thread_id,
                 task: record.task,
@@ -462,6 +591,11 @@ impl AgentSupervisor {
                 turn: children
                     .get(&record.agent_id)
                     .and_then(|child| child.handle.status().turn),
+                pending_messages: pending
+                    .iter()
+                    .filter(|queued| queued.agent_id == record.agent_id)
+                    .count(),
+                attached: children.contains_key(&record.agent_id),
                 elapsed_ms: record
                     .ended_at_ms
                     .unwrap_or(now)
@@ -526,17 +660,55 @@ impl AgentSupervisor {
         ready
     }
 
-    /// Sends a message to a child (US-014).
+    /// Resolves what a model wrote into a child of this thread.
+    pub fn resolve(&self, target: &str) -> Result<AgentRecord, AgentError> {
+        self.graph.resolve(target)
+    }
+
+    /// Queues a message on a child WITHOUT opening a turn (v2 `send_message`).
     ///
-    /// A running child is STEERED, through the same protocol a user steers with;
-    /// an idle one opens a new turn. Which of the two happened is reported, not
-    /// decided by the caller: only the supervisor knows the child's state at the
-    /// instant the message is accepted.
-    pub async fn send(
-        &self,
+    /// A running child is steered, so the message reaches it at its next safe
+    /// point; an idle one keeps it in the parent's durable mail until one of its
+    /// turns starts. Neither path opens a second concurrent turn, which is the
+    /// whole difference with [`Self::followup_task`].
+    pub async fn send_message(
+        self: &Arc<Self>,
         agent_id: AgentId,
         text: impl Into<String>,
         client_message_id: Option<String>,
+    ) -> Result<AgentSent, AgentError> {
+        self.deliver(agent_id, text.into(), client_message_id, false)
+            .await
+    }
+
+    /// Sends a follow-up task: a new turn on an idle child, a steer on a
+    /// running one (v2 `followup_task`, US-012 AC2).
+    pub async fn followup_task(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        text: impl Into<String>,
+        client_message_id: Option<String>,
+    ) -> Result<AgentSent, AgentError> {
+        self.deliver(agent_id, text.into(), client_message_id, true)
+            .await
+    }
+
+    /// Compatibility alias of [`Self::followup_task`].
+    pub async fn send(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        text: impl Into<String>,
+        client_message_id: Option<String>,
+    ) -> Result<AgentSent, AgentError> {
+        self.followup_task(agent_id, text, client_message_id).await
+    }
+
+    async fn deliver(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        text: String,
+        client_message_id: Option<String>,
+        open_turn: bool,
     ) -> Result<AgentSent, AgentError> {
         if let Some(key) = &client_message_id
             && let Some(prior) = self.lock_accepted().get(key).copied()
@@ -546,28 +718,69 @@ impl AgentSupervisor {
             return Ok(prior);
         }
         let record = self.reachable(agent_id)?;
-        let handle = self.handle_of(agent_id)?;
-        let submission = Submission {
-            text: text.into(),
-            client_message_id: client_message_id.clone(),
-        };
+        // A child restored from a log has no live actor until something
+        // addresses it; the first message is what reopens its thread.
+        let handle = self.reopen(&record).await?;
+        let message_id = client_message_id
+            .clone()
+            .unwrap_or_else(|| self.next_message_id());
 
         let sent = if record.state.is_active() {
-            handle.steer(submission, None).await?;
+            handle
+                .steer(
+                    Submission {
+                        text,
+                        client_message_id: Some(message_id.clone()),
+                    },
+                    None,
+                )
+                .await?;
             AgentSent {
                 agent_id,
-                steered: true,
+                delivery: AgentDelivery::Steered,
+            }
+        } else if !open_turn {
+            // Durable BEFORE it is acknowledged, like every accepted operation:
+            // a message the log does not carry is a message a restart loses.
+            self.journal(ThreadEventPayload::AgentMessageQueued {
+                agent_id,
+                message_id: message_id.clone(),
+                text: text.clone(),
+            })
+            .await;
+            self.lock_pending().push(AgentMessage {
+                agent_id,
+                message_id: message_id.clone(),
+                text,
+            });
+            AgentSent {
+                agent_id,
+                delivery: AgentDelivery::Queued,
             }
         } else {
             // A slot first: a child coming back to life costs the same
             // concurrency as a new one.
             self.graph.resume(agent_id)?;
-            match handle.submit(submission).await {
-                Ok(_) => AgentSent {
-                    agent_id,
-                    steered: false,
-                },
+            let taken = self.take_pending(agent_id);
+            let composed = compose_turn(&taken, &text);
+            match handle
+                .submit(Submission {
+                    text: composed,
+                    client_message_id: Some(message_id.clone()),
+                })
+                .await
+            {
+                Ok(_) => {
+                    self.mark_delivered(&taken).await;
+                    AgentSent {
+                        agent_id,
+                        delivery: AgentDelivery::Started,
+                    }
+                }
                 Err(err) => {
+                    // Nothing was consumed: the queue keeps what the refused
+                    // turn would have carried.
+                    self.lock_pending().extend(taken);
                     self.graph
                         .transition(agent_id, AgentState::Idle, None, self.clock.now_ms());
                     return Err(err.into());
@@ -580,14 +793,40 @@ impl AgentSupervisor {
         Ok(sent)
     }
 
+    /// Identifier of a message the caller did not key itself. Derived from the
+    /// injected generator, so a deterministic test replays the same keys.
+    fn next_message_id(&self) -> String {
+        EventId::generate(self.ids.as_ref()).to_string()
+    }
+
+    /// Takes the mail queued on a child, in acceptance order.
+    fn take_pending(&self, agent_id: AgentId) -> Vec<AgentMessage> {
+        let mut pending = self.lock_pending();
+        let (taken, kept) = std::mem::take(&mut *pending)
+            .into_iter()
+            .partition(|queued| queued.agent_id == agent_id);
+        *pending = kept;
+        taken
+    }
+
+    async fn mark_delivered(&self, taken: &[AgentMessage]) {
+        for message in taken {
+            self.journal(ThreadEventPayload::AgentMessageDelivered {
+                agent_id: message.agent_id,
+                message_id: message.message_id.clone(),
+            })
+            .await;
+        }
+    }
+
     /// Interrupts one child (US-014 AC3).
     ///
     /// Signals its running turn, then closes its cancellation node. Only that
     /// branch: a sibling and the parent keep running, which is the whole point
     /// of hanging every child off a token of its own.
-    pub async fn interrupt(&self, agent_id: AgentId) -> Result<(), AgentError> {
-        self.reachable(agent_id)?;
-        let handle = self.handle_of(agent_id)?;
+    pub async fn interrupt(self: &Arc<Self>, agent_id: AgentId) -> Result<(), AgentError> {
+        let record = self.reachable(agent_id)?;
+        let handle = self.reopen(&record).await?;
         let cancel = self
             .lock_children()
             .get(&agent_id)
@@ -595,6 +834,12 @@ impl AgentSupervisor {
         let _ = handle.interrupt(None).await;
         if let Some(cancel) = cancel {
             cancel.cancel();
+        }
+        if !record.state.is_active() {
+            // Nothing was running, so no terminal turn will be observed: the
+            // closure is recorded here or it is recorded nowhere.
+            self.close(agent_id, Some("interrupted: closed by its parent".into()))
+                .await;
         }
         tracing::debug!(target: "pyxis::runtime", agent_id = %agent_id, "sub-agent interruption signalled");
         Ok(())
@@ -627,6 +872,42 @@ impl AgentSupervisor {
         if drained.is_err() {
             tracing::warn!("sub-agents did not unwind inside {CHILD_DRAIN:?}");
         }
+        // Whatever the drain did, no descendant may be left without a terminal
+        // state: a child still open here did not answer its cancellation, and
+        // that timeout is a durable cause, not a log line (US-012 AC3). The
+        // records are walked in creation order, so the causal chain the parent
+        // persists is the one the tree actually has.
+        let now = self.clock.now_ms();
+        for record in self.graph.records() {
+            // Only what was RUNNING. An idle child holds no process and no
+            // slot, and its own log is durable: closing it here would make a
+            // shutdown destroy state a restart is supposed to find (AC1).
+            if !record.state.is_active() {
+                continue;
+            }
+            let cause = if drained.is_err() {
+                format!(
+                    "interrupted: the sub-agent did not unwind within {} ms of the parent shutdown",
+                    CHILD_DRAIN.as_millis()
+                )
+            } else {
+                "interrupted: the parent thread shut down".to_string()
+            };
+            if self.graph.transition(
+                record.agent_id,
+                AgentState::Interrupted,
+                Some(cause.clone()),
+                now,
+            ) {
+                self.journal(ThreadEventPayload::AgentStateChanged {
+                    agent_id: record.agent_id,
+                    to: AgentState::Interrupted,
+                    cause: Some(cause),
+                })
+                .await;
+            }
+        }
+        self.finished.notify_waiters();
     }
 
     /// The record of a child this thread owns and can still address.
@@ -641,18 +922,26 @@ impl AgentSupervisor {
         }
     }
 
-    fn handle_of(&self, agent_id: AgentId) -> Result<Arc<ThreadHandle>, AgentError> {
-        self.lock_children()
-            .get(&agent_id)
-            .map(|child| Arc::clone(&child.handle))
-            .ok_or(AgentError::Unreachable { agent_id })
+    /// Drops the LIVE thread of a child that already reported, without touching
+    /// its state or its handoff.
+    ///
+    /// A child that reported is idle: it holds no slot, no process, and its own
+    /// log is durable. Recording a terminal here would erase exactly what makes
+    /// it reopenable after a restart (US-012 AC1), and erasing its handoff would
+    /// lose a result its parent has not read yet. So this only forgets the
+    /// actor; [`Self::reopen`] rebuilds one when something addresses the child
+    /// again.
+    fn detach(&self, agent_id: AgentId) {
+        self.lock_children().remove(&agent_id);
+        self.finished.notify_waiters();
     }
 
     /// Closes a child WITHOUT touching its handoff.
     ///
-    /// Used when a child that already reported is torn down: being closed
-    /// afterwards must not erase what it produced and its parent has not read
-    /// yet.
+    /// Used by [`Self::interrupt`] on a child that has no turn to interrupt:
+    /// there is no terminal for the watcher to observe, so the refusal has to
+    /// be recorded here. The handoff is left alone, because being closed must
+    /// not erase a result the parent has not read yet.
     async fn close(&self, agent_id: AgentId, cause: Option<String>) {
         if self.graph.transition(
             agent_id,
@@ -666,9 +955,8 @@ impl AgentSupervisor {
                 cause,
             })
             .await;
-            self.lock_children().remove(&agent_id);
-            self.finished.notify_waiters();
         }
+        self.detach(agent_id);
     }
 
     /// Publishes what a child owes its parent at a handoff point.
@@ -712,6 +1000,22 @@ impl AgentSupervisor {
         }
         self.finished.notify_waiters();
     }
+}
+
+/// Text of the turn a follow-up opens: the mail queued while the child was
+/// idle, in acceptance order, then the follow-up itself. Nothing is dropped and
+/// nothing is reordered, so a child reads its parent in the order it spoke.
+fn compose_turn(queued: &[AgentMessage], text: &str) -> String {
+    if queued.is_empty() {
+        return text.to_string();
+    }
+    let mut composed = String::new();
+    for message in queued {
+        composed.push_str(&message.text);
+        composed.push_str("\n\n");
+    }
+    composed.push_str(text);
+    composed
 }
 
 /// Bounds the brief a child is spawned with.
@@ -798,10 +1102,12 @@ async fn watch(
     handle: Arc<ThreadHandle>,
     cancel: CancellationToken,
     mut events: broadcast::Receiver<crate::thread::RuntimeEvent>,
+    // Terminal turn the child already handed off before this process saw it.
+    already_published: Option<crate::id::TurnId>,
 ) {
     let mut status = handle.status_watch();
     let mut draft = DraftCollector::default();
-    let mut published: Option<crate::id::TurnId> = None;
+    let mut published: Option<crate::id::TurnId> = already_published;
 
     loop {
         // Fold in everything already buffered BEFORE reading the state: the
@@ -862,16 +1168,20 @@ async fn watch(
     // that already reported keeps that report, because being torn down does not
     // erase a result its parent has not read yet.
     if let Some(supervisor) = supervisor.upgrade() {
-        let cause = "interrupted: sub-agent stopped".to_string();
         let reported = supervisor
             .graph()
             .get(agent_id)
             .is_some_and(|record| !record.state.is_active());
         if reported {
-            supervisor.close(agent_id, Some(cause)).await;
+            supervisor.detach(agent_id);
         } else {
             supervisor
-                .publish(agent_id, AgentState::Interrupted, Some(cause), draft.take())
+                .publish(
+                    agent_id,
+                    AgentState::Interrupted,
+                    Some("interrupted: sub-agent stopped".to_string()),
+                    draft.take(),
+                )
                 .await;
         }
     }

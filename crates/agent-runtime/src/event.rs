@@ -65,7 +65,9 @@ impl ThreadEvent {
             ThreadEventPayload::ThreadCreated
             | ThreadEventPayload::ModelRuntimeResolved { .. }
             | ThreadEventPayload::AgentLinked { .. }
-            | ThreadEventPayload::AgentStateChanged { .. } => None,
+            | ThreadEventPayload::AgentStateChanged { .. }
+            | ThreadEventPayload::AgentMessageQueued { .. }
+            | ThreadEventPayload::AgentMessageDelivered { .. } => None,
         }
     }
 }
@@ -121,6 +123,11 @@ pub enum ThreadEventPayload {
     /// do without replaying the tool pipeline.
     AgentLinked {
         agent_id: AgentId,
+        /// Canonical task name of the child (`/root/<task_name>`). Absent in a
+        /// log written before v2 named its children; a resume then falls back
+        /// on the opaque handle rather than inventing a name (edge case #13).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<crate::path::AgentPath>,
         child_thread_id: ThreadId,
         task: String,
         authority: AgentAuthority,
@@ -132,6 +139,22 @@ pub enum ThreadEventPayload {
         to: AgentState,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cause: Option<String>,
+    },
+    /// A message the parent addressed to a child and the child has not taken
+    /// yet (US-012 AC1). `send_message` opens no turn, so without this event a
+    /// restart would lose everything queued on an idle child.
+    AgentMessageQueued {
+        agent_id: AgentId,
+        /// Idempotency key. The same one is queued once and delivered once.
+        message_id: String,
+        text: String,
+    },
+    /// The queued message reached the child. Written when the delivery is
+    /// accepted, so a resume replays neither a message already taken nor a turn
+    /// that already started (FR-08).
+    AgentMessageDelivered {
+        agent_id: AgentId,
+        message_id: String,
     },
 }
 
@@ -229,6 +252,7 @@ mod tests {
         for payload in [
             ThreadEventPayload::AgentLinked {
                 agent_id,
+                name: Some(crate::path::AgentPath::root().join("explorer").unwrap()),
                 child_thread_id: ThreadId::generate(&ids),
                 task: "explorer les tests".into(),
                 authority: AgentAuthority::read_only(),
@@ -237,6 +261,15 @@ mod tests {
                 agent_id,
                 to: AgentState::Failed,
                 cause: Some("provider indisponible".into()),
+            },
+            ThreadEventPayload::AgentMessageQueued {
+                agent_id,
+                message_id: "msg-1".into(),
+                text: "une precision".into(),
+            },
+            ThreadEventPayload::AgentMessageDelivered {
+                agent_id,
+                message_id: "msg-1".into(),
             },
         ] {
             let event = ThreadEvent {
@@ -250,6 +283,21 @@ mod tests {
             assert_eq!(serde_json::from_str::<ThreadEvent>(&line).unwrap(), event);
             assert_eq!(event.turn_id(), None, "an agent event owns no turn");
         }
+
+        // Edge case #13: a filiation written before v2 named its children still
+        // replays, without a name and without a rewrite.
+        let legacy = r#"{"event_id":"evt_00000000000000000000000000000009",
+            "thread_id":"thr_00000000000000000000000000000008","seq":1,"at_ms":0,
+            "payload":{"kind":"agent_linked",
+            "agent_id":"agt_00000000000000000000000000000007",
+            "child_thread_id":"thr_00000000000000000000000000000006",
+            "task":"ancienne tache","authority":{"read_only":true,"granted":[]}}}"#;
+        assert!(matches!(
+            serde_json::from_str::<ThreadEvent>(legacy)
+                .expect("a pre-v2 filiation still replays")
+                .payload,
+            ThreadEventPayload::AgentLinked { name: None, .. }
+        ));
     }
 
     #[test]

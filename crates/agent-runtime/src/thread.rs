@@ -492,14 +492,16 @@ impl ThreadHandle {
             );
         }
 
-        // US-012 AC5: a child the log left open belongs to a process that is
+        // US-012 AC1: a child the log left RUNNING belongs to a process that is
         // gone. Closing it here, once, is what keeps a restart from inheriting
-        // a phantom slot.
+        // a phantom slot. A child left IDLE held no slot and no process, and its
+        // own log is durable, so it survives the restart addressable and no
+        // event is written for it.
         for record in &mut resumed.agents {
-            if record.state.is_terminal() {
+            if !record.state.is_active() {
                 continue;
             }
-            let cause = format!("interrupted: recovered from `{}` at resume", record.state);
+            let cause = crate::agent::RESTART_CAUSE.to_string();
             actor
                 .commit(ThreadEventPayload::AgentStateChanged {
                     agent_id: record.agent_id,
@@ -519,7 +521,7 @@ impl ThreadHandle {
                 }),
                 token.child_token(),
             );
-            agents.restore(resumed.agents.clone());
+            agents.restore(resumed.agents.clone(), resumed.agent_messages.clone());
         }
 
         actor.start_next_turn().await;

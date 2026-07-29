@@ -18,6 +18,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::id::{AgentId, ThreadId};
+use crate::path::{AgentPath, AgentPathError};
 
 /// Children a thread may run AT ONCE. The bound is on concurrency, which is
 /// what actually costs provider calls and context.
@@ -29,6 +30,10 @@ pub const MAX_AGENTS_PER_ROOT: usize = 8;
 pub const MAX_AGENT_DEPTH: usize = 1;
 /// How long a wait blocks before answering "still running" instead (US-013 AC4).
 pub const AGENT_WAIT_WINDOW: Duration = Duration::from_secs(10);
+/// Cause persisted for a child whose turn a restart interrupted. Named so every
+/// surface reports the same sentence for the same event (US-019).
+pub const RESTART_CAUSE: &str =
+    "interrupted: the process restarted while the sub-agent was running";
 
 /// Lifecycle of a sub-agent, from its parent's point of view.
 ///
@@ -207,10 +212,37 @@ impl Default for AgentAuthority {
     }
 }
 
+/// A message the parent addressed to a child and the child has not taken yet.
+///
+/// `send_message` opens no turn, so a queued message is durable state of the
+/// PARENT: it survives a restart and is handed to the child the next time one
+/// of its turns starts (US-012 AC1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentMessage {
+    pub agent_id: AgentId,
+    /// Idempotency key. The same one is queued once and delivered once.
+    pub message_id: String,
+    pub text: String,
+}
+
+/// Name of a child a pre-v2 log declared without one: the opaque handle itself.
+///
+/// An identifier is `agt_<32 hex>`, which is already a valid segment, so a
+/// legacy child is addressable by a name that is visibly not a task name rather
+/// than by a name the resume invented (edge case #13).
+pub fn legacy_name(agent_id: AgentId) -> AgentPath {
+    AgentPath::root()
+        .join(&agent_id.to_string())
+        .unwrap_or_else(|_| AgentPath::root())
+}
+
 /// One child in the parent-owned graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRecord {
     pub agent_id: AgentId,
+    /// Canonical task name (`/root/<task_name>`). What a v2 model addresses the
+    /// child by, and what survives a restart when the opaque handle does not.
+    pub name: AgentPath,
     /// Durable thread of the child. It survives the child's death.
     pub thread_id: ThreadId,
     /// Task the child was spawned for. Bounded at spawn time.
@@ -238,8 +270,18 @@ pub enum AgentError {
     /// so a probe cannot tell them apart.
     #[error("sub-agent {agent_id} is not reachable from this thread")]
     Unreachable { agent_id: AgentId },
+    /// Same refusal, for a target named rather than identified.
+    #[error("no sub-agent named `{target}` is reachable from this thread")]
+    UnknownTarget { target: AgentPath },
     #[error("sub-agent runtime is not attached to a thread")]
     Detached,
+    /// A task name already used in this thread. Refused BEFORE anything is
+    /// created: reusing a name would make one handle point at two children and
+    /// is the shape a spawn cycle takes (US-013 AC3).
+    #[error("task name `{name}` is already used by a sub-agent of this thread")]
+    NameTaken { name: AgentPath },
+    #[error(transparent)]
+    InvalidName(#[from] AgentPathError),
     #[error("sub-agent could not be created: {0}")]
     Spawn(String),
     #[error(transparent)]
@@ -254,6 +296,10 @@ pub enum AgentError {
 #[derive(Debug)]
 pub struct AgentGraph {
     depth: usize,
+    /// Canonical path of the thread that OWNS this graph. Children hang under
+    /// it, so a name a model writes is resolved from the caller's position and
+    /// never from a global namespace.
+    base: AgentPath,
     state: Mutex<GraphState>,
 }
 
@@ -272,14 +318,53 @@ impl AgentGraph {
     /// Graph of a thread sitting `depth` levels below the root. At
     /// [`MAX_AGENT_DEPTH`] every spawn is refused.
     pub fn at_depth(depth: usize) -> Self {
+        Self::under(AgentPath::root(), depth)
+    }
+
+    /// Graph of the thread sitting at `base`, `depth` levels below the root.
+    pub fn under(base: AgentPath, depth: usize) -> Self {
         Self {
             depth,
+            base,
             state: Mutex::new(GraphState::default()),
         }
     }
 
     pub fn depth(&self) -> usize {
         self.depth
+    }
+
+    /// Canonical path of the owning thread.
+    pub fn base(&self) -> &AgentPath {
+        &self.base
+    }
+
+    /// Canonical name a `task_name` would produce here, validated.
+    pub fn canonical_name(&self, task_name: &str) -> Result<AgentPath, AgentError> {
+        Ok(self.base.join(task_name)?)
+    }
+
+    /// Resolves what a model wrote (`reader`, `/root/reader`) into a child of
+    /// this thread. A reference outside this subtree, or one naming an agent
+    /// this thread does not own, is `Unreachable` like any foreign handle.
+    pub fn resolve(&self, reference: &str) -> Result<AgentRecord, AgentError> {
+        let reference = reference.trim();
+        if let Ok(agent_id) = AgentId::parse(reference) {
+            return self
+                .get(agent_id)
+                .ok_or(AgentError::Unreachable { agent_id });
+        }
+        let path = self.base.resolve(reference)?;
+        self.by_name(&path)
+            .ok_or(AgentError::UnknownTarget { target: path })
+    }
+
+    pub fn by_name(&self, name: &AgentPath) -> Option<AgentRecord> {
+        self.lock()
+            .records
+            .iter()
+            .find(|record| &record.name == name)
+            .cloned()
     }
 
     /// A poisoned lock is recovered rather than propagated: the accounting is
@@ -305,6 +390,7 @@ impl AgentGraph {
     pub fn reserve(
         &self,
         agent_id: AgentId,
+        name: AgentPath,
         thread_id: ThreadId,
         task: String,
         authority: AgentAuthority,
@@ -314,6 +400,12 @@ impl AgentGraph {
             return Err(AgentError::DepthExceeded);
         }
         let mut state = self.lock();
+        // Name uniqueness is checked INSIDE the critical section, next to the
+        // slot: two spawns racing on the same name must not both believe they
+        // own it.
+        if state.records.iter().any(|record| record.name == name) {
+            return Err(AgentError::NameTaken { name });
+        }
         let active = state.records.iter().filter(|r| r.state.is_active()).count();
         if active >= MAX_ACTIVE_AGENTS || state.created >= MAX_AGENTS_PER_ROOT {
             return Err(AgentError::LimitReached {
@@ -324,6 +416,7 @@ impl AgentGraph {
         state.created += 1;
         state.records.push(AgentRecord {
             agent_id,
+            name,
             thread_id,
             task,
             state: AgentState::Running,
@@ -408,19 +501,23 @@ impl AgentGraph {
         self.lock().created
     }
 
-    /// Rebuilds the graph from a resumed log (US-012 AC5).
+    /// Rebuilds the graph from a resumed log (US-012 AC1).
     ///
-    /// A child the log left non-terminal belongs to a process that no longer
-    /// exists, so it is restored as `interrupted`. After this call the active
-    /// count is zero by construction: no phantom slot survives a restart.
+    /// A child the log left RUNNING belongs to a process that no longer exists:
+    /// its turn is closed as `interrupted`, with the cause the restart is. A
+    /// child left IDLE held no slot and no process, and its own thread log is
+    /// durable, so it stays addressable and a follow-up can reopen it. After
+    /// this call the active count is zero either way: no phantom slot survives
+    /// a restart.
     pub fn restore(&self, records: Vec<AgentRecord>) {
         let mut state = self.lock();
         state.created = records.len();
         state.records = records
             .into_iter()
             .map(|mut record| {
-                if !record.state.is_terminal() {
+                if record.state.is_active() {
                     record.state = AgentState::Interrupted;
+                    record.cause = Some(RESTART_CAUSE.to_string());
                 }
                 record
             })
@@ -443,10 +540,34 @@ mod tests {
         SequentialIds::new()
     }
 
+    /// Reserves under a name derived from the generated handle, for the cases
+    /// where the name is not what is under test.
     fn reserve(graph: &AgentGraph, ids: &dyn IdGenerator) -> Result<AgentId, AgentError> {
+        reserve_as(graph, ids, None)
+    }
+
+    /// Reserves under an explicit task name.
+    fn named(
+        graph: &AgentGraph,
+        ids: &dyn IdGenerator,
+        task_name: &str,
+    ) -> Result<AgentId, AgentError> {
+        reserve_as(graph, ids, Some(task_name))
+    }
+
+    fn reserve_as(
+        graph: &AgentGraph,
+        ids: &dyn IdGenerator,
+        task_name: Option<&str>,
+    ) -> Result<AgentId, AgentError> {
         let agent_id = AgentId::generate(ids);
+        let name = match task_name {
+            Some(name) => graph.canonical_name(name)?,
+            None => graph.canonical_name(&agent_id.to_string())?,
+        };
         graph.reserve(
             agent_id,
+            name,
             ThreadId::generate(ids),
             "explorer".into(),
             AgentAuthority::read_only(),
@@ -628,15 +749,18 @@ mod tests {
         assert!(graph.get(stranger).is_none());
     }
 
-    /// US-012 AC5: a graph rebuilt from a log holds no running child and no
-    /// phantom slot.
+    /// US-012 AC1: a graph rebuilt from a log holds no phantom slot. What was
+    /// RUNNING is closed with the restart as its cause; what was IDLE keeps its
+    /// name and stays addressable, because its own log is durable and a
+    /// follow-up must be able to reopen it.
     #[test]
-    fn a_restored_graph_closes_its_orphans_and_frees_every_slot() {
+    fn a_restored_graph_closes_what_was_running_and_keeps_an_idle_child_addressable() {
         let ids = ids();
         let graph = AgentGraph::new();
         let records = vec![
             AgentRecord {
                 agent_id: AgentId::generate(&ids),
+                name: AgentPath::root().join("en_vol").unwrap(),
                 thread_id: ThreadId::generate(&ids),
                 task: "toujours en vol".into(),
                 state: AgentState::Running,
@@ -647,6 +771,7 @@ mod tests {
             },
             AgentRecord {
                 agent_id: AgentId::generate(&ids),
+                name: AgentPath::root().join("en_attente").unwrap(),
                 thread_id: ThreadId::generate(&ids),
                 task: "en attente".into(),
                 state: AgentState::Idle,
@@ -657,6 +782,7 @@ mod tests {
             },
             AgentRecord {
                 agent_id: AgentId::generate(&ids),
+                name: AgentPath::root().join("close").unwrap(),
                 thread_id: ThreadId::generate(&ids),
                 task: "déjà close".into(),
                 state: AgentState::Failed,
@@ -675,15 +801,85 @@ mod tests {
             states,
             vec![
                 AgentState::Interrupted,
-                AgentState::Interrupted,
+                AgentState::Idle,
                 AgentState::Failed
             ]
         );
+        assert_eq!(graph.records()[0].cause.as_deref(), Some(RESTART_CAUSE));
         assert_eq!(
             graph.records()[2].cause.as_deref(),
             Some("provider"),
             "a cause already recorded is not rewritten"
         );
+
+        // The canonical names survive, so a model addresses the same child by
+        // the same handle across a restart.
+        let idle = AgentPath::root().join("en_attente").unwrap();
+        let restored = graph
+            .resolve("en_attente")
+            .expect("the name still resolves");
+        assert_eq!(restored.name, idle);
+        assert!(restored.state.accepts_input());
+        assert!(matches!(
+            graph.resolve("en_vol").map(|record| record.state),
+            Ok(AgentState::Interrupted)
+        ));
+        assert!(matches!(
+            graph.resolve("jamais_cree"),
+            Err(AgentError::UnknownTarget { .. })
+        ));
+    }
+
+    /// A task name is a handle: two children of one thread may not share it,
+    /// and the refusal costs neither a slot nor a creation (US-013 AC3).
+    #[test]
+    fn a_reused_task_name_is_refused_without_burning_a_creation() {
+        let ids = ids();
+        let graph = AgentGraph::new();
+        named(&graph, &ids, "reader").expect("the first name is free");
+        assert!(matches!(
+            named(&graph, &ids, "reader"),
+            Err(AgentError::NameTaken { .. })
+        ));
+        assert_eq!(graph.created(), 1, "a refused name creates nothing");
+        assert_eq!(graph.active(), 1);
+
+        // And a name that is not a name at all never reaches the graph.
+        assert!(matches!(
+            named(&graph, &ids, "Reader"),
+            Err(AgentError::InvalidName(_))
+        ));
+        assert!(matches!(
+            named(&graph, &ids, "root"),
+            Err(AgentError::InvalidName(_))
+        ));
+        assert_eq!(graph.created(), 1);
+    }
+
+    /// A reference is resolved from the graph's OWN base path, so a child of
+    /// another thread is never reachable by name.
+    #[test]
+    fn a_name_resolves_only_inside_the_subtree_that_owns_it() {
+        let ids = ids();
+        let graph = AgentGraph::under(AgentPath::root().join("branch").unwrap(), 0);
+        let agent_id = named(&graph, &ids, "reader").unwrap();
+        assert_eq!(
+            graph.resolve("reader").unwrap().agent_id,
+            agent_id,
+            "a relative reference is resolved from the owner"
+        );
+        assert_eq!(
+            graph.resolve("/root/branch/reader").unwrap().agent_id,
+            agent_id
+        );
+        assert!(matches!(
+            graph.resolve("/root/reader"),
+            Err(AgentError::UnknownTarget { .. })
+        ));
+        assert!(matches!(
+            graph.resolve("agt_00000000000000000000000000000099"),
+            Err(AgentError::Unreachable { .. })
+        ));
     }
 
     /// US-012 AC3: whichever thread wins, exactly one does.

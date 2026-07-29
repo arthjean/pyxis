@@ -22,7 +22,7 @@ use agent_runtime::id::{AgentId, EventId, RandomIds, ThreadId};
 use agent_runtime::lifecycle::TurnState;
 use agent_runtime::runner::RunAgentRunner;
 use agent_runtime::store::{MemoryThreadStore, ThreadStore};
-use agent_runtime::supervisor::{AgentSpawner, AgentSupervisor, WaitOutcome};
+use agent_runtime::supervisor::{AgentDelivery, AgentSpawner, AgentSupervisor, WaitOutcome};
 use agent_runtime::thread::Submission;
 use common::{
     ChildScript, FakeProvider, FakeSession, Harness, InstantClock, Scripted, ScriptedSpawner,
@@ -120,7 +120,11 @@ async fn a_spawn_is_reserved_and_persisted_before_the_child_is_created() {
     let (harness, supervisor) = start(&spawner).await;
 
     let spawned = supervisor
-        .spawn("explorer les tests", &AgentAuthority::read_only())
+        .spawn(
+            "agent_1",
+            "explorer les tests",
+            &AgentAuthority::read_only(),
+        )
         .await
         .expect("the spawn is accepted");
 
@@ -140,7 +144,10 @@ async fn a_spawn_is_reserved_and_persisted_before_the_child_is_created() {
         vec![2],
         "the child is created only once the edge is durable"
     );
-    assert_eq!(supervisor.graph().active(), 1);
+    // The reservation itself, not the child's speed: a fast child may already
+    // have answered and gone idle by the time the spawn returns.
+    assert_eq!(supervisor.graph().created(), 1);
+    assert!(supervisor.graph().get(spawned.agent_id).is_some());
     harness.handle.shutdown().await;
 }
 
@@ -151,14 +158,18 @@ async fn the_v1_limits_refuse_a_spawn_before_anything_is_created() {
     let spawner = ScriptedSpawner::new(vec![hangs(), hangs(), hangs(), hangs()]);
     let (harness, supervisor) = start(&spawner).await;
 
-    for _ in 0..MAX_ACTIVE_AGENTS {
+    for index in 0..MAX_ACTIVE_AGENTS {
         supervisor
-            .spawn("explorer", &AgentAuthority::read_only())
+            .spawn(
+                &format!("agent_{index}"),
+                "explorer",
+                &AgentAuthority::read_only(),
+            )
             .await
             .expect("a slot is available");
     }
     let refused = supervisor
-        .spawn("un de trop", &AgentAuthority::read_only())
+        .spawn("un_de_trop", "un de trop", &AgentAuthority::read_only())
         .await
         .expect_err("the fifth concurrent child must be refused");
 
@@ -186,7 +197,7 @@ async fn a_failed_creation_frees_its_slot_and_records_why() {
     let (harness, supervisor) = start(&spawner).await;
 
     let err = supervisor
-        .spawn("explorer", &AgentAuthority::read_only())
+        .spawn("agent_4", "explorer", &AgentAuthority::read_only())
         .await
         .expect_err("a broken spawner must not produce a child");
     assert!(matches!(err, AgentError::Spawn(cause) if cause.contains("indisponible")));
@@ -219,6 +230,7 @@ async fn a_resumed_thread_closes_its_orphan_children_and_frees_every_slot() {
         ThreadEventPayload::ThreadCreated,
         ThreadEventPayload::AgentLinked {
             agent_id,
+            name: Some(agent_runtime::AgentPath::root().join("orphelin").unwrap()),
             child_thread_id: ThreadId::generate(&RandomIds),
             task: "exploration interrompue par un crash".into(),
             authority: AgentAuthority::read_only(),
@@ -280,7 +292,7 @@ async fn a_child_gets_its_own_durable_thread_and_a_read_only_authority() {
 
     // Asking for a mutating tool from a read-only request grants nothing.
     let spawned = supervisor
-        .spawn("lire le crate", &AgentAuthority::read_only())
+        .spawn("agent_5", "lire le crate", &AgentAuthority::read_only())
         .await
         .unwrap();
     assert!(spawned.authority.is_read_only());
@@ -329,7 +341,11 @@ async fn a_listing_shows_states_and_never_transcripts() {
     let spawner = ScriptedSpawner::new(vec![hangs()]);
     let (harness, supervisor) = start(&spawner).await;
     let spawned = supervisor
-        .spawn("chercher la régression", &AgentAuthority::read_only())
+        .spawn(
+            "agent_6",
+            "chercher la régression",
+            &AgentAuthority::read_only(),
+        )
         .await
         .unwrap();
 
@@ -368,7 +384,11 @@ async fn a_wait_that_finds_nothing_terminal_answers_with_the_running_states() {
     let spawner = ScriptedSpawner::new(vec![hangs()]);
     let (harness, supervisor) = start(&spawner).await;
     supervisor
-        .spawn("longue exploration", &AgentAuthority::read_only())
+        .spawn(
+            "agent_7",
+            "longue exploration",
+            &AgentAuthority::read_only(),
+        )
         .await
         .unwrap();
 
@@ -391,7 +411,11 @@ async fn a_parent_shutdown_closes_its_children_before_its_own_terminal() {
     let harness = common::start_with(hanging_parent_runner(), Some(Arc::clone(&supervisor))).await;
     spawner.watch(Arc::clone(&harness.store));
     let spawned = supervisor
-        .spawn("exploration sans fin", &AgentAuthority::read_only())
+        .spawn(
+            "agent_8",
+            "exploration sans fin",
+            &AgentAuthority::read_only(),
+        )
         .await
         .unwrap();
     let child_store = spawner.store_of(spawned.agent_id);
@@ -454,11 +478,15 @@ async fn a_failing_child_leaves_its_parent_and_its_sibling_alive() {
     let spawner = ScriptedSpawner::new(vec![crashes(), hangs()]);
     let (harness, supervisor) = start(&spawner).await;
     let failing = supervisor
-        .spawn("celui qui casse", &AgentAuthority::read_only())
+        .spawn("agent_9", "celui qui casse", &AgentAuthority::read_only())
         .await
         .unwrap();
     let sibling = supervisor
-        .spawn("celui qui continue", &AgentAuthority::read_only())
+        .spawn(
+            "agent_10",
+            "celui qui continue",
+            &AgentAuthority::read_only(),
+        )
         .await
         .unwrap();
 
@@ -500,7 +528,7 @@ async fn a_message_steers_a_running_child_and_opens_a_turn_on_an_idle_one() {
     ])]);
     let (harness, supervisor) = start(&spawner).await;
     let spawned = supervisor
-        .spawn("chercher", &AgentAuthority::read_only())
+        .spawn("agent_11", "chercher", &AgentAuthority::read_only())
         .await
         .unwrap();
     let provider = spawner.provider_of(spawned.agent_id);
@@ -510,7 +538,11 @@ async fn a_message_steers_a_running_child_and_opens_a_turn_on_an_idle_one() {
         .send(spawned.agent_id, "regarde plutôt les tests", None)
         .await
         .unwrap();
-    assert!(sent.steered, "a running child is steered, not restarted");
+    assert_eq!(
+        sent.delivery,
+        AgentDelivery::Steered,
+        "a running child is steered, not restarted"
+    );
     wait_for(
         || {
             provider
@@ -537,7 +569,11 @@ async fn a_message_steers_a_running_child_and_opens_a_turn_on_an_idle_one() {
         .send(spawned.agent_id, "continue sur cette piste", None)
         .await
         .unwrap();
-    assert!(!sent.steered, "an idle child opens a new turn");
+    assert_eq!(
+        sent.delivery,
+        AgentDelivery::Started,
+        "an idle child opens a new turn"
+    );
 
     let child_store = spawner.store_of(spawned.agent_id);
     let turns: Vec<String> = events(&child_store)
@@ -566,11 +602,15 @@ async fn an_interruption_reaches_one_child_and_spares_its_sibling() {
     let spawner = ScriptedSpawner::new(vec![hangs(), hangs()]);
     let (harness, supervisor) = start(&spawner).await;
     let target = supervisor
-        .spawn("celui qu'on arrête", &AgentAuthority::read_only())
+        .spawn(
+            "agent_12",
+            "celui qu'on arrête",
+            &AgentAuthority::read_only(),
+        )
         .await
         .unwrap();
     let sibling = supervisor
-        .spawn("celui qui reste", &AgentAuthority::read_only())
+        .spawn("agent_13", "celui qui reste", &AgentAuthority::read_only())
         .await
         .unwrap();
 
@@ -602,7 +642,7 @@ async fn an_agent_this_thread_does_not_own_is_refused_without_leaking_anything()
     let spawner = ScriptedSpawner::new(vec![answers("terminé")]);
     let (harness, supervisor) = start(&spawner).await;
     let mine = supervisor
-        .spawn("le mien", &AgentAuthority::read_only())
+        .spawn("agent_14", "le mien", &AgentAuthority::read_only())
         .await
         .unwrap();
     supervisor.interrupt(mine.agent_id).await.unwrap();
@@ -654,7 +694,7 @@ async fn a_replayed_message_is_delivered_once_and_order_is_preserved() {
     let spawner = ScriptedSpawner::new(vec![hangs()]);
     let (harness, supervisor) = start(&spawner).await;
     let spawned = supervisor
-        .spawn("chercher", &AgentAuthority::read_only())
+        .spawn("agent_15", "chercher", &AgentAuthority::read_only())
         .await
         .unwrap();
     let child_store = spawner.store_of(spawned.agent_id);
@@ -698,7 +738,7 @@ async fn a_finished_child_hands_back_an_untrusted_summary_exactly_once() {
     let spawner = ScriptedSpawner::new(vec![answers("trois pistes, la deuxième tient")]);
     let (harness, supervisor) = start(&spawner).await;
     let spawned = supervisor
-        .spawn("explorer", &AgentAuthority::read_only())
+        .spawn("agent_16", "explorer", &AgentAuthority::read_only())
         .await
         .unwrap();
 
@@ -728,7 +768,7 @@ async fn a_failed_child_still_hands_back_its_state_and_cause() {
     let spawner = ScriptedSpawner::new(vec![crashes()]);
     let (harness, supervisor) = start(&spawner).await;
     supervisor
-        .spawn("celui qui casse", &AgentAuthority::read_only())
+        .spawn("agent_17", "celui qui casse", &AgentAuthority::read_only())
         .await
         .unwrap();
 

@@ -286,6 +286,18 @@ impl MemoryThreadStore {
         }
     }
 
+    /// Reopens a closed in-memory log, keeping everything it holds.
+    ///
+    /// The durable half of a restart: a process going away closes its store,
+    /// the state it wrote is still there, and the next process opens the same
+    /// log. A file adapter gets that for free; the in-memory one needs this to
+    /// let a test exercise the same path.
+    pub fn reopen(&self) {
+        if let Ok(mut state) = self.lock() {
+            state.closed = false;
+        }
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, MemoryState>, StoreError> {
         self.state
             .lock()

@@ -37,7 +37,10 @@ pub mod write;
 #[cfg(test)]
 mod tests_integration;
 
-pub use agent::{InterruptAgent, ListAgents, SendAgent, SpawnAgent, WaitAgent};
+pub use agent::{
+    AgentHandle, FollowupTask, InterruptAgent, ListAgents, MULTI_AGENT_V2_TOOLS, SendMessage,
+    SpawnAgent, WaitAgent,
+};
 pub use bash::Bash;
 pub use code_mode::{CodeModeHandle, CodeModeSessionFactory, ExecTool, WaitTool};
 pub use command::{CommandClass, classify};

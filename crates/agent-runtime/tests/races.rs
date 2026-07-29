@@ -439,18 +439,22 @@ async fn two_spawns_for_the_last_slot_leave_exactly_one_winner() {
 
         for index in 0..MAX_ACTIVE_AGENTS - 1 {
             supervisor
-                .spawn(format!("tâche {index}"), &AgentAuthority::read_only())
+                .spawn(
+                    &format!("agent_{index}"),
+                    format!("tâche {index}"),
+                    &AgentAuthority::read_only(),
+                )
                 .await
                 .expect("the slots before the last one are free");
         }
 
         let read_only = AgentAuthority::read_only();
         let (first, second) = tokio::join!(
-            supervisor.spawn("premier candidat".to_string(), &read_only),
+            supervisor.spawn("premier", "premier candidat".to_string(), &read_only),
             async {
                 jitter(round).await;
                 supervisor
-                    .spawn("second candidat".to_string(), &read_only)
+                    .spawn("second", "second candidat".to_string(), &read_only)
                     .await
             }
         );

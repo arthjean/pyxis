@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use agent_core::message::{INTERRUPTED_TOOL_RESULT, Message, ToolErrorKind, unanswered_tool_calls};
 
-use crate::agent::{AgentRecord, AgentState};
+use crate::agent::{AgentMessage, AgentRecord, AgentState};
 use crate::context::TurnContext;
 use crate::event::{ForkOrigin, ThreadEventPayload};
 use crate::id::{ThreadId, TurnId};
@@ -51,6 +51,9 @@ pub struct ResumedThread {
     /// closed by [`crate::agent::AgentGraph::restore`]: the plan describes the
     /// log, the graph decides what a restart makes of it (US-012 AC5).
     pub agents: Vec<AgentRecord>,
+    /// Messages queued on a child and not delivered yet, in log order
+    /// (US-012 AC1). A delivered one is absent: the log says it was taken.
+    pub agent_messages: Vec<AgentMessage>,
 }
 
 impl ResumedThread {
@@ -83,6 +86,7 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
     let mut accepted: HashMap<String, Accepted> = HashMap::new();
     let mut submitted: Vec<(TurnId, Submission)> = Vec::new();
     let mut agents: Vec<AgentRecord> = Vec::new();
+    let mut agent_messages: Vec<AgentMessage> = Vec::new();
     let mut turn_context: Option<TurnContext> = None;
     let mut thread_created = false;
 
@@ -130,11 +134,17 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
             }
             ThreadEventPayload::AgentLinked {
                 agent_id,
+                name,
                 child_thread_id,
                 task,
                 authority,
             } => agents.push(AgentRecord {
                 agent_id: *agent_id,
+                // A log written before v2 named its children keeps the opaque
+                // handle as its name: explicit legacy value, no rewrite.
+                name: name
+                    .clone()
+                    .unwrap_or_else(|| crate::agent::legacy_name(*agent_id)),
                 thread_id: *child_thread_id,
                 task: task.clone(),
                 state: AgentState::Running,
@@ -153,6 +163,25 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
                     record.cause = cause.clone();
                     record.ended_at_ms = (!to.is_active()).then_some(event.at_ms);
                 }
+            }
+            ThreadEventPayload::AgentMessageQueued {
+                agent_id,
+                message_id,
+                text,
+            } => {
+                if !agent_messages
+                    .iter()
+                    .any(|queued| queued.message_id == *message_id)
+                {
+                    agent_messages.push(AgentMessage {
+                        agent_id: *agent_id,
+                        message_id: message_id.clone(),
+                        text: text.clone(),
+                    });
+                }
+            }
+            ThreadEventPayload::AgentMessageDelivered { message_id, .. } => {
+                agent_messages.retain(|queued| queued.message_id != *message_id);
             }
             ThreadEventPayload::Forked { .. } => {}
         }
@@ -194,6 +223,7 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
             accepted,
             origin: snapshot.origin,
             agents,
+            agent_messages,
         },
         unfinished,
         queued,

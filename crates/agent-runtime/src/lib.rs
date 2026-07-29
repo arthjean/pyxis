@@ -22,6 +22,7 @@ pub mod handoff;
 pub mod id;
 pub mod inputs;
 pub mod lifecycle;
+pub mod path;
 pub mod resume;
 pub mod runner;
 pub mod store;
@@ -47,6 +48,7 @@ pub use id::{
 };
 pub use inputs::TurnInputs;
 pub use lifecycle::{LifecycleError, TurnLifecycle, TurnState};
+pub use path::{AgentPath, AgentPathError, MAX_AGENT_NAME, MAX_AGENT_PATH, ROOT_PATH};
 pub use resume::ResumedThread;
 pub use runner::{RunAgentRunner, TurnOutcome, TurnRequest, TurnRunner};
 pub use store::{

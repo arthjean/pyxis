@@ -686,11 +686,11 @@ async fn a_failing_child_leaves_the_parent_and_its_siblings_alive() {
     .await;
 
     let doomed = supervisor
-        .spawn("tâche qui échoue", &AgentAuthority::read_only())
+        .spawn("agent_1", "tâche qui échoue", &AgentAuthority::read_only())
         .await
         .expect("the spawn is accepted");
     let sibling = supervisor
-        .spawn("tâche qui réussit", &AgentAuthority::read_only())
+        .spawn("agent_2", "tâche qui réussit", &AgentAuthority::read_only())
         .await
         .expect("the sibling spawns");
 
@@ -796,7 +796,11 @@ async fn cancelling_the_parent_closes_every_child_before_its_own_terminal() {
     .await;
     for index in 0..2 {
         supervisor
-            .spawn(format!("tâche {index}"), &AgentAuthority::read_only())
+            .spawn(
+                &format!("agent_{index}"),
+                format!("tâche {index}"),
+                &AgentAuthority::read_only(),
+            )
             .await
             .expect("the spawn is accepted");
     }
