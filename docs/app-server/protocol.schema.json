@@ -1,0 +1,1213 @@
+{
+  "$defs": {
+    "ApprovalDecision": {
+      "description": "The four answers a client may give: allow or refuse, once or for the\nsession. Aborting the turn is NOT one of them, because that is\n`turn/interrupt` and it must reach the model and the tools, not just this\none call. A `*ForSession` answer is remembered only when the request said it\nwas memoizable; the pipeline, never the client, decides that.",
+      "enum": [
+        "approved",
+        "approvedForSession",
+        "declined",
+        "declinedForSession"
+      ],
+      "type": "string"
+    },
+    "ApprovalDecisionResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "decision": {
+          "$ref": "#/$defs/ApprovalDecision"
+        }
+      },
+      "required": [
+        "decision"
+      ],
+      "type": "object"
+    },
+    "ClientInfo": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "CommandExecutionApprovalParams": {
+      "properties": {
+        "callId": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "itemId": {
+          "type": "string"
+        },
+        "memoRefused": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "memoizable": {
+          "description": "The answer may be remembered for the session.",
+          "type": "boolean"
+        },
+        "mode": {
+          "description": "The permission mode in force when the request was raised.",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "taintForced": {
+          "description": "The request was forced by recent untrusted content: approving it opts\nout of the prompt-injection defense for this call.",
+          "type": "boolean"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "threadId",
+        "itemId",
+        "callId",
+        "command",
+        "reason",
+        "taintForced",
+        "mode",
+        "memoizable"
+      ],
+      "type": "object"
+    },
+    "DynamicToolCallParams": {
+      "properties": {
+        "arguments": true,
+        "callId": {
+          "type": "string"
+        },
+        "itemId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "threadId",
+        "itemId",
+        "callId",
+        "tool",
+        "arguments"
+      ],
+      "type": "object"
+    },
+    "DynamicToolCallResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "description": "What the model reads. Untrusted like any other tool output.",
+          "type": "string"
+        },
+        "isError": {
+          "default": false,
+          "type": "boolean"
+        },
+        "structuredContent": true
+      },
+      "required": [
+        "content"
+      ],
+      "type": "object"
+    },
+    "DynamicToolSpec": {
+      "additionalProperties": false,
+      "description": "A tool the client executes on the model's behalf.",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "inputSchema": true,
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "inputSchema"
+      ],
+      "type": "object"
+    },
+    "EmptyResult": {
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "ErrorNotification": {
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "message"
+      ],
+      "type": "object"
+    },
+    "FileChangeApprovalParams": {
+      "properties": {
+        "callId": {
+          "type": "string"
+        },
+        "input": {
+          "description": "The tool input, verbatim, so a client can render a real diff."
+        },
+        "itemId": {
+          "type": "string"
+        },
+        "memoRefused": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "memoizable": {
+          "type": "boolean"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "taintForced": {
+          "type": "boolean"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "threadId",
+        "itemId",
+        "callId",
+        "tool",
+        "paths",
+        "input",
+        "reason",
+        "taintForced",
+        "mode",
+        "memoizable"
+      ],
+      "type": "object"
+    },
+    "InitializeParams": {
+      "additionalProperties": false,
+      "properties": {
+        "clientInfo": {
+          "$ref": "#/$defs/ClientInfo"
+        },
+        "protocolVersion": {
+          "description": "Protocol version the client asks for. Absent means \"the oldest this\nbuild still speaks\", never \"whatever the server prefers\".",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "clientInfo"
+      ],
+      "type": "object"
+    },
+    "InitializeResult": {
+      "properties": {
+        "capabilities": {
+          "$ref": "#/$defs/ServerCapabilities"
+        },
+        "protocolVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "serverInfo": {
+          "$ref": "#/$defs/ServerInfo"
+        }
+      },
+      "required": [
+        "serverInfo",
+        "protocolVersion",
+        "capabilities"
+      ],
+      "type": "object"
+    },
+    "InputItem": {
+      "oneOf": [
+        {
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ItemDeltaNotification": {
+      "properties": {
+        "delta": {
+          "type": "string"
+        },
+        "itemId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "threadId",
+        "itemId",
+        "delta"
+      ],
+      "type": "object"
+    },
+    "ItemNotification": {
+      "properties": {
+        "item": {
+          "$ref": "#/$defs/ThreadItem"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "threadId",
+        "item"
+      ],
+      "type": "object"
+    },
+    "ItemStatus": {
+      "enum": [
+        "inProgress",
+        "completed",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "ServerCapabilities": {
+      "description": "What this build can actually do. Published BEFORE any mutation so a client\nnever discovers a missing capability by having a call fail.",
+      "properties": {
+        "dynamicTools": {
+          "description": "Client-declared tools may be registered at `thread/start`.",
+          "type": "boolean"
+        },
+        "maxOpenThreads": {
+          "description": "How many threads this server hosts at once. One, in this build: the tool\nregistry, the Code Mode session and the sub-agent handle of the process\neach belong to the open thread.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maxQueuedBytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maxQueuedEvents": {
+          "description": "Queue bound past which a slow client is closed (US-018 AC4).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "methods": {
+          "description": "Methods served by this build.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "notifications": {
+          "description": "Notifications this build may push.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "serverRequests": {
+          "description": "Requests this build may send to the client. A client that answers none\nof them will see every approval fail closed.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "methods",
+        "notifications",
+        "serverRequests",
+        "dynamicTools",
+        "maxOpenThreads",
+        "maxQueuedEvents",
+        "maxQueuedBytes"
+      ],
+      "type": "object"
+    },
+    "ServerInfo": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "type": "object"
+    },
+    "ServerRequestResolution": {
+      "description": "Why a pending server request stopped waiting (US-017 AC3/AC4).",
+      "oneOf": [
+        {
+          "const": "answered",
+          "description": "The client answered it.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "The turn was interrupted or the thread closed under it. The client must\ndrop the dialog: an answer sent afterwards is refused.",
+          "type": "string"
+        }
+      ]
+    },
+    "ServerRequestResolvedNotification": {
+      "properties": {
+        "itemId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requestId": {
+          "description": "The `id` of the server request, as a string whatever its JSON type.",
+          "type": "string"
+        },
+        "resolution": {
+          "$ref": "#/$defs/ServerRequestResolution"
+        },
+        "threadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "requestId",
+        "resolution"
+      ],
+      "type": "object"
+    },
+    "ThreadClosedNotification": {
+      "properties": {
+        "reason": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "ThreadItem": {
+      "description": "One projected element of a thread. The same shapes are served by\n`thread/items/list` and by `item/started` / `item/completed`, so a client\nwrites one renderer.",
+      "oneOf": [
+        {
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "userMessage",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "assistantMessage",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "callId": {
+              "type": "string"
+            },
+            "command": {
+              "type": "string"
+            },
+            "exitCode": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "id": {
+              "type": "string"
+            },
+            "output": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/$defs/ItemStatus"
+            },
+            "type": {
+              "const": "commandExecution",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "callId",
+            "command",
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "callId": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "output": {
+              "type": "string"
+            },
+            "paths": {
+              "description": "Workspace-relative paths the call declared it would touch.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "status": {
+              "$ref": "#/$defs/ItemStatus"
+            },
+            "type": {
+              "const": "fileChange",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "callId",
+            "paths",
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Everything the two families above do not cover: MCP, multi-agent, Code\nMode, reads, and every client-side dynamic tool.",
+          "properties": {
+            "callId": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "input": true,
+            "output": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/$defs/ItemStatus"
+            },
+            "tool": {
+              "type": "string"
+            },
+            "type": {
+              "const": "toolCall",
+              "type": "string"
+            },
+            "untrusted": {
+              "description": "The result carries untrusted content (taint).",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "callId",
+            "tool",
+            "input",
+            "status",
+            "untrusted"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "const": "error",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "message"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ThreadItemsListParams": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "description": "Opaque cursor returned by the previous page. Absent starts at the first\nitem.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pageSize": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "ThreadItemsListResult": {
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/$defs/ThreadItem"
+          },
+          "type": "array"
+        },
+        "nextCursor": {
+          "description": "Absent on the last page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "type": "object"
+    },
+    "ThreadRef": {
+      "additionalProperties": false,
+      "description": "Names a thread. Used on its own as the parameter of `thread/unsubscribe`.",
+      "properties": {
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "ThreadResumeParams": {
+      "additionalProperties": false,
+      "properties": {
+        "dynamicTools": {
+          "items": {
+            "$ref": "#/$defs/DynamicToolSpec"
+          },
+          "type": "array"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "ThreadStartParams": {
+      "additionalProperties": false,
+      "properties": {
+        "dynamicTools": {
+          "description": "Tools the CLIENT executes. They enter the same registry, the same\npermission pipeline and the same dispatch as the built-in ones\n(US-017 AC2).",
+          "items": {
+            "$ref": "#/$defs/DynamicToolSpec"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "ThreadStartedNotification": {
+      "properties": {
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "ThreadStartedResult": {
+      "properties": {
+        "itemCount": {
+          "description": "Items already in the durable log. Read them with `thread/items/list`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId",
+        "itemCount"
+      ],
+      "type": "object"
+    },
+    "ToolApprovalParams": {
+      "properties": {
+        "callId": {
+          "type": "string"
+        },
+        "input": true,
+        "itemId": {
+          "type": "string"
+        },
+        "memoRefused": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "memoizable": {
+          "type": "boolean"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "taintForced": {
+          "type": "boolean"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "threadId",
+        "itemId",
+        "callId",
+        "tool",
+        "input",
+        "summary",
+        "reason",
+        "taintForced",
+        "mode",
+        "memoizable"
+      ],
+      "type": "object"
+    },
+    "TurnCompletedNotification": {
+      "properties": {
+        "cause": {
+          "description": "Terminal cause, as the durable log recorded it. Present whenever the\nruntime recorded one, which is what makes a failure diagnosable instead\nof silent (FR-19).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/TurnStatus"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId",
+        "turnId",
+        "status"
+      ],
+      "type": "object"
+    },
+    "TurnDeltaNotification": {
+      "properties": {
+        "delta": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "threadId",
+        "delta"
+      ],
+      "type": "object"
+    },
+    "TurnInterruptParams": {
+      "additionalProperties": false,
+      "properties": {
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "description": "Absent interrupts whatever is running.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "TurnStartParams": {
+      "additionalProperties": false,
+      "properties": {
+        "clientMessageId": {
+          "description": "Idempotency key. Two `turn/start` carrying the same key open one turn.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input": {
+          "items": {
+            "$ref": "#/$defs/InputItem"
+          },
+          "type": "array"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId",
+        "input"
+      ],
+      "type": "object"
+    },
+    "TurnStartedNotification": {
+      "properties": {
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId",
+        "turnId"
+      ],
+      "type": "object"
+    },
+    "TurnStartedResult": {
+      "properties": {
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId",
+        "turnId"
+      ],
+      "type": "object"
+    },
+    "TurnStatus": {
+      "enum": [
+        "completed",
+        "interrupted",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "TurnSteerParams": {
+      "additionalProperties": false,
+      "properties": {
+        "clientMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input": {
+          "items": {
+            "$ref": "#/$defs/InputItem"
+          },
+          "type": "array"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "description": "The turn the client believes it is correcting. Naming a turn that is no\nlonger running is refused instead of becoming a new turn.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "threadId",
+        "input"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "methods": [
+    {
+      "method": "initialize",
+      "params": {
+        "$ref": "#/$defs/InitializeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/InitializeResult"
+      }
+    },
+    {
+      "method": "thread/start",
+      "params": {
+        "$ref": "#/$defs/ThreadStartParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ThreadStartedResult"
+      }
+    },
+    {
+      "method": "thread/resume",
+      "params": {
+        "$ref": "#/$defs/ThreadResumeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ThreadStartedResult"
+      }
+    },
+    {
+      "method": "thread/unsubscribe",
+      "params": {
+        "$ref": "#/$defs/ThreadRef"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    },
+    {
+      "method": "thread/items/list",
+      "params": {
+        "$ref": "#/$defs/ThreadItemsListParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ThreadItemsListResult"
+      }
+    },
+    {
+      "method": "turn/start",
+      "params": {
+        "$ref": "#/$defs/TurnStartParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TurnStartedResult"
+      }
+    },
+    {
+      "method": "turn/steer",
+      "params": {
+        "$ref": "#/$defs/TurnSteerParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TurnStartedResult"
+      }
+    },
+    {
+      "method": "turn/interrupt",
+      "params": {
+        "$ref": "#/$defs/TurnInterruptParams"
+      },
+      "result": {
+        "$ref": "#/$defs/EmptyResult"
+      }
+    }
+  ],
+  "notifications": [
+    {
+      "method": "error",
+      "params": {
+        "$ref": "#/$defs/ErrorNotification"
+      }
+    },
+    {
+      "method": "thread/started",
+      "params": {
+        "$ref": "#/$defs/ThreadStartedNotification"
+      }
+    },
+    {
+      "method": "thread/closed",
+      "params": {
+        "$ref": "#/$defs/ThreadClosedNotification"
+      }
+    },
+    {
+      "method": "turn/started",
+      "params": {
+        "$ref": "#/$defs/TurnStartedNotification"
+      }
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "$ref": "#/$defs/TurnCompletedNotification"
+      }
+    },
+    {
+      "method": "item/started",
+      "params": {
+        "$ref": "#/$defs/ItemNotification"
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "$ref": "#/$defs/ItemNotification"
+      }
+    },
+    {
+      "method": "item/agentMessage/delta",
+      "params": {
+        "$ref": "#/$defs/ItemDeltaNotification"
+      }
+    },
+    {
+      "method": "item/commandExecution/outputDelta",
+      "params": {
+        "$ref": "#/$defs/ItemDeltaNotification"
+      }
+    },
+    {
+      "method": "turn/reasoning/delta",
+      "params": {
+        "$ref": "#/$defs/TurnDeltaNotification"
+      }
+    },
+    {
+      "method": "serverRequest/resolved",
+      "params": {
+        "$ref": "#/$defs/ServerRequestResolvedNotification"
+      }
+    }
+  ],
+  "protocolVersion": 1,
+  "serverRequests": [
+    {
+      "method": "item/commandExecution/requestApproval",
+      "params": {
+        "$ref": "#/$defs/CommandExecutionApprovalParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ApprovalDecisionResponse"
+      }
+    },
+    {
+      "method": "item/fileChange/requestApproval",
+      "params": {
+        "$ref": "#/$defs/FileChangeApprovalParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ApprovalDecisionResponse"
+      }
+    },
+    {
+      "method": "item/tool/requestApproval",
+      "params": {
+        "$ref": "#/$defs/ToolApprovalParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ApprovalDecisionResponse"
+      }
+    },
+    {
+      "method": "item/tool/call",
+      "params": {
+        "$ref": "#/$defs/DynamicToolCallParams"
+      },
+      "result": {
+        "$ref": "#/$defs/DynamicToolCallResponse"
+      }
+    }
+  ],
+  "title": "Pyxis app-server protocol"
+}

@@ -1,0 +1,35 @@
+[package]
+name = "agent-app-server"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# App-server (EP-005): the external client contract. Owns the JSON-RPC surface,
+# the thread/turn/item projection and the transports; owns NOTHING of the
+# runtime assembly, which stays the binary's job behind [`host::RuntimeHost`].
+# That seam is what keeps the crate testable without a provider, a keyring or a
+# sandbox.
+[dependencies]
+agent-core.workspace = true
+agent-runtime.workspace = true
+agent-tools.workspace = true
+# `io-std`: the stdio transport reads the process's own standard input.
+tokio = { workspace = true, features = ["io-std"] }
+tokio-util.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-std", "io-util", "test-util"] }
