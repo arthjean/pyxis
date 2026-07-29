@@ -6,6 +6,7 @@
 //! subprocesses inherit the confinement (fork-safe, see `agent_sandbox::fs`).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod app_server;
 mod approver;
 mod code_mode;
 mod context;
@@ -76,6 +77,13 @@ struct Args {
     overload_fallback_model: Option<String>,
     /// Output format of the headless mode (US-017). `Text` by default.
     output_format: jsonl::OutputFormat,
+    /// `--app-server` (EP-005): serve the JSON-RPC client contract instead of
+    /// opening a TUI or running one prompt.
+    app_server: bool,
+    /// `--listen <addr>`: serve the same contract over WebSocket as well.
+    app_server_listen: Option<String>,
+    /// `--emit-schemas <dir>`: write the published protocol schemas and exit.
+    emit_schemas: Option<String>,
     help: bool,
 }
 
@@ -122,6 +130,14 @@ Options:
       --overload-fallback-model <slug>  Fallback model on overload
       --output-format <text|json>       Headless output: final text (default) or
                                         one JSON event per line (docs/EVENT_SCHEMA.md)
+      --app-server                      Serve the JSON-RPC client contract on
+                                        standard input/output instead of opening
+                                        a TUI (docs/app-server/README.md)
+      --listen <addr>                   Also serve that contract over WebSocket.
+                                        Loopback addresses only; the bearer token
+                                        is printed on stderr at startup
+      --emit-schemas <dir>              Write the app-server JSON Schema and
+                                        TypeScript declarations there, then exit
   -h, --help                            Show this help
 
 Configuration (TOML), by increasing precedence. `/status` names the layer every
@@ -186,6 +202,9 @@ where
         output_cost_micro_per_ktok: None,
         overload_fallback_model: None,
         output_format: jsonl::OutputFormat::Text,
+        app_server: false,
+        app_server_listen: None,
+        emit_schemas: None,
         help: false,
     };
     let mut it = raw.into_iter().peekable();
@@ -284,6 +303,11 @@ where
                     anyhow::anyhow!("--output-format: expected `text` or `json`, got `{raw}`")
                 })?;
             }
+            // EP-005: the third client. `app-server` is accepted as a bare word
+            // too, since that is how Codex names the same mode.
+            "--app-server" | "app-server" => args.app_server = true,
+            "--listen" => args.app_server_listen = Some(next_value(&mut it, "--listen")?),
+            "--emit-schemas" => args.emit_schemas = Some(next_value(&mut it, "--emit-schemas")?),
             other => {
                 // A bare argument without -p is treated as the prompt.
                 if other.starts_with('-') {
@@ -299,8 +323,83 @@ where
     }
     if !args.help {
         validate_ephemeral(&args)?;
+        validate_app_server(&args)?;
     }
     Ok(args)
+}
+
+/// EP-005: the app-server drives threads on behalf of a client, so it cannot
+/// also be a one-shot run or an ephemeral one. Refused rather than silently
+/// ignoring whichever flag came second.
+fn validate_app_server(args: &Args) -> anyhow::Result<()> {
+    if !args.app_server {
+        if args.app_server_listen.is_some() {
+            anyhow::bail!("--listen requires --app-server");
+        }
+        return Ok(());
+    }
+    if args.print || args.prompt.is_some() {
+        anyhow::bail!("--app-server and -p/--print are incompatible");
+    }
+    if args.ephemeral {
+        anyhow::bail!("--app-server and --ephemeral are incompatible");
+    }
+    if args.resume.is_some() {
+        anyhow::bail!(
+            "--app-server and --resume are incompatible: a client resumes with `thread/resume`"
+        );
+    }
+    Ok(())
+}
+
+/// Serves the app-server on stdio, plus WebSocket when an address was given.
+///
+/// The two transports share ONE protocol actor, so the ownership of a thread is
+/// arbitrated across them: a WebSocket client asking for the thread the stdio
+/// client drives gets the same typed conflict a second stdio client would.
+async fn serve_app_server(
+    server: Arc<agent_app_server::AppServer>,
+    listen: Option<String>,
+) -> anyhow::Result<()> {
+    let websocket = match listen {
+        None => None,
+        Some(raw) => {
+            let addr: std::net::SocketAddr = raw
+                .parse()
+                .map_err(|err| anyhow::anyhow!("--listen `{raw}`: {err}"))?;
+            let token = Arc::new(agent_app_server::mint_token());
+            // On stderr, never on stdout: stdout is the protocol stream.
+            eprintln!("[app-server] ws://{addr} token={token}");
+            let server = Arc::clone(&server);
+            Some(tokio::spawn(async move {
+                agent_app_server::serve_websocket(server, addr, token).await
+            }))
+        }
+    };
+    let outcome = agent_app_server::serve_stdio(server).await;
+    if let Some(websocket) = websocket {
+        websocket.abort();
+    }
+    outcome.map_err(|err| anyhow::anyhow!("{err}"))
+}
+
+/// Writes the published app-server schemas (US-018 AC3).
+///
+/// Deterministic by construction: the generator sorts every map and walks the
+/// method tables in declaration order, so re-running it on one commit rewrites
+/// byte-identical files and the repository diff is the real drift signal.
+fn emit_schemas(dir: &std::path::Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let schema = dir.join(agent_app_server::schema::JSON_SCHEMA_FILE);
+    let types = dir.join(agent_app_server::schema::TYPESCRIPT_FILE);
+    let mut document =
+        serde_json::to_string_pretty(&agent_app_server::schema::json_schema_document())?;
+    document.push('\n');
+    std::fs::write(&schema, document)?;
+    std::fs::write(&types, agent_app_server::schema::typescript())?;
+    println!("{}", schema.display());
+    println!("{}", types.display());
+    Ok(())
 }
 
 /// US-020 AC6: `--ephemeral` contradicts a resume, and outside the headless mode
@@ -743,6 +842,12 @@ fn main() -> anyhow::Result<()> {
     if args.help {
         print!("{HELP}");
         return Ok(());
+    }
+    // EP-005: pure generation, so it runs before the credential, the sandbox and
+    // the runtime. Writing the published contract must never depend on being
+    // able to connect to anything.
+    if let Some(dir) = args.emit_schemas.as_deref() {
+        return emit_schemas(std::path::Path::new(dir));
     }
     // US-020: standard input resolved FIRST, because `args.prompt.is_some()` is
     // what tells the rest of the startup it is running headless.
@@ -1382,7 +1487,16 @@ async fn run(
         );
     }
     let permission_mode = PermissionModeState::new(initial_permission_mode);
-    let approver: Arc<dyn agent_tools::permission::Approver> = if headless {
+    // EP-005: the slot the app-server connection binds itself into. Built here
+    // because the registry is assembled once, before any thread exists, and
+    // fail-closed while nothing is bound: an app-server with no client attached
+    // denies rather than approves.
+    let app_bridge = agent_app_server::ClientBridge::new();
+    let approver: Arc<dyn agent_tools::permission::Approver> = if args.app_server {
+        Arc::new(agent_app_server::BridgeApprover::new(Arc::clone(
+            &app_bridge,
+        )))
+    } else if headless {
         Arc::new(AutoDeny)
     } else {
         Arc::new(TuiApprover::new(perm_tx))
@@ -1582,7 +1696,29 @@ async fn run(
     // fires on every way out, including the failures each branch bails on.
     let output_last_message = args.output_last_message.take();
     let outcome: anyhow::Result<()> = async {
-        if let Some(prompt) = args.prompt {
+        if args.app_server {
+            // EP-005: the third client. It opens no thread at startup: a client
+            // decides which one it drives, and until then this process holds a
+            // provider, a registry and a sandbox and nothing else.
+            let host = app_server::CliHost::new(app_server::CliHostParts {
+                sessions_dir: sessions_dir.clone(),
+                engine,
+                registry: Arc::clone(&registry),
+                settings: Arc::clone(&settings),
+                steps: Arc::clone(&steps),
+                agents: Some(agents.clone()),
+                bridge: Arc::clone(&app_bridge),
+                cancel: tokio_util::sync::CancellationToken::new(),
+            });
+            let server = agent_app_server::AppServer::new(
+                Arc::new(app_server::SharedHost(host)) as Arc<dyn agent_app_server::RuntimeHost>,
+                Arc::clone(&app_bridge),
+            );
+            let outcome = serve_app_server(server, args.app_server_listen.clone()).await;
+            exec_sessions.shutdown();
+            steps.shutdown_code_mode().await;
+            outcome?;
+        } else if let Some(prompt) = args.prompt {
             let outcome = headless::run(headless::HeadlessRun {
                 agents: Some(agents.clone()),
                 prompt,
@@ -1706,6 +1842,9 @@ mod tests {
             output_cost_micro_per_ktok: None,
             overload_fallback_model: None,
             output_format: jsonl::OutputFormat::Text,
+            app_server: false,
+            app_server_listen: None,
+            emit_schemas: None,
             help: false,
         }
     }
@@ -2349,6 +2488,42 @@ mod tests {
         assert!(validate_ephemeral(&a).is_ok());
         a.resume = Some(String::new());
         assert!(validate_ephemeral(&a).is_err());
+    }
+
+    /// EP-005: the app-server drives threads for a client, so it is neither a
+    /// one-shot run nor an ephemeral one, and each contradiction is NAMED
+    /// rather than resolved by whichever flag came last.
+    #[test]
+    fn the_app_server_refuses_the_modes_it_contradicts() {
+        let parsed = parse_args_from(argv(&["--app-server"])).expect("bare mode");
+        assert!(parsed.app_server);
+        assert!(
+            parse_args_from(argv(&["app-server"]))
+                .expect("bare word")
+                .app_server
+        );
+
+        for (argv_case, expected) in [
+            (vec!["--app-server", "-p", "x"], "-p/--print"),
+            (vec!["--app-server", "--ephemeral"], "--ephemeral"),
+            (vec!["--app-server", "--resume", "latest"], "--resume"),
+            (vec!["--listen", "127.0.0.1:7777"], "--listen requires"),
+        ] {
+            let err = parse_args_from(argv(&argv_case))
+                .expect_err("incoherent combination")
+                .to_string();
+            assert!(err.contains(expected), "{argv_case:?} -> {err}");
+        }
+    }
+
+    /// The generated schemas are what the repository holds, and the flag that
+    /// writes them takes a destination.
+    #[test]
+    fn emit_schemas_takes_a_destination() {
+        let parsed =
+            parse_args_from(argv(&["--emit-schemas", "docs/app-server"])).expect("a destination");
+        assert_eq!(parsed.emit_schemas.as_deref(), Some("docs/app-server"));
+        assert!(parse_args_from(argv(&["--emit-schemas"])).is_err());
     }
 
     /// US-020 AC3: the destination is taken as given; no default, no extension.

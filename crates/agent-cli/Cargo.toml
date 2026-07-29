@@ -22,6 +22,8 @@ path = "src/main.rs"
 [dependencies]
 agent-core.workspace = true
 agent-runtime.workspace = true
+# EP-005: the external client contract. The binary supplies its runtime host.
+agent-app-server.workspace = true
 agent-tokenizer.workspace = true
 agent-session.workspace = true
 agent-auth.workspace = true
