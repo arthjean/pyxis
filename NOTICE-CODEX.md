@@ -86,4 +86,14 @@ Nothing structural is derived: `agent-app-server` was written against the
 acceptance criteria of EP-005 and the method table the US-001 verifier extracts
 from the read-only clone, not against the upstream implementation.
 
+As of EP-006 of the same PRD (2026-07-29), the observability and parity-proof
+work adopts **nothing** from Codex, verbatim or structural. That is a finding
+worth recording rather than an omission: the failure taxonomy, the trace
+correlation, the offline coverage recipe and the drift verifier answer Pyxis
+criteria (a shared cause category across four surfaces, opt-in-only remote
+export, a pinned baseline that never follows HEAD) that have no upstream
+counterpart. The only Codex artifacts involved are the ones already recorded:
+the baseline clone, read but never written, and the contract matrix
+`agent-parity` derives from it.
+
 Reference source inventory: `docs/codex-port-inventory.md`.

@@ -4,7 +4,9 @@
 > `docs/parity/codex-baseline-matrix.json`, générée depuis le clone Codex figé
 > au commit `fa1d4c40d0e63eef2e0ba8a9e004ccd0a80b77f5`
 > (`cargo run -p agent-parity -- check`). Ce document décrit un instantané
-> antérieur : il informe, il n'arbitre plus un écart.
+> antérieur : il informe, il n'arbitre plus un écart. L'état réellement livré
+> est dans `docs/CURRENT_STATUS.md`, et la preuve qui l'accompagne dans
+> `docs/parity/offline-suite.md`.
 
 Audit en lecture seule, réalisé le 2026-07-24. Référence amont : Codex CLI (~363k lignes Rust, ~100 crates). Cible : Pyxis (~39k lignes, 10 crates).
 
