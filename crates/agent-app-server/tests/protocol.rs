@@ -425,6 +425,42 @@ async fn a_failed_turn_carries_its_cause() {
     assert_eq!(completed["params"]["cause"], "provider unreachable");
 }
 
+/// US-019 AC1: the cause reaches the client already CLASSIFIED, in the same
+/// vocabulary the TUI prints and the JSONL summary carries, plus the same next
+/// step. A client branches on the category instead of matching free text.
+#[tokio::test]
+async fn a_failed_turn_carries_the_shared_category_and_next_step() {
+    let harness = Harness::new();
+    harness.open_thread().await;
+    harness.turn_running();
+    harness.turn_terminal(TurnState::Failed, Some("provider: 503 from upstream"));
+
+    let completed = harness.next_notification("turn/completed").await;
+    assert_eq!(completed["params"]["causeCategory"], "provider");
+    assert_eq!(
+        completed["params"]["causeGuidance"],
+        agent_runtime::FailureCategory::Provider.guidance()
+    );
+    // The identifiers a surface needs to find the same turn elsewhere.
+    assert_eq!(completed["params"]["threadId"], THREAD_ID);
+    assert_eq!(completed["params"]["turnId"], TURN_ID);
+}
+
+/// A cause the classifier does not recognize is published as `unknown` rather
+/// than guessed into a category that would send a client to the wrong
+/// diagnostic.
+#[tokio::test]
+async fn an_unrecognized_cause_is_published_as_unknown() {
+    let harness = Harness::new();
+    harness.open_thread().await;
+    harness.turn_running();
+    harness.turn_terminal(TurnState::Failed, Some("le moteur a rendu l'âme"));
+
+    let completed = harness.next_notification("turn/completed").await;
+    assert_eq!(completed["params"]["causeCategory"], "unknown");
+    assert_eq!(completed["params"]["cause"], "le moteur a rendu l'âme");
+}
+
 /// AC3: two clients, one writer. The loser is told which thread is held and
 /// nothing of its request took effect.
 #[tokio::test]

@@ -195,6 +195,21 @@
       ],
       "type": "object"
     },
+    "FailureCategory": {
+      "description": "Wire mirror of `agent_runtime::FailureCategory`.\n\nRe-declared here rather than re-exported because the protocol crate owns what\nit publishes: a runtime refactor must not silently rename a client-visible\nvalue. The `From` below is where the two stay in step, and a new runtime\nvariant fails to compile until it is decided here too.",
+      "enum": [
+        "provider",
+        "auth",
+        "context",
+        "invalid_request",
+        "model_runtime",
+        "guardrail",
+        "interrupted",
+        "store",
+        "unknown"
+      ],
+      "type": "string"
+    },
     "FileChangeApprovalParams": {
       "properties": {
         "callId": {
@@ -868,6 +883,24 @@
       "properties": {
         "cause": {
           "description": "Terminal cause, as the durable log recorded it. Present whenever the\nruntime recorded one, which is what makes a failure diagnosable instead\nof silent (FR-19).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "causeCategory": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FailureCategory"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Category the shared classifier read out of `cause` (US-019 AC1), in the\nsame vocabulary the TUI prints and the JSONL summary carries. A client\nbranches on this instead of matching the free text of `cause`."
+        },
+        "causeGuidance": {
+          "description": "Next diagnostic step for that category, identical to the sentence the\nother surfaces show.",
           "type": [
             "string",
             "null"

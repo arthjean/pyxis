@@ -608,6 +608,10 @@ impl Pump {
                         let cause_text = cause
                             .clone()
                             .unwrap_or_else(|| format!("turn {}", terminal_label(*state)));
+                        // US-019 AC1: read once, by the classifier the TUI, the
+                        // headless summary and the durable log all share.
+                        let failure =
+                            agent_runtime::TurnFailure::classify(*state, cause.as_deref());
                         // Exactly one terminal projection per open item, before
                         // the turn is declared over (US-017 AC3).
                         let closed = self.projector.close_open(&cause_text);
@@ -626,6 +630,12 @@ impl Pump {
                                     _ => TurnStatus::Failed,
                                 },
                                 cause: cause.clone(),
+                                cause_category: failure
+                                    .as_ref()
+                                    .map(|failure| failure.category.into()),
+                                cause_guidance: failure
+                                    .as_ref()
+                                    .map(|failure| failure.category.guidance().to_string()),
                             },
                         ));
                         if self.current_turn.as_deref() == Some(turn.as_str()) {

@@ -570,6 +570,51 @@ pub struct TurnCompletedNotification {
     /// of silent (FR-19).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<String>,
+    /// Category the shared classifier read out of `cause` (US-019 AC1), in the
+    /// same vocabulary the TUI prints and the JSONL summary carries. A client
+    /// branches on this instead of matching the free text of `cause`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause_category: Option<FailureCategory>,
+    /// Next diagnostic step for that category, identical to the sentence the
+    /// other surfaces show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause_guidance: Option<String>,
+}
+
+/// Wire mirror of `agent_runtime::FailureCategory`.
+///
+/// Re-declared here rather than re-exported because the protocol crate owns what
+/// it publishes: a runtime refactor must not silently rename a client-visible
+/// value. The `From` below is where the two stay in step, and a new runtime
+/// variant fails to compile until it is decided here too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCategory {
+    Provider,
+    Auth,
+    Context,
+    InvalidRequest,
+    ModelRuntime,
+    Guardrail,
+    Interrupted,
+    Store,
+    Unknown,
+}
+
+impl From<agent_runtime::FailureCategory> for FailureCategory {
+    fn from(category: agent_runtime::FailureCategory) -> Self {
+        match category {
+            agent_runtime::FailureCategory::Provider => Self::Provider,
+            agent_runtime::FailureCategory::Auth => Self::Auth,
+            agent_runtime::FailureCategory::Context => Self::Context,
+            agent_runtime::FailureCategory::InvalidRequest => Self::InvalidRequest,
+            agent_runtime::FailureCategory::ModelRuntime => Self::ModelRuntime,
+            agent_runtime::FailureCategory::Guardrail => Self::Guardrail,
+            agent_runtime::FailureCategory::Interrupted => Self::Interrupted,
+            agent_runtime::FailureCategory::Store => Self::Store,
+            agent_runtime::FailureCategory::Unknown => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

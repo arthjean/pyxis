@@ -49,6 +49,24 @@ des versions servies.
 | `-32005` | le runtime a refusé (mailbox pleine, arrêt, journal) |
 | `-32006` | file client saturée : la connexion se ferme |
 
+## Causes terminales
+
+`turn/completed` porte `status`, puis trois champs facultatifs qui décrivent
+l'échec : `cause` (le texte que le journal durable a enregistré),
+`causeCategory` et `causeGuidance`. Les deux derniers viennent du
+classificateur partagé (`agent_runtime::TurnFailure`), celui qui alimente aussi
+la TUI, la sortie stderr de `pyxis -p` et le champ `cause_category` de la ligne
+`run_summary` : les quatre surfaces ne peuvent donc pas nommer deux catégories
+différentes pour la même cause (EP-006/US-019 AC1).
+
+Un client **branche sur `causeCategory`**, jamais sur le texte de `cause`. Les
+valeurs sont fermées et publiées dans le schéma : `provider`, `auth`, `context`,
+`invalid_request`, `model_runtime`, `guardrail`, `interrupted`, `store`,
+`unknown`. Une cause que le classificateur ne reconnaît pas sort en `unknown`
+avec son texte intact, plutôt que rangée dans une catégorie devinée qui
+enverrait le client vers le mauvais diagnostic. Le détail de chaque catégorie
+est dans `docs/EVENT_SCHEMA.md`.
+
 ## Approvals et outils dynamiques
 
 Une approbation traverse le pipeline de permissions de Pyxis inchangé : mode de
