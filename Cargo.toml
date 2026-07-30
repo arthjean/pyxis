@@ -3,6 +3,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+default-members = ["crates/agent-cli"]
 exclude = ["spikes"]
 
 [workspace.package]
