@@ -135,7 +135,7 @@ pub struct SpawnInput {
     /// Ask for the ability to mutate. Ignored unless the parent holds it, and a
     /// child gets nothing here by default (US-011 AC2).
     #[serde(default)]
-    pub tools: Vec<String>,
+    pub tools: Option<Vec<String>>,
 }
 
 /// Delegates an isolated task to a bounded read-only child.
@@ -184,12 +184,12 @@ impl Tool for SpawnAgent {
                     "description": "Self-contained brief. The child sees none of this conversation."
                 },
                 "tools": {
-                    "type": "array",
+                    "type": ["array", "null"],
                     "items": {"type": "string"},
-                    "description": "Mutating tools to request. Only granted if this agent holds them."
+                    "description": "Mutating tools to request. Only granted if this agent holds them. Null defaults to none."
                 }
             },
-            "required": ["task_name", "message"],
+            "required": ["task_name", "message", "tools"],
             "additionalProperties": false
         })
     }
@@ -224,10 +224,11 @@ impl Tool for SpawnAgent {
     }
 
     async fn call(&self, input: Self::Input, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let request = if input.tools.is_empty() {
+        let tools = input.tools.unwrap_or_default();
+        let request = if tools.is_empty() {
             AgentAuthority::read_only()
         } else {
-            AgentAuthority::with_tools(input.tools)
+            AgentAuthority::with_tools(tools)
         };
         let spawned = self
             .agents
@@ -285,10 +286,11 @@ impl Tool for ListAgents {
             "type": "object",
             "properties": {
                 "path_prefix": {
-                    "type": "string",
-                    "description": "Task-path prefix filter without a trailing slash. Omit to list every sub-agent."
+                    "type": ["string", "null"],
+                    "description": "Task-path prefix filter without a trailing slash. Null lists every sub-agent."
                 }
             },
+            "required": ["path_prefix"],
             "additionalProperties": false
         })
     }
@@ -385,19 +387,20 @@ impl Tool for WaitAgent {
             "type": "object",
             "properties": {
                 "target": {
-                    "type": "string",
-                    "description": "Task name or identifier of the sub-agent to wait for. Omit to wait for any of them."
+                    "type": ["string", "null"],
+                    "description": "Task name or identifier of the sub-agent to wait for. Null waits for any of them."
                 },
                 "timeout_ms": {
-                    "type": "number",
+                    "type": ["integer", "null"],
                     "description": format!(
-                        "Timeout in milliseconds. Defaults to {}, min {}, max {}.",
+                        "Timeout in milliseconds. Null defaults to {}, min {}, max {}.",
                         AGENT_WAIT_WINDOW.as_millis(),
                         MIN_AGENT_WAIT.as_millis(),
                         MAX_AGENT_WAIT.as_millis()
                     )
                 }
             },
+            "required": ["target", "timeout_ms"],
             "additionalProperties": false
         })
     }
@@ -482,11 +485,11 @@ impl Messenger {
                 },
                 "message": {"type": "string"},
                 "message_id": {
-                    "type": "string",
-                    "description": "Idempotency key: the same one is never delivered twice."
+                    "type": ["string", "null"],
+                    "description": "Optional idempotency key: the same non-null value is never delivered twice."
                 }
             },
-            "required": ["target", "message"],
+            "required": ["target", "message", "message_id"],
             "additionalProperties": false
         })
     }
@@ -779,30 +782,55 @@ mod tests {
         assert_eq!(names, MULTI_AGENT_V2_TOOLS);
     }
 
-    /// The baseline requires `task_name` and `message` on a spawn, and
-    /// `target` plus `message` on both message tools. A schema that forgets one
-    /// makes the model guess.
+    /// Strict function schemas require every property. Optional values are
+    /// represented by nullable types instead of omitted keys.
     #[test]
-    fn the_schemas_require_what_the_baseline_requires() {
+    fn the_schemas_require_every_property_for_strict_mode() {
         let handle = handle();
         let spawn = SpawnAgent::new(Arc::clone(&handle)).input_schema();
         assert_eq!(
             spawn["required"],
-            serde_json::json!(["task_name", "message"])
+            serde_json::json!(["task_name", "message", "tools"])
         );
         for schema in [
             SendMessage::new(Arc::clone(&handle)).input_schema(),
             FollowupTask::new(Arc::clone(&handle)).input_schema(),
         ] {
-            assert_eq!(schema["required"], serde_json::json!(["target", "message"]));
+            assert_eq!(
+                schema["required"],
+                serde_json::json!(["target", "message", "message_id"])
+            );
         }
         assert_eq!(
             InterruptAgent::new(Arc::clone(&handle)).input_schema()["required"],
             serde_json::json!(["target"])
         );
-        // A wait and a listing are both callable with no argument at all.
-        assert!(WaitAgent::new(Arc::clone(&handle)).input_schema()["required"].is_null());
-        assert!(ListAgents::new(handle).input_schema()["required"].is_null());
+        assert_eq!(
+            WaitAgent::new(Arc::clone(&handle)).input_schema()["required"],
+            serde_json::json!(["target", "timeout_ms"])
+        );
+        assert_eq!(
+            ListAgents::new(handle).input_schema()["required"],
+            serde_json::json!(["path_prefix"])
+        );
+    }
+
+    #[test]
+    fn the_six_tool_specs_are_valid_strict_schemas() {
+        let handle = handle();
+        let registry = crate::Registry::builder("/tmp")
+            .register(SpawnAgent::new(Arc::clone(&handle)))
+            .register(SendMessage::new(Arc::clone(&handle)))
+            .register(FollowupTask::new(Arc::clone(&handle)))
+            .register(ListAgents::new(Arc::clone(&handle)))
+            .register(WaitAgent::new(Arc::clone(&handle)))
+            .register(InterruptAgent::new(handle))
+            .build();
+
+        for spec in registry.tool_specs() {
+            spec.validate()
+                .unwrap_or_else(|error| panic!("invalid {} spec: {error}", spec.name));
+        }
     }
 
     /// The four acting tools must never be read-only: `Plan` denies them and
@@ -950,7 +978,7 @@ mod tests {
                 SpawnInput {
                     task_name: "explorer".into(),
                     message: "explorer".into(),
-                    tools: Vec::new(),
+                    tools: None,
                 },
                 &ctx,
             )
