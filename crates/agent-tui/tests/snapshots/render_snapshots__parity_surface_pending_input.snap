@@ -1,9 +1,7 @@
 ---
 source: crates/agent-tui/tests/render_snapshots.rs
-expression: "harness::frame_parity(\"parity_surface_pending_input\", &s, &surface, W, H)"
+expression: "harness::chat_frame(\"parity_surface_pending_input\", &s, &chat, W, H)"
 ---
-
-
 
 
 
@@ -13,6 +11,8 @@ expression: "harness::frame_parity(\"parity_surface_pending_input\", &s, &surfac
 
 › Récapitule
 
+
+• context compacted
 
 › gpt-5.6-sol          code mode required
   gpt-5.6-terra        code mode required

@@ -1,6 +1,6 @@
 ---
 source: crates/agent-tui/tests/render_snapshots.rs
-expression: "harness::frame_parity(\"parity_surface_conversation\", &s, &surface, W, H)"
+expression: "harness::chat_frame(\"parity_surface_conversation\", &s, &chat, W, H)"
 ---
 
 
@@ -20,7 +20,7 @@ expression: "harness::frame_parity(\"parity_surface_conversation\", &s, &surface
 › Quelle est la frontière d'arrêt ?
 
 
-● La fin d'événement de stream et le retour de dispatch.
+• La fin d'événement de stream et le retour de dispatch.
 
 ────────────────────────────────────────────────────────────────────────────────
 ›

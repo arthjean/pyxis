@@ -667,9 +667,8 @@ fn scrolled_transcript() {
 
 // ─────────────── Rendering path actually shipped (parity) ───────────────
 
-/// The inline-scrollback mode renders the transcript from `ChatSurface` and not
-/// from `AppState::blocks`: without these snapshots, the path that ships stays
-/// uncovered.
+/// The inline-scrollback mode renders through `ChatWidget`, not
+/// `AppState::blocks`.
 #[cfg(feature = "codex_tui_parity")]
 #[test]
 fn parity_surface_conversation() {
@@ -679,10 +678,11 @@ fn parity_surface_conversation() {
         Message::assistant_text("La fin d'événement de stream et le retour de dispatch."),
     ];
     s.blocks = blocks_from_messages(&messages);
-    let surface = agent_tui::ChatSurface::from_messages(&messages);
+    let mut chat = agent_tui::ChatWidget::new(&messages);
+    chat.sync_local_blocks(&s);
     insta::assert_snapshot!(
         "parity_surface_conversation",
-        harness::frame_parity("parity_surface_conversation", &s, &surface, W, H)
+        harness::chat_frame("parity_surface_conversation", &s, &chat, W, H)
     );
 }
 
@@ -696,10 +696,11 @@ fn parity_surface_pending_input() {
         .push(agent_tui::Block::Notice("context compacted".into()));
     s.input = "/models ".into();
     s.cursor = s.input.len();
-    let surface = agent_tui::ChatSurface::from_messages(&messages);
+    let mut chat = agent_tui::ChatWidget::new(&messages);
+    chat.sync_local_blocks(&s);
     insta::assert_snapshot!(
         "parity_surface_pending_input",
-        harness::frame_parity("parity_surface_pending_input", &s, &surface, W, H)
+        harness::chat_frame("parity_surface_pending_input", &s, &chat, W, H)
     );
 }
 

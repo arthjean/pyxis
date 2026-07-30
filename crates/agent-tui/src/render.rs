@@ -82,7 +82,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
 }
 
 #[cfg(feature = "codex_tui_parity")]
-pub fn render_parity(
+pub(crate) fn render_parity(
     frame: &mut Frame,
     state: &AppState,
     surface: &crate::history_cell::ChatSurface,

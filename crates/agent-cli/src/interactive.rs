@@ -36,8 +36,8 @@ use tokio_util::sync::CancellationToken;
 use crate::runtime::{CliStepSource, EngineDeps, SessionRuntime, SettingsCell};
 #[cfg(feature = "codex_tui_parity")]
 use agent_tui::{
-    BottomPane, ChatSurface, HistoryInserter, InsertHistoryMode, PermissionTranscriptRequest,
-    TerminalViewport, TerminalViewportState, TranscriptMapper,
+    ChatWidget, HistoryInserter, InsertHistoryMode, PermissionTranscriptRequest, TerminalViewport,
+    TerminalViewportState,
 };
 use crossterm::event::{Event, KeyEventKind, MouseEventKind};
 use tokio::sync::{mpsc, oneshot};
@@ -786,10 +786,7 @@ async fn event_loop(
     }
     apply_runtime_status(&mut state, &status);
     #[cfg(feature = "codex_tui_parity")]
-    let mut parity_mapper = TranscriptMapper::new();
-    #[cfg(feature = "codex_tui_parity")]
-    let mut parity_surface = ChatSurface::from_messages(&initial_messages);
-    #[cfg(feature = "codex_tui_parity")]
+    let mut chat = ChatWidget::new(&initial_messages);
     #[cfg(feature = "codex_tui_parity")]
     let mut viewport_sync_enabled = true;
     #[cfg(feature = "codex_tui_parity")]
@@ -800,8 +797,6 @@ async fn event_loop(
         TerminalViewport::new(1, 1, 1),
         InsertHistoryMode::InlineScrollback,
     );
-    #[cfg(feature = "codex_tui_parity")]
-    let mut parity_bottom_pane = BottomPane::new();
     // Empty transcript at startup -> the welcome screen (card + logo) shows
     // by itself (see `AppState::is_welcome`), no Notice to push.
 
@@ -877,6 +872,7 @@ async fn event_loop(
         }
         #[cfg(feature = "codex_tui_parity")]
         {
+            chat.sync_local_blocks(&state);
             // Terminal enlarged: the inline viewport keeps its original height and
             // leaves the composer anchored in the middle of the screen until it is
             // rebuilt. A failure (terminal not answering the position
@@ -908,8 +904,9 @@ async fn event_loop(
             }
             parity_viewport.resize(size.width, size.height, size.height);
             if parity_inserter.mode() == InsertHistoryMode::InlineScrollback
-                && let Some(insert) =
-                    parity_surface.drain_pending_insert(size.width, parity_inserter.mode())
+                && let Some(insert) = chat
+                    .surface_mut()
+                    .drain_pending_insert(size.width, parity_inserter.mode())
                 && let Err(err) = parity_inserter.insert(tui, &insert)
             {
                 parity_viewport.activate_legacy_fallback(err.message().to_string());
@@ -919,7 +916,7 @@ async fn event_loop(
         #[cfg(feature = "codex_tui_parity")]
         {
             if parity_inserter.mode() == InsertHistoryMode::InlineScrollback {
-                tui.draw(|f| agent_tui::render_parity(f, &state, &parity_surface))?;
+                tui.draw(|frame| chat.render(frame, &state))?;
             } else {
                 tui.draw(|f| agent_tui::render(f, &state))?;
             }
@@ -946,7 +943,7 @@ async fn event_loop(
                     Some(Event::Paste(p)) => {
                         #[cfg(feature = "codex_tui_parity")]
                         {
-                            parity_bottom_pane.route_paste(&mut state, &p);
+                            chat.route_paste(&mut state, &p);
                         }
                         #[cfg(not(feature = "codex_tui_parity"))]
                         {
@@ -967,7 +964,7 @@ async fn event_loop(
                     }
                 };
                 #[cfg(feature = "codex_tui_parity")]
-                let action = parity_bottom_pane.route_key(&mut state, k);
+                let action = chat.route_key(&mut state, k);
                 #[cfg(not(feature = "codex_tui_parity"))]
                 let action = state.on_key(k);
                 match action {
@@ -1035,8 +1032,7 @@ async fn event_loop(
                                 }
                                 state.push_user(prompt.clone());
                                 #[cfg(feature = "codex_tui_parity")]
-                                parity_surface
-                                    .apply_update(parity_mapper.map_user_message(prompt.clone()));
+                                chat.push_user_message(&state, prompt.clone());
                                 if was_running {
                                     state.blocks.push(Block::Notice(
                                         "Steering the current turn.".into(),
@@ -1202,8 +1198,6 @@ async fn event_loop(
                                         )));
                                     }
                                     sync_settings(&cfg);
-                                    #[cfg(feature = "codex_tui_parity")]
-                                    parity_surface.apply_update(parity_mapper.map_notice(message));
                                 } else {
                                     state.blocks.push(Block::Notice(format!(
                                         "Unknown permission mode: {arg}"
@@ -1244,9 +1238,7 @@ async fn event_loop(
                                         Ok(_) => {
                                             state.push_user(g);
                                             #[cfg(feature = "codex_tui_parity")]
-                                            parity_surface.apply_update(
-                                                parity_mapper.map_user_message(g.to_string()),
-                                            );
+                                            chat.push_user_message(&state, g.to_string());
                                         }
                                         Err(err) => state
                                             .blocks
@@ -1332,8 +1324,7 @@ async fn event_loop(
                                         state.blocks = blocks_from_messages(&msgs);
                                         #[cfg(feature = "codex_tui_parity")]
                                         {
-                                            parity_mapper = TranscriptMapper::new();
-                                            parity_surface = ChatSurface::from_messages(&msgs);
+                                            chat.replace_messages(&msgs);
                                         }
                                         state.blocks.push(Block::Notice(format!(
                                             "Branch {} created at turn {} ({} messages). The \
@@ -1407,8 +1398,7 @@ async fn event_loop(
                                         state.blocks = blocks_from_messages(&msgs);
                                         #[cfg(feature = "codex_tui_parity")]
                                         {
-                                            parity_mapper = TranscriptMapper::new();
-                                            parity_surface = ChatSurface::from_messages(&msgs);
+                                            chat.replace_messages(&msgs);
                                         }
                                         // A cleared transcript brings the welcome
                                         // screen back, which is its own confirmation.
@@ -1564,9 +1554,7 @@ async fn event_loop(
                                         Ok(_) => {
                                             state.push_user(cmd);
                                             #[cfg(feature = "codex_tui_parity")]
-                                            parity_surface.apply_update(
-                                                parity_mapper.map_user_message(cmd.to_string()),
-                                            );
+                                            chat.push_user_message(&state, cmd.to_string());
                                             // AC1: the project context was read before
                                             // this turn wrote the file, so it is
                                             // re-read when the turn ends, no restart
@@ -1735,7 +1723,7 @@ async fn event_loop(
                             });
                         }
                         #[cfg(feature = "codex_tui_parity")]
-                        parity_surface.apply_update(parity_mapper.map_approval_decision(allow));
+                        chat.record_approval_decision(allow);
                     }
                     _ => {}
                 }
@@ -1756,13 +1744,11 @@ async fn event_loop(
                                 {
                                     agent_tui::debug_log::log(&line);
                                 }
+                                #[cfg(feature = "codex_tui_parity")]
+                                chat.sync_local_blocks(&state);
                                 state.apply(&ev);
                                 #[cfg(feature = "codex_tui_parity")]
-                                {
-                                    for update in parity_mapper.map_event(&ev) {
-                                        parity_surface.apply_update(update);
-                                    }
-                                }
+                                chat.handle_agent_event(&state, &ev);
                             }
                             RuntimeEventPayload::TurnStateChanged { to, ref cause, .. } => {
                                 if to == TurnState::Running {
@@ -1782,13 +1768,11 @@ async fn event_loop(
                                         match tracker.turn_diff().await {
                                             Ok(diff) if !diff.is_empty() => {
                                                 let ev = AgentEvent::TurnDiff(diff);
+                                                #[cfg(feature = "codex_tui_parity")]
+                                                chat.sync_local_blocks(&state);
                                                 state.apply(&ev);
                                                 #[cfg(feature = "codex_tui_parity")]
-                                                {
-                                                    for update in parity_mapper.map_event(&ev) {
-                                                        parity_surface.apply_update(update);
-                                                    }
-                                                }
+                                                chat.handle_agent_event(&state, &ev);
                                             }
                                             Ok(_) => {}
                                             Err(err) => agent_tui::debug_log::log(&format!(
@@ -1983,7 +1967,7 @@ async fn event_loop(
                     state.pending = Some(to_prompt(&req));
                     #[cfg(feature = "codex_tui_parity")]
                     {
-                        for update in parity_mapper.map_permission_request(PermissionTranscriptRequest {
+                        chat.handle_permission_request(PermissionTranscriptRequest {
                             call_id: req.call_id.clone(),
                             tool: req.tool.clone(),
                             reason: req.reason.clone(),
@@ -1991,9 +1975,7 @@ async fn event_loop(
                             input_summary: req.input_summary.clone(),
                             mode: req.mode.clone(),
                             input: req.input.clone(),
-                        }) {
-                            parity_surface.apply_update(update);
-                        }
+                        });
                     }
                     pending_resp = Some(resp);
                 }

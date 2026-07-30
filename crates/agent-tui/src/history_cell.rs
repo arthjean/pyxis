@@ -563,7 +563,7 @@ impl HistoryCell for AgentMarkdownCell {
         };
         render_prefixed(
             &lines,
-            Span::styled("● ", theme.accent()),
+            Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
             Span::raw("  "),
             width,
         )
@@ -692,13 +692,11 @@ fn style_reasoning_line(mut line: Line<'static>) -> Line<'static> {
 }
 
 fn reasoning_summary_style() -> Style {
-    Style::default()
-        .fg(Color::Rgb(0xa8, 0xa8, 0xb0))
-        .add_modifier(Modifier::ITALIC)
+    Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC)
 }
 
 fn reasoning_prefix_style() -> Style {
-    Style::default().fg(Color::Rgb(0x6f, 0x6f, 0x78))
+    Style::default().add_modifier(Modifier::DIM)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -719,7 +717,7 @@ impl HistoryCell for NoticeCell {
         let lines = text_lines(&self.message, Style::default().add_modifier(Modifier::DIM));
         render_prefixed(
             &lines,
-            Span::styled("· ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
             Span::raw("  "),
             width,
         )
@@ -4505,7 +4503,7 @@ mod tests {
 
         let text = flatten(&cells.display_lines(40));
         assert!(text.iter().any(|line| line.starts_with('›')));
-        assert!(text.iter().any(|line| line.starts_with('●')));
+        assert!(text.iter().any(|line| line.starts_with('•')));
         assert!(text.iter().any(|line| line.contains("checking")));
         assert!(cells.desired_height(0) >= 1);
     }
@@ -4523,6 +4521,17 @@ mod tests {
         assert_eq!(lines[0].style.bg, Some(user_message_bg()));
         assert_eq!(lines[1].style.bg, Some(user_message_bg()));
         assert_eq!(lines[2].style.bg, Some(user_message_bg()));
+    }
+
+    #[test]
+    fn assistant_message_uses_codex_transcript_bullet() {
+        let cell = AgentMarkdownCell::new("hello", false);
+        let lines = cell.display_lines(24);
+        let prefix = &lines[0].spans[0];
+
+        assert_eq!(prefix.content, "• ");
+        assert!(prefix.style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(prefix.style.fg, None);
     }
 
     #[test]

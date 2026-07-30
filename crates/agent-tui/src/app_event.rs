@@ -6,14 +6,8 @@
 //! pane decisions.
 
 use agent_core::AgentEvent;
-use agent_core::message::{Message, ToolErrorKind};
+use agent_core::message::ToolErrorKind;
 use std::collections::HashMap;
-
-use crate::bottom_pane::BottomPane;
-use crate::history_cell::ChatSurface;
-use crate::insert_history::InsertHistoryMode;
-use crate::state::{AppState, Block, PermissionPrompt};
-use crate::terminal_viewport::{TerminalViewport, TerminalViewportState};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TranscriptItemId(String);
@@ -616,18 +610,7 @@ impl TranscriptMapper {
             }
             AgentEvent::Error(error) => {
                 let mut updates = self.drain_active_streams();
-                updates.push(TranscriptUpdate::new(
-                    TranscriptLifecycle::Completed,
-                    TranscriptItem::new(
-                        Some(self.next_local("error")),
-                        TranscriptRole::System,
-                        TranscriptItemKind::Error,
-                        TranscriptItemStatus::Failed,
-                        TranscriptPayload::Error {
-                            message: error.to_string(),
-                        },
-                    ),
-                ));
+                updates.push(self.map_error(error.to_string()));
                 updates
             }
             // US-009: the plan cell the parity surface already models, now fed
@@ -710,6 +693,21 @@ impl TranscriptMapper {
                 TranscriptItemKind::Notice,
                 TranscriptItemStatus::Complete,
                 TranscriptPayload::Notice {
+                    message: message.into(),
+                },
+            ),
+        )
+    }
+
+    pub fn map_error(&mut self, message: impl Into<String>) -> TranscriptUpdate {
+        TranscriptUpdate::new(
+            TranscriptLifecycle::Completed,
+            TranscriptItem::new(
+                Some(self.next_local("error")),
+                TranscriptRole::System,
+                TranscriptItemKind::Error,
+                TranscriptItemStatus::Failed,
+                TranscriptPayload::Error {
                     message: message.into(),
                 },
             ),
@@ -972,147 +970,6 @@ fn strip_read_line_numbers(content: &str) -> String {
     out.join("\n")
 }
 
-#[derive(Debug, Clone)]
-pub enum AppEvent {
-    UserSubmitted(String),
-    InputQueued(String),
-    Agent(AgentEvent),
-    PermissionPrompt(PermissionPrompt),
-    ApprovalDecision {
-        allow: bool,
-    },
-    Resize {
-        width: u16,
-        height: u16,
-        active_height: u16,
-    },
-    CommitTick,
-    HistoryInsertFailed(String),
-    FatalExit(String),
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct AppDispatchOutcome {
-    pub agent_stopped: bool,
-    pub should_exit: bool,
-    pub commit_revision: u64,
-}
-
-pub struct AppEventDispatcher {
-    mapper: TranscriptMapper,
-    surface: ChatSurface,
-    viewport: TerminalViewportState,
-    bottom_pane: BottomPane,
-    commit_revision: u64,
-    fatal_error: Option<String>,
-}
-
-impl AppEventDispatcher {
-    pub fn new(messages: &[Message], viewport: TerminalViewport, mode: InsertHistoryMode) -> Self {
-        Self {
-            mapper: TranscriptMapper::new(),
-            surface: ChatSurface::from_messages(messages),
-            viewport: TerminalViewportState::new(viewport, mode),
-            bottom_pane: BottomPane::new(),
-            commit_revision: 0,
-            fatal_error: None,
-        }
-    }
-
-    pub fn surface(&self) -> &ChatSurface {
-        &self.surface
-    }
-
-    pub fn surface_mut(&mut self) -> &mut ChatSurface {
-        &mut self.surface
-    }
-
-    pub fn viewport(&self) -> &TerminalViewportState {
-        &self.viewport
-    }
-
-    pub fn bottom_pane(&self) -> &BottomPane {
-        &self.bottom_pane
-    }
-
-    pub fn bottom_pane_mut(&mut self) -> &mut BottomPane {
-        &mut self.bottom_pane
-    }
-
-    pub fn fatal_error(&self) -> Option<&str> {
-        self.fatal_error.as_deref()
-    }
-
-    pub fn dispatch(&mut self, state: &mut AppState, event: AppEvent) -> AppDispatchOutcome {
-        let mut outcome = AppDispatchOutcome::default();
-        match event {
-            AppEvent::UserSubmitted(prompt) => {
-                state.push_user(prompt.clone());
-                self.surface
-                    .apply_update(self.mapper.map_user_message(prompt));
-            }
-            AppEvent::InputQueued(prompt) => {
-                state.push_user(prompt.clone());
-                self.surface
-                    .apply_update(self.mapper.map_user_message(prompt));
-                state.blocks.push(Block::Notice("Message queued.".into()));
-            }
-            AppEvent::Agent(event) => {
-                outcome.agent_stopped = matches!(
-                    event,
-                    AgentEvent::EndTurn
-                        | AgentEvent::Interrupted
-                        | AgentEvent::Error(_)
-                        | AgentEvent::Exhausted(_)
-                );
-                state.apply(&event);
-                for update in self.mapper.map_event(&event) {
-                    self.surface.apply_update(update);
-                }
-            }
-            AppEvent::PermissionPrompt(prompt) => {
-                state.pending = Some(prompt);
-            }
-            AppEvent::ApprovalDecision { allow } => {
-                state.pending = None;
-                self.surface
-                    .apply_update(self.mapper.map_approval_decision(allow));
-                let label = if allow {
-                    "permission approved"
-                } else {
-                    "permission denied"
-                };
-                state.blocks.push(Block::Notice(label.into()));
-            }
-            AppEvent::Resize {
-                width,
-                height,
-                active_height,
-            } => {
-                self.viewport.resize(width, height, active_height);
-            }
-            AppEvent::CommitTick => {
-                self.commit_revision = self.commit_revision.saturating_add(1);
-            }
-            AppEvent::HistoryInsertFailed(reason) => {
-                self.viewport.activate_legacy_fallback(reason.clone());
-                state.blocks.push(Block::Notice(format!(
-                    "Terminal scrollback fallback active: {reason}"
-                )));
-            }
-            AppEvent::FatalExit(message) => {
-                self.fatal_error = Some(message.clone());
-                state.blocks.push(Block::Error(message));
-                state.should_quit = true;
-                outcome.should_exit = true;
-            }
-        }
-        outcome.commit_revision = self.commit_revision;
-        outcome.should_exit |= state.should_quit;
-        outcome
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1359,74 +1216,5 @@ mod tests {
                 input_summary: "cargo test".into(),
             }
         );
-    }
-
-    #[test]
-    fn app_dispatcher_routes_transcript_resize_commit_and_exit() {
-        let mut dispatcher = AppEventDispatcher::new(
-            &[],
-            TerminalViewport::new(80, 24, 8),
-            InsertHistoryMode::InlineScrollback,
-        );
-        let mut state = AppState::new("gpt-5", false);
-
-        dispatcher.dispatch(&mut state, AppEvent::UserSubmitted("hello".into()));
-        assert_eq!(state.blocks.len(), 1);
-        assert_eq!(dispatcher.surface().transcript_cells().len(), 1);
-
-        let out = dispatcher.dispatch(&mut state, AppEvent::Agent(AgentEvent::Text("ok".into())));
-        assert!(!out.agent_stopped);
-        let out = dispatcher.dispatch(&mut state, AppEvent::Agent(AgentEvent::EndTurn));
-        assert!(out.agent_stopped);
-        assert_eq!(dispatcher.surface().transcript_cells().len(), 2);
-
-        dispatcher.dispatch(
-            &mut state,
-            AppEvent::Resize {
-                width: 100,
-                height: 30,
-                active_height: 10,
-            },
-        );
-        assert_eq!(dispatcher.viewport().viewport().width, 100);
-
-        let out = dispatcher.dispatch(&mut state, AppEvent::CommitTick);
-        assert_eq!(out.commit_revision, 1);
-
-        let out = dispatcher.dispatch(&mut state, AppEvent::FatalExit("boom".into()));
-        assert!(out.should_exit);
-        assert_eq!(dispatcher.fatal_error(), Some("boom"));
-    }
-
-    #[test]
-    fn app_dispatcher_routes_permission_and_fallback() {
-        let mut dispatcher = AppEventDispatcher::new(
-            &[],
-            TerminalViewport::new(80, 24, 8),
-            InsertHistoryMode::InlineScrollback,
-        );
-        let mut state = AppState::new("gpt-5", false);
-
-        dispatcher.dispatch(
-            &mut state,
-            AppEvent::PermissionPrompt(PermissionPrompt::new(
-                "bash",
-                "writes",
-                crate::diff::Diff::default(),
-            )),
-        );
-        assert!(state.pending.is_some());
-
-        dispatcher.dispatch(&mut state, AppEvent::ApprovalDecision { allow: false });
-        assert!(state.pending.is_none());
-        assert!(
-            state
-                .blocks
-                .iter()
-                .any(|b| matches!(b, Block::Notice(t) if t.contains("permission denied")))
-        );
-
-        dispatcher.dispatch(&mut state, AppEvent::HistoryInsertFailed("io".into()));
-        assert_eq!(dispatcher.viewport().mode(), InsertHistoryMode::Legacy);
     }
 }

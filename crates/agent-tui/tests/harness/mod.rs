@@ -37,20 +37,17 @@ pub fn frame(label: &str, state: &AppState, width: u16, height: u16) -> String {
     })
 }
 
-/// Renders a frame of the `render_parity` path (history surface actually
-/// used in inline-scrollback mode).
+/// Renders the `ChatWidget` path used in inline-scrollback mode.
 #[cfg(feature = "codex_tui_parity")]
-pub fn frame_parity(
+pub fn chat_frame(
     label: &str,
     state: &AppState,
-    surface: &agent_tui::ChatSurface,
+    chat: &agent_tui::ChatWidget,
     width: u16,
     height: u16,
 ) -> String {
     capture(label, width, height, |terminal| {
-        terminal
-            .draw(|f| agent_tui::render_parity(f, state, surface))
-            .unwrap();
+        terminal.draw(|frame| chat.render(frame, state)).unwrap();
     })
 }
 

@@ -15,6 +15,8 @@ pub mod app_event;
 #[cfg(feature = "codex_tui_parity")]
 pub mod bottom_pane;
 mod cache;
+#[cfg(feature = "codex_tui_parity")]
+pub mod chatwidget;
 mod composer;
 pub mod debug_log;
 pub mod diff;
@@ -40,11 +42,10 @@ mod tool;
 
 #[cfg(feature = "codex_tui_parity")]
 pub use app_event::{
-    AppDispatchOutcome, AppEvent as TuiAppEvent, AppEventDispatcher, PermissionTranscriptRequest,
-    TranscriptExecSource, TranscriptExecStream, TranscriptHookOutputEntry,
-    TranscriptHookOutputKind, TranscriptHookStatus, TranscriptItem, TranscriptItemId,
-    TranscriptItemKind, TranscriptItemStatus, TranscriptLifecycle, TranscriptMapper,
-    TranscriptNoticeKind, TranscriptNoticeLink, TranscriptPatchChangeKind,
+    PermissionTranscriptRequest, TranscriptExecSource, TranscriptExecStream,
+    TranscriptHookOutputEntry, TranscriptHookOutputKind, TranscriptHookStatus, TranscriptItem,
+    TranscriptItemId, TranscriptItemKind, TranscriptItemStatus, TranscriptLifecycle,
+    TranscriptMapper, TranscriptNoticeKind, TranscriptNoticeLink, TranscriptPatchChangeKind,
     TranscriptPatchFileChange, TranscriptPayload, TranscriptPlanStep, TranscriptPlanStepStatus,
     TranscriptRole, TranscriptToolErrorKind, TranscriptUpdate, TranscriptUserInputAnswer,
     TranscriptUserInputQuestion,
@@ -53,6 +54,8 @@ pub use app_event::{
 pub use bottom_pane::{
     BottomPane, BottomPaneView, ListSelectionView, SelectionRow, SelectionTab, ViewCompletion,
 };
+#[cfg(feature = "codex_tui_parity")]
+pub use chatwidget::ChatWidget;
 #[cfg(feature = "codex_tui_parity")]
 pub use history_cell::{
     ActiveHistoryCell, AgentMarkdownCell, ApprovalCell, ChatSurface, CompositeCell, ErrorCell,
@@ -69,8 +72,6 @@ pub use insert_history::{
     SanitizedHistoryLine,
 };
 pub use render::render;
-#[cfg(feature = "codex_tui_parity")]
-pub use render::render_parity;
 pub use state::{
     AppState, Block, COMMANDS, DEFAULT_PERMISSION_MODE_ID, InputAction, McpServerMeta, McpStatus,
     MenuItem, ModelCatalogEntry, ModelMeta, PERMISSION_MODES, PermissionModeMeta, PermissionPrompt,
