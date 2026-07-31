@@ -52,6 +52,22 @@ impl McpServer {
             _ => &[],
         }
     }
+
+    /// What the server said about itself at handshake time (capped, untrusted).
+    pub fn instructions(&self) -> Option<&str> {
+        match self {
+            McpServer::Connected { conn, .. } => conn.instructions(),
+            _ => None,
+        }
+    }
+
+    /// Why this server is not usable, when it failed.
+    pub fn failure(&self) -> Option<&str> {
+        match self {
+            McpServer::Failed { error, .. } => Some(error),
+            _ => None,
+        }
+    }
 }
 
 /// Registry of the known MCP servers, indexed by name (stable lexicographic order).
