@@ -1,5 +1,11 @@
-//! Terminal setup/teardown: raw mode + alternate screen (crossterm). Isolated
-//! here so that rendering (`render.rs`) stays pure and testable without a real terminal.
+//! Terminal setup/teardown and viewport anchoring. Isolated here so that
+//! rendering (`render.rs`) stays pure and testable without a real terminal.
+//!
+//! The parity path keeps the native terminal scrollback: no alternate screen,
+//! and a viewport that is only as tall as what the renderer actually owns
+//! (active cell plus bottom pane). Everything above it is finalized history the
+//! terminal keeps for good. The legacy path still uses the alternate screen and
+//! draws the whole transcript itself.
 
 use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,16 +15,14 @@ use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 #[cfg(not(feature = "codex_tui_parity"))]
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
-#[cfg(feature = "codex_tui_parity")]
-use crossterm::terminal::size;
 use crossterm::terminal::{Clear, ClearType};
 #[cfg(not(feature = "codex_tui_parity"))]
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-#[cfg(feature = "codex_tui_parity")]
-use ratatui::{TerminalOptions, Viewport};
+use ratatui::layout::Rect;
+
+use crate::custom_terminal::{Frame, Terminal};
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -47,42 +51,25 @@ pub fn enter() -> io::Result<Tui> {
         return Err(e);
     }
     #[cfg(feature = "codex_tui_parity")]
-    let measured = size();
-    #[cfg(feature = "codex_tui_parity")]
-    crate::debug_log::log(&format!("enter: crossterm::size() = {measured:?}"));
-    #[cfg(feature = "codex_tui_parity")]
-    let inline_height = measured.map(|(_, rows)| rows.max(1)).unwrap_or(24);
-    #[cfg(feature = "codex_tui_parity")]
-    if let Err(e) = execute!(
-        out,
-        EnableBracketedPaste,
-        Clear(ClearType::All),
-        MoveTo(0, 0)
-    ) {
+    if let Err(e) = execute!(out, EnableBracketedPaste) {
         let _ = disable_raw_mode();
         return Err(e);
     }
-    #[cfg(not(feature = "codex_tui_parity"))]
-    let terminal = Terminal::new(CrosstermBackend::new(out));
-    #[cfg(feature = "codex_tui_parity")]
-    let terminal = Terminal::with_options(
-        CrosstermBackend::new(out),
-        TerminalOptions {
-            viewport: Viewport::Inline(inline_height),
-        },
-    );
-    match terminal {
-        #[cfg(feature = "codex_tui_parity")]
-        Ok(mut tui) => {
-            crate::debug_log::log(&format!(
-                "enter: inline_height={inline_height} viewport={:?}",
-                tui.get_frame().area()
-            ));
-            ACTIVE.store(true, Ordering::SeqCst);
-            Ok(tui)
-        }
-        #[cfg(not(feature = "codex_tui_parity"))]
+
+    match Terminal::new(CrosstermBackend::new(out)) {
         Ok(tui) => {
+            // Legacy owns the whole (alternate) screen; parity starts with an
+            // empty viewport anchored at the cursor and grows on the first draw.
+            #[cfg(not(feature = "codex_tui_parity"))]
+            let mut tui = tui;
+            #[cfg(not(feature = "codex_tui_parity"))]
+            {
+                let size = tui.size()?;
+                tui.set_viewport_area(Rect::new(0, 0, size.width, size.height));
+                tui.clear_screen()?;
+            }
+            #[cfg(feature = "codex_tui_parity")]
+            crate::debug_log::log(&format!("enter: viewport={:?}", tui.viewport_area));
             ACTIVE.store(true, Ordering::SeqCst);
             Ok(tui)
         }
@@ -103,56 +90,38 @@ pub fn enter() -> io::Result<Tui> {
     }
 }
 
+/// Draws one frame into a viewport of `height` rows anchored at the bottom of
+/// the screen.
+///
+/// Growing the viewport steals rows from the history above it, which is why the
+/// rows are scrolled up (into the scrollback) rather than overwritten. Shrinking
+/// it leaves rows behind that nothing else repaints, so the area from the
+/// highest row either viewport touched is cleared before the frame is drawn.
+pub fn draw(tui: &mut Tui, height: u16, render: impl FnOnce(&mut Frame)) -> io::Result<()> {
+    tui.anchor_viewport(height)?;
+    tui.draw(render)
+}
+
+/// Debounce before reflowing. Dragging a window edge emits a resize per pixel
+/// column; reflowing on each one would rewrite the transcript dozens of times.
+pub const REFLOW_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(75);
+
+/// Frees the history rows this session still owns on screen, so the transcript
+/// can be rewritten at the current width. Returns how many rows are available.
+///
+/// Deliberately not `ESC[3J`: purging the scrollback would also erase what the
+/// user had in their terminal before Pyxis started. Rows that already scrolled
+/// out keep their old wrapping, exactly like the output of any other program.
+pub fn clear_for_reflow(tui: &mut Tui) -> io::Result<u16> {
+    tui.clear_owned_history()
+}
+
 pub fn clear(tui: &mut Tui) -> io::Result<()> {
-    tui.clear()?;
     execute!(tui.backend_mut(), Clear(ClearType::All), MoveTo(0, 0))?;
+    let size = tui.size()?;
+    tui.set_viewport_area(Rect::new(0, size.height.saturating_sub(1), size.width, 1));
+    tui.invalidate_viewport();
     Ok(())
-}
-
-/// True when the inline viewport no longer covers the whole terminal height.
-///
-/// `Viewport::Inline(h)` freezes `h` at construction time: ratatui then clamps to
-/// `min(screen_height, h)`. A SHRUNK terminal is therefore tracked correctly, but
-/// an ENLARGED terminal keeps the old height, and the whole rendering (transcript,
-/// composer, status bar) stays locked inside that stale area.
-#[cfg(feature = "codex_tui_parity")]
-pub fn inline_viewport_stale(viewport_height: u16, screen_height: u16) -> bool {
-    viewport_height < screen_height
-}
-
-/// Realigns the inline viewport on the current terminal height, starting from
-/// a fresh `Terminal`: ratatui exposes no way to change the height of a
-/// `Viewport::Inline`. Returns `true` when the rebuild happened.
-///
-/// The scrollback already emitted by `insert_before` is untouched: we clear the
-/// visible screen and the next `draw` repaints from the state, as at startup.
-///
-/// The construction queries the cursor position; the caller MUST therefore guarantee
-/// that no blocking `crossterm::event::read()` runs in parallel, otherwise the
-/// terminal response stays captive of that reader and the request times out.
-#[cfg(feature = "codex_tui_parity")]
-pub fn sync_inline_viewport(tui: &mut Tui) -> io::Result<bool> {
-    let screen = tui.size()?;
-    let viewport = tui.get_frame().area();
-    if !inline_viewport_stale(viewport.height, screen.height) {
-        return Ok(false);
-    }
-    crate::debug_log::log(&format!(
-        "sync: rebuild viewport={viewport:?} -> screen={screen:?}"
-    ));
-    let mut out = io::stdout();
-    execute!(out, Clear(ClearType::All), MoveTo(0, 0))?;
-    *tui = Terminal::with_options(
-        CrosstermBackend::new(out),
-        TerminalOptions {
-            viewport: Viewport::Inline(screen.height.max(1)),
-        },
-    )?;
-    crate::debug_log::log(&format!(
-        "sync: rebuilt viewport={:?}",
-        tui.get_frame().area()
-    ));
-    Ok(true)
 }
 
 /// Restores the terminal from OUTSIDE the normal exit path: panic hook, signal,
@@ -259,39 +228,76 @@ mod restore_tests {
     }
 }
 
-#[cfg(all(test, feature = "codex_tui_parity"))]
-mod tests {
-    use super::*;
+#[cfg(test)]
+mod viewport_tests {
+    use crate::custom_terminal::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::layout::{Position, Rect, Size};
+    use ratatui::widgets::Paragraph;
 
-    #[test]
-    fn viewport_is_stale_only_when_the_screen_grew() {
-        assert!(inline_viewport_stale(24, 47), "terminal agrandi");
-        assert!(!inline_viewport_stale(47, 47), "tailles alignées");
-        assert!(
-            !inline_viewport_stale(47, 24),
-            "rétréci : ratatui clampe déjà"
-        );
+    fn terminal(width: u16, height: u16) -> Terminal<TestBackend> {
+        Terminal::with_geometry(
+            TestBackend::new(width, height),
+            Size::new(width, height),
+            Position { x: 0, y: 0 },
+        )
     }
 
-    /// Pins down the ratatui constraint that forces rebuilding the terminal.
-    /// Should this test break (height tracked automatically), `sync_inline_viewport`
-    /// becomes useless and can disappear.
+    fn draw_at<B: ratatui::backend::Backend>(
+        tui: &mut Terminal<B>,
+        height: u16,
+    ) -> std::io::Result<()> {
+        tui.anchor_viewport(height)?;
+        tui.draw(|frame| {
+            let area = frame.area();
+            frame.render_widget(Paragraph::new("x"), area);
+        })
+    }
+
     #[test]
-    fn ratatui_inline_viewport_keeps_its_initial_height_when_the_screen_grows() {
-        let mut terminal = Terminal::with_options(
-            TestBackend::new(20, 24),
-            TerminalOptions {
-                viewport: Viewport::Inline(24),
-            },
-        )
-        .expect("terminal inline");
+    fn a_growing_viewport_stays_anchored_at_the_bottom() {
+        let mut tui = terminal(10, 8);
+        tui.set_viewport_area(Rect::new(0, 7, 10, 1));
 
-        terminal.backend_mut().resize(20, 47);
-        terminal.autoresize().expect("autoresize");
+        draw_at(&mut tui, 3).expect("rendu");
 
-        let height = terminal.get_frame().area().height;
-        assert_eq!(height, 24, "hauteur figée à la construction");
-        assert!(inline_viewport_stale(height, 47));
+        assert_eq!(tui.viewport_area, Rect::new(0, 5, 10, 3));
+    }
+
+    /// Content shorter than the viewport does not shrink it: the surplus becomes
+    /// empty space above the composer, which stays on the last row. Only history
+    /// insertion takes rows back, and it takes them from the top.
+    #[test]
+    fn shorter_content_leaves_the_viewport_anchored_at_the_bottom() {
+        let mut tui = terminal(10, 8);
+        tui.set_viewport_area(Rect::new(0, 3, 10, 5));
+
+        draw_at(&mut tui, 2).expect("rendu");
+
+        assert_eq!(tui.viewport_area, Rect::new(0, 3, 10, 5));
+        assert_eq!(tui.viewport_area.bottom(), 8);
+    }
+
+    /// A viewport that lost rows to history keeps its bottom edge: the composer
+    /// never drifts up the screen.
+    #[test]
+    fn the_viewport_bottom_never_leaves_the_last_row() {
+        let mut tui = terminal(10, 8);
+        tui.set_viewport_area(Rect::new(0, 6, 10, 2));
+
+        draw_at(&mut tui, 1).expect("rendu");
+
+        assert_eq!(tui.viewport_area.bottom(), 8);
+        assert_eq!(tui.viewport_area.y, 6, "aucune rangée reprise sans besoin");
+    }
+
+    #[test]
+    fn the_viewport_never_exceeds_the_screen() {
+        let mut tui = terminal(10, 4);
+        tui.set_viewport_area(Rect::new(0, 3, 10, 1));
+
+        draw_at(&mut tui, 40).expect("rendu");
+
+        assert_eq!(tui.viewport_area, Rect::new(0, 0, 10, 4));
     }
 }

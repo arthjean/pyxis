@@ -2972,18 +2972,31 @@ impl ChatSurface {
     }
 
     pub fn from_messages(messages: &[Message]) -> Self {
-        let transcript_cells = cells_from_messages(messages);
-        Self {
-            pending_insert_cells: transcript_cells.clone(),
-            transcript_cells,
-            active_cell: None,
-            active_tools: Vec::new(),
-            pending_insert_needs_leading_separator: false,
+        let mut surface = Self::default();
+        for cell in cells_from_messages(messages) {
+            surface.push_finalized(cell);
         }
+        surface
     }
 
     pub fn transcript_cells(&self) -> &[HistoryCellKind] {
         &self.transcript_cells
+    }
+
+    /// What the turn is currently doing, for the status row.
+    ///
+    /// Derived from the in-flight cell rather than announced by the model: it is
+    /// the same source the viewport draws from, so the two never disagree.
+    pub fn activity_header(&self) -> Option<ActivityHeader> {
+        let active = self.active_cell()?;
+        Some(match &active.cell {
+            HistoryCellKind::Exec(cell) if cell.is_exploring() => ActivityHeader::Exploring,
+            HistoryCellKind::Exec(_) => ActivityHeader::Running,
+            HistoryCellKind::Reasoning(_) => ActivityHeader::Thinking,
+            HistoryCellKind::AgentMarkdown(_) => ActivityHeader::Responding,
+            HistoryCellKind::Tool(_) | HistoryCellKind::McpTool(_) => ActivityHeader::UsingTool,
+            _ => ActivityHeader::Working,
+        })
     }
 
     pub fn active_cell(&self) -> Option<&ActiveHistoryCell> {
@@ -3065,23 +3078,102 @@ impl ChatSurface {
         width: u16,
         mode: InsertHistoryMode,
     ) -> Option<PendingHistoryInsert> {
-        if self.pending_insert_cells.is_empty() {
+        if self.pending_inserts.is_empty() {
             return None;
         }
-        let mut lines = Vec::new();
-        if self.pending_insert_needs_leading_separator {
-            lines.push(Line::default());
-        }
-        for cell in self.pending_insert_cells.drain(..) {
-            extend_surface_lines(&mut lines, cell.display_lines(width));
-        }
-        self.pending_insert_needs_leading_separator = false;
-        match mode {
-            InsertHistoryMode::Legacy => Some(PendingHistoryInsert::legacy_lines(lines)),
-            InsertHistoryMode::InlineScrollback => {
-                Some(PendingHistoryInsert::inline_scrollback_lines(lines))
+        // Rows carry their link destinations all the way down: once written, the
+        // terminal owns them and nothing can annotate them after the fact.
+        let mut lines: Vec<HyperlinkLine> = Vec::new();
+        for pending in self.pending_inserts.drain(..) {
+            if pending.leading_blank {
+                lines.push(HyperlinkLine::new(Line::default()));
+            }
+            match pending.payload {
+                PendingInsertPayload::Cell(cell) => {
+                    lines.extend(cell.display_hyperlink_lines(width))
+                }
+                PendingInsertPayload::Lines(queued) => lines.extend(annotate_web_urls(queued)),
             }
         }
+        if lines.is_empty() {
+            return None;
+        }
+        match mode {
+            InsertHistoryMode::Legacy => Some(PendingHistoryInsert::legacy_hyperlink_lines(lines)),
+            InsertHistoryMode::InlineScrollback => Some(
+                PendingHistoryInsert::inline_scrollback_hyperlink_lines(lines),
+            ),
+        }
+    }
+
+    /// Rebuilds the whole scrollback from the transcript cells.
+    ///
+    /// Rows already written were wrapped at the previous width and the terminal
+    /// will not rewrap them. The cells are the source of truth, so the caller
+    /// clears what it owns and this hands back every cell to be written again.
+    /// Bounded by `max_rows`, dropping the oldest cells first: replaying more
+    /// than the terminal retains is work nobody will ever scroll back to.
+    pub fn reflow(&mut self, width: u16, max_rows: usize) {
+        self.pending_inserts.clear();
+        self.history_blocks = 0;
+        self.stream_open = false;
+        if let Some(active) = self.active_cell.as_mut()
+            && let HistoryCellKind::AgentMarkdown(cell) = &mut active.cell
+        {
+            cell.reset_release();
+        }
+
+        let mut budget = max_rows;
+        let mut kept: Vec<HistoryCellKind> = Vec::new();
+        for cell in self.transcript_cells.iter().rev() {
+            let rows = cell.display_lines(width).len();
+            if !kept.is_empty() && rows > budget {
+                break;
+            }
+            budget = budget.saturating_sub(rows);
+            kept.push(cell.clone());
+        }
+        for cell in kept.into_iter().rev() {
+            let leading_blank = self.history_blocks > 0;
+            self.history_blocks += 1;
+            self.pending_inserts.push(PendingInsert {
+                payload: PendingInsertPayload::Cell(cell),
+                leading_blank,
+            });
+        }
+    }
+
+    /// Advances the display pacing of the in-flight assistant message.
+    ///
+    /// Returns whether anything was released. Callers drive this on a timer
+    /// while a turn is running: releasing lines is what makes a burst of deltas
+    /// scroll steadily instead of landing in one frame.
+    pub fn commit_tick(&mut self, width: u16, now: Instant) -> bool {
+        let Some(active) = self.active_cell.as_mut() else {
+            return false;
+        };
+        let HistoryCellKind::AgentMarkdown(cell) = &mut active.cell else {
+            return false;
+        };
+        let released = cell.commit_tick(width, now, &mut self.chunking);
+        if released.is_empty() {
+            return false;
+        }
+        active.revision = active.revision.saturating_add(1);
+        self.push_stream_lines(released);
+        true
+    }
+
+    fn push_stream_lines(&mut self, lines: Vec<Line<'static>>) {
+        let leading_blank = self.history_blocks > 0 && !self.stream_open;
+        if !self.stream_open {
+            self.history_blocks += 1;
+            self.stream_open = true;
+        }
+        self.pending_inserts.push(PendingInsert {
+            payload: PendingInsertPayload::Lines(lines),
+            leading_blank,
+        });
     }
 
     fn start(&mut self, item: TranscriptItem) {
@@ -3295,11 +3387,17 @@ impl ChatSurface {
         if cell.is_empty_control() {
             return;
         }
-        let has_prior_transcript = !self.transcript_cells.is_empty();
-        if self.pending_insert_cells.is_empty() && has_prior_transcript {
-            self.pending_insert_needs_leading_separator = true;
+        // A cell closing a stream continues the block its lines already opened,
+        // so it must not add a second blank row inside the same message.
+        let leading_blank = self.history_blocks > 0 && !self.stream_open;
+        if !self.stream_open {
+            self.history_blocks += 1;
         }
-        self.pending_insert_cells.push(cell.clone());
+        self.stream_open = false;
+        self.pending_inserts.push(PendingInsert {
+            payload: PendingInsertPayload::Cell(cell.clone()),
+            leading_blank,
+        });
         self.transcript_cells.push(cell);
     }
 }

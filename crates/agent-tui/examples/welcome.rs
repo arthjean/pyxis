@@ -4,12 +4,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use agent_tui::{AppState, render};
-use ratatui::Terminal;
+use agent_tui::custom_terminal::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
 fn dump(state: &AppState, w: u16, h: u16, label: &str) {
-    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    let mut term = Terminal::full_screen(TestBackend::new(w, h), w, h);
     term.draw(|f| render(f, state)).unwrap();
     let buf = term.backend().buffer();
     println!(
@@ -29,7 +29,7 @@ fn dump(state: &AppState, w: u16, h: u16, label: &str) {
 /// 24-bit terminal (otherwise the bi-color half-blocks look uniform). The
 /// codes are only emitted on a color change (compact output).
 fn dump_ansi(state: &AppState, w: u16, h: u16, label: &str) {
-    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    let mut term = Terminal::full_screen(TestBackend::new(w, h), w, h);
     term.draw(|f| render(f, state)).unwrap();
     let buf = term.backend().buffer();
     println!("\n── {label} · couleurs réelles ──");

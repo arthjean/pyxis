@@ -12,12 +12,12 @@ use std::time::{Duration, Instant};
 use agent_core::AgentEvent;
 use agent_tui::render;
 use agent_tui::state::AppState;
-use ratatui::Terminal;
+use agent_tui::custom_terminal::Terminal;
 use ratatui::backend::TestBackend;
 
 /// Renders a frame and returns the cursor position reported by the backend.
 fn cursor_after_render(state: &AppState, width: u16, height: u16) -> (u16, u16) {
-    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let mut terminal = Terminal::full_screen(TestBackend::new(width, height), width, height);
     terminal.draw(|f| render(f, state)).unwrap();
     let position = terminal.get_cursor_position().unwrap();
     (position.x, position.y)
@@ -120,7 +120,7 @@ fn p95_frame_time_under_16ms_with_a_ten_line_composer() {
             .join("\n"),
     );
 
-    let mut terminal = Terminal::new(TestBackend::new(200, 50)).unwrap();
+    let mut terminal = Terminal::full_screen(TestBackend::new(200, 50), 200, 50);
     let mut samples: Vec<Duration> = Vec::with_capacity(100);
     for _ in 0..100 {
         let start = Instant::now();

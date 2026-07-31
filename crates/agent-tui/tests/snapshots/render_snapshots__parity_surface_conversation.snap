@@ -1,26 +1,26 @@
 ---
 source: crates/agent-tui/tests/render_snapshots.rs
-expression: "harness::chat_frame(\"parity_surface_conversation\", &s, &chat, W, H)"
+expression: "harness::chat_frame(\"parity_surface_conversation\", &s, &mut chat, W, H)"
 ---
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 › Quelle est la frontière d'arrêt ?
 
 
 • La fin d'événement de stream et le retour de dispatch.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 ────────────────────────────────────────────────────────────────────────────────
 › Ask Pyxis to do anything

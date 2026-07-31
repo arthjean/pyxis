@@ -16,7 +16,7 @@
 //! wrapping. The footer is always exactly one line except in
 //! [`FooterMode::ShortcutOverlay`].
 
-use ratatui::Frame;
+use crate::custom_terminal::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -348,14 +348,15 @@ fn truncate(line: Line<'static>, budget: u16) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::Terminal;
+    use crate::custom_terminal::Terminal;
     use ratatui::backend::TestBackend;
 
     fn draw(props: &FooterProps, width: u16, height_rows: u16) -> Vec<String> {
-        let mut term = Terminal::new(TestBackend::new(width, height_rows)).unwrap();
+        let mut term = Terminal::full_screen(TestBackend::new(width, height_rows), width, height_rows);
         term.draw(|frame| {
             let theme = Theme::new(true);
-            render(frame, frame.area(), props, &theme);
+            let area = frame.area();
+            render(frame, area, props, &theme);
         })
         .unwrap();
         let buf = term.backend().buffer();

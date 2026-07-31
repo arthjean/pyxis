@@ -22,11 +22,12 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+use agent_tui::custom_terminal::Terminal;
 use agent_tui::render;
 use agent_tui::state::AppState;
-use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use unicode_width::UnicodeWidthStr;
 
 /// Renders a frame of the `render` path (composer, status, menu, permission
@@ -37,16 +38,37 @@ pub fn frame(label: &str, state: &AppState, width: u16, height: u16) -> String {
     })
 }
 
-/// Renders the `ChatWidget` path used in inline-scrollback mode.
+/// Renders the `ChatWidget` path used in inline-scrollback mode, following the
+/// same two steps as the app loop: finalized cells are written above the
+/// viewport, then the viewport is drawn, bottom-anchored, tall enough for its
+/// content.
+///
+/// The dump concatenates what the terminal keeps (scrollback) and what it shows
+/// (screen), separated by a marker. A cell appearing on both sides of that
+/// marker is the double-render regression this path exists to prevent.
 #[cfg(feature = "codex_tui_parity")]
 pub fn chat_frame(
     label: &str,
     state: &AppState,
-    chat: &agent_tui::ChatWidget,
+    chat: &mut agent_tui::ChatWidget,
     width: u16,
     height: u16,
 ) -> String {
+    let mode = agent_tui::InsertHistoryMode::InlineScrollback;
+    let pending = chat.surface_mut().drain_pending_insert(width, mode);
+    let requested = agent_tui::parity_content_height(state, chat.surface(), width, height);
+    let chat = &*chat;
+
     capture(label, width, height, |terminal| {
+        // A fresh terminal hands the whole screen to the viewport; history takes
+        // rows back from its top as it is written.
+        terminal.set_viewport_area(Rect::new(0, 0, width, height));
+        if let Some(insert) = pending.as_ref() {
+            agent_tui::HistoryInserter::new(mode)
+                .insert(terminal, insert)
+                .unwrap();
+        }
+        terminal.anchor_viewport(requested).unwrap();
         terminal.draw(|frame| chat.render(frame, state)).unwrap();
     })
 }
@@ -91,9 +113,19 @@ fn draw_once(
     draw: &impl Fn(&mut Terminal<TestBackend>),
 ) -> String {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut terminal = Terminal::full_screen(TestBackend::new(width, height), width, height);
         draw(&mut terminal);
-        dump(terminal.backend().buffer())
+        let backend = terminal.backend();
+        let scrollback = backend.scrollback();
+        if scrollback.area().height == 0 {
+            dump(backend.buffer())
+        } else {
+            format!(
+                "{}{SCROLLBACK_MARKER}\n{}",
+                dump(scrollback),
+                dump(backend.buffer())
+            )
+        }
     }));
     match outcome {
         Ok(rendered) => rendered,
@@ -107,6 +139,9 @@ fn draw_once(
         }
     }
 }
+
+/// Separates what the terminal keeps from what it currently shows.
+const SCROLLBACK_MARKER: &str = "── scrollback above · screen below ──";
 
 /// Ratatui buffer -> text. Trailing spaces are removed: they are invisible
 /// in a snapshot diff and some editors rewrite them, which

@@ -6,7 +6,7 @@
 //! `render` is PURE -> testable through `TestBackend`. Degradation without truecolor
 //! (AC4) replaces the accent with bold; the layout is unchanged.
 
-use ratatui::Frame;
+use crate::custom_terminal::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -82,8 +82,115 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     }
     match &state.pending {
         Some(prompt) => render_permission(frame, chunks[2], prompt, &theme),
-        None => render_input(frame, chunks[2], state, &theme),
+        None => render_input(frame, chunks[2], state, &theme, None),
     }
+}
+
+/// Vertical budget of the parity viewport, in screen rows.
+///
+/// The viewport owns only what is still mutable: the in-flight cell, the command
+/// menu and the bottom pane. Finalized history lives in the terminal scrollback
+/// and is never measured here. Computing the layout and the height through the
+/// same function keeps the drawn frame and the reserved rows from drifting apart.
+#[cfg(feature = "codex_tui_parity")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParityLayout {
+    pub(crate) welcome: u16,
+    pub(crate) active: u16,
+    pub(crate) menu: u16,
+    pub(crate) bottom: u16,
+}
+
+#[cfg(feature = "codex_tui_parity")]
+impl ParityLayout {
+    pub(crate) fn total(self) -> u16 {
+        self.welcome
+            .saturating_add(self.active)
+            .saturating_add(self.menu)
+            .saturating_add(self.bottom)
+    }
+}
+
+/// Blank row kept between the last history row and the active cell, so streamed
+/// content does not touch the transcript above it.
+#[cfg(feature = "codex_tui_parity")]
+const ACTIVE_CELL_TOP_MARGIN: u16 = 1;
+
+#[cfg(feature = "codex_tui_parity")]
+pub(crate) fn parity_layout(
+    state: &AppState,
+    surface: &crate::history_cell::ChatSurface,
+    width: u16,
+    max_height: u16,
+) -> ParityLayout {
+    if state.transcript_overlay_open() {
+        return ParityLayout {
+            welcome: 0,
+            active: max_height,
+            menu: 0,
+            bottom: 0,
+        };
+    }
+
+    let bottom = match &state.pending {
+        Some(p) => permission_height(p, width),
+        None => input_height(state, width),
+    }
+    .min(max_height);
+
+    let matches = state.menu_items();
+    let menu_open = state.pending.is_none() && !state.shutdown_in_progress() && !matches.is_empty();
+    let menu = if menu_open {
+        ((matches.len() as u16).min(MENU_MAX_ITEMS) + 1).min(max_height.saturating_sub(bottom))
+    } else {
+        0
+    };
+
+    let remaining = max_height.saturating_sub(bottom).saturating_sub(menu);
+    let welcome_visible = state.is_welcome()
+        && surface.transcript_cells().is_empty()
+        && surface.active_cell().is_none();
+    if welcome_visible {
+        return ParityLayout {
+            welcome: welcome_height(state, width).min(remaining),
+            active: 0,
+            menu,
+            bottom,
+        };
+    }
+
+    let active_lines = surface.active_display_lines(width).len();
+    let active = if active_lines == 0 {
+        0
+    } else {
+        (active_lines.min(u16::MAX as usize) as u16)
+            .saturating_add(ACTIVE_CELL_TOP_MARGIN)
+            .min(remaining)
+    };
+
+    ParityLayout {
+        welcome: 0,
+        active,
+        menu,
+        bottom,
+    }
+}
+
+/// Rows of content the parity renderer needs.
+///
+/// The viewport is anchored to the bottom of the screen and may be taller than
+/// this: the surplus becomes empty space above the composer, not a shorter
+/// viewport.
+#[cfg(feature = "codex_tui_parity")]
+pub fn parity_content_height(
+    state: &AppState,
+    surface: &crate::history_cell::ChatSurface,
+    width: u16,
+    screen_height: u16,
+) -> u16 {
+    parity_layout(state, surface, width, screen_height)
+        .total()
+        .clamp(1, screen_height.max(1))
 }
 
 #[cfg(feature = "codex_tui_parity")]
@@ -100,112 +207,65 @@ pub(crate) fn render_parity(
         return;
     }
 
-    let bottom_height = match &state.pending {
-        Some(p) => permission_height(p, area.width),
-        None => input_height(state, area.width),
-    }
-    .min(area.height.saturating_sub(1));
-    let matches = state.menu_items();
-    let menu_open = state.pending.is_none() && !state.shutdown_in_progress() && !matches.is_empty();
-    let max_menu_height = area.height.saturating_sub(bottom_height).saturating_sub(1);
-    let menu_height = if menu_open {
-        ((matches.len() as u16).min(MENU_MAX_ITEMS) + 1).min(max_menu_height)
-    } else {
-        0
-    };
-    let menu = menu_open && menu_height > 0;
-
-    if state.is_welcome()
-        && surface.transcript_cells().is_empty()
-        && surface.active_cell().is_none()
-    {
-        let chunks = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(menu_height),
-            Constraint::Length(bottom_height),
-        ])
-        .split(area);
-        render_welcome(frame, chunks[0], state, &theme);
-        if menu {
-            render_command_menu(frame, chunks[1], state, &theme, &matches);
-        }
-        match &state.pending {
-            Some(prompt) => render_permission(frame, chunks[2], prompt, &theme),
-            None => render_input(frame, chunks[2], state, &theme),
-        }
-        return;
-    }
-
-    let separator_height = u16::from(state.scroll == 0);
-    let available_transcript_height = area
-        .height
-        .saturating_sub(menu_height)
-        .saturating_sub(bottom_height)
-        .saturating_sub(separator_height);
-    let transcript_height = if state.scroll > 0 {
-        available_transcript_height
-    } else {
-        let visible_height = surface
-            .display_lines(area.width)
-            .len()
-            .min(u16::MAX as usize) as u16;
-        visible_height.min(available_transcript_height)
-    };
-    let trailing_height = area
-        .height
-        .saturating_sub(transcript_height)
-        .saturating_sub(separator_height)
-        .saturating_sub(menu_height)
-        .saturating_sub(bottom_height);
+    let layout = parity_layout(state, surface, area.width, area.height);
+    // The in-flight cell continues the history above it, and the bottom pane
+    // hugs the last row: the composer stays where the eye and the cursor already
+    // are, whatever the turn is doing. The slack sits between them, so a growing
+    // answer reads as one thread flowing down rather than as a block drifting up
+    // from the prompt. The completion menu stays attached to the composer.
     let chunks = Layout::vertical([
-        Constraint::Length(trailing_height),
-        Constraint::Length(transcript_height),
-        Constraint::Length(separator_height),
-        Constraint::Length(menu_height),
-        Constraint::Length(bottom_height),
+        Constraint::Length(layout.welcome),
+        Constraint::Length(layout.active),
+        Constraint::Min(0),
+        Constraint::Length(layout.menu),
+        Constraint::Length(layout.bottom),
     ])
     .split(area);
 
-    render_parity_transcript(frame, chunks[1], state, surface, &theme);
-    if menu {
-        render_command_menu(frame, chunks[3], state, &theme, &matches);
+    if layout.welcome > 0 {
+        render_welcome(frame, chunks[0], state, &theme);
+    }
+    if layout.active > 0 {
+        render_active_cell(frame, chunks[1], surface);
+    }
+    if layout.menu > 0 {
+        render_command_menu(frame, chunks[3], state, &theme, &state.menu_items());
     }
     match &state.pending {
         Some(prompt) => render_permission(frame, chunks[4], prompt, &theme),
-        None => render_input(frame, chunks[4], state, &theme),
+        None => render_input(frame, chunks[4], state, &theme, surface.activity_header()),
     }
 }
 
+/// Draws the in-flight cell, bottom-aligned inside its area.
+///
+/// A streamed cell can outgrow the rows reserved for it between two frames (a
+/// long tool output, a table). Showing its tail rather than its head keeps the
+/// newest content visible, which is what the reader is following.
 #[cfg(feature = "codex_tui_parity")]
-fn render_parity_transcript(
+fn render_active_cell(
     frame: &mut Frame,
     area: Rect,
-    state: &AppState,
     surface: &crate::history_cell::ChatSurface,
-    theme: &Theme,
 ) {
-    let all_lines = surface.display_lines(area.width);
-    let max_off = all_lines.len().saturating_sub(area.height as usize);
-    state.scroll_max.set(max_off);
-
-    let lines = if area.height == 0 {
-        Vec::new()
-    } else if state.scroll == 0 {
-        all_lines
-            .into_iter()
-            .skip(max_off)
-            .take(area.height as usize)
-            .collect()
-    } else {
-        let offset = max_off.saturating_sub(state.scroll.min(max_off));
-        all_lines
-            .into_iter()
-            .skip(offset)
-            .take(area.height as usize)
-            .collect()
+    let content = Rect {
+        y: area.y.saturating_add(ACTIVE_CELL_TOP_MARGIN),
+        height: area.height.saturating_sub(ACTIVE_CELL_TOP_MARGIN),
+        ..area
     };
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
-    render_scroll_pill(frame, area, state, theme);
+    if content.height == 0 || content.width == 0 {
+        return;
+    }
+    let lines = surface.active_display_lines(content.width);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let overflow = paragraph
+        .line_count(content.width)
+        .saturating_sub(content.height as usize);
+    frame.render_widget(Clear, content);
+    frame.render_widget(
+        paragraph.scroll((u16::try_from(overflow).unwrap_or(u16::MAX), 0)),
+        content,
+    );
 }
 
 #[cfg(feature = "codex_tui_parity")]
@@ -483,10 +543,100 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     // No transcript to scroll on the welcome screen.
     state.scroll_max.set(0);
 
-    let logo = logo_lines(theme);
+    let (logo, info) = welcome_parts(state, theme);
     let logo_w = logo.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
+    let WelcomeMetrics {
+        card_w,
+        card_h,
+        inner_h,
+        gap,
+        pad,
+    } = welcome_metrics(&logo, &info);
 
-    // Right column: identity, meta (model/workspace/provider), shortcuts.
+    // Terminal too small for the full card -> compact fallback.
+    if area.width < card_w || area.height < card_h {
+        render_welcome_compact(frame, area, &info);
+        return;
+    }
+
+    let rect = top_centered_rect(area, card_w, card_h);
+    let frame_block = Boundary::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.faint());
+    let content = frame_block.inner(rect);
+    frame.render_widget(frame_block, rect);
+
+    // Composes each line: logo (left) + gap + info (right), both blocks
+    // vertically centered in `inner_h`.
+    let logo_off = (inner_h - logo.len() as u16) / 2;
+    let info_off = (inner_h - info.len() as u16) / 2;
+    let mut rows: Vec<Line> = Vec::with_capacity(inner_h as usize);
+    for i in 0..inner_h {
+        let mut spans: Vec<Span> = Vec::new();
+        match i.checked_sub(logo_off).map(|j| logo.get(j as usize)) {
+            Some(Some(line)) => spans.extend(line.spans.iter().cloned()),
+            _ => spans.push(Span::raw(" ".repeat(logo_w as usize))),
+        }
+        spans.push(Span::raw(" ".repeat(gap as usize)));
+        if let Some(Some(line)) = i.checked_sub(info_off).map(|j| info.get(j as usize)) {
+            spans.extend(line.spans.iter().cloned());
+        }
+        rows.push(Line::from(spans));
+    }
+
+    // 1 margin line at the top, `pad` columns on the left, inside the frame.
+    let body = Rect {
+        x: content.x + pad,
+        y: content.y + 1,
+        width: content.width.saturating_sub(pad),
+        height: content.height.saturating_sub(1),
+    };
+    frame.render_widget(Paragraph::new(rows), body);
+}
+
+struct WelcomeMetrics {
+    card_w: u16,
+    card_h: u16,
+    inner_h: u16,
+    gap: u16,
+    pad: u16,
+}
+
+fn welcome_metrics(logo: &[Line<'static>], info: &[Line<'static>]) -> WelcomeMetrics {
+    let logo_w = logo.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
+    let info_w = info.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
+    let gap: u16 = 3; // breathing column between logo and text
+    let pad: u16 = 2; // inner horizontal margin (on both sides)
+    let inner_w = logo_w + gap + info_w;
+    let inner_h = logo.len().max(info.len()) as u16;
+    WelcomeMetrics {
+        card_w: inner_w + pad * 2 + 2, // + 2 borders
+        card_h: inner_h + 4,           // 2 margin lines (top/bottom) + 2 borders
+        inner_h,
+        gap,
+        pad,
+    }
+}
+
+/// Rows the welcome screen asks for. The parity viewport must reserve them
+/// before drawing, and the fallback card is shorter than the full one.
+fn welcome_height(state: &AppState, width: u16) -> u16 {
+    let theme = Theme::new(state.truecolor);
+    let (logo, info) = welcome_parts(state, &theme);
+    let metrics = welcome_metrics(&logo, &info);
+    if width < metrics.card_w {
+        // The compact fallback keeps `top_centered_rect`'s one-row top offset.
+        (info.len() as u16).max(1).saturating_add(1)
+    } else {
+        metrics.card_h.saturating_add(1)
+    }
+}
+
+/// Left column (logo) and right column (identity, model, shortcuts) of the
+/// welcome card, shared by the renderer and the height budget.
+fn welcome_parts(state: &AppState, theme: &Theme) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
+    let logo = logo_lines(theme);
     let mut info: Vec<Line> = vec![
         Line::from(Span::styled(
             "PYXIS",
@@ -545,54 +695,7 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         theme.faint(),
     )));
 
-    let info_w = info.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
-    let gap: u16 = 3; // breathing column between logo and text
-    let pad: u16 = 2; // inner horizontal margin (on both sides)
-    let inner_w = logo_w + gap + info_w;
-    let inner_h = logo.len().max(info.len()) as u16;
-    let card_w = inner_w + pad * 2 + 2; // + 2 borders
-    let card_h = inner_h + 4; // 2 margin lines (top/bottom) + 2 borders
-
-    // Terminal too small for the full card -> compact fallback.
-    if area.width < card_w || area.height < card_h {
-        render_welcome_compact(frame, area, &info);
-        return;
-    }
-
-    let rect = top_centered_rect(area, card_w, card_h);
-    let frame_block = Boundary::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(theme.faint());
-    let content = frame_block.inner(rect);
-    frame.render_widget(frame_block, rect);
-
-    // Composes each line: logo (left) + gap + info (right), both blocks
-    // vertically centered in `inner_h`.
-    let logo_off = (inner_h - logo.len() as u16) / 2;
-    let info_off = (inner_h - info.len() as u16) / 2;
-    let mut rows: Vec<Line> = Vec::with_capacity(inner_h as usize);
-    for i in 0..inner_h {
-        let mut spans: Vec<Span> = Vec::new();
-        match i.checked_sub(logo_off).map(|j| logo.get(j as usize)) {
-            Some(Some(line)) => spans.extend(line.spans.iter().cloned()),
-            _ => spans.push(Span::raw(" ".repeat(logo_w as usize))),
-        }
-        spans.push(Span::raw(" ".repeat(gap as usize)));
-        if let Some(Some(line)) = i.checked_sub(info_off).map(|j| info.get(j as usize)) {
-            spans.extend(line.spans.iter().cloned());
-        }
-        rows.push(Line::from(spans));
-    }
-
-    // 1 margin line at the top, `pad` columns on the left, inside the frame.
-    let body = Rect {
-        x: content.x + pad,
-        y: content.y + 1,
-        width: content.width.saturating_sub(pad),
-        height: content.height.saturating_sub(1),
-    };
-    frame.render_widget(Paragraph::new(rows), body);
+    (logo, info)
 }
 
 /// Welcome fallback for a narrow terminal: the identity block alone at the top,
@@ -1877,7 +1980,7 @@ mod tests {
     use super::*;
     use agent_core::AgentEvent;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use ratatui::Terminal;
+    use crate::custom_terminal::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
 
@@ -1894,7 +1997,7 @@ mod tests {
     }
 
     fn draw(state: &AppState, w: u16, h: u16) -> String {
-        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut term = Terminal::full_screen(TestBackend::new(w, h), w, h);
         term.draw(|f| render(f, state)).unwrap();
         dump(term.backend().buffer())
     }
@@ -1905,6 +2008,9 @@ mod tests {
         out.lines().last().unwrap_or_default()
     }
 
+    /// Draws the parity path the way the app loop does: a viewport only as tall
+    /// as the renderer asks for, anchored at the bottom of the screen. The rows
+    /// above it belong to the scrollback and stay blank here.
     #[cfg(feature = "codex_tui_parity")]
     fn draw_parity(
         state: &AppState,
@@ -1912,7 +2018,9 @@ mod tests {
         w: u16,
         h: u16,
     ) -> String {
-        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        let mut term = Terminal::full_screen(TestBackend::new(w, h), w, h);
+        let requested = parity_content_height(state, surface, w, h).min(h);
+        term.set_viewport_area(Rect::new(0, h - requested, w, requested));
         term.draw(|f| render_parity(f, state, surface)).unwrap();
         dump(term.backend().buffer())
     }
@@ -1936,7 +2044,7 @@ mod tests {
     fn composer_uses_rules_without_filled_background() {
         let mut s = AppState::new("gpt-5", true);
         s.set_input("Try something".into());
-        let mut term = Terminal::new(TestBackend::new(48, 10)).unwrap();
+        let mut term = Terminal::full_screen(TestBackend::new(48, 10), 48, 10);
         term.draw(|f| render(f, &s)).unwrap();
         let buf = term.backend().buffer();
         let prompt_y = (0..buf.area().height)
@@ -2133,10 +2241,13 @@ mod tests {
         );
     }
 
+    /// Finalized cells belong to the terminal scrollback. Drawing them again in
+    /// the viewport would show every committed row twice: once where the
+    /// terminal keeps it, once where the renderer repaints it.
     #[cfg(feature = "codex_tui_parity")]
     #[test]
-    fn parity_scroll_reaches_full_transcript() {
-        let mut state = AppState::new("gpt-5", true);
+    fn parity_viewport_leaves_finalized_history_to_the_scrollback() {
+        let state = AppState::new("gpt-5", true);
         let messages = (0..10)
             .flat_map(|i| {
                 [
@@ -2147,50 +2258,52 @@ mod tests {
             .collect::<Vec<_>>();
         let surface = crate::history_cell::ChatSurface::from_messages(&messages);
 
-        let bottom = draw_parity(&state, &surface, 48, 10);
-        assert!(
-            state.scroll_max.get() > 0,
-            "parity transcript should publish a scroll bound:\n{bottom}"
-        );
-        assert!(
-            !bottom.contains("message 0"),
-            "bottom-pinned parity view should show the transcript tail:\n{bottom}"
-        );
+        let out = draw_parity(&state, &surface, 48, 10);
 
-        state.scroll_up(1000);
-        assert_eq!(state.scroll, state.scroll_max.get());
-        let top = draw_parity(&state, &surface, 48, 10);
         assert!(
-            top.contains("message 0"),
-            "scrolled parity view should render the top of retained transcript:\n{top}"
+            !out.contains("message 0") && !out.contains("answer 9"),
+            "aucune cellule finalisée ne doit être repeinte dans le viewport :\n{out}"
+        );
+        assert!(out.contains("›"), "le composer doit rester rendu :\n{out}");
+    }
+
+    /// The one mutable cell stays in the viewport: it is still changing, so the
+    /// scrollback cannot own it yet.
+    #[cfg(feature = "codex_tui_parity")]
+    #[test]
+    fn parity_viewport_renders_the_active_cell() {
+        let state = AppState::new("gpt-5", true);
+        let mut surface = crate::history_cell::ChatSurface::new();
+        let mut mapper = crate::app_event::TranscriptMapper::new();
+        for update in mapper.map_event(&AgentEvent::Text("réponse en cours".into())) {
+            surface.apply_update(update);
+        }
+
+        let out = draw_parity(&state, &surface, 48, 12);
+
+        assert!(
+            out.contains("réponse en cours"),
+            "la cellule active doit être rendue dans le viewport :\n{out}"
         );
     }
 
+    /// An idle turn owns nothing but the bottom pane, so the viewport shrinks to
+    /// it and the rest of the screen keeps showing scrollback.
     #[cfg(feature = "codex_tui_parity")]
     #[test]
-    fn parity_idle_composer_is_bottom_anchored() {
+    fn parity_content_height_collapses_to_the_bottom_pane_when_idle() {
         let state = AppState::new("gpt-5", true);
         let surface = crate::history_cell::ChatSurface::from_messages(&[
             agent_core::Message::user("prompt"),
             agent_core::Message::assistant_text("final answer"),
         ]);
 
-        let out = draw_parity(&state, &surface, 48, 12);
-        let prompt_row = out
-            .lines()
-            .enumerate()
-            .filter_map(|(idx, line)| line.contains("›").then_some(idx))
-            .last()
-            .expect("composer prompt should render");
+        let height = parity_content_height(&state, &surface, 48, 40);
+
+        assert_eq!(height, input_height(&state, 48));
         assert!(
-            prompt_row >= 8,
-            "idle parity composer should stay near the terminal bottom:\n{out}"
-        );
-        assert!(
-            out.lines()
-                .take(prompt_row)
-                .any(|line| line.contains("final answer")),
-            "transcript tail should remain visible above the bottom composer:\n{out}"
+            height < 40,
+            "le contenu ne réclame que le composer ; le reste du viewport est du vide au-dessus"
         );
     }
 

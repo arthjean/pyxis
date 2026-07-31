@@ -1,4 +1,4 @@
-use ratatui::Frame;
+use crate::custom_terminal::Frame;
 
 use super::ChatWidget;
 use crate::state::AppState;

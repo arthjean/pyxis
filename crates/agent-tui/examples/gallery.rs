@@ -7,11 +7,11 @@ use agent_core::AgentEvent;
 use agent_core::event::{ToolCallView, ToolResultView};
 use agent_tui::state::PermissionPrompt;
 use agent_tui::{AppState, diff, render};
-use ratatui::Terminal;
+use agent_tui::custom_terminal::Terminal;
 use ratatui::backend::TestBackend;
 
 fn dump(state: &AppState, w: u16, h: u16, label: &str) {
-    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    let mut term = Terminal::full_screen(TestBackend::new(w, h), w, h);
     term.draw(|f| render(f, state)).unwrap();
     let buf = term.backend().buffer();
     println!(

@@ -18,6 +18,7 @@ mod cache;
 #[cfg(feature = "codex_tui_parity")]
 pub mod chatwidget;
 mod composer;
+pub mod custom_terminal;
 pub mod debug_log;
 pub mod diff;
 pub mod footer;
@@ -28,6 +29,8 @@ pub mod history_cell;
 pub mod insert_history;
 mod markdown;
 mod measure;
+#[cfg(feature = "codex_tui_parity")]
+pub mod parse_command;
 pub mod render;
 mod spinner;
 pub mod state;
@@ -36,8 +39,6 @@ pub mod streaming;
 pub mod term;
 #[cfg(feature = "codex_tui_parity")]
 pub mod terminal_hyperlinks;
-#[cfg(feature = "codex_tui_parity")]
-pub mod terminal_viewport;
 pub mod theme;
 mod tool;
 
@@ -61,7 +62,8 @@ pub use footer::{FooterMode, FooterProps, StatusAccent, StatusSegment};
 #[cfg(feature = "codex_tui_parity")]
 pub use history_cell::{
     ActiveHistoryCell, AgentMarkdownCell, ApprovalCell, ChatSurface, CompositeCell, ErrorCell,
-    ExecCell, FileChangeCell, FinalMessageSeparatorCell, HistoryCell, HistoryCellKind, HookCell,
+    ActivityHeader, ExecCell, FileChangeCell, FinalMessageSeparatorCell, HistoryCell,
+    HistoryCellKind, HookCell,
     HookOutputEntry, HookOutputKind, HookStatus, McpInvocation, McpToolCell, NoticeCell,
     PatchApplyFailureCell, PatchChangeKind, PatchFileChange, PatchSummaryCell, PlanStep,
     PlanStepStatus, PlanUpdateCell, ReasoningCell, RequestUserInputCell, SessionHeaderCell,
@@ -73,7 +75,10 @@ pub use insert_history::{
     HistoryInsertError, HistoryInserter, InsertHistoryMode, PendingHistoryInsert,
     SanitizedHistoryLine,
 };
+pub use custom_terminal::Frame;
 pub use render::render;
+#[cfg(feature = "codex_tui_parity")]
+pub use render::parity_content_height;
 pub use state::{
     AppState, Block, COMMANDS, DEFAULT_PERMISSION_MODE_ID, InputAction, McpServerMeta, McpStatus,
     MenuItem, ModelCatalogEntry, ModelMeta, PERMISSION_MODES, PermissionModeMeta, PermissionPrompt,
@@ -86,10 +91,9 @@ pub use state::{
     set_models, supported_reasoning_efforts_for_model, turn_diff_summary,
 };
 #[cfg(feature = "codex_tui_parity")]
-pub use streaming::{StreamController, StreamView};
-pub use term::{Tui, clear, enter, is_active, leave, restore, supports_truecolor};
-#[cfg(feature = "codex_tui_parity")]
-pub use term::{inline_viewport_stale, sync_inline_viewport};
-#[cfg(feature = "codex_tui_parity")]
-pub use terminal_viewport::{TerminalViewport, TerminalViewportState};
+pub use streaming::{COMMIT_TICK_INTERVAL, ChunkingMode, ChunkingPolicy, StreamController, StreamView};
+pub use term::{
+    REFLOW_DEBOUNCE, Tui, clear, clear_for_reflow, draw, enter, is_active, leave, restore,
+    supports_truecolor,
+};
 pub use theme::Theme;
