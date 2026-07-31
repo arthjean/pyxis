@@ -515,6 +515,9 @@ pub struct McpServerMeta {
     pub needs_trust: bool,
     /// Number of exposed tools (meaningful only when `Connected`).
     pub tool_count: usize,
+    /// Remote (Streamable HTTP) server: only those have an OAuth endpoint, so
+    /// only those are offered a login.
+    pub remote: bool,
 }
 
 /// Rebuilds the displayable transcript from canonical messages (resuming
@@ -1844,18 +1847,21 @@ impl AppState {
             }
             Menu::McpActions => {
                 let srv = self.active_mcp_server();
-                let status = self
-                    .mcp_servers
-                    .iter()
-                    .find(|m| m.name == srv)
-                    .map(|m| (m.status, m.needs_trust));
-                let needs_trust = status.is_some_and(|(_, trust)| trust);
-                let status = status.map(|(status, _)| status);
+                let meta = self.mcp_servers.iter().find(|m| m.name == srv);
+                let needs_trust = meta.is_some_and(|m| m.needs_trust);
+                let remote = meta.is_some_and(|m| m.remote);
+                let status = meta.map(|m| m.status);
                 let connecting = status == Some(McpStatus::Connecting);
-                if status == Some(McpStatus::Connected) {
+                let mut items = if status == Some(McpStatus::Connected) {
                     vec![
                         MenuItem::new("disconnect", "Disconnect", "", true),
                         MenuItem::new("tools", "View tools", "", true),
+                        MenuItem::new("resources", "View resources", "", true),
+                        // What the server says about itself. Inspected here
+                        // because it never reaches the model: a tool definition
+                        // is not a tool output and would carry that prose past
+                        // the taint defense.
+                        MenuItem::new("info", "View server instructions", "", true),
                     ]
                 } else if needs_trust {
                     vec![MenuItem::new(
@@ -1879,7 +1885,13 @@ impl AppState {
                         },
                         false,
                     )]
+                };
+                // Only a remote server has an authorization server to talk to.
+                if remote {
+                    items.push(MenuItem::new("login", "Authorize (OAuth)", "browser", true));
+                    items.push(MenuItem::new("logout", "Forget authorization", "", true));
                 }
+                items
             }
         }
     }
@@ -2833,6 +2845,7 @@ mod tests {
                 source: "workspace".into(),
                 needs_trust: false,
                 tool_count: 3,
+                remote: false,
             },
             McpServerMeta {
                 name: "fetch".into(),
@@ -2840,6 +2853,7 @@ mod tests {
                 source: "user".into(),
                 needs_trust: false,
                 tool_count: 0,
+                remote: false,
             },
         ];
         for c in "/mcp ".chars() {
@@ -2863,6 +2877,7 @@ mod tests {
             source: "user".into(),
             needs_trust: false,
             tool_count: 0,
+            remote: false,
         }];
         for c in "/mcp ".chars() {
             s.on_key(key(c));
@@ -2890,6 +2905,7 @@ mod tests {
             source: "workspace".into(),
             needs_trust: true,
             tool_count: 0,
+            remote: false,
         }];
         s.set_input("/mcp local ".into());
         let items = s.menu_items();
@@ -2909,10 +2925,39 @@ mod tests {
             source: "workspace".into(),
             needs_trust: false,
             tool_count: 2,
+            remote: false,
         }];
         s.set_input("/mcp fs ".into());
         let ids: Vec<_> = s.menu_items().into_iter().map(|i| i.id).collect();
-        assert_eq!(ids, vec!["disconnect", "tools"]);
+        assert_eq!(ids, vec!["disconnect", "tools", "resources", "info"]);
+    }
+
+    /// Only a remote server has an authorization server to talk to, so a stdio
+    /// one is never offered a login it could not run.
+    #[test]
+    fn only_a_remote_server_offers_the_oauth_actions() {
+        let mut s = AppState::new("gpt-5", false);
+        s.mcp_servers = vec![McpServerMeta {
+            name: "remote".into(),
+            status: McpStatus::Connected,
+            source: "user".into(),
+            needs_trust: false,
+            tool_count: 1,
+            remote: true,
+        }];
+        s.set_input("/mcp remote ".into());
+        let ids: Vec<_> = s.menu_items().into_iter().map(|i| i.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "disconnect",
+                "tools",
+                "resources",
+                "info",
+                "login",
+                "logout"
+            ]
+        );
     }
 
     #[test]
@@ -2924,12 +2969,13 @@ mod tests {
             source: "workspace".into(),
             needs_trust: false,
             tool_count: 1,
+            remote: false,
         }];
         // complete() writes the full name (with a space); the menu must switch to
         // actions, not stay stuck on the list (review regression #7).
         s.set_input("/mcp my server ".into());
         let ids: Vec<_> = s.menu_items().into_iter().map(|i| i.id).collect();
-        assert_eq!(ids, vec!["disconnect", "tools"]);
+        assert_eq!(ids, vec!["disconnect", "tools", "resources", "info"]);
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
             action,
