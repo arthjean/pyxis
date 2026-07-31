@@ -35,10 +35,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::runtime::{CliStepSource, EngineDeps, SessionRuntime, SettingsCell};
 #[cfg(feature = "codex_tui_parity")]
-use agent_tui::{
-    ChatWidget, HistoryInserter, InsertHistoryMode, PermissionTranscriptRequest, TerminalViewport,
-    TerminalViewportState,
-};
+use agent_tui::{ChatWidget, HistoryInserter, InsertHistoryMode, PermissionTranscriptRequest};
 use crossterm::event::{Event, KeyEventKind, MouseEventKind};
 use tokio::sync::{mpsc, oneshot};
 
@@ -813,15 +810,12 @@ async fn event_loop(
     #[cfg(feature = "codex_tui_parity")]
     let mut chat = ChatWidget::new(&initial_messages);
     #[cfg(feature = "codex_tui_parity")]
-    let mut viewport_sync_enabled = true;
-    #[cfg(feature = "codex_tui_parity")]
     let mut last_logged_geometry: Option<String> = None;
-    let mut parity_inserter = HistoryInserter::new(InsertHistoryMode::InlineScrollback);
+    // Terminal width the scrollback was last written at, and the deadline of a
+    // pending rewrite.
     #[cfg(feature = "codex_tui_parity")]
-    let mut parity_viewport = TerminalViewportState::new(
-        TerminalViewport::new(1, 1, 1),
-        InsertHistoryMode::InlineScrollback,
-    );
+    let (mut reflow_width, mut reflow_due): (Option<u16>, Option<Instant>) = (None, None);
+    let mut parity_inserter = HistoryInserter::new(InsertHistoryMode::InlineScrollback);
     // Empty transcript at startup -> the welcome screen (card + logo) shows
     // by itself (see `AppState::is_welcome`), no Notice to push.
 
@@ -878,6 +872,14 @@ async fn event_loop(
     // coming back from idle. The `select!` branch is guarded by `if running` -> 0 CPU when idle.
     let mut spinner = tokio::time::interval(Duration::from_millis(100));
     spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Display pacing of the streamed answer (US-019). Separate from the spinner:
+    // it releases committed lines to the scrollback at a steady rate whatever
+    // the burstiness of the provider, and its cadence must not be tied to the
+    // speed of an animation.
+    #[cfg(feature = "codex_tui_parity")]
+    let mut commit_tick = tokio::time::interval(agent_tui::COMMIT_TICK_INTERVAL);
+    #[cfg(feature = "codex_tui_parity")]
+    commit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // Start of the current turn (rising edge of `running`) for the elapsed time.
     let mut turn_start: Option<Instant> = None;
 
@@ -898,56 +900,66 @@ async fn event_loop(
         #[cfg(feature = "codex_tui_parity")]
         {
             chat.sync_local_blocks(&state);
-            // Terminal enlarged: the inline viewport keeps its original height and
-            // leaves the composer anchored in the middle of the screen until it is
-            // rebuilt. A failure (terminal not answering the position
-            // request) must not kill the session: we give up the realignment
-            // and go on with the stale viewport.
-            if viewport_sync_enabled && let Err(err) = agent_tui::sync_inline_viewport(tui) {
-                viewport_sync_enabled = false;
-                agent_tui::debug_log::log(&format!("sync: disabled after error: {err}"));
-                state.blocks.push(Block::Notice(format!(
-                    "Viewport resize disabled: {err}. Restart Pyxis after resizing."
-                )));
-            }
             let size = tui.size()?;
+            // A width change invalidates every row already written: the terminal
+            // does not rewrap what it was handed. The transcript cells are the
+            // source of truth, so the scrollback is dropped and rewritten. The
+            // debounce covers drag-resize, which emits one event per column.
+            match reflow_width {
+                Some(previous) if previous != size.width => {
+                    reflow_due = Some(Instant::now() + agent_tui::REFLOW_DEBOUNCE);
+                    reflow_width = Some(size.width);
+                }
+                None => reflow_width = Some(size.width),
+                _ => {}
+            }
+            if reflow_due.is_some_and(|due| Instant::now() >= due) {
+                reflow_due = None;
+                if parity_inserter.mode() == InsertHistoryMode::InlineScrollback {
+                    // Only the rows still on screen can be rewritten, so only
+                    // the cells that fit back into them are replayed. Replaying
+                    // more would scroll the repaired transcript straight past
+                    // the old one, showing both.
+                    let rows = agent_tui::clear_for_reflow(tui)?;
+                    chat.surface_mut().reflow(size.width, rows as usize);
+                }
+            }
             if agent_tui::debug_log::enabled() {
-                let viewport = tui.get_frame().area();
+                let viewport = tui.viewport_area;
                 let line = format!(
-                    "frame: screen={}x{} viewport=(x{} y{} w{} h{}) sync_enabled={viewport_sync_enabled}",
-                    size.width,
-                    size.height,
-                    viewport.x,
-                    viewport.y,
-                    viewport.width,
-                    viewport.height
+                    "frame: screen={}x{} viewport=(x{} y{} w{} h{})",
+                    size.width, size.height, viewport.x, viewport.y, viewport.width, viewport.height
                 );
                 if last_logged_geometry.as_deref() != Some(line.as_str()) {
                     agent_tui::debug_log::log(&line);
                     last_logged_geometry = Some(line);
                 }
             }
-            parity_viewport.resize(size.width, size.height, size.height);
+            // Finalized cells go to the terminal scrollback ONCE, above the
+            // viewport. The renderer below never draws them again: the terminal
+            // owns them, which is what makes its own scroll and selection work
+            // on the transcript.
             if parity_inserter.mode() == InsertHistoryMode::InlineScrollback
                 && let Some(insert) = chat
                     .surface_mut()
                     .drain_pending_insert(size.width, parity_inserter.mode())
                 && let Err(err) = parity_inserter.insert(tui, &insert)
             {
-                parity_viewport.activate_legacy_fallback(err.message().to_string());
                 state.blocks.push(Block::Notice(err.message().to_string()));
             }
-        }
-        #[cfg(feature = "codex_tui_parity")]
-        {
+            let height =
+                agent_tui::parity_content_height(&state, chat.surface(), size.width, size.height);
             if parity_inserter.mode() == InsertHistoryMode::InlineScrollback {
-                tui.draw(|frame| chat.render(frame, &state))?;
+                agent_tui::draw(tui, height, |frame| chat.render(frame, &state))?;
             } else {
-                tui.draw(|f| agent_tui::render(f, &state))?;
+                agent_tui::draw(tui, size.height, |f| agent_tui::render(f, &state))?;
             }
         }
         #[cfg(not(feature = "codex_tui_parity"))]
-        tui.draw(|f| agent_tui::render(f, &state))?;
+        {
+            let size = tui.size()?;
+            agent_tui::draw(tui, size.height, |f| agent_tui::render(f, &state))?;
+        }
         if state.should_quit {
             break;
         }
@@ -2123,6 +2135,13 @@ async fn event_loop(
             _ = spinner.tick(), if running && state.pending.is_none() => {
                 let elapsed = turn_start.map(|t| t.elapsed()).unwrap_or_default();
                 state.tick_progress(elapsed);
+            }
+            _ = commit_tick.tick(), if cfg!(feature = "codex_tui_parity") && running => {
+                #[cfg(feature = "codex_tui_parity")]
+                {
+                    let width = tui.size()?.width;
+                    chat.surface_mut().commit_tick(width, Instant::now());
+                }
             }
             _ = tokio::time::sleep(state.quit_shortcut_remaining().unwrap_or(Duration::ZERO)), if state.quit_shortcut_hint_visible() => {
                 state.clear_quit_shortcut_hint();

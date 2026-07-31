@@ -6283,6 +6283,170 @@ mod tests {
         assert!(rendered.contains("truncated"));
     }
 
+    /// A streamed answer leaves the active cell one line at a time. Each line
+    /// crosses into the scrollback exactly once: still drawn while queued, gone
+    /// from the cell once released.
+    #[test]
+    fn commit_tick_moves_stable_lines_from_the_active_cell_to_the_scrollback() {
+        let mut surface = ChatSurface::new();
+        let now = Instant::now();
+        surface.apply_update(text_update(
+            TranscriptLifecycle::Started,
+            Some(TranscriptItemId::local("assistant", 1)),
+            "une\n\ndeux\n\ntrois\n\nen cours",
+            TranscriptItemStatus::Running,
+        ));
+
+        let before = flatten(&surface.active_display_lines(80)).join("\n");
+        assert!(before.contains("une") && before.contains("trois"));
+
+        assert!(surface.commit_tick(80, now), "un tick libère une ligne");
+        let insert = surface
+            .drain_pending_insert(80, InsertHistoryMode::InlineScrollback)
+            .expect("la ligne libérée part vers le scrollback");
+        let scrollback = insert
+            .lines
+            .iter()
+            .map(|line| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(scrollback.contains("une"), "{scrollback}");
+
+        let after = flatten(&surface.active_display_lines(80)).join("\n");
+        assert!(
+            !after.contains("une"),
+            "la ligne libérée ne doit plus être redessinée :\n{after}"
+        );
+        assert!(after.contains("deux"), "le reste attend son tour :\n{after}");
+        assert!(after.contains("en cours"), "le tail mutable reste visible");
+    }
+
+    /// After a width change the terminal keeps the old wrapping, so the caller
+    /// drops the scrollback and the surface hands every cell back.
+    #[test]
+    fn reflow_requeues_the_whole_transcript_at_the_new_width() {
+        let mut surface = ChatSurface::new();
+        let id = TranscriptItemId::local("assistant", 1);
+        surface.apply_update(text_update(
+            TranscriptLifecycle::Completed,
+            Some(id),
+            "une réponse assez longue pour être repliée différemment selon la largeur",
+            TranscriptItemStatus::Complete,
+        ));
+        let first = surface
+            .drain_pending_insert(80, InsertHistoryMode::InlineScrollback)
+            .expect("insertion initiale");
+        assert!(
+            surface
+                .drain_pending_insert(80, InsertHistoryMode::InlineScrollback)
+                .is_none(),
+            "rien ne reste en attente après un drain"
+        );
+
+        surface.reflow(40, 5_000);
+
+        let replayed = surface
+            .drain_pending_insert(40, InsertHistoryMode::InlineScrollback)
+            .expect("le transcript est réémis");
+        assert!(
+            replayed.lines.len() > first.lines.len(),
+            "une largeur réduite produit plus de lignes : {} contre {}",
+            replayed.lines.len(),
+            first.lines.len()
+        );
+    }
+
+    /// Replaying more rows than the terminal keeps is work nobody can scroll
+    /// back to, so the oldest cells are dropped first.
+    #[test]
+    fn reflow_drops_the_oldest_cells_past_the_row_cap() {
+        let mut surface = ChatSurface::new();
+        for idx in 0..10 {
+            surface.apply_update(text_update(
+                TranscriptLifecycle::Completed,
+                Some(TranscriptItemId::local("assistant", idx)),
+                &format!("message {idx}"),
+                TranscriptItemStatus::Complete,
+            ));
+        }
+        let _ = surface.drain_pending_insert(80, InsertHistoryMode::InlineScrollback);
+
+        surface.reflow(80, 3);
+
+        let replayed = surface
+            .drain_pending_insert(80, InsertHistoryMode::InlineScrollback)
+            .expect("le transcript est réémis");
+        let text = replayed
+            .lines
+            .iter()
+            .map(|line| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("message 9"), "le plus récent survit :\n{text}");
+        assert!(!text.contains("message 0"), "le plus ancien tombe :\n{text}");
+    }
+
+    /// The status row names what the turn is doing, and it reads that from the
+    /// same cell the viewport draws.
+    #[test]
+    fn the_activity_header_follows_the_active_cell() {
+        let mut surface = ChatSurface::new();
+        assert_eq!(surface.activity_header(), None);
+
+        surface.apply_update(exec_command_update(
+            TranscriptLifecycle::Started,
+            Some(TranscriptItemId::derived("exec", "call-1")),
+            "cargo build",
+            TranscriptItemStatus::Running,
+        ));
+        assert_eq!(surface.activity_header(), Some(ActivityHeader::Running));
+
+        surface.apply_update(exec_command_update(
+            TranscriptLifecycle::Started,
+            Some(TranscriptItemId::derived("exec", "call-2")),
+            "cat README.md",
+            TranscriptItemStatus::Running,
+        ));
+        assert_eq!(surface.activity_header(), Some(ActivityHeader::Exploring));
+    }
+
+    /// Finalizing must hand over exactly what is left, never replay what the
+    /// terminal already holds.
+    #[test]
+    fn finalizing_a_streamed_message_inserts_only_the_unreleased_lines() {
+        let mut surface = ChatSurface::new();
+        let now = Instant::now();
+        let id = TranscriptItemId::local("assistant", 1);
+        surface.apply_update(text_update(
+            TranscriptLifecycle::Started,
+            Some(id.clone()),
+            "une\n\ndeux\n\ntrois\n\n",
+            TranscriptItemStatus::Running,
+        ));
+        surface.commit_tick(80, now);
+        let _ = surface.drain_pending_insert(80, InsertHistoryMode::InlineScrollback);
+
+        surface.apply_update(text_update(
+            TranscriptLifecycle::Completed,
+            Some(id),
+            "",
+            TranscriptItemStatus::Complete,
+        ));
+
+        let insert = surface
+            .drain_pending_insert(80, InsertHistoryMode::InlineScrollback)
+            .expect("le reste du message part vers le scrollback");
+        let scrollback = insert
+            .lines
+            .iter()
+            .map(|line| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!scrollback.contains("une"), "ligne rejouée :\n{scrollback}");
+        assert!(scrollback.contains("deux") && scrollback.contains("trois"));
+    }
+
+
     #[test]
     fn streaming_cell_exposes_stable_prefix_and_mutable_tail() {
         let mut surface = ChatSurface::new();
