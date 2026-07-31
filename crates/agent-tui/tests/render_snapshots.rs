@@ -487,22 +487,24 @@ fn resumed_session() {
     );
 }
 
+/// The footer spends its row on the status line: the model with its reasoning
+/// level, then the workspace, exactly like the Codex default configuration.
 #[test]
-fn context_indicator() {
+fn footer_status_line() {
     let mut s = conversation();
-    s.context_pct = Some(84);
     s.reasoning_effort = Some("high".into());
     insta::assert_snapshot!(
-        "context_indicator",
-        harness::frame("context_indicator", &s, W, H)
+        "footer_status_line",
+        harness::frame("footer_status_line", &s, W, H)
     );
 }
 
-/// US-004 AC6: fed by real counters, the indicator must not push the status line
-/// past a narrow terminal. The frame is captured at `NARROW` width, so any
-/// overflow would show up as a truncated or wrapped line in the snapshot.
+/// US-004 AC6: the backend counters still feed `context_pct` (read by
+/// `/usage`) even though the footer no longer displays it, and the status line
+/// must not overflow a narrow terminal. The frame is captured at `NARROW`
+/// width, so any overflow would show up as a truncated or wrapped line.
 #[test]
-fn context_indicator_narrow() {
+fn footer_status_line_narrow() {
     let mut s = conversation();
     s.apply(&AgentEvent::ModelTurn(agent_core::ModelTurnView {
         index: 1,
@@ -520,8 +522,22 @@ fn context_indicator_narrow() {
         "alimenté par les compteurs backend"
     );
     insta::assert_snapshot!(
-        "context_indicator_narrow",
-        harness::frame("context_indicator_narrow", &s, NARROW, H)
+        "footer_status_line_narrow",
+        harness::frame("footer_status_line_narrow", &s, NARROW, H)
+    );
+}
+
+/// The shortcut cheatsheet replaces the footer row when `?` opens it.
+#[test]
+fn footer_shortcut_overlay() {
+    let mut s = conversation();
+    s.on_key(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Char('?'),
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    insta::assert_snapshot!(
+        "footer_shortcut_overlay",
+        harness::frame("footer_shortcut_overlay", &s, W, H)
     );
 }
 

@@ -1,6 +1,6 @@
 ---
 source: crates/agent-tui/tests/render_snapshots.rs
-expression: "harness::frame(\"composer_large_paste\", &s, W, H)"
+expression: "harness::frame(\"footer_shortcut_overlay\", &s, W, H)"
 ---
 › Explique la boucle d'agent et montre le code
 
@@ -15,14 +15,14 @@ expression: "harness::frame(\"composer_large_paste\", &s, W, H)"
 
 
 
-
-
-
-
-
-
-
 ────────────────────────────────────────────────────────────────────────────────
-› [collage : 847 lignes] corrige la cause
+›
 ────────────────────────────────────────────────────────────────────────────────
-  gpt-5 · pyxis
+  / for commands                      @ for file paths
+  ctrl + j for newline                enter to send
+  tab to complete                     ↑ ↓ to browse history
+  ctrl + a to go to line start        ctrl + e to go to line end
+  ctrl + w to delete previous word    ctrl + u to clear the input
+  ctrl + t to view transcript         ctrl + c to interrupt or exit
+
+  ? or esc to close

@@ -25,4 +25,4 @@ expression: "harness::frame(\"composer_multiline\", &s, W, H)"
   ligne 9 du prompt
   ligne 10 du prompt
 ────────────────────────────────────────────────────────────────────────────────
-gpt-5 · pyxis · Ask for approval           ctrl+j newline · ctrl+c twice to quit
+  gpt-5 · pyxis

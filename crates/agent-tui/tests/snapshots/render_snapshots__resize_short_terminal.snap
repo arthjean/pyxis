@@ -9,4 +9,4 @@ expression: "harness::frame(\"resize_short_terminal\", &s, W, 8)"
 ────────────────────────────────────────────────────────────────────────────────
 › Le terminal est plus court que la mise en page ne le demande
 ────────────────────────────────────────────────────────────────────────────────
-gpt-5 · pyxis · Ask for approval           ctrl+j newline · ctrl+c twice to quit
+  gpt-5 · pyxis

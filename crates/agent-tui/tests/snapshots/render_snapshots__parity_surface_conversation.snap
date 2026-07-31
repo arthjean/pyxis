@@ -25,4 +25,4 @@ expression: "harness::chat_frame(\"parity_surface_conversation\", &s, &chat, W, 
 ────────────────────────────────────────────────────────────────────────────────
 ›
 ────────────────────────────────────────────────────────────────────────────────
-gpt-5 · pyxis · Ask for approval           ctrl+j newline · ctrl+c twice to quit
+  gpt-5 · pyxis

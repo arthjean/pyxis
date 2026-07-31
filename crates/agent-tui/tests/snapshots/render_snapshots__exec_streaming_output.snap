@@ -25,4 +25,4 @@ expression: "harness::frame(\"exec_streaming_output\", &s, W, H)"
 ────────────────────────────────────────────────────────────────────────────────
 ›
 ────────────────────────────────────────────────────────────────────────────────
-gpt-5 · pyxis · Ask for approval               ctrl+j newline · ctrl+c interrupt
+  gpt-5 · pyxis

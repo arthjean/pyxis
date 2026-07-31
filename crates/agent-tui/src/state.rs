@@ -12,6 +12,7 @@ use agent_core::{AgentEvent, TurnDiffView};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 
+use crate::footer::FooterMode;
 use crate::measure;
 
 /// A transcript item. Rendering picks weight/tint; no color here.
@@ -713,6 +714,10 @@ pub struct AppState {
     pub should_quit: bool,
     shutdown_in_progress: bool,
     quit_shortcut_expires_at: Option<Instant>,
+    /// Shortcut cheatsheet toggled with `?` on an empty composer. The ONLY
+    /// footer state that is stored: the other modes are derived from the input
+    /// and from the quit timer, so they cannot drift out of sync.
+    shortcut_overlay_open: bool,
     // ── Live progress (EP-013) ──────────────────────────────────────────────────
     /// Spinner animation tick, advanced by the loop (~10 fps) as long as a turn
     /// is active. Rendering picks the frame from this counter (stays pure).
@@ -856,6 +861,7 @@ impl AppState {
             should_quit: false,
             shutdown_in_progress: false,
             quit_shortcut_expires_at: None,
+            shortcut_overlay_open: false,
             spinner_tick: 0,
             turn_elapsed: None,
             turn_chars: 0,
@@ -932,6 +938,49 @@ impl AppState {
         self.quit_shortcut_expires_at = None;
     }
 
+    pub fn shortcut_overlay_open(&self) -> bool {
+        self.shortcut_overlay_open
+    }
+
+    /// Effective footer mode, resolved as a priority waterfall (Codex
+    /// `ChatComposer::footer_mode`): a transient instruction always outranks the
+    /// ambient status line, and the base mode only says whether a draft exists.
+    pub fn footer_mode(&self) -> FooterMode {
+        if self.shortcut_overlay_open {
+            return FooterMode::ShortcutOverlay;
+        }
+        if self.quit_shortcut_hint_visible() {
+            return FooterMode::QuitShortcutReminder;
+        }
+        if self.input.is_empty() {
+            FooterMode::ComposerEmpty
+        } else {
+            FooterMode::ComposerHasDraft
+        }
+    }
+
+    /// Handles the overlay toggle key. Returns `true` when the key was consumed.
+    ///
+    /// The toggle only fires on an EMPTY composer, so typing or pasting a `?`
+    /// still inserts the character instead of opening help.
+    fn on_shortcut_overlay_key(&mut self, key: &KeyEvent) -> bool {
+        let toggles = matches!(key.code, KeyCode::Char('?'))
+            && (key.modifiers - KeyModifiers::SHIFT).is_empty()
+            && self.input.is_empty()
+            && !self.shutdown_in_progress;
+        if toggles {
+            self.shortcut_overlay_open = !self.shortcut_overlay_open;
+            return true;
+        }
+        if !self.shortcut_overlay_open {
+            return false;
+        }
+        // Any other key closes the overlay; Esc does nothing else, so it does
+        // not also interrupt the running turn.
+        self.shortcut_overlay_open = false;
+        key.code == KeyCode::Esc
+    }
+
     pub fn shutdown_in_progress(&self) -> bool {
         self.shutdown_in_progress
     }
@@ -941,6 +990,7 @@ impl AppState {
         self.pending = None;
         self.status = Status::Idle;
         self.completion_index = 0;
+        self.shortcut_overlay_open = false;
         self.clear_quit_shortcut_hint();
     }
 
@@ -2014,7 +2064,16 @@ impl AppState {
         }
 
         if is_ctrl_t && !self.shutdown_in_progress {
+            self.shortcut_overlay_open = false;
             self.open_transcript_overlay();
+            return InputAction::None;
+        }
+
+        // A permission dialog replaces the composer: the overlay is dropped
+        // rather than left armed to reappear once the dialog is answered.
+        if self.pending.is_some() {
+            self.shortcut_overlay_open = false;
+        } else if self.on_shortcut_overlay_key(&key) {
             return InputAction::None;
         }
 

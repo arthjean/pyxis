@@ -11,7 +11,7 @@ your terminal coding agent
 
 /help  ·  /models  ·  /effort
 /permissions  ·  /goal
-ctrl+c twice to quit   ·   ↑ history
+? for shortcuts   ·   ↑ history
 
 
 
@@ -25,4 +25,4 @@ ctrl+c twice to quit   ·   ↑ history
 ────────────────────────────────────────
 ›
 ────────────────────────────────────────
-gpt-5 · pyxis · As  ctrl+c twice to quit
+  gpt-5 · pyxis

@@ -1,6 +1,6 @@
 ---
 source: crates/agent-tui/tests/render_snapshots.rs
-expression: "harness::frame(\"context_indicator\", &s, W, H)"
+expression: "harness::frame(\"footer_status_line\", &s, W, H)"
 ---
 › Explique la boucle d'agent et montre le code
 
@@ -25,4 +25,4 @@ expression: "harness::frame(\"context_indicator\", &s, W, H)"
 ────────────────────────────────────────────────────────────────────────────────
 ›
 ────────────────────────────────────────────────────────────────────────────────
-gpt-5 [high] · pyxis · Ask for approval ·  ctrl+j newline · ctrl+c twice to quit
+  gpt-5 high · pyxis

@@ -33,4 +33,4 @@ expression: "harness::frame(\"runtime_status_narrow\", &s, NARROW, 32)"
 ────────────────────────────────────────
 ›
 ────────────────────────────────────────
-gpt-5 · pyxis · As  ctrl+c twice to quit
+  gpt-5 · pyxis

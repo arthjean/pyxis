@@ -1,6 +1,6 @@
 ---
 source: crates/agent-tui/tests/render_snapshots.rs
-expression: "harness::frame(\"context_indicator_narrow\", &s, NARROW, H)"
+expression: "harness::frame(\"footer_status_line_narrow\", &s, NARROW, H)"
 ---
 › Explique la boucle d'agent et montre
   le code
@@ -25,4 +25,4 @@ expression: "harness::frame(\"context_indicator_narrow\", &s, NARROW, H)"
 ────────────────────────────────────────
 ›
 ────────────────────────────────────────
-gpt-5 [high] · pyx  ctrl+c twice to quit
+  gpt-5 high · pyxis

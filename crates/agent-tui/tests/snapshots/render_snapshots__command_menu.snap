@@ -11,7 +11,7 @@ expression: "harness::frame(\"command_menu\", &s, W, H)"
 
                   /help  ·  /models  ·  /effort
                   /permissions  ·  /goal
-                  ctrl+c twice to quit   ·   ↑ history
+                  ? for shortcuts   ·   ↑ history
 
 › /help         Show available commands
   /models       Choose the active model
@@ -25,4 +25,4 @@ expression: "harness::frame(\"command_menu\", &s, W, H)"
 ────────────────────────────────────────────────────────────────────────────────
 › /
 ────────────────────────────────────────────────────────────────────────────────
-gpt-5 · pyxis · Ask for approval           ctrl+j newline · ctrl+c twice to quit
+  gpt-5 · pyxis

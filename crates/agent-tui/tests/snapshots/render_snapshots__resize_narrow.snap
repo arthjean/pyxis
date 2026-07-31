@@ -25,4 +25,4 @@ expression: "harness::frame(\"resize_narrow\", &s, NARROW, H)"
 › Un prompt qui dépasse largement la
   largeur du terminal étroit
 ────────────────────────────────────────
-gpt-5 · pyxis · As  ctrl+c twice to quit
+  gpt-5 · pyxis

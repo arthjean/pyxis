@@ -20,6 +20,7 @@ pub mod chatwidget;
 mod composer;
 pub mod debug_log;
 pub mod diff;
+pub mod footer;
 mod highlight;
 #[cfg(feature = "codex_tui_parity")]
 pub mod history_cell;
@@ -56,6 +57,7 @@ pub use bottom_pane::{
 };
 #[cfg(feature = "codex_tui_parity")]
 pub use chatwidget::ChatWidget;
+pub use footer::{FooterMode, FooterProps, StatusAccent, StatusSegment};
 #[cfg(feature = "codex_tui_parity")]
 pub use history_cell::{
     ActiveHistoryCell, AgentMarkdownCell, ApprovalCell, ChatSurface, CompositeCell, ErrorCell,

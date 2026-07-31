@@ -25,4 +25,4 @@ expression: "harness::frame(\"composer_wrapped_line\", &s, NARROW, H)"
   la reconciliation du transcript, puis
   propose un plan de test.
 ────────────────────────────────────────
-gpt-5 · pyxis · As  ctrl+c twice to quit
+  gpt-5 · pyxis

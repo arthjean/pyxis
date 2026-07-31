@@ -17,13 +17,16 @@ use agent_core::ToolErrorKind;
 
 use crate::cache::fingerprint;
 use crate::composer;
+use crate::footer::{self, FooterProps, StatusSegment};
 use crate::measure;
-use crate::state::{AppState, Block, COMMANDS, MenuItem, PermissionPrompt, Status};
+use crate::state::{
+    AppState, Block, COMMANDS, DEFAULT_PERMISSION_MODE_ID, MenuItem, PermissionPrompt, Status,
+};
 use crate::theme::Theme;
 use crate::tool;
 
 const INDENT: &str = "  ";
-/// Composer collapsed when the session stops: separator + line + separator.
+/// Composer collapsed when the session stops: rule + line + rule.
 const SHUTDOWN_INPUT_HEIGHT: u16 = 3;
 /// Height cap of the composer, in text lines (US-010 AC2). Past it, the
 /// area scrolls to keep the cursor line visible.
@@ -533,8 +536,10 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         Span::styled("  ·  ", theme.faint()),
         Span::styled("/goal", theme.accent()),
     ]));
+    // The footer spends its row on the status line, so `?` is announced here:
+    // without it the shortcut overlay would be unreachable by discovery.
     info.push(Line::from(Span::styled(
-        format!("{}   ·   ↑ history", shortcut_hint(state)),
+        "? for shortcuts   ·   ↑ history",
         theme.faint(),
     )));
 
@@ -1431,9 +1436,17 @@ fn strip_md(line: &str) -> String {
 }
 
 fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let footer_height = u16::from(!state.shutdown_in_progress());
+    let props = footer_props(state);
+    // Codex frames the composer with blank rows; Pyxis keeps its two full-width
+    // rules instead, so the input reads as a bounded field and the status line
+    // sits directly under the closing rule.
+    let footer_height = if state.shutdown_in_progress() {
+        0
+    } else {
+        footer::height(&props, area.width)
+    };
     // The received area can be SMALLER than the requested height (short terminal,
-    // US-010 AC6): the composer takes what is left after progress and status,
+    // US-010 AC6): the composer takes what is left after progress and footer,
     // instead of overflowing.
     let (progress_area, composer_area, footer_area) = if progress_visible(state) {
         let rows = Layout::vertical([
@@ -1454,7 +1467,8 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         render_progress_line(frame, progress_area, state, theme);
     }
 
-    // Top/bottom separators only when a text line remains between them.
+    // Rules only when a text line survives between them; on a crushed terminal
+    // the text wins over the frame.
     let ruled = composer_area.height >= 3;
     if ruled {
         let rule = Line::from(Span::styled(
@@ -1543,7 +1557,7 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         .min(text_area.right().saturating_sub(1));
     frame.set_cursor_position((col, text_area.y + cursor_row));
 
-    render_status_line(frame, footer_area, state, theme);
+    footer::render(frame, footer_area, &props, theme);
 }
 
 /// Usable width for the composer text, gutter subtracted.
@@ -1561,12 +1575,40 @@ fn input_height(state: &AppState, width: u16) -> u16 {
         0
     };
     // Height derived from the number of lines ACTUALLY rendered after folding (AC2),
-    // bounded by the cap; + 2 separators + 1 status line.
+    // bounded by the cap; + the 2 rules framing the text, + the footer (one
+    // line, or the shortcut cheatsheet).
     let rows = composer::layout(&state.input, state.cursor, composer_text_width(width))
         .rows
         .len()
         .clamp(1, COMPOSER_MAX_ROWS as usize) as u16;
-    rows + 2 + 1 + progress
+    rows + 2 + footer::height(&footer_props(state), width) + progress
+}
+
+/// Footer inputs derived from the session state.
+///
+/// The status line carries what Codex puts there by default: the model with its
+/// reasoning level, then the workspace. The permission mode goes to the right,
+/// and only when it leaves its default: an indicator that is always on says
+/// nothing.
+fn footer_props(state: &AppState) -> FooterProps {
+    let mut status_line = Vec::new();
+    let model = match state.reasoning_effort.as_deref().map(str::trim) {
+        Some(effort) if !effort.is_empty() => format!("{} {effort}", state.model),
+        _ => state.model.clone(),
+    };
+    if !model.is_empty() {
+        status_line.push(StatusSegment::model(model));
+    }
+    if !state.workspace.is_empty() {
+        status_line.push(StatusSegment::path(state.workspace.clone()));
+    }
+    FooterProps {
+        mode: state.footer_mode(),
+        status_line,
+        mode_indicator: (state.permission_mode_id() != DEFAULT_PERMISSION_MODE_ID)
+            .then(|| state.permission_mode_label().to_string()),
+        is_task_running: matches!(state.status, Status::Thinking),
+    }
 }
 
 fn progress_visible(state: &AppState) -> bool {
@@ -1614,75 +1656,6 @@ fn input_spans(
     spans
 }
 
-fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let mut left: Vec<Span> = Vec::new();
-    left.push(Span::styled(
-        state.model.clone(),
-        theme.fg().add_modifier(Modifier::BOLD),
-    ));
-    if let Some(effort) = &state.reasoning_effort
-        && !effort.trim().is_empty()
-    {
-        left.push(Span::styled(format!(" [{}]", effort.trim()), theme.dim()));
-    }
-    if !state.workspace.is_empty() {
-        left.push(Span::styled(" · ", theme.faint()));
-        left.push(Span::styled(state.workspace.clone(), theme.success()));
-    }
-    left.push(Span::styled(" · ", theme.faint()));
-    left.push(Span::styled(state.permission_mode_label(), theme.dim()));
-    if let Some(pct) = state.context_pct {
-        left.push(Span::styled(" · ", theme.faint()));
-        left.push(Span::styled(context_gauge(pct), theme.faint()));
-        left.push(Span::styled(format!(" {pct}% context"), theme.dim()));
-    }
-
-    let right = vec![Span::styled(
-        shortcut_hints(state, area.width),
-        theme.faint(),
-    )];
-    // Clamped to `area.width - 1`: on a narrow terminal, the right segment is truncated
-    // rather than evicting the left column (workspace/model).
-    let right_w = (right
-        .iter()
-        .map(|s| measure::width(s.content.as_ref()))
-        .sum::<usize>() as u16
-        + INDENT.len() as u16)
-        .min(area.width.saturating_sub(1));
-    let cols = Layout::horizontal([Constraint::Min(1), Constraint::Length(right_w)]).split(area);
-
-    frame.render_widget(Paragraph::new(Line::from(left)), cols[0]);
-    frame.render_widget(
-        Paragraph::new(Line::from(right)).alignment(Alignment::Right),
-        cols[1],
-    );
-}
-
-fn shortcut_hint(state: &AppState) -> &'static str {
-    if state.quit_shortcut_hint_visible() {
-        "ctrl+c again to quit"
-    } else if matches!(state.status, Status::Thinking) {
-        "ctrl+c interrupt"
-    } else {
-        "ctrl+c twice to quit"
-    }
-}
-
-/// Footer shortcut reminders. `ctrl+j newline` is announced because
-/// it is the insertion shortcut ACTUALLY available everywhere: Shift+Enter
-/// depends on the terminal keyboard protocol, Ctrl+J does not (US-009 AC3). It is
-/// dropped first when the right half of the line is no longer enough, so as
-/// not to evict the model and the workspace on the left.
-fn shortcut_hints(state: &AppState, width: u16) -> String {
-    let quit = shortcut_hint(state);
-    let full = format!("ctrl+j newline · {quit}");
-    if measure::width(&full) <= (width / 2) as usize {
-        full
-    } else {
-        quit.to_string()
-    }
-}
-
 fn render_progress_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -1721,12 +1694,6 @@ fn progress_spans(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
     ));
 
     spans
-}
-
-/// Compact context gauge in 8 cells (`▰` full / `▱` empty), rounded.
-fn context_gauge(pct: u8) -> String {
-    let filled = ((pct as usize * 8 + 50) / 100).min(8);
-    (0..8).map(|i| if i < filled { '▰' } else { '▱' }).collect()
 }
 
 fn render_permission(frame: &mut Frame, area: Rect, prompt: &PermissionPrompt, theme: &Theme) {
@@ -1906,6 +1873,12 @@ mod tests {
         dump(term.backend().buffer())
     }
 
+    /// Bottom row of the frame, where the footer lands. Scoping assertions here
+    /// keeps them from matching the welcome card, which shows the same facts.
+    fn footer_row(out: &str) -> &str {
+        out.lines().last().unwrap_or_default()
+    }
+
     #[cfg(feature = "codex_tui_parity")]
     fn draw_parity(
         state: &AppState,
@@ -1931,6 +1904,9 @@ mod tests {
     }
 
     #[test]
+    /// The input is a bounded field: one full-width rule above, one below, and
+    /// the status line directly under the closing rule. The input row itself
+    /// keeps the terminal background (no filled block).
     fn composer_uses_rules_without_filled_background() {
         let mut s = AppState::new("gpt-5", true);
         s.set_input("Try something".into());
@@ -1947,10 +1923,15 @@ mod tests {
         );
         let last_x = buf.area().width.saturating_sub(1);
 
-        assert_eq!(buf[(0, prompt_y - 1)].symbol(), "─");
-        assert_eq!(buf[(last_x, prompt_y - 1)].symbol(), "─");
-        assert_eq!(buf[(0, prompt_y + 1)].symbol(), "─");
-        assert_eq!(buf[(last_x, prompt_y + 1)].symbol(), "─");
+        for y in [prompt_y - 1, prompt_y + 1] {
+            for x in [0, last_x] {
+                assert_eq!(
+                    buf[(x, y)].symbol(),
+                    "─",
+                    "rule should span the full width at ({x}, {y})"
+                );
+            }
+        }
         for x in 0..buf.area().width {
             assert_eq!(
                 buf[(x, prompt_y)].bg,
@@ -1958,6 +1939,13 @@ mod tests {
                 "composer input row should keep the terminal background at column {x}"
             );
         }
+        // The status line follows the closing rule immediately, with no blank
+        // row between them.
+        let footer_y = prompt_y + 2;
+        assert!(
+            (0..buf.area().width).any(|x| buf[(x, footer_y)].symbol() != " "),
+            "the footer should sit right under the bottom rule"
+        );
     }
 
     // Welcome screen: card with braille logo (Dyson) + identity, empty transcript.
@@ -2701,38 +2689,104 @@ mod tests {
     }
 
     #[test]
-    fn footer_shows_double_ctrl_c_quit_hint() {
-        let s = AppState::new("gpt-5", true);
+    /// Idle, the footer spends its row on ambient context, never on a quit
+    /// instruction: the reminder is earned by pressing Ctrl+C once.
+    fn idle_footer_shows_the_status_line_not_a_quit_hint() {
+        let mut s = AppState::new("gpt-5", true);
+        s.workspace = "~/dev/pyxis".into();
+        s.reasoning_effort = Some("high".into());
         let out = draw(&s, 80, 12);
         assert!(
-            out.contains("ctrl+c twice to quit"),
-            "double ctrl+c hint missing:\n{out}"
+            out.contains("gpt-5 high · ~/dev/pyxis"),
+            "status line missing:\n{out}"
         );
         assert!(
-            !out.contains("^C quit"),
-            "footer should not advertise single ctrl+c quit:\n{out}"
+            !out.contains("to quit"),
+            "idle footer should not advertise quit:\n{out}"
         );
     }
 
+    /// The interrupt affordance belongs to the progress line (`esc to
+    /// interrupt`), so the footer keeps showing ambient context while running.
     #[test]
-    fn footer_shows_ctrl_c_interrupt_while_running() {
+    fn running_turn_keeps_the_status_line_and_interrupts_from_the_progress_line() {
         let mut s = AppState::new("gpt-5", true);
-        s.push_user("?");
+        s.push_user("hello");
         let out = draw(&s, 80, 12);
-        assert!(
-            out.contains("ctrl+c interrupt"),
-            "ctrl+c interrupt hint missing:\n{out}"
-        );
+        assert!(out.contains("esc to interrupt"), "{out}");
+        assert!(out.contains("gpt-5"), "status line missing:\n{out}");
     }
 
     #[test]
     fn footer_shows_ctrl_c_again_after_first_press() {
         let mut s = AppState::new("gpt-5", true);
+        s.workspace = "~/dev/pyxis".into();
         s.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         let out = draw(&s, 80, 12);
         assert!(
-            out.contains("ctrl+c again to quit"),
+            out.contains("ctrl + c again to quit"),
             "ctrl+c again hint missing:\n{out}"
+        );
+        assert!(
+            !footer_row(&out).contains("~/dev/pyxis"),
+            "the reminder should evict the status line:\n{out}"
+        );
+    }
+
+    /// `?` on an empty composer opens the cheatsheet; typing it into a draft
+    /// inserts the character instead.
+    #[test]
+    fn question_mark_toggles_the_shortcut_overlay_only_when_the_composer_is_empty() {
+        let mut s = AppState::new("gpt-5", true);
+        s.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        let out = draw(&s, 80, 24);
+        assert!(s.input.is_empty(), "`?` should not reach the draft");
+        assert!(out.contains("for commands"), "overlay missing:\n{out}");
+        assert!(
+            out.contains("to view transcript"),
+            "overlay missing:\n{out}"
+        );
+
+        s.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let out = draw(&s, 80, 24);
+        assert!(
+            !out.contains("for commands"),
+            "overlay should close:\n{out}"
+        );
+
+        s.set_input("draft".into());
+        s.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert_eq!(s.input, "draft?");
+        let out = draw(&s, 80, 24);
+        assert!(
+            !out.contains("for commands"),
+            "a typed `?` must not open the overlay:\n{out}"
+        );
+    }
+
+    /// Codex reserves the right half for the mode indicator, and only shows it
+    /// when the mode leaves its default.
+    #[test]
+    fn permission_mode_reaches_the_right_of_the_footer_only_when_non_default() {
+        let mut s = AppState::new("gpt-5", true);
+        s.workspace = "~/dev/pyxis".into();
+        let out = draw(&s, 80, 12);
+        assert!(
+            !footer_row(&out).contains("Ask for approval"),
+            "the default mode should stay silent:\n{out}"
+        );
+
+        s.set_permission_mode("read-only");
+        let out = draw(&s, 80, 12);
+        let row = footer_row(&out);
+        assert!(row.contains("Read Only"), "mode indicator missing:\n{out}");
+        assert!(
+            row.contains("~/dev/pyxis"),
+            "indicator should share the footer row with the status line:\n{out}"
+        );
+        assert!(
+            row.trim_end().ends_with("Read Only"),
+            "indicator should be right-aligned:\n{out}"
         );
     }
 

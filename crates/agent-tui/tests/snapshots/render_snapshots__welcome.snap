@@ -13,7 +13,7 @@ expression: "harness::frame(\"welcome\", &s, W, H)"
     │      ⢽⠟⠅ ⠙⠝⠟⢅⠕⠍⠁⠑⢅⠄                                                  │
     │    ⢀⣽⠁   ⢁⠤⢟⣅    ⢙⣷⠅    /help  ·  /models  ·  /effort                │
     │    ⠝⢷⠵⠴⠗⠉⠁  ⠁⠉⠙⠓⠗⠟⠝⠁    /permissions  ·  /goal                       │
-    │    ⠁ ⠁                  ctrl+c twice to quit   ·   ↑ history         │
+    │    ⠁ ⠁                  ? for shortcuts   ·   ↑ history              │
     │                                                                      │
     │                                                                      │
     ╰──────────────────────────────────────────────────────────────────────╯
@@ -25,4 +25,4 @@ expression: "harness::frame(\"welcome\", &s, W, H)"
 ────────────────────────────────────────────────────────────────────────────────
 ›
 ────────────────────────────────────────────────────────────────────────────────
-gpt-5 · pyxis · Ask for approval           ctrl+j newline · ctrl+c twice to quit
+  gpt-5 · pyxis
