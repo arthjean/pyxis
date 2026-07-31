@@ -105,12 +105,41 @@ impl PendingHistoryInsert {
     where
         I: IntoIterator<Item = Line<'static>>,
     {
+        Self::from_hyperlink_lines(plain_hyperlink_lines(lines.into_iter().collect()), mode)
+    }
+
+    /// Builds an insert from rows that already carry their link destinations.
+    ///
+    /// Sanitizing can drop characters, which shifts every column after them, so
+    /// destinations are re-derived from the sanitized text rather than carried
+    /// across. Annotations the caller made on non-URL text (a markdown label
+    /// pointing at a path) are preserved by column when the text is unchanged.
+    pub fn from_hyperlink_lines<I>(lines: I, mode: InsertHistoryMode) -> Self
+    where
+        I: IntoIterator<Item = HyperlinkLine>,
+    {
         let mut raw_lines = Vec::new();
         let mut render_lines = Vec::new();
         for line in lines.into_iter().take(MAX_PENDING_HISTORY_LINES) {
-            let (raw, render) = sanitize_render_line(line);
+            let original: String = line
+                .line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            let hyperlinks = line.hyperlinks;
+            let (raw, render) = sanitize_render_line(line.line);
+            let mut annotated = HyperlinkLine::new(render);
+            annotated.hyperlinks = if raw.as_str() == original {
+                hyperlinks
+            } else {
+                // Sanitizing dropped characters, so every column after them
+                // moved. Re-deriving beats carrying ranges that now point at the
+                // wrong text.
+                annotate_web_urls_in_line(annotated.line.clone()).hyperlinks
+            };
             raw_lines.push(raw);
-            render_lines.push(render);
+            render_lines.push(annotated);
         }
         Self {
             lines: raw_lines,

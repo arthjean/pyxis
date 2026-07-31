@@ -101,8 +101,13 @@ pub trait HistoryCell {
         plain_lines(self.display_lines(u16::MAX))
     }
 
+    /// Visible rows plus the link destinations to mark them with.
+    ///
+    /// Marking URLs is the default rather than an opt-in per cell: a link in a
+    /// command's output or a tool result is as worth clicking as one in prose,
+    /// and the transcript is where both are read from.
     fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
-        plain_hyperlink_lines(self.display_lines(width))
+        annotate_web_urls(self.display_lines(width))
     }
 
     fn display_lines_for_mode(&self, width: u16, mode: HistoryRenderMode) -> Vec<Line<'static>> {
