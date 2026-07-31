@@ -98,7 +98,7 @@ Shipped today:
 - **Execution sandbox**: Landlock confines writes to the workspace on Linux (the agent *and* its `bash` subprocesses); a local proxy gates cooperative outbound HTTP(S) subprocess traffic via `--allow <host>`.
 - **Persistent sessions**: one append-only JSONL file per conversation under `.pyxis/sessions/`, with `/resume` to reopen a past session and a workspace-wide prompt history.
 - **`/goal` completion loop**: set a session objective and Pyxis re-runs the agentic loop until it emits a done marker (capped at 25 iterations), persisted in a `.pyxis/goal` sidecar so it survives restarts.
-- **MCP tools (stdio and remote HTTP)**: load servers from `.mcp.json` or your existing `~/.claude.json`, connect them at startup, and let the model call their tools as `mcp__<server>__<tool>`. A remote server is declared with `"type": "http"` and a `url` (https, or plain http on a loopback host only); its bearer token is named through `bearerTokenEnvVar` and read from the environment at connect time, so no secret ever sits in the config, the logs or the transcript. Per server, `enabledTools` then `disabledTools` shrink what the model sees, and `toolsApproval` can auto-approve a named tool. Every MCP result is untrusted content, every MCP call asks for confirmation by default, no approval setting survives recent untrusted content in the turn, and a server declared by the workspace stays behind an explicit `/mcp <server> trust` and can never auto-approve anything. An unavailable server never blocks the session: its tools are simply absent. Connecting or disconnecting a server in session changes what the model can call from the next turn on. Lifecycle and config diagnostics live in the `/mcp` submenu.
+- **MCP tools (stdio and remote HTTP)**: load servers from `.mcp.json` or your existing `~/.claude.json`, connect them at startup, and let the model call their tools as `mcp__<server>__<tool>`. A remote server is declared with `"type": "http"` and a `url` (https, or plain http on a loopback host only). **No readable secret ever enters the config**: `bearerTokenEnvVar` names the variable holding a token, `envHttpHeaders` names one per header, and `envVars` forwards named variables to a stdio server, all read at connect time. Remote servers that require OAuth are handled per server (`/mcp <server> login`): discovery, PKCE, dynamic client registration and refresh, with the credential in the OS keyring. Per server, `enabledTools` then `disabledTools` shrink what the model sees, `toolsApproval` can auto-approve a named tool, and `startupTimeoutMs` / `toolTimeoutMs` / `cwd` / `required` / `supportsParallelToolCalls` tune the rest. Every MCP result is untrusted content, every MCP call asks for confirmation by default, and a confirmation you choose to remember is remembered for that exact call, arguments included, never for a tool name. A tool the server itself marks `destructiveHint` always asks whatever the config says, no approval setting survives recent untrusted content in the turn, and a server declared by the workspace stays behind an explicit `/mcp <server> trust` and can never auto-approve anything. What a server writes is bounded before it is allocated: one JSON-RPC frame, one listing, one description, one result. What a server *says* (`initialize.instructions`, resources) is shown on request through `/mcp <server> info` and `/mcp <server> resources`, never folded into what the model reads, so it cannot push text into a turn nobody asked for. Images a server returns reach the conversation when the model reads images, validated on their own bytes rather than on the announced mime type. An unavailable server never blocks the session (unless you marked it `required`): its tools are simply absent, and its last stderr lines are in the failure notice. Connecting or disconnecting a server in session changes what the model can call from the next turn on. Lifecycle and config diagnostics live in the `/mcp` submenu.
 - **Agent Skills (open spec)**: a `~/.agents/skills/<name>/SKILL.md` installed for another agent works as is. Names and descriptions are exposed to the model; `/<name>` injects that skill's instructions for the turn, framed as user-level content. An invalid skill is dropped with a trace instead of failing the startup.
 - **Hooks with a veto**: declare `[[hooks]]` in `~/.pyxis/settings.toml` and your own command decides, on the Claude Code contract (JSON event on stdin, `hookSpecificOutput.permissionDecision` on stdout, exit code 2 blocks). A hook can only tighten: `deny` outranks even `--yes`, `ask` forces a confirmation in any mode, and any failure (missing binary, 5 s timeout, unreadable output) denies. A repository cannot declare one.
 - **Diagnosable crashes**: a panic restores the terminal *before* saying anything, appends a dated report to `~/.pyxis/logs/panic.log`, and tells you where to look. `PYXIS_LOG=debug` (or `trace`) writes a structured `tracing` log of the run next to it; unset, nothing is installed and nothing is emitted. Message and tool-input content only ever appears at `trace`.
@@ -141,7 +141,7 @@ The founding invariant: **`agent-core` depends on neither the TUI nor the provid
 | `agent-core` | Agent loop, transition state machine, canonical message/transcript types (headless) |
 | `agent-provider` | `Provider` trait + adapters (reqwest + SSE), canonical `StreamEvent`, error taxonomy |
 | `agent-tools` | Tool registry, fail-closed trait, concurrent/serial dispatch, permissions, taint |
-| `agent-mcp` | `rmcp`-based MCP client (stdio + Streamable HTTP), config loading, server registry, per-server tool policy, MCP tools as `DynTool` |
+| `agent-mcp` | `rmcp`-based MCP client (stdio + Streamable HTTP), config loading, server registry, per-server tool policy and bounds, per-server OAuth, MCP tools as `DynTool` |
 | `agent-tui` | Ratatui + crossterm frontend, decoupled from the core via channels |
 | `agent-session` | Append-only JSONL persistence, resume, compaction boundaries |
 | `agent-sandbox` | Landlock FS confinement + local network allow-list proxy |
@@ -276,6 +276,45 @@ Configuration is resolved by named layers, each carrying an explicit precedence.
 
 `permission_mode`, `sandbox_mode`, `writable_roots`, `hooks` and `profile` are security keys: the project file is refused on them with a warning, and so is `-c`, since an argument can come from a script of the repository. `--permission-mode` and `--sandbox` are the documented way to choose a perimeter for one session.
 
+### MCP servers
+
+`<workspace>/.mcp.json` and the `mcpServers` object of `~/.claude.json` share one format, Claude Code compatible. The workspace file wins on a name collision, but only ever to *narrow*: an entry that hides another one gets the intersection of the two tool filters and the stricter approval level.
+
+```jsonc
+{
+  "mcpServers": {
+    "files": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "env": { "LOG_LEVEL": "warn" },   // literal values
+      "envVars": ["GITHUB_TOKEN"],       // NAMES forwarded from your environment
+      "cwd": "/srv/project",
+      "startupTimeoutMs": 10000,          // one deadline: spawn + handshake + retries + tools/list
+      "toolTimeoutMs": 60000,             // one call
+      "required": false,                  // true: refuse to start without it
+      "supportsParallelToolCalls": false, // true: lift the serialization
+      "enabledTools": ["read_file"],      // allow-list, applied first
+      "disabledTools": ["write_file"],    // deny-list, applied second
+      "toolsApproval": { "default": "ask", "tools": { "read_file": "allow" } }
+    },
+    "remote": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "bearerTokenEnvVar": "EXAMPLE_TOKEN",             // NAME of the variable
+      "httpHeaders": { "X-Api-Version": "2" },          // literal headers
+      "envHttpHeaders": { "X-Api-Key": "EXAMPLE_KEY" }, // value read from EXAMPLE_KEY
+      "oauthClientId": "...",                            // optional: else dynamic registration
+      "oauthScopes": ["mcp.read"],
+      "oauthResource": "https://mcp.example.com/mcp"     // RFC 8707, defaults to `url`
+    }
+  }
+}
+```
+
+What a **workspace-controlled** file cannot do, whatever it writes: auto-approve a tool (`toolsApproval` is dropped back to `ask`), lift the call serialization (`supportsParallelToolCalls` is dropped), or get spawned at all before an explicit `/mcp <server> trust`.
+
+Authorization for a remote server is per server and interactive: `/mcp <server> login` discovers the authorization server (RFC 9728 then RFC 8414), registers this CLI as a public client when the server supports it (RFC 7591), runs an authorization-code flow with PKCE S256 bound to the resource (RFC 8707), and stores the credential in the OS keyring. `/mcp <server> logout` forgets it. Refresh is automatic, including token rotation. Every discovered endpoint must be https, with plain http accepted for loopback only, and a protected-resource document that claims a resource it does not cover ends the flow: without that check the server picks the resource the token is bound to, so it could send you to consent at a third party's real identity provider and receive the result.
+
 ## Sandbox and security
 
 - **Filesystem**: Landlock confines every write to the workspace, kernel-level, inherited by `bash` subprocesses (the FS sandbox is applied on the main thread before the Tokio runtime is built, so workers inherit it).
@@ -290,7 +329,7 @@ Configuration is resolved by named layers, each carrying an explicit precedence.
 The MVP target was deliberately narrow: **make Pyxis excellent with one model channel (the ChatGPT subscription) and dogfood it daily**, rather than ship six empty provider columns. The multi-provider architecture is the invariant; adapters land incrementally.
 
 - **Now (shipped)**: agentic loop, tool suite + Linux FS sandbox, sessions + resume, `/goal`, MCP tools in the model loop, monochrome TUI, ChatGPT subscription provider.
-- **Next**: more provider adapters behind the existing `Provider` trait, per-server MCP OAuth, richer TUI (plan trees, hunk review).
+- **Next**: more provider adapters behind the existing `Provider` trait, MCP elicitation and progress notifications, richer TUI (plan trees, hunk review).
 - **Later**: vector memory (`sqlite-vec`), sub-agents, macOS Seatbelt hardening, VCR provider tests in CI.
 
 Phases and the de-risking spikes live in [`docs/ROADMAP.md`](docs/ROADMAP.md).
