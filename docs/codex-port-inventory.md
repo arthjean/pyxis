@@ -117,3 +117,30 @@ EP-003 de `tasks/prd-harness-parity.md` a levé la limitation qui figurait ici :
 `resize_narrow` montrait une saisie tronquée à la largeur du terminal, elle est
 maintenant repliée sur deux lignes visuelles. Le diff de ce snapshot est la
 preuve du correctif.
+
+## Refonte de la surface de chat (2026-07-31)
+
+Le chemin `codex_tui_parity` rend désormais le chat comme Codex : l'historique
+finalisé appartient au scrollback du terminal, le viewport ne porte que ce qui
+est encore mutable. Les entrées ci-dessous complètent l'inventaire et la notice
+`NOTICE-CODEX.md`.
+
+| Fichier Pyxis | Source | Nature |
+|---|---|---|
+| `crates/agent-tui/src/custom_terminal.rs` | `ratatui::Terminal` / `ratatui::Frame` (0.29.0, **MIT**) | Dérivé, licence conservée en tête de fichier. Rend `viewport_area` modifiable, ce que ratatui n'expose pas. |
+| `crates/agent-tui/src/insert_history.rs` | `ratatui::Terminal::insert_before` (chemin `scrolling-regions`, **MIT**) | Stratégie de découpe des lignes adaptée. |
+| `crates/agent-tui/src/parse_command.rs` | `codex-rs/shell-command/src/parse_command.rs`, `codex-rs/protocol/src/parse_command.rs` | Structurellement dérivé : classification Read/ListFiles/Search/Unknown. |
+| `crates/agent-tui/src/streaming.rs` (politique de cadence) | `codex-rs/tui/src/streaming/{chunking,commit_tick}.rs` | Structurellement dérivé : modèle Smooth/CatchUp à hystérésis. |
+| `ExecCell` (groupement `Explored`) dans `history_cell.rs` | `codex-rs/tui/src/exec_cell/{model,render}.rs` | Structurellement dérivé. |
+| `term::draw` / `ChatSurface::reflow` | `codex-rs/tui/src/tui.rs`, `codex-rs/tui/src/app/resize_reflow.rs` | Structurellement dérivé : ancrage du viewport, reflow débouncé. |
+
+### Divergences supplémentaires assumées
+
+| Divergence | Snapshot témoin | Raison |
+|---|---|---|
+| Un appel exec en échec quitte le groupe `Explored` et retrouve son rendu complet | `parity_surface_exploring_then_streaming` | Le groupe dit ce qui a été consulté, pas ce qui est revenu. Y replier un échec masquerait le message d'erreur. Codex garde l'appel dans le groupe. |
+| Coloration syntaxique active pendant le streaming | `parity_surface_exploring_then_streaming` | Une ligne partie dans le scrollback ne peut plus être repeinte : rendre la première moitié d'un message sans coloration et la seconde avec serait définitif. |
+| Composer ancré sur la dernière ligne de l'écran, quelle que soit la longueur du fil | `parity_surface_conversation`, `parity_surface_exploring_then_streaming` | Divergence Pyxis conservée à travers la refonte du viewport. Codex laisse son composer suivre la fin de l'historique, donc flotter au milieu de l'écran tant que la session est courte. Pyxis garde le viewport ancré en bas : il s'étend de la fin de l'historique jusqu'à la dernière ligne, le vide se place entre la cellule active et le composer, et la ligne de saisie ne bouge jamais. L'historique reprend ses rangées par le haut du viewport. |
+| Écran d'accueil rendu dans le viewport, jamais inséré dans le scrollback | `parity_surface_conversation` | Il disparaît au premier message au lieu de rester en haut de l'historique comme l'en-tête de session Codex. La carte Pyxis est une signature de démarrage, pas un enregistrement de session. |
+| Une ligne repliée par le terminal perd ses hyperliens (le texte reste intact) | `parity_surface_conversation` | Les colonnes d'un lien décrivent une rangée. Une ligne source qui occupe plusieurs rangées ne permet plus de dire laquelle porte le lien ; marquer au hasard vaut moins que ne pas marquer. Les cellules pré-replient leur rendu, donc le cas est résiduel. |
+| Le reflow au resize ne réécrit que les rangées encore visibles que Pyxis a écrites | `parity_surface_conversation` | Codex purge tout le scrollback (`ESC[3J`), ce qui efface aussi ce que l'utilisateur avait dans son terminal avant la session. Pyxis ne reprend que ses propres rangées visibles ; ce qui a défilé garde son ancien repli, comme la sortie de n'importe quel programme. |

@@ -116,4 +116,57 @@ Structurally derived, written against Pyxis types:
   full-width rules rather than Codex's blank framing. Divergences are listed
   in `docs/codex-port-inventory.md`.
 
+As of the chat-surface rework (2026-07-31), the TUI adds one **MIT** derivation
+and four structurally derived boundaries. The Codex baseline is unchanged
+(`f0c30e528a54bdf0fa9a4d52ff74b34383434811`).
+
+Derived from Ratatui (MIT, not Apache-2.0), with its licence text preserved in
+the file header:
+
+- `crates/agent-tui/src/custom_terminal.rs`, from `ratatui::Terminal` and
+  `ratatui::Frame` (ratatui 0.29.0). Ratatui freezes the height of a
+  `Viewport::Inline` at construction and exposes no way to change it, so the
+  parity renderer cannot size the drawn area to its content. The derivation
+  exists to make `viewport_area` writable; double buffering, `Buffer::diff` and
+  cursor handling stay upstream's. Codex derived the same type for the same
+  reason (`codex-rs/tui/src/custom_terminal.rs`), which is where the approach
+  comes from; the Pyxis file is written from the ratatui source, not from
+  Codex's.
+- The row-splitting strategy of `crates/agent-tui/src/insert_history.rs`, from
+  `ratatui::Terminal::insert_before` (its `scrolling-regions` path): paint into
+  rows the viewport gives up while it has any, then scroll the rows above it
+  into the scrollback. Divergence: upstream pushes the viewport down towards a
+  screen bottom it does not occupy, where the Pyxis viewport is already anchored
+  there and yields rows from its top instead.
+
+Structurally derived from Codex, written against Pyxis types:
+
+- `crates/agent-tui/src/parse_command.rs`, from
+  `codex-rs/shell-command/src/parse_command.rs` and the `ParsedCommand` shape in
+  `codex-rs/protocol/src/parse_command.rs`. The Read/ListFiles/Search/Unknown
+  classification, the shell-wrapper unwrapping and the pipeline collapse rule
+  are adapted; the tokenizer, the redirection and command-substitution guard,
+  and the command tables are Pyxis's own.
+- The pacing policy in `crates/agent-tui/src/streaming.rs`, from
+  `codex-rs/tui/src/streaming/chunking.rs` and `streaming/commit_tick.rs`. The
+  Smooth/CatchUp two-gear model, its hysteresis and the thresholds are adapted;
+  the queue lives inside `StreamController` rather than in a separate
+  `StreamState`.
+- `ExecCell`'s `Explored` grouping in `crates/agent-tui/src/history_cell.rs`,
+  from `codex-rs/tui/src/exec_cell/{model,render}.rs`. Divergence: a failed call
+  leaves the group so its error stays visible, where Codex keeps it.
+- The viewport anchoring in `crates/agent-tui/src/term.rs` and the resize
+  reflow in `ChatSurface::reflow`, from `codex-rs/tui/src/tui.rs` (`draw`) and
+  `codex-rs/tui/src/app/resize_reflow.rs`. Divergence: the Pyxis viewport always
+  reaches the last row of the screen, so the composer never drifts up; history
+  takes rows back from the viewport's top. Codex lets its viewport follow the end
+  of the transcript instead. Second divergence: the reflow reclaims only
+  the rows this session wrote and still shows, where Codex purges the whole
+  scrollback with `ESC[3J`. Purging would also erase what the user had in their
+  terminal before Pyxis started.
+- The OSC 8 marking in `crates/agent-tui/src/insert_history.rs`, from the
+  hyperlink handling of `codex-rs/tui/src/insert_history.rs`: the destination is
+  folded into the cell symbol, which carries no display width, because the write
+  path is a cell diff with no room for out-of-band output.
+
 Reference source inventory: `docs/codex-port-inventory.md`.
