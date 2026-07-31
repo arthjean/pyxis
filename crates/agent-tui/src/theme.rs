@@ -72,11 +72,29 @@ impl Theme {
         }
     }
     /// Horizontal rule of the composer, visible without enclosing the input in a block.
+    ///
+    /// Near-white on purpose: the rule is the only thing marking where the input
+    /// field begins and ends, so it is read as chrome, not as decoration. It
+    /// stays a touch below `fg` and cooler than it, so the frame never competes
+    /// with the text it holds.
     pub fn composer_rule(&self) -> Style {
         if self.truecolor {
-            Style::default().fg(Color::Rgb(0x2a, 0x2f, 0x37))
+            Style::default().fg(Color::Rgb(0xd4, 0xd7, 0xdc))
         } else {
-            Style::default().add_modifier(Modifier::DIM)
+            Style::default().fg(Color::White)
+        }
+    }
+    /// Invitation shown in an empty composer.
+    ///
+    /// One step below `composer_rule`: the frame is what the eye must find
+    /// first, the invitation second. Deliberately NOT `faint`, which is the
+    /// tint of things already read (separators, hints) and made the placeholder
+    /// look disabled.
+    pub fn composer_placeholder(&self) -> Style {
+        if self.truecolor {
+            Style::default().fg(Color::Rgb(0xc2, 0xc6, 0xcd))
+        } else {
+            Style::default().fg(Color::Gray)
         }
     }
     /// Highlight of a `/skill` inserted in the input: sky-blue chip on a dark background.

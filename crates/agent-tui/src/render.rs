@@ -1527,7 +1527,7 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("› ", theme.fg().add_modifier(Modifier::BOLD)),
-                Span::styled(COMPOSER_PLACEHOLDER, theme.faint()),
+                Span::styled(COMPOSER_PLACEHOLDER, theme.composer_placeholder()),
             ])),
             Rect {
                 height: 1,
