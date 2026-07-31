@@ -191,7 +191,7 @@ enum Anchor {
 }
 
 enum LocateError {
-    /// >= 2 matches on a pass (or on exact) -> irreducible ambiguity
+    /// \>= 2 matches on a pass (or on exact) -> irreducible ambiguity
     /// (more permissive passes would only merge further, never
     /// distinguish). No level: it only documents SUCCESS (AC4).
     Ambiguous { count: usize },

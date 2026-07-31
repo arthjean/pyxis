@@ -816,6 +816,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::panic)]
     fn the_six_tool_specs_are_valid_strict_schemas() {
         let handle = handle();
         let registry = crate::Registry::builder("/tmp")
