@@ -42,7 +42,9 @@ pub type CommandHardener = Arc<dyn Fn(&mut tokio::process::Command) + Send + Syn
 /// Emitter of output fragments for a running tool (US-015). Installed by the
 /// Registry for the duration of a call, already correlated to that call's `id`:
 /// a tool therefore knows nothing about the transport nor about its own identifier.
-pub type OutputSink = Arc<dyn Fn(String) + Send + Sync>;
+/// Publishes one live output fragment: the stream it came from, and the bytes
+/// exactly as the process wrote them.
+pub type OutputSink = Arc<dyn Fn(agent_core::event::OutputStream, Vec<u8>) + Send + Sync>;
 
 /// Shared execution context passed to every tool. `&ToolCtx` (shared):
 /// concurrent tools read it in parallel. Agent state mutation
@@ -154,9 +156,9 @@ impl ToolCtx {
         ctx
     }
     /// Publishes an output fragment when a consumer is listening. No-op otherwise.
-    pub fn emit_output(&self, chunk: impl Into<String>) {
+    pub fn emit_output(&self, stream: agent_core::event::OutputStream, chunk: impl Into<Vec<u8>>) {
         if let Some(sink) = &self.output {
-            sink(chunk.into());
+            sink(stream, chunk.into());
         }
     }
 }
@@ -244,6 +246,12 @@ impl ToolOutput {
 pub trait Tool: Send + Sync {
     /// Input type (deserialized from the `tool_use` JSON).
     type Input: DeserializeOwned + Send;
+
+    /// Nature of one call, for the clients (exec, patch, MCP). Left `Other` by
+    /// default: most tools are just functions.
+    fn call_kind(&self, _input: &serde_json::Value) -> agent_core::event::ToolCallKind {
+        agent_core::event::ToolCallKind::Other
+    }
 
     fn name(&self) -> &str;
     /// Description given to the model (capped by the Registry at exposure time).
@@ -338,6 +346,11 @@ pub trait DynTool: Send + Sync {
             input_schema: self.input_schema(),
         }
     }
+    /// Nature of one call, for the clients. Declared by the tool because it is
+    /// the only thing that knows: a name and a JSON shape are a guess.
+    fn call_kind(&self, _raw: &serde_json::Value) -> agent_core::event::ToolCallKind {
+        agent_core::event::ToolCallKind::Other
+    }
     fn is_concurrency_safe(&self) -> bool;
     fn is_read_only(&self) -> bool;
     fn is_sensitive(&self) -> bool;
@@ -381,6 +394,9 @@ impl<T: Tool> DynTool for DynToolAdapter<T> {
     }
     fn kind(&self) -> ToolKind {
         self.inner.tool_kind()
+    }
+    fn call_kind(&self, raw: &serde_json::Value) -> agent_core::event::ToolCallKind {
+        self.inner.call_kind(raw)
     }
     fn is_concurrency_safe(&self) -> bool {
         self.inner.is_concurrency_safe()

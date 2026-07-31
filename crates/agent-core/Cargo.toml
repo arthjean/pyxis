@@ -14,6 +14,10 @@ workspace = true
 # (headless). The I/O (Provider, Session, Clock, Tools) are injected through traits.
 [dependencies]
 agent-tokenizer.workspace = true
+# Tool output travels as RAW BYTES (a command may emit anything): base64 is how
+# it survives a JSON event without the core deciding, on the client's behalf,
+# what non-UTF-8 should look like.
+base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

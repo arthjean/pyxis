@@ -137,7 +137,7 @@ impl TurnDiffTracker {
         };
         let after = self.snapshot_dirty().await?;
 
-        let mut files = Vec::new();
+        let mut changed: Vec<(String, FileState, FileState)> = Vec::new();
         let mut paths: Vec<&String> = baseline.keys().chain(after.keys()).collect();
         paths.sort_unstable();
         paths.dedup();
@@ -156,7 +156,30 @@ impl TurnDiffTracker {
             if before == after_state {
                 continue;
             }
-            files.push(self.file_diff(path, &before, &after_state));
+            changed.push((path.clone(), before, after_state));
+        }
+
+        // Renames are paired BEFORE the diffs are built: the pairing needs the
+        // content on both sides, which the rendered view no longer carries.
+        let renamed_from = pair_renames(&changed);
+        let mut files = Vec::with_capacity(changed.len());
+        for (path, before, after_state) in &changed {
+            if renamed_from.values().any(|source| source == path) {
+                // The source of a rename: it is reported on the destination
+                // entry, not as a deletion of its own.
+                continue;
+            }
+            let mut view = self.file_diff(path, before, after_state);
+            if let Some(source) = renamed_from.get(path) {
+                view.change = FileChange::Renamed;
+                view.moved_from = Some(self.display_path(source));
+                // A pure rename moves no line: the counts would otherwise
+                // report the whole file as added.
+                view.added_lines = 0;
+                view.removed_lines = 0;
+                view.unified = None;
+            }
+            files.push(view);
         }
 
         Ok(TurnDiffView { files })
@@ -178,6 +201,7 @@ impl TurnDiffTracker {
                     added_lines: added,
                     removed_lines: removed,
                     unified: Some(unified),
+                    moved_from: None,
                 }
             }
             (FileState::Absent, FileState::Text(after)) => {
@@ -188,6 +212,7 @@ impl TurnDiffTracker {
                     added_lines: added,
                     removed_lines: removed,
                     unified: Some(unified),
+                    moved_from: None,
                 }
             }
             (FileState::Text(before), FileState::Absent) => {
@@ -198,6 +223,7 @@ impl TurnDiffTracker {
                     added_lines: added,
                     removed_lines: removed,
                     unified: Some(unified),
+                    moved_from: None,
                 }
             }
             // At least one side is binary or too large: listed without a diff
@@ -208,12 +234,14 @@ impl TurnDiffTracker {
                 added_lines: 0,
                 removed_lines: 0,
                 unified: None,
+                moved_from: None,
             },
         }
     }
 
     /// Path as the user refers to it: relative to the workspace when the
-    /// workspace is a subdirectory of the repository, relative to the repository otherwise.
+    /// workspace is a subdirectory of the repository, relative to the repository
+    /// otherwise.
     fn display_path(&self, repo_path: &str) -> String {
         let absolute = self.repo_root.join(repo_path);
         absolute
@@ -277,6 +305,47 @@ impl TurnDiffTracker {
             Err(_) => FileState::Absent,
         }
     }
+}
+
+/// Pairs each disappeared path with a reappeared one holding the SAME content:
+/// destination -> source.
+///
+/// Only exact content matches pair up. Git decides renames with a similarity
+/// threshold; applying one here would mean guessing, and a wrong guess reports
+/// two unrelated files as one move. A content that appears twice is left alone
+/// for the same reason: nothing designates which copy is "the" rename.
+fn pair_renames(changed: &[(String, FileState, FileState)]) -> BTreeMap<String, String> {
+    // An empty file never pairs: every empty file has the same content, so the
+    // match would carry no evidence of an actual move.
+    let pairable = |state: &FileState| match state {
+        FileState::Absent => false,
+        FileState::Text(text) => !text.is_empty(),
+        FileState::Opaque(_) => true,
+    };
+    let disappeared: Vec<(&String, &FileState)> = changed
+        .iter()
+        .filter(|(_, before, after)| !after.exists() && pairable(before))
+        .map(|(path, before, _)| (path, before))
+        .collect();
+
+    let mut renamed_from = BTreeMap::new();
+    let mut claimed: Vec<&String> = Vec::new();
+    for (path, before, after) in changed {
+        if before.exists() || !pairable(after) {
+            continue;
+        }
+        let available: Vec<&String> = disappeared
+            .iter()
+            .filter(|(source, state)| *state == after && !claimed.contains(source))
+            .map(|(source, _)| *source)
+            .collect();
+        // Exactly one unclaimed source, otherwise the move is ambiguous.
+        if let [source] = available.as_slice() {
+            claimed.push(source);
+            renamed_from.insert(path.clone(), (*source).clone());
+        }
+    }
+    renamed_from
 }
 
 fn state_from_bytes(bytes: &[u8]) -> FileState {
@@ -461,6 +530,44 @@ mod tests {
         repo.commit("tout").await;
         let clean = changes(workspace_diff(&repo.dir).await.unwrap()).expect("dépôt git présent");
         assert!(clean.is_empty());
+    }
+
+    /// A pure rename is ONE change naming both ends, not a deletion plus an
+    /// unrelated creation.
+    #[tokio::test]
+    async fn a_moved_file_is_reported_as_a_rename() {
+        let repo = Repo::new("rename").await;
+        repo.write("old.txt", "contenu stable\n");
+        repo.commit("initial").await;
+        repo.write("new.txt", "contenu stable\n");
+        repo.remove("old.txt");
+
+        let diff = changes(workspace_diff(&repo.dir).await.unwrap()).expect("dépôt git présent");
+        assert_eq!(diff.files.len(), 1, "{:?}", diff.files);
+        let moved = find(&diff, "new.txt");
+        assert_eq!(moved.change, FileChange::Renamed);
+        assert_eq!(moved.moved_from.as_deref(), Some("old.txt"));
+        // A move touches no line: reporting the file as fully added and fully
+        // removed would double-count the whole turn.
+        assert_eq!((moved.added_lines, moved.removed_lines), (0, 0));
+    }
+
+    /// Two files with the same content leave the move ambiguous, so nothing is
+    /// paired: a wrong pairing reports two unrelated files as one.
+    #[tokio::test]
+    async fn an_ambiguous_move_stays_a_delete_and_an_add() {
+        let repo = Repo::new("rename-ambiguous").await;
+        repo.write("a.txt", "meme contenu\n");
+        repo.write("b.txt", "meme contenu\n");
+        repo.commit("initial").await;
+        repo.write("c.txt", "meme contenu\n");
+        repo.remove("a.txt");
+        repo.remove("b.txt");
+
+        let diff = changes(workspace_diff(&repo.dir).await.unwrap()).expect("dépôt git présent");
+        assert_eq!(find(&diff, "c.txt").change, FileChange::Added);
+        assert_eq!(find(&diff, "a.txt").change, FileChange::Deleted);
+        assert_eq!(find(&diff, "b.txt").change, FileChange::Deleted);
     }
 
     /// US-006 AC2: outside a repository the absence of scope is named, never

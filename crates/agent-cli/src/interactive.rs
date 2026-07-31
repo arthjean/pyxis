@@ -191,11 +191,17 @@ fn workspace_diff_report(diff: &agent_core::TurnDiffView) -> String {
             agent_core::FileChange::Added => 'A',
             agent_core::FileChange::Modified => 'M',
             agent_core::FileChange::Deleted => 'D',
+            agent_core::FileChange::Renamed => 'R',
         };
-        report.push_str(&format!(
-            "\n  {mark} {} +{} -{}",
-            file.path, file.added_lines, file.removed_lines
-        ));
+        // A rename names both ends: the destination alone would read as a file
+        // appearing from nowhere.
+        match &file.moved_from {
+            Some(source) => report.push_str(&format!("\n  {mark} {source} -> {}", file.path)),
+            None => report.push_str(&format!(
+                "\n  {mark} {} +{} -{}",
+                file.path, file.added_lines, file.removed_lines
+            )),
+        }
     }
     report
 }
@@ -1011,12 +1017,21 @@ async fn event_loop(
                         // composer and names the reason, so the user can amend it.
                         if cfg.hooks.watches(agent_tools::HookEvent::UserPromptSubmit) {
                             let hooks = Arc::clone(&cfg.hooks);
-                            if let agent_tools::HookDecision::Deny(reason) = hooks
+                            let decision = hooks
                                 .lifecycle(agent_tools::Lifecycle::UserPromptSubmit {
                                     prompt: &prompt,
                                 })
-                                .await
-                            {
+                                .await;
+                            // US-018: the run is filed like any other, so a
+                            // lifecycle hook is as visible as a tool one.
+                            state.apply(&agent_core::AgentEvent::Hook(
+                                agent_tools::registry::hook_run_view(
+                                    agent_tools::HookEvent::UserPromptSubmit,
+                                    None,
+                                    &decision,
+                                ),
+                            ));
+                            if let agent_tools::HookDecision::Deny(reason) = decision {
                                 state.blocks.push(Block::Error(format!("Prompt refused: {reason}")));
                                 state.set_input(prompt);
                                 continue;
@@ -1754,10 +1769,19 @@ async fn event_loop(
                     InputAction::Interrupt => {}
                     InputAction::Permission { allow, remember } => {
                         if let Some(resp) = pending_resp.take() {
-                            let _ = resp.send(agent_tools::permission::ApprovalResponse {
-                                allow,
-                                remember,
-                            });
+                            // The picker offers allow/deny with an optional
+                            // session scope; the free-text rejection and the
+                            // turn-ending abort are reachable from the composer,
+                            // not from this two-axis choice.
+                            let answer = if allow {
+                                agent_tools::permission::ApprovalResponse::Approved { remember }
+                            } else {
+                                agent_tools::permission::ApprovalResponse::Denied {
+                                    remember,
+                                    rejection: None,
+                                }
+                            };
+                            let _ = resp.send(answer);
                         }
                         #[cfg(feature = "codex_tui_parity")]
                         chat.record_approval_decision(allow);
@@ -1937,7 +1961,15 @@ async fn event_loop(
                                     // another turn right away.
                                     if !running && cfg.hooks.watches(agent_tools::HookEvent::Stop) {
                                         let hooks = Arc::clone(&cfg.hooks);
-                                        hooks.lifecycle(agent_tools::Lifecycle::Stop).await;
+                                        let decision =
+                                            hooks.lifecycle(agent_tools::Lifecycle::Stop).await;
+                                        state.apply(&agent_core::AgentEvent::Hook(
+                                            agent_tools::registry::hook_run_view(
+                                                agent_tools::HookEvent::Stop,
+                                                None,
+                                                &decision,
+                                            ),
+                                        ));
                                     }
                                 }
                             }
@@ -2010,7 +2042,7 @@ async fn event_loop(
                             reason: req.reason.clone(),
                             taint_forced: req.taint_forced,
                             input_summary: req.input_summary.clone(),
-                            mode: req.mode.clone(),
+                            mode: req.mode.to_string(),
                             input: req.input.clone(),
                         });
                     }

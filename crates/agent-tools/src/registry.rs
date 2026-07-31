@@ -29,8 +29,8 @@ use futures_util::stream::{self, StreamExt};
 use crate::error::ToolError;
 use crate::hooks::{HookDecision, HookEvent, HookToolResult, Hooks, NoHooks};
 use crate::permission::{
-    ApprovalKey, ApprovalMemo, ApprovalMemory, Approver, AutoDeny, PermCtx, PermissionMode,
-    PermissionModeState, PermissionRequest, Resolved, resolve_permission,
+    ApprovalKey, ApprovalMemo, ApprovalMemory, ApprovalResponse, Approver, AutoDeny, PermCtx,
+    PermissionMode, PermissionModeState, PermissionRequest, Resolved, resolve_permission,
 };
 use crate::sandbox::{SandboxDenial, SandboxEscalator};
 use crate::taint::TaintTracker;
@@ -313,7 +313,16 @@ impl Registry {
         // of every mode, including `BypassPermissions` (US-018 AC4).
         let mut hook_ask: Option<String> = None;
         if self.hooks.intercepts(HookEvent::PreToolUse, &call.name) {
-            match self.hooks.pre_tool_use(&call.name, &call.input).await {
+            let decision = self.hooks.pre_tool_use(&call.name, &call.input).await;
+            // US-018: the run is reported whatever it decided. A hook that
+            // blocks a call is the reason the call did not happen, and a client
+            // that cannot see it shows an agent that did nothing for no reason.
+            events.emit(ToolDispatchEvent::Hook(hook_run_view(
+                HookEvent::PreToolUse,
+                Some(&call.name),
+                &decision,
+            )));
+            match decision {
                 HookDecision::Deny(reason) => {
                     return err_outcome(
                         id,
@@ -419,7 +428,7 @@ impl Registry {
                             tool: call.name.clone(),
                             reason: ask_reason(taint_forced, hook_ask.as_deref()),
                             taint_forced,
-                            mode: format!("{mode:?}"),
+                            mode,
                             input_summary: summarize(&call.input),
                             input: call.input.clone(),
                             memoizable: key.is_some(),
@@ -432,20 +441,28 @@ impl Registry {
                             taint_forced: req.taint_forced,
                             input_summary: req.input_summary.clone(),
                             input: req.input.clone(),
-                            mode: req.mode.clone(),
+                            mode: req.mode,
                         }));
                         let answer = self.approver.approve(&req).await;
-                        if answer.remember
+                        if answer.remembers()
                             && let Some(key) = key
                         {
-                            self.approvals.remember(key, answer.allow);
+                            self.approvals.remember(key, answer.allows());
                         }
-                        if !answer.allow {
-                            return err_outcome(
+                        if let Some(refusal) = answer.refusal_for_model(&call.name) {
+                            // The refusal keeps the user's own wording: a model
+                            // told only "denied" retries the same call, one told
+                            // why does not.
+                            let mut outcome = err_outcome(
                                 id,
-                                format!("action \"{}\" rejected by user", call.name),
-                                ToolErrorKind::PermissionDenied,
+                                refusal,
+                                match answer {
+                                    ApprovalResponse::TimedOut => ToolErrorKind::Timeout,
+                                    _ => ToolErrorKind::PermissionDenied,
+                                },
                             );
+                            outcome.aborts_turn = answer.aborts_turn();
+                            return outcome;
                         }
                     }
                 }
@@ -466,12 +483,15 @@ impl Registry {
         let ctx = self.ctx.for_call(id.clone(), {
             let events = events.clone();
             let id = id.clone();
-            std::sync::Arc::new(move |chunk: String| {
-                events.emit(ToolDispatchEvent::OutputDelta {
-                    id: id.clone(),
-                    chunk,
-                });
-            })
+            std::sync::Arc::new(
+                move |stream: agent_core::event::OutputStream, chunk: Vec<u8>| {
+                    events.emit(ToolDispatchEvent::OutputDelta {
+                        id: id.clone(),
+                        stream,
+                        chunk,
+                    });
+                },
+            )
         });
         let untrusted = tool.returns_untrusted();
         // The retry of an escalation (US-004) needs the input again. Cloned only
@@ -567,6 +587,14 @@ impl Registry {
                     },
                 )
                 .await;
+            // A post hook observes and decides nothing, so the run is always
+            // reported as completed. It is still reported: the user declared it
+            // and is entitled to see it fire.
+            events.emit(ToolDispatchEvent::Hook(hook_run_view(
+                HookEvent::PostToolUse,
+                Some(&call.name),
+                &HookDecision::NoObjection,
+            )));
         }
         outcome
     }
@@ -603,7 +631,7 @@ impl Registry {
             tool: tool.name().to_string(),
             reason: denial.escalation_reason(),
             taint_forced,
-            mode: format!("{mode:?}"),
+            mode,
             input_summary: summarize(&input),
             input: input.clone(),
             memoizable: false,
@@ -616,9 +644,9 @@ impl Registry {
             taint_forced: req.taint_forced,
             input_summary: req.input_summary.clone(),
             input: req.input.clone(),
-            mode: req.mode.clone(),
+            mode: req.mode,
         }));
-        if !self.approver.approve(&req).await.allow {
+        if !self.approver.approve(&req).await.allows() {
             return original;
         }
         // The guard IS the widening: it lives on the stack for the duration of
@@ -740,6 +768,16 @@ impl ToolDispatch for Registry {
         Registry::seed_taint(self, recent_untrusted);
     }
 
+    /// Asks the tool itself. An unknown name qualifies as `Other`: the call is
+    /// about to be rejected, and inventing a nature for it would be a lie a
+    /// client could render.
+    fn call_kind(&self, call: &ToolInvocation) -> agent_core::event::ToolCallKind {
+        match self.tools_read().get(&call.name) {
+            Some(tool) => tool.call_kind(&call.input),
+            None => agent_core::event::ToolCallKind::Other,
+        }
+    }
+
     async fn dispatch(
         &self,
         calls: Vec<ToolInvocation>,
@@ -838,6 +876,27 @@ fn err_outcome_tainted(
     error_kind: ToolErrorKind,
 ) -> ToolOutcome {
     ToolOutcome::new(id, msg, true, untrusted, Some(error_kind))
+}
+
+/// Projects a hook decision into the client view. `Ask` counts as blocked: the
+/// call did not proceed on its own, a human now has to answer for it.
+pub fn hook_run_view(
+    event: HookEvent,
+    tool: Option<&str>,
+    decision: &HookDecision,
+) -> agent_core::event::HookRunView {
+    use agent_core::event::HookRunStatus;
+    let (status, message) = match decision {
+        HookDecision::NoObjection => (HookRunStatus::Completed, None),
+        HookDecision::Ask(reason) => (HookRunStatus::Blocked, Some(reason.clone())),
+        HookDecision::Deny(reason) => (HookRunStatus::Blocked, Some(reason.clone())),
+    };
+    agent_core::event::HookRunView {
+        event: event.name().to_string(),
+        tool: tool.map(str::to_string),
+        status,
+        message,
+    }
 }
 
 fn ask_reason(taint_forced: bool, hook: Option<&str>) -> String {

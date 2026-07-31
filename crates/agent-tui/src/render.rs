@@ -2469,6 +2469,7 @@ mod tests {
             input: serde_json::json!({
                 "path": "src/main.rs", "old_string": "a\nb", "new_string": "x\ny\nz"
             }),
+            kind: Default::default(),
         }));
         s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
             id: "c1".into(),
@@ -2500,6 +2501,7 @@ mod tests {
             id: "r1".into(),
             name: "read".into(),
             input: serde_json::json!({ "path": "a.rs" }),
+            kind: Default::default(),
         }));
         s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
             id: "r1".into(),
@@ -2593,6 +2595,7 @@ mod tests {
             input: serde_json::json!({
                 "path": "a.rs", "old_string": "let x = 1;", "new_string": "let x = 2;"
             }),
+            kind: Default::default(),
         }));
         s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
             id: "c1".into(),
@@ -2623,6 +2626,7 @@ mod tests {
             id: "c1".into(),
             name: "edit".into(),
             input: serde_json::json!({ "path": "a.rs", "old_string": "ZZZ", "new_string": "YYY" }),
+            kind: Default::default(),
         }));
         s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
             id: "c1".into(),

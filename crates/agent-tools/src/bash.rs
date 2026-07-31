@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
+use agent_core::event::OutputStream;
 use agent_core::tools::ToolExecution;
 
 use crate::error::{ToolError, ValidationError};
@@ -37,6 +38,17 @@ impl Tool for Bash {
 
     fn name(&self) -> &str {
         "bash"
+    }
+    /// Runs a command: the clients get the command itself, not a JSON blob to
+    /// re-parse.
+    fn call_kind(&self, input: &serde_json::Value) -> agent_core::event::ToolCallKind {
+        match input.get("command").and_then(serde_json::Value::as_str) {
+            Some(command) => agent_core::event::ToolCallKind::Exec {
+                command: command.to_string(),
+                cwd: None,
+            },
+            None => agent_core::event::ToolCallKind::Other,
+        }
     }
     fn description(&self) -> String {
         #[cfg(windows)]
@@ -165,13 +177,13 @@ impl Tool for Bash {
         let stderr_sink = ctx.output.clone();
         let stdout_task = tokio::spawn(async move {
             match stdout {
-                Some(out) => read_tail(out, stdout_sink).await,
+                Some(out) => read_tail(out, stdout_sink, OutputStream::Stdout).await,
                 None => Capture::default(),
             }
         });
         let stderr_task = tokio::spawn(async move {
             match stderr {
-                Some(err) => read_tail(err, stderr_sink).await,
+                Some(err) => read_tail(err, stderr_sink, OutputStream::Stderr).await,
                 None => Capture::default(),
             }
         });
@@ -383,6 +395,7 @@ impl Capture {
 async fn read_tail(
     mut reader: impl tokio::io::AsyncRead + Unpin,
     sink: Option<crate::tool::OutputSink>,
+    stream: OutputStream,
 ) -> Capture {
     let mut out = Capture::default();
     let mut buf = [0_u8; 8192];
@@ -402,7 +415,7 @@ async fn read_tail(
             // latency well under a second.
             if pending.len() >= STREAM_FLUSH_BYTES || last_flush.elapsed() >= STREAM_FLUSH_INTERVAL
             {
-                flush_stream(&mut pending, sink.as_ref());
+                flush_stream(&mut pending, sink.as_ref(), stream);
                 last_flush = tokio::time::Instant::now();
             }
         }
@@ -412,14 +425,22 @@ async fn read_tail(
             out.omitted = out.omitted.saturating_add(overflow);
         }
     }
-    flush_stream(&mut pending, sink.as_ref());
+    flush_stream(&mut pending, sink.as_ref(), stream);
     out
 }
 
 /// Publishes the complete UTF-8 part of `pending` and keeps the remainder: a
-/// multi-byte character cut by a read boundary must not become a
-/// `U+FFFD` in the display.
-fn flush_stream(pending: &mut Vec<u8>, sink: Option<&crate::tool::OutputSink>) {
+/// multi-byte character cut by a read boundary must not be split across two
+/// fragments, which would show as `U+FFFD` in a client decoding one at a time.
+///
+/// The bytes go out RAW. A payload that is not UTF-8 at all is forwarded as-is
+/// rather than replaced: deciding what unreadable output looks like belongs to
+/// the client, not to the pipeline.
+fn flush_stream(
+    pending: &mut Vec<u8>,
+    sink: Option<&crate::tool::OutputSink>,
+    stream: OutputStream,
+) {
     let Some(sink) = sink else {
         pending.clear();
         return;
@@ -432,22 +453,31 @@ fn flush_stream(pending: &mut Vec<u8>, sink: Option<&crate::tool::OutputSink>) {
         Err(e) => e.valid_up_to(),
     };
     if valid_up_to == 0 {
-        // Remainder longer than a UTF-8 character: it will never be completed,
-        // so we render it lossily rather than let it grow.
+        // Longer than any single character: the remainder will never complete
+        // into valid UTF-8, so it is emitted rather than left to grow.
         if pending.len() > 4 {
-            sink(String::from_utf8_lossy(pending).into_owned());
-            pending.clear();
+            sink(stream, std::mem::take(pending));
         }
         return;
     }
     let rest = pending.split_off(valid_up_to);
-    let mut text = String::from_utf8_lossy(pending).into_owned();
-    // Backstop: a giant fragment adds nothing to a bounded live display.
-    if text.len() > STREAM_CHUNK_MAX {
-        text = truncate_tail(&text, STREAM_CHUNK_MAX);
+    let mut chunk = std::mem::replace(pending, rest);
+    // Backstop: a giant fragment adds nothing to a bounded live display. The cut
+    // walks back to a character boundary so the kept tail stays decodable.
+    if chunk.len() > STREAM_CHUNK_MAX {
+        let mut start = chunk.len() - STREAM_CHUNK_MAX;
+        while start < chunk.len() && !is_char_boundary(&chunk, start) {
+            start += 1;
+        }
+        chunk.drain(0..start);
     }
-    *pending = rest;
-    sink(text);
+    sink(stream, chunk);
+}
+
+/// Is `index` the start of a UTF-8 character in `bytes`? Continuation bytes are
+/// `10xxxxxx`, every other byte starts one.
+fn is_char_boundary(bytes: &[u8], index: usize) -> bool {
+    bytes.get(index).is_none_or(|byte| (*byte as i8) >= -0x40)
 }
 
 /// Kills the process GROUP of a command whose future is dropped before it ends

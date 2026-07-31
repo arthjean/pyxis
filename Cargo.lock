@@ -112,6 +112,7 @@ dependencies = [
  "agent-tokenizer",
  "async-stream",
  "async-trait",
+ "base64",
  "futures-util",
  "serde",
  "serde_json",

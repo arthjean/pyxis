@@ -65,6 +65,17 @@ impl Tool for ApplyPatch {
     fn name(&self) -> &str {
         "apply_patch"
     }
+    /// Names the files the patch touches. An unparseable envelope yields no
+    /// path rather than a guess: the call is about to be refused anyway.
+    fn call_kind(&self, input: &serde_json::Value) -> agent_core::event::ToolCallKind {
+        let paths = input
+            .get("input")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|text| parse_patch(text).ok())
+            .map(|patch| patch.touched_paths().into_iter().collect())
+            .unwrap_or_default();
+        agent_core::event::ToolCallKind::Patch { paths }
+    }
     fn description(&self) -> String {
         "Apply a patch to workspace files, in the apply_patch format. The text \
          opens with \"*** Begin Patch\" and closes with \"*** End Patch\"; \
@@ -265,7 +276,7 @@ pub struct Patch {
 impl Patch {
     /// Every path the patch writes to, destinations of a move included. Sorted
     /// and deduplicated: the guardrails are evaluated once per path.
-    fn touched_paths(&self) -> BTreeSet<String> {
+    pub fn touched_paths(&self) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         for hunk in &self.hunks {
             match hunk {

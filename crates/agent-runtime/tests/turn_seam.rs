@@ -342,7 +342,7 @@ async fn engine_events_cross_the_seam_without_reimplementing_retry_or_dispatch()
             .filter(|e| matches!(
                 e,
                 AgentEvent::EndTurn
-                    | AgentEvent::Interrupted
+                    | AgentEvent::Interrupted(..)
                     | AgentEvent::Error(_)
                     | AgentEvent::Exhausted(_)
             ))
@@ -397,7 +397,7 @@ async fn the_hierarchical_token_interrupts_the_engine_through_the_seam() {
 
     assert_eq!(outcome, TurnOutcome::Interrupted);
     assert!(
-        matches!(events.last(), Some(AgentEvent::Interrupted)),
+        matches!(events.last(), Some(AgentEvent::Interrupted(..))),
         "the engine emitted its own terminal after reconciling: {events:?}"
     );
     assert!(

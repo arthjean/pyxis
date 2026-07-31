@@ -168,11 +168,14 @@ impl Projector {
                 let Some((id, open)) = self.find_by_call(delta.id.as_str()) else {
                     return Vec::new();
                 };
-                open.streamed.push_str(&delta.chunk);
+                // The app-server protocol carries text, so the bytes are decoded
+                // here, once, at the edge that serializes them.
+                let text = delta.chunk_lossy().into_owned();
+                open.streamed.push_str(&text);
                 match &open.item {
                     ThreadItem::CommandExecution { .. } => vec![Projected::CommandDelta {
                         item_id: id,
-                        delta: delta.chunk.clone(),
+                        delta: text,
                     }],
                     // Other families have no streaming contract: their output
                     // reaches the client with `item/completed`.
@@ -190,7 +193,7 @@ impl Projector {
                 let (_, open) = self.open.remove(position);
                 vec![Projected::Completed(complete_tool_item(open, result))]
             }
-            AgentEvent::EndTurn | AgentEvent::Interrupted => self.commit_message(),
+            AgentEvent::EndTurn | AgentEvent::Interrupted(..) => self.commit_message(),
             AgentEvent::Error(error) => {
                 let mut out = self.commit_message();
                 let id = format!("error_{}", self.next_error);
@@ -507,6 +510,7 @@ mod tests {
             id: ToolCallId::from(id.to_string()),
             name: name.to_string(),
             input,
+            kind: Default::default(),
         })
     }
 
@@ -596,7 +600,8 @@ mod tests {
         projector.engine(&call("c1", "bash", serde_json::json!({"command": "ls -l"})));
         let delta = projector.engine(&AgentEvent::ToolOutputDelta(ToolOutputDeltaView {
             id: ToolCallId::from("c1".to_string()),
-            chunk: "total 0\n".into(),
+            stream: agent_core::event::OutputStream::Stdout,
+            chunk: b"total 0\n".to_vec(),
         }));
         assert!(matches!(
             delta.as_slice(),

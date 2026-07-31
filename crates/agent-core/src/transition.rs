@@ -72,8 +72,10 @@ pub enum Transition {
     /// Context error held back (withholding), to recover before propagating.
     Recover(PendingError),
     /// US-001: cooperative cancellation signalled, stop at the current boundary,
-    /// after transcript reconciliation (US-002).
-    Interrupted,
+    /// after transcript reconciliation (US-002). Carries WHY, because a
+    /// cancelled turn and a turn the user ended by refusing a tool read the same
+    /// on screen and are not the same event.
+    Interrupted(crate::event::InterruptReason),
     /// Turn cap / budget exhausted.
     Exhausted(ExhaustReason),
     /// Fatal, unrecoverable error.
@@ -236,9 +238,12 @@ impl Accumulator {
                 );
             }
             // Telemetry, not turn content: consumed by the loop, nothing to
-            // accumulate for the assistant message.
+            // accumulate for the assistant message. An unmapped item is reported
+            // to the client but adds nothing to the transcript, precisely
+            // because its content could not be read.
             StreamEvent::Usage { .. }
             | StreamEvent::Quota { .. }
+            | StreamEvent::UnmappedItem { .. }
             | StreamEvent::ReasoningReplayDisabled { .. } => {}
             StreamEvent::Done { stop } => self.stop = Some(stop),
         }

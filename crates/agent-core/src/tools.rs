@@ -114,6 +114,11 @@ pub struct ModelToolResult {
     /// carries text only, so the loop turns these into a user message right
     /// after the result. Empty for every other tool.
     pub images: Vec<ToolImage>,
+    /// The user refused this call AND ended the turn with it. The result is
+    /// still written to the transcript (the backend needs its pair), but the
+    /// loop stops instead of sampling the model again. Mirrors Codex
+    /// `ReviewDecision::Abort` (`codex-rs/protocol/src/protocol.rs:4138`).
+    pub aborts_turn: bool,
 }
 
 impl ModelToolResult {
@@ -137,6 +142,7 @@ impl ModelToolResult {
             truncation: None,
             execution: None,
             images: Vec::new(),
+            aborts_turn: false,
         }
     }
 
@@ -489,7 +495,10 @@ fn slice_chars<'a>(
 
 /// Image a tool read for the model (US-011). Base64 payload plus its media
 /// type: the exact pair `ContentBlock::Image` carries.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable because it now travels INSIDE the tool result, so it has to
+/// survive the transcript on disk like every other part of that result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolImage {
     pub media_type: String,
     pub data: String,
@@ -597,6 +606,12 @@ impl StepToolPlan {
         &self.specs
     }
 
+    /// The captured dispatcher, so the loop can ask it to qualify a call before
+    /// dispatching it. Same generation as the specs the model saw.
+    pub fn dispatcher(&self) -> &Arc<dyn ToolDispatch> {
+        &self.dispatcher
+    }
+
     pub fn with_parallel_allowed(&self, parallel_allowed: bool) -> Self {
         Self {
             generation: self.generation,
@@ -670,13 +685,18 @@ fn tool_plan_fingerprint(specs: &[ToolSpec], parallel_allowed: bool) -> String {
 pub enum ToolDispatchEvent {
     PermissionAsk(PermissionReq),
     /// Output fragment of a tool still running (US-015), correlated by `id`.
+    /// Raw bytes and stream of origin, both preserved up to the client.
     OutputDelta {
         id: ToolCallId,
-        chunk: String,
+        stream: crate::event::OutputStream,
+        chunk: Vec<u8>,
     },
     /// Structured plan a tool just published (US-009). Travels beside the
     /// textual result because it is addressed to the client, not to the model.
     Plan(PlanView),
+    /// A hook ran around a tool call (US-017/US-019). Observational: the
+    /// decision is already applied by the time this is emitted.
+    Hook(crate::event::HookRunView),
 }
 
 #[derive(Clone, Default)]
@@ -701,6 +721,14 @@ pub trait ToolDispatch: Send + Sync {
     /// Reseeds the permission taint from a resumed transcript. Implementations
     /// without taint can ignore this signal.
     fn seed_taint(&self, _recent_untrusted: bool) {}
+
+    /// Nature of a call, for the client event. The dispatcher answers because it
+    /// holds the actual tool; the loop only sees a name and a JSON value, which
+    /// is not enough to tell an MCP tool from a built-in one that shares its
+    /// name. Default `Other`: an implementation that says nothing loses nothing.
+    fn call_kind(&self, _call: &ToolInvocation) -> crate::event::ToolCallKind {
+        crate::event::ToolCallKind::Other
+    }
 
     /// Runs a batch of calls and returns their results (order not guaranteed;
     /// each result is correlated by `id`).

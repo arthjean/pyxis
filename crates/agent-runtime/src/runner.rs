@@ -114,7 +114,7 @@ where
 fn outcome_of(event: &AgentEvent) -> Option<TurnOutcome> {
     match event {
         AgentEvent::EndTurn => Some(TurnOutcome::Completed),
-        AgentEvent::Interrupted => Some(TurnOutcome::Interrupted),
+        AgentEvent::Interrupted(..) => Some(TurnOutcome::Interrupted),
         AgentEvent::Exhausted(reason) => Some(TurnOutcome::Exhausted(format!("{reason:?}"))),
         AgentEvent::Error(err) => Some(TurnOutcome::Failed(err.to_string())),
         _ => None,

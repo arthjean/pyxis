@@ -284,7 +284,7 @@ fn permission_request(tool: &str, call_id: &str) -> PermissionRequest {
         tool: tool.to_string(),
         reason: "a confirmation is required".into(),
         taint_forced: false,
-        mode: "Default".into(),
+        mode: agent_core::PermissionMode::Default,
         input_summary: "rm -rf build".into(),
         input: json!({"command": "rm -rf build"}),
         memoizable: true,
@@ -544,7 +544,7 @@ async fn approvals_reach_the_owner_and_not_a_late_connection() {
             &json!({"jsonrpc":"2.0","id":request_id,"result":{"decision":"approved"}}).to_string(),
         )
         .await;
-    assert!(asked.await.expect("answered").allow);
+    assert!(asked.await.expect("answered").allows());
 
     // Nothing was ever written to the latecomer beyond its own answers.
     let pending = tokio::time::timeout(Duration::from_millis(50), latecomer.receiver.recv()).await;
@@ -564,6 +564,7 @@ async fn an_approval_correlates_and_resolves_once() {
         id: ToolCallId::from("call_1".to_string()),
         name: "bash".into(),
         input: json!({"command": "rm -rf build"}),
+        kind: Default::default(),
     }));
 
     let bridge = Arc::clone(&harness.host.bridge);
@@ -592,7 +593,7 @@ async fn an_approval_correlates_and_resolves_once() {
         )
         .await;
     let answer = asked.await.expect("the approver answered");
-    assert!(answer.allow && answer.remember);
+    assert!(answer.allows() && answer.remembers());
 
     let resolved = harness.next_notification("serverRequest/resolved").await;
     assert_eq!(resolved["params"]["resolution"], "answered");
@@ -636,8 +637,8 @@ async fn an_unreadable_approval_answer_denies() {
         .send(&json!({"jsonrpc":"2.0","id":request_id,"result":{"decision":"maybe"}}).to_string())
         .await;
     let answer = asked.await.expect("the approver answered");
-    assert!(!answer.allow, "an unreadable decision must deny");
-    assert!(!answer.remember);
+    assert!(!answer.allows(), "an unreadable decision must deny");
+    assert!(!answer.remembers());
 }
 
 /// AC3: an interruption closes every open item exactly once and cancels the
@@ -651,6 +652,7 @@ async fn an_interruption_closes_items_and_cancels_pending_requests() {
         id: ToolCallId::from("call_1".to_string()),
         name: "bash".into(),
         input: json!({"command": "sleep 100"}),
+        kind: Default::default(),
     }));
 
     let bridge = Arc::clone(&harness.host.bridge);
@@ -680,7 +682,7 @@ async fn an_interruption_closes_items_and_cancels_pending_requests() {
     // The pending approval is released as a DENIAL: a permission nobody
     // granted is a permission refused.
     let answer = asked.await.expect("the approver was released");
-    assert!(!answer.allow);
+    assert!(!answer.allows());
 
     let closed = harness.next_notification("item/completed").await;
     assert_eq!(closed["params"]["item"]["id"], "item_0");
@@ -723,6 +725,7 @@ async fn a_dynamic_tool_travels_the_ordinary_dispatch() {
         id: ToolCallId::from("call_7".to_string()),
         name: "lookup".into(),
         input: json!({"id": "42"}),
+        kind: Default::default(),
     }));
 
     // The tool the registry would run, invoked exactly as the registry does.
@@ -742,7 +745,7 @@ async fn a_dynamic_tool_travels_the_ordinary_dispatch() {
     assert!(rejected.is_empty());
     let tool = tools.into_iter().next().expect("one tool");
     let ctx = agent_tools::tool::ToolCtx::new(std::env::temp_dir())
-        .for_call(ToolCallId::from("call_7".to_string()), Arc::new(|_| {}));
+        .for_call(ToolCallId::from("call_7".to_string()), Arc::new(|_, _| {}));
     let called = tokio::spawn(async move { tool.invoke(json!({"id": "42"}), &ctx).await });
 
     let request = harness.next_notification("item/tool/call").await;
@@ -874,6 +877,7 @@ async fn a_resumed_thread_continues_its_numbering() {
         id: ToolCallId::from("call_1".to_string()),
         name: "read".into(),
         input: json!({"path": "a.rs"}),
+        kind: Default::default(),
     }));
     let started = harness.next_notification("item/started").await;
     assert_eq!(started["params"]["item"]["id"], "item_2");

@@ -459,7 +459,36 @@ impl TranscriptMapper {
             )],
             AgentEvent::ToolCall(view) => {
                 let mut updates = self.drain_active_streams();
-                if let Some(display) = exec_display_from_tool(&view.name, &view.input) {
+                // An MCP call is named by its server and its tool, which is the
+                // fact; `mcp__server__tool` is only how we encode it for the
+                // model. The pipeline qualifies it, so no client has to guess.
+                if let agent_core::event::ToolCallKind::Mcp { server, tool } = &view.kind {
+                    updates.push(TranscriptUpdate::new(
+                        TranscriptLifecycle::Started,
+                        TranscriptItem::new(
+                            Some(TranscriptItemId::derived("mcp", &view.id)),
+                            TranscriptRole::Assistant,
+                            TranscriptItemKind::McpToolCall,
+                            TranscriptItemStatus::Running,
+                            TranscriptPayload::McpToolCall {
+                                server: server.clone(),
+                                tool: tool.clone(),
+                                arguments: Some(view.input.clone()),
+                            },
+                        ),
+                    ));
+                    return updates;
+                }
+                // A command the pipeline named is used verbatim. The heuristic
+                // below stays for the read/glob/grep tools, where the shell line
+                // is a RENDERING we invent, not a command anyone runs.
+                let display = match &view.kind {
+                    agent_core::event::ToolCallKind::Exec { command, .. } => {
+                        Some(ExecToolDisplay::shell(command.clone()))
+                    }
+                    _ => exec_display_from_tool(&view.name, &view.input),
+                };
+                if let Some(display) = display {
                     self.active_exec_tools
                         .insert(view.id.clone(), display.clone());
                     updates.push(TranscriptUpdate::new(
@@ -543,6 +572,55 @@ impl TranscriptMapper {
             // parity transcript, which has no equivalent cell. Both are read
             // from `AppState` by the status line and the session commands.
             AgentEvent::ModelTurn(_) | AgentEvent::Quota(_) => Vec::new(),
+            AgentEvent::Hook(run) => vec![TranscriptUpdate::new(
+                TranscriptLifecycle::Completed,
+                TranscriptItem::new(
+                    Some(self.next_local("hook")),
+                    TranscriptRole::System,
+                    TranscriptItemKind::HookRun,
+                    match run.status {
+                        agent_core::event::HookRunStatus::Completed => {
+                            TranscriptItemStatus::Complete
+                        }
+                        agent_core::event::HookRunStatus::Blocked => TranscriptItemStatus::Cancelled,
+                        agent_core::event::HookRunStatus::Failed => TranscriptItemStatus::Failed,
+                    },
+                    TranscriptPayload::HookRun {
+                        event: match &run.tool {
+                            Some(tool) => format!("{} ({tool})", run.event),
+                            None => run.event.clone(),
+                        },
+                        status_message: run.message.clone(),
+                        status: match run.status {
+                            agent_core::event::HookRunStatus::Completed => {
+                                TranscriptHookStatus::Completed
+                            }
+                            agent_core::event::HookRunStatus::Blocked => {
+                                TranscriptHookStatus::Blocked
+                            }
+                            agent_core::event::HookRunStatus::Failed => TranscriptHookStatus::Failed,
+                        },
+                        entries: Vec::new(),
+                    },
+                ),
+            )],
+            // An item the adapter could not read: shown as a notice precisely
+            // because there is nothing else to show. Staying silent would let
+            // the user believe the model produced only what is on screen.
+            AgentEvent::UnmappedResponseItem { item_type } => vec![TranscriptUpdate::new(
+                TranscriptLifecycle::Completed,
+                TranscriptItem::new(
+                    Some(self.next_local("notice")),
+                    TranscriptRole::System,
+                    TranscriptItemKind::Notice,
+                    TranscriptItemStatus::Complete,
+                    TranscriptPayload::Notice {
+                        message: format!(
+                            "the backend sent a `{item_type}` item this build does not render"
+                        ),
+                    },
+                ),
+            )],
             AgentEvent::TurnDiff(view) => vec![TranscriptUpdate::new(
                 TranscriptLifecycle::Completed,
                 TranscriptItem::new(
@@ -574,12 +652,12 @@ impl TranscriptMapper {
                     reason: req.reason.clone(),
                     taint_forced: req.taint_forced,
                     input_summary: req.input_summary.clone(),
-                    mode: req.mode.clone(),
+                    mode: req.mode.to_string(),
                     input: req.input.clone(),
                 })
             }
             AgentEvent::EndTurn => self.complete_active_streams(),
-            AgentEvent::Interrupted => {
+            AgentEvent::Interrupted(..) => {
                 let mut updates = self.drain_active_streams();
                 updates.push(TranscriptUpdate::new(
                     TranscriptLifecycle::Completed,
@@ -1020,6 +1098,7 @@ mod tests {
             id: "call-1".into(),
             name: "custom_tool".into(),
             input: serde_json::json!({ "path": "Cargo.toml" }),
+            kind: Default::default(),
         }));
         let result = mapper.map_event(&AgentEvent::ToolResult(ToolResultView {
             id: "call-1".into(),
@@ -1052,6 +1131,7 @@ mod tests {
             id: "call-1".into(),
             name: "read".into(),
             input: serde_json::json!({ "path": "README.md" }),
+            kind: Default::default(),
         }));
         let result = mapper.map_event(&AgentEvent::ToolResult(ToolResultView {
             id: "call-1".into(),
@@ -1093,6 +1173,7 @@ mod tests {
             id: "call-1".into(),
             name: "bash".into(),
             input: serde_json::json!({ "command": "cargo test" }),
+            kind: Default::default(),
         }));
         let result = mapper.map_event(&AgentEvent::ToolResult(ToolResultView {
             id: "call-1".into(),
@@ -1163,6 +1244,7 @@ mod tests {
             id: "call-1".into(),
             name: "bash".into(),
             input: serde_json::json!({ "cmd": "pwd" }),
+            kind: Default::default(),
         }));
 
         assert_eq!(updates.len(), 2);
@@ -1182,7 +1264,7 @@ mod tests {
             taint_forced: false,
             input_summary: "cargo test".into(),
             input: serde_json::json!({ "cmd": "cargo test" }),
-            mode: "ask".into(),
+            mode: agent_core::PermissionMode::Default,
         }));
 
         assert_eq!(update[0].item.kind, TranscriptItemKind::PermissionRequest);
@@ -1203,7 +1285,7 @@ mod tests {
             taint_forced: false,
             input_summary: "cargo test".into(),
             input: serde_json::json!({ "cmd": "cargo test" }),
-            mode: "ask".into(),
+            mode: agent_core::PermissionMode::Default,
         }));
 
         let decision = mapper.map_approval_decision(false);

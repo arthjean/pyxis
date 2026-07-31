@@ -249,10 +249,7 @@ mod tests {
         b.observe_estimated(75_999);
         assert!(!b.should_autocompact());
         assert!(!b.would_autocompact(75_999));
-        b.observe_usage(TokenUsage {
-            input: 76_000,
-            output: 1,
-        });
+        b.observe_usage(TokenUsage::new(76_000, 1));
         assert!(b.should_autocompact());
         assert!(b.would_autocompact(76_000));
     }
@@ -271,10 +268,7 @@ mod tests {
         let mut b = ContextBudget::for_model(1000, 200);
         b.begin_turn();
         assert!(!b.usage_seen());
-        b.observe_usage(TokenUsage {
-            input: 650,
-            output: 10,
-        });
+        b.observe_usage(TokenUsage::new(650, 10));
         assert!(b.usage_seen());
         assert!(b.should_autocompact());
 
@@ -300,30 +294,21 @@ mod tests {
         // 1st real usage after compaction: 650 (incompressible overhead). Without a
         // baseline, 650 >= 640 -> immediate recompaction. With the baseline: 650 becomes
         // the prefill, so current - prefill = 0 -> no compaction.
-        b.observe_usage(TokenUsage {
-            input: 650,
-            output: 5,
-        });
+        b.observe_usage(TokenUsage::new(650, 5));
         assert_eq!(b.prefill_input(), 650);
         assert!(
             !b.should_autocompact(),
             "le baseline neutralise l'overhead post-compaction"
         );
         // the conversation grows 640 above the baseline -> triggers again.
-        b.observe_usage(TokenUsage {
-            input: 650 + 640,
-            output: 5,
-        });
+        b.observe_usage(TokenUsage::new(650 + 640, 5));
         assert!(b.should_autocompact(), "croissance réelle re-déclenche");
     }
 
     #[test]
     fn would_autocompact_projects_without_mutation() {
         let mut b = ContextBudget::for_model(1000, 200); // auto 640
-        b.observe_usage(TokenUsage {
-            input: 100,
-            output: 5,
-        });
+        b.observe_usage(TokenUsage::new(100, 5));
         assert!(b.would_autocompact(640), "projection franchit le seuil");
         assert!(!b.would_autocompact(639));
         // the projection does not mutate the real budget.

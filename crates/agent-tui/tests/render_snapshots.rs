@@ -39,6 +39,7 @@ fn tool_call(id: &str, name: &str, input: serde_json::Value) -> AgentEvent {
         id: id.to_string(),
         name: name.to_string(),
         input,
+        kind: Default::default(),
     })
 }
 
@@ -196,7 +197,8 @@ fn exec_streaming_output() {
     ] {
         s.apply(&AgentEvent::ToolOutputDelta(ToolOutputDeltaView {
             id: "call_1".to_string(),
-            chunk: format!("   Compiling {krate} v0.0.0\n"),
+            stream: agent_core::event::OutputStream::Stdout,
+            chunk: format!("   Compiling {krate} v0.0.0\n").into_bytes(),
         }));
     }
     s.spinner_tick = 2;
@@ -514,6 +516,7 @@ fn footer_status_line_narrow() {
         context_window: Some(272_000),
         auto_compact_token_limit: Some(244_800),
         estimated_context_tokens: None,
+        ..agent_core::ModelTurnView::default()
     }));
     s.reasoning_effort = Some("high".into());
     assert_eq!(
@@ -555,7 +558,7 @@ fn interrupted_turn() {
     // US-002: the in-flight call gets its synthetic result BEFORE the
     // interruption event emitted by the core.
     s.apply(&tool_result("call_1", "interrupted by user", true));
-    s.apply(&AgentEvent::Interrupted);
+    s.apply(&AgentEvent::Interrupted(agent_core::InterruptedView::cancelled()));
     insta::assert_snapshot!(
         "interrupted_turn",
         harness::frame("interrupted_turn", &s, W, H)

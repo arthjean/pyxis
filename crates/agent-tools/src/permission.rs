@@ -15,21 +15,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-/// The 5 permission modes (ARCHITECTURE 4.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PermissionMode {
-    /// Asks on a sensitive action.
-    #[default]
-    Default,
-    /// Auto-accepts file edits, asks for the rest.
-    AcceptEdits,
-    /// Never interrupts (controlled automations).
-    DontAsk,
-    /// Short-circuits every check (advanced use / under a sandbox).
-    BypassPermissions,
-    /// Read-only: no mutation allowed (planning phase).
-    Plan,
-}
+/// The 5 permission modes. Defined in `agent-core` because a permission request
+/// travels to the clients and must carry the mode as a VALUE, not as a debug
+/// string; re-exported here so the pipeline keeps one import path.
+pub use agent_core::permission::PermissionMode;
 
 /// Shared state of the current permission mode.
 ///
@@ -291,7 +280,7 @@ pub struct PermissionRequest {
     pub reason: String,
     /// True when the request is forced by recent untrusted content.
     pub taint_forced: bool,
-    pub mode: String,
+    pub mode: PermissionMode,
     /// Short summary of the input (e.g. the Bash command, the written path).
     pub input_summary: String,
     /// Raw structured input: lets the frontend render a rich preview
@@ -305,36 +294,90 @@ pub struct PermissionRequest {
     pub memo_refused: Option<String>,
 }
 
-/// Answer to a confirmation: what to do now, and whether to remember it for the
-/// session. `remember` is ignored when the request is not memoizable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ApprovalResponse {
-    pub allow: bool,
-    pub remember: bool,
+/// Answer to a confirmation: what to do now, and how far that answer reaches.
+///
+/// Ported from Codex `ReviewDecision` (`codex-rs/protocol/src/protocol.rs:4108`).
+/// Two things a boolean could not express are carried here: the user's own
+/// WORDING for a refusal, which is what lets the model change approach instead
+/// of retrying the same call, and the difference between refusing one action and
+/// stopping the turn.
+///
+/// `remember` is ignored when the request is not memoizable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalResponse {
+    /// Run it.
+    Approved { remember: bool },
+    /// Do not run it, and keep the turn going. `rejection` is handed to the
+    /// model verbatim; `None` falls back to a generic sentence.
+    Denied {
+        remember: bool,
+        rejection: Option<String>,
+    },
+    /// No answer arrived in time. Distinct from a refusal: nobody decided, so
+    /// nothing is ever remembered from it.
+    TimedOut,
+    /// Do not run it, and stop the turn. The model is not asked to try
+    /// something else, because the user is done with this turn.
+    Abort,
 }
 
 impl ApprovalResponse {
-    pub const ALLOW_ONCE: Self = Self {
-        allow: true,
+    pub const ALLOW_ONCE: Self = Self::Approved { remember: false };
+    pub const DENY_ONCE: Self = Self::Denied {
         remember: false,
+        rejection: None,
     };
-    pub const DENY_ONCE: Self = Self {
-        allow: false,
-        remember: false,
-    };
-    pub const ALLOW_SESSION: Self = Self {
-        allow: true,
+    pub const ALLOW_SESSION: Self = Self::Approved { remember: true };
+    pub const DENY_SESSION: Self = Self::Denied {
         remember: true,
-    };
-    pub const DENY_SESSION: Self = Self {
-        allow: false,
-        remember: true,
+        rejection: None,
     };
 
     pub const fn once(allow: bool) -> Self {
-        Self {
-            allow,
-            remember: false,
+        if allow {
+            Self::ALLOW_ONCE
+        } else {
+            Self::DENY_ONCE
+        }
+    }
+
+    /// May the call run?
+    pub fn allows(&self) -> bool {
+        matches!(self, Self::Approved { .. })
+    }
+
+    /// Does the answer extend to the whole session? A timeout and an abort never
+    /// do: neither is a decision the user made about future calls.
+    pub fn remembers(&self) -> bool {
+        match self {
+            Self::Approved { remember } | Self::Denied { remember, .. } => *remember,
+            Self::TimedOut | Self::Abort => false,
+        }
+    }
+
+    /// Should the turn stop instead of carrying on without this tool?
+    pub fn aborts_turn(&self) -> bool {
+        matches!(self, Self::Abort)
+    }
+
+    /// Sentence handed back to the model, `None` when the answer allows the call.
+    pub fn refusal_for_model(&self, tool: &str) -> Option<String> {
+        match self {
+            Self::Approved { .. } => None,
+            Self::Denied {
+                rejection: Some(rejection),
+                ..
+            } if !rejection.trim().is_empty() => Some(format!(
+                "action \"{tool}\" rejected by user: {}",
+                rejection.trim()
+            )),
+            Self::Denied { .. } => Some(format!("action \"{tool}\" rejected by user")),
+            Self::TimedOut => Some(format!(
+                "action \"{tool}\" was not confirmed in time and did not run"
+            )),
+            Self::Abort => Some(format!(
+                "action \"{tool}\" rejected by user, who ended the turn"
+            )),
         }
     }
 }

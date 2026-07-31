@@ -183,7 +183,17 @@ pub async fn run(run: HeadlessRun<'_>) -> anyhow::Result<()> {
     // `Stop` fires when the agent really stops, so not on an interruption or a
     // failure, which the client owns.
     if ended == RunEnd::EndTurn {
-        hooks.lifecycle(agent_tools::hooks::Lifecycle::Stop).await;
+        let decision = hooks.lifecycle(agent_tools::hooks::Lifecycle::Stop).await;
+        // The run is machine-readable output: a hook that fired belongs in the
+        // stream like every other event, not only on an interactive screen.
+        writer.identified_event(
+            &AgentEvent::Hook(agent_tools::registry::hook_run_view(
+                agent_tools::HookEvent::Stop,
+                None,
+                &decision,
+            )),
+            &identity,
+        );
     }
 
     let answer = text

@@ -134,7 +134,7 @@ impl ScopedApprover {
 impl Approver for ScopedApprover {
     async fn approve(&self, req: &PermissionRequest) -> crate::permission::ApprovalResponse {
         self.calls.lock().unwrap().push(req.clone());
-        self.response
+        self.response.clone()
     }
 }
 
@@ -1219,9 +1219,15 @@ async fn bash_streams_output_before_the_command_ends() {
         label.contains("OutputDelta"),
         "événement inattendu: {label}"
     );
-    if let ToolDispatchEvent::OutputDelta { id, chunk } = first {
+    if let ToolDispatchEvent::OutputDelta { id, stream, chunk } = first {
         assert_eq!(id.as_str(), "a");
-        assert!(chunk.contains("debut"), "fragment inattendu: {chunk}");
+        let text = String::from_utf8_lossy(&chunk);
+        assert!(text.contains("debut"), "fragment inattendu: {text}");
+        assert_eq!(
+            stream,
+            agent_core::event::OutputStream::Stdout,
+            "un echo sort sur stdout"
+        );
     }
 
     let out = dispatch.await;
@@ -1521,6 +1527,56 @@ async fn remembered_refusal_denies_without_asking_again() {
     assert!(out.content.contains("remembered answer"), "{}", out.content);
     assert_eq!(calls.lock().unwrap().len(), 1, "asked only once");
     assert!(!ws.path().join("denied.txt").exists());
+}
+
+/// A refusal carries the user's own wording to the model, and an abort marks
+/// the result so the loop stops instead of sampling again.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn a_typed_refusal_reaches_the_model_and_an_abort_ends_the_turn() {
+    let ws = TempWs::new("typed-refusal");
+    let (appr, _) = ScopedApprover::new(crate::permission::ApprovalResponse::Denied {
+        remember: false,
+        rejection: Some("pas sur cette branche".to_string()),
+    });
+    let reg = Registry::builder(ws.path())
+        .mode(PermissionMode::Default)
+        .approver(appr)
+        .register(Bash)
+        .build();
+    let out = reg
+        .dispatch(vec![call(
+            "a",
+            "bash",
+            serde_json::json!({"command": "touch x.txt"}),
+        )])
+        .await;
+    let denied = by_id(&out, "a");
+    assert!(denied.is_error);
+    assert!(
+        denied.content.contains("pas sur cette branche"),
+        "le motif du refus doit atteindre le modèle: {}",
+        denied.content
+    );
+    assert!(!denied.aborts_turn, "un refus simple laisse le tour vivre");
+
+    let (appr, _) = ScopedApprover::new(crate::permission::ApprovalResponse::Abort);
+    let reg = Registry::builder(ws.path())
+        .mode(PermissionMode::Default)
+        .approver(appr)
+        .register(Bash)
+        .build();
+    let out = reg
+        .dispatch(vec![call(
+            "b",
+            "bash",
+            serde_json::json!({"command": "touch y.txt"}),
+        )])
+        .await;
+    let aborted = by_id(&out, "b");
+    assert!(aborted.is_error);
+    assert!(aborted.aborts_turn, "un abandon doit arrêter le tour");
+    assert!(!ws.path().join("y.txt").exists());
 }
 
 #[cfg(not(windows))]
@@ -2118,6 +2174,109 @@ async fn a_hook_refusal_stops_the_call_and_carries_its_reason() {
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].0, "ask");
     assert_eq!(seen[0].1["x"], 1);
+}
+
+/// The dispatcher qualifies a call from the TOOL, so clients stop deriving the
+/// nature of an act from a tool name.
+#[tokio::test]
+async fn the_dispatcher_qualifies_exec_and_patch_calls() {
+    use agent_core::event::ToolCallKind;
+    use agent_core::tools::ToolDispatch;
+
+    let ws = TempWs::new("call-kind");
+    let reg = Registry::builder(ws.path())
+        .mode(PermissionMode::DontAsk)
+        .approver(Arc::new(crate::permission::AutoApprove::new()))
+        .register(crate::Bash)
+        .register(crate::ApplyPatch)
+        .register(crate::Read)
+        .build();
+
+    let exec = ToolDispatch::call_kind(
+        &reg,
+        &call("a", "bash", serde_json::json!({"command": "cargo test"})),
+    );
+    assert_eq!(
+        exec,
+        ToolCallKind::Exec {
+            command: "cargo test".to_string(),
+            cwd: None,
+        }
+    );
+
+    let patch = ToolDispatch::call_kind(
+        &reg,
+        &call(
+            "b",
+            "apply_patch",
+            serde_json::json!({
+                "input": "*** Begin Patch\n*** Delete File: gone.txt\n*** End Patch\n"
+            }),
+        ),
+    );
+    assert_eq!(
+        patch,
+        ToolCallKind::Patch {
+            paths: vec!["gone.txt".to_string()],
+        }
+    );
+
+    // A plain tool claims nothing, and an unknown name invents nothing.
+    assert_eq!(
+        ToolDispatch::call_kind(&reg, &call("c", "read", serde_json::json!({"path": "a.rs"}))),
+        ToolCallKind::Other
+    );
+    assert_eq!(
+        ToolDispatch::call_kind(&reg, &call("d", "nope", serde_json::json!({}))),
+        ToolCallKind::Other
+    );
+}
+
+/// A blocking hook is REPORTED to the client. Without this, a refused call
+/// looks like an agent that quietly chose to do nothing.
+#[tokio::test]
+async fn a_hook_run_reaches_the_client_as_an_event() {
+    use agent_core::event::HookRunStatus;
+    use agent_core::tools::ToolDispatchEvent;
+
+    let hooks = ScriptedHooks::new(crate::hooks::HookDecision::Deny("refus net".to_string()));
+    let reg = hooked_registry(Arc::clone(&hooks), PermissionMode::DontAsk);
+
+    let (_, events) = dispatch_capturing(&reg, vec![call("a", "ask", serde_json::json!({}))]).await;
+
+    let run = events
+        .iter()
+        .find_map(|event| match event {
+            ToolDispatchEvent::Hook(run) => Some(run),
+            _ => None,
+        })
+        .expect("le run du hook doit atteindre le client");
+    assert_eq!(run.event, "PreToolUse");
+    assert_eq!(run.tool.as_deref(), Some("ask"));
+    assert_eq!(run.status, HookRunStatus::Blocked);
+    assert_eq!(run.message.as_deref(), Some("refus net"));
+}
+
+/// A hook that raises no objection is still reported: the user declared it and
+/// is entitled to see it fire.
+#[tokio::test]
+async fn a_silent_hook_run_is_reported_as_completed() {
+    use agent_core::event::HookRunStatus;
+    use agent_core::tools::ToolDispatchEvent;
+
+    let hooks = ScriptedHooks::new(crate::hooks::HookDecision::NoObjection);
+    let reg = hooked_registry(Arc::clone(&hooks), PermissionMode::DontAsk);
+
+    let (_, events) = dispatch_capturing(&reg, vec![call("a", "ask", serde_json::json!({}))]).await;
+
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ToolDispatchEvent::Hook(run)
+                if run.status == HookRunStatus::Completed && run.event == "PreToolUse"
+        )),
+        "{events:?}"
+    );
 }
 
 /// US-018 AC4: the refusal outranks the mode that bypasses every confirmation.

@@ -31,6 +31,7 @@ fn tool(s: &mut AppState, name: &str, input: serde_json::Value, out: &str) {
         id: name.into(),
         name: name.into(),
         input,
+        kind: Default::default(),
     }));
     s.apply(&AgentEvent::ToolResult(ToolResultView {
         id: name.into(),

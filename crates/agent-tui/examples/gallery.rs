@@ -40,6 +40,7 @@ fn main() {
         id: "c1".into(),
         name: "read".into(),
         input: serde_json::json!({ "path": "src/lexer.rs" }),
+        kind: Default::default(),
     }));
     s.apply(&AgentEvent::ToolResult(ToolResultView {
         id: "c1".into(),
@@ -83,6 +84,7 @@ fn main() {
         id: "c2".into(),
         name: "glob".into(),
         input: serde_json::json!({ "pattern": "**/*.rs" }),
+        kind: Default::default(),
     }));
     m.apply(&AgentEvent::Text("Voici les fichiers trouvés.".into()));
     m.apply(&AgentEvent::EndTurn);

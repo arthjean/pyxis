@@ -66,7 +66,7 @@ pub fn to_prompt(req: &PermissionRequest) -> PermissionPrompt {
 
     let mut prompt = PermissionPrompt::new(title, req.reason.clone(), preview);
     prompt.call_id = Some(req.call_id.clone());
-    prompt.mode = Some(req.mode.clone());
+    prompt.mode = Some(req.mode.to_string());
     prompt.taint_forced = req.taint_forced;
     prompt.memoizable = req.memoizable;
     prompt.memo_note = req.memo_refused.clone();
@@ -83,7 +83,7 @@ mod tests {
             tool: tool.into(),
             reason: "test".into(),
             taint_forced: false,
-            mode: "Default".into(),
+            mode: agent_tools::PermissionMode::Default,
             input_summary: input.to_string(),
             input,
             memoizable: false,
@@ -118,7 +118,8 @@ mod tests {
         ));
         assert_eq!(p.title, "edit a.rs");
         assert_eq!(p.call_id.as_deref(), Some("c1"));
-        assert_eq!(p.mode.as_deref(), Some("Default"));
+        // The prompt shows the spelling the user types, not a debug rendering.
+        assert_eq!(p.mode.as_deref(), Some("ask"));
         assert!(!p.taint_forced);
         assert!(
             p.preview

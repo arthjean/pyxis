@@ -16,18 +16,50 @@
 //! Codex also parses a `credits` family and several metered limit ids. They are
 //! left out: this story exposes consumption and reset, nothing else.
 
-use agent_core::quota::{QuotaSnapshot, QuotaWindow};
+use agent_core::quota::{QuotaCredits, QuotaReachedKind, QuotaSnapshot, QuotaWindow};
 use reqwest::header::HeaderMap;
 
 /// Reads the quota state from a response. Returns `None` as soon as nothing
 /// usable is served, so that a client never has to distinguish "empty" from
 /// "absent".
+///
+/// The credit and cause header names come from the same reference client:
+/// `codex-rs/codex-api/src/rate_limits.rs:217` for `x-codex-credits-*` and
+/// `:186` for `x-codex-rate-limit-reached-type`. The plan is NOT served by a
+/// header on this backend, which is why it is left to the streamed event.
 pub fn parse_quota_headers(headers: &HeaderMap) -> Option<QuotaSnapshot> {
     let snapshot = QuotaSnapshot {
         primary: parse_window(headers, "primary"),
         secondary: parse_window(headers, "secondary"),
+        credits: parse_credits(headers),
+        plan: None,
+        reached: header_str(headers, "x-codex-rate-limit-reached-type")
+            .and_then(|value| value.parse::<QuotaReachedKind>().ok()),
     };
     (!snapshot.is_empty()).then_some(snapshot)
+}
+
+/// Credit balance. The two booleans are what make the block meaningful: without
+/// them a lone balance string says nothing about whether the account can spend.
+fn parse_credits(headers: &HeaderMap) -> Option<QuotaCredits> {
+    Some(QuotaCredits {
+        has_credits: header_bool(headers, "x-codex-credits-has-credits")?,
+        unlimited: header_bool(headers, "x-codex-credits-unlimited")?,
+        balance: header_str(headers, "x-codex-credits-balance").map(str::to_string),
+    })
+}
+
+/// Both spellings the backend uses for a flag. Anything else is not a boolean
+/// and is treated as absent rather than as `false`.
+fn header_bool(headers: &HeaderMap, name: &str) -> Option<bool> {
+    let raw = header_str(headers, name)?;
+    if raw.eq_ignore_ascii_case("true") || raw == "1" {
+        Some(true)
+    } else if raw.eq_ignore_ascii_case("false") || raw == "0" {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn parse_window(headers: &HeaderMap, family: &str) -> Option<QuotaWindow> {
@@ -54,20 +86,94 @@ fn header_str<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Quota state carried by the streamed `codex.rate_limits` event, which is the
+/// ONLY source that names the subscription plan (the headers never do). Baseline:
+/// `codex-rs/codex-api/src/rate_limits.rs:134`.
+///
+/// The plan is kept as a free string rather than a closed enum: it is a label we
+/// display and never branch on, and a plan the backend adds tomorrow must not
+/// make the whole snapshot unreadable.
+pub fn parse_quota_event(value: &serde_json::Value) -> Option<QuotaSnapshot> {
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("codex.rate_limits") {
+        return None;
+    }
+    let windows = value.get("rate_limits");
+    let snapshot = QuotaSnapshot {
+        primary: windows.and_then(|w| event_window(w.get("primary"))),
+        secondary: windows.and_then(|w| event_window(w.get("secondary"))),
+        credits: event_credits(value.get("credits")),
+        plan: value
+            .get("plan_type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|plan| !plan.is_empty())
+            .map(str::to_string),
+        reached: None,
+    };
+    (!snapshot.is_empty()).then_some(snapshot)
+}
+
+/// One window of the streamed event. Note the field name: the event says
+/// `reset_at` where the header family says `reset-at`.
+fn event_window(window: Option<&serde_json::Value>) -> Option<QuotaWindow> {
+    let window = window?;
+    let used_percent = window
+        .get("used_percent")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))?;
+    let window = QuotaWindow {
+        used_percent,
+        window_minutes: window
+            .get("window_minutes")
+            .and_then(serde_json::Value::as_u64)
+            .map(|minutes| minutes as u32)
+            .filter(|minutes| *minutes > 0),
+        resets_at_unix: window
+            .get("reset_at")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|instant| *instant > 0),
+    };
+    (!window.is_empty()).then_some(window)
+}
+
+fn event_credits(credits: Option<&serde_json::Value>) -> Option<QuotaCredits> {
+    let credits = credits?;
+    Some(QuotaCredits {
+        has_credits: credits
+            .get("has_credits")
+            .and_then(serde_json::Value::as_bool)?,
+        unlimited: credits
+            .get("unlimited")
+            .and_then(serde_json::Value::as_bool)?,
+        balance: credits
+            .get("balance")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|balance| !balance.is_empty())
+            .map(str::to_string),
+    })
+}
+
 /// Human-readable sentence for a quota refusal (US-003 AC3): names the limit
 /// reached and the reset instant when it is known, instead of handing back the
 /// raw HTTP body.
 pub fn quota_refusal_message(snapshot: Option<&QuotaSnapshot>) -> String {
+    // The named cause takes precedence over the generic sentence: "credits
+    // depleted" and "rate limit reached" call for different user actions, and
+    // waiting for a window reset fixes only one of them.
+    let cause = snapshot
+        .and_then(|snapshot| snapshot.reached)
+        .map_or("Subscription usage limit reached", QuotaReachedKind::label);
     let Some(window) = snapshot.and_then(QuotaSnapshot::most_consumed) else {
-        return "Subscription usage limit reached.".to_string();
+        return format!("{cause}.");
     };
     let scope = match window.window_label() {
         Some(label) => format!(" ({label})"),
         None => String::new(),
     };
     match window.resets_at_label() {
-        Some(instant) => format!("Subscription usage limit reached{scope}, resets at {instant}."),
-        None => format!("Subscription usage limit reached{scope}."),
+        Some(instant) => format!("{cause}{scope}, resets at {instant}."),
+        None => format!("{cause}{scope}."),
     }
 }
 
@@ -151,7 +257,7 @@ mod tests {
                 window_minutes: Some(10_080),
                 resets_at_unix: Some(1_784_989_920),
             }),
-            secondary: None,
+            ..QuotaSnapshot::default()
         };
         assert_eq!(
             quota_refusal_message(Some(&snapshot)),

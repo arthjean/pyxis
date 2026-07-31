@@ -1043,6 +1043,7 @@ mod tests {
             id: "call_1".into(),
             name: "bash".into(),
             input: serde_json::json!({}),
+            kind: Default::default(),
         })
     }
 

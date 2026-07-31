@@ -18,8 +18,8 @@ use crate::compaction::{CompactKind, CompactionState, full_compact, microcompact
 use crate::deps::Deps;
 use crate::error::{AgentError, ProviderFailure};
 use crate::event::{
-    AgentEvent, CredentialRefreshOutcome, CredentialRefreshView, RetryScheduledView, ToolCallView,
-    ToolOutputDeltaView, ToolResultView,
+    AgentEvent, CredentialRefreshOutcome, CredentialRefreshView, InterruptReason,
+    RetryScheduledView, ToolCallView, ToolOutputDeltaView, ToolResultView,
 };
 use crate::guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget, batch_signature};
 use crate::input::InputQueue;
@@ -648,6 +648,14 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
         let mut compaction = CompactionState::default();
         let mut pending: Option<PendingError> = None;
         let mut model_turns: u32 = 0;
+        // Element-wise cumulation of the usages the backend actually REPORTED.
+        // Deliberately separate from `usage_budget`, which also folds in local
+        // estimates: mixing the two would let a guess masquerade as a measure.
+        let mut run_usage = TokenUsage::default();
+        let run_started_ms = deps.clock.now_ms();
+        // Armed by a tool the user refused with "stop the turn"; consumed at the
+        // next loop boundary so the stop never happens mid-dispatch.
+        let mut pending_abort: Option<InterruptReason> = None;
         let mut attempt_policy = ResolvedAttemptPolicy::resolve(&config, model_runtime.as_ref());
         let mut attempt_ordinal: u32 = 1;
         let mut credential_refresh_attempted = false;
@@ -686,7 +694,13 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
             let transition: Transition = if deps.cancel.is_cancelled() {
                 // US-001: SINGLE stop boundary, every deep cancellation point loops
                 // back here, where the transcript is in a known state.
-                Transition::Interrupted
+                Transition::Interrupted(InterruptReason::Cancelled)
+            } else if let Some(reason) = pending_abort.take() {
+                // A tool refused with "stop the turn": its result is already in
+                // the transcript, so the stop happens at this boundary like any
+                // other, and reconciliation still runs for the calls that never
+                // got one.
+                Transition::Interrupted(reason)
             } else if required_profile_compaction.is_some() && pending.is_none() {
                 Transition::Compact(CompactKind::Auto)
             } else if force_compact && pending.is_none() {
@@ -1136,6 +1150,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     );
                                 }
                                 budget.observe_usage(usage);
+                                run_usage.add_assign(&usage);
                                 last_usage = Some(usage);
                             }
                             Ok(StreamEvent::Quota { snapshot }) => {
@@ -1147,6 +1162,12 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 reasoning_replay_downgraded = true;
                                 reasoning_replay = false;
                                 yield AgentEvent::ReasoningReplayDisabled { reason };
+                            }
+                            Ok(StreamEvent::UnmappedItem { item_type }) => {
+                                // The turn continues: an item we cannot read is a
+                                // gap in what the client can show, never a reason
+                                // to fail a turn the model completed.
+                                yield AgentEvent::UnmappedResponseItem { item_type };
                             }
                             Ok(other) => {
                                 if let Err(e) = acc.push(other) {
@@ -1440,6 +1461,8 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         index: model_turns,
                         input_tokens: usage_budget.spent_input(),
                         output_tokens: usage_budget.spent_output(),
+                        last_usage,
+                        total_usage: run_usage,
                         // US-002: real occupancy of the window, absent when the
                         // provider reported nothing (never reported as zero).
                         context_tokens: last_usage.map(|usage| usage.input),
@@ -1538,6 +1561,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     id: c.id.clone(),
                                     name: c.name.clone(),
                                     input: c.input.clone(),
+                                    kind: tool_plan.dispatcher().call_kind(c),
                                 });
                             }
                             let (tool_event_tx, mut tool_event_rx) =
@@ -1563,12 +1587,15 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                             Some(ToolDispatchEvent::PermissionAsk(req)) => {
                                                 yield AgentEvent::PermissionAsk(req);
                                             }
-                                            Some(ToolDispatchEvent::OutputDelta { id, chunk }) => {
-                                                yield AgentEvent::ToolOutputDelta(ToolOutputDeltaView { id, chunk });
+                                            Some(ToolDispatchEvent::OutputDelta { id, stream, chunk }) => {
+                                                yield AgentEvent::ToolOutputDelta(ToolOutputDeltaView { id, stream, chunk });
                                             }
                                             Some(ToolDispatchEvent::Plan(view)) => {
                                                 yield AgentEvent::Plan(view);
                                             }
+                                                Some(ToolDispatchEvent::Hook(view)) => {
+                                                    yield AgentEvent::Hook(view);
+                                                }
                                             None => tool_events_open = false,
                                         }
                                     }
@@ -1597,12 +1624,15 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     ToolDispatchEvent::PermissionAsk(req) => {
                                         yield AgentEvent::PermissionAsk(req);
                                     }
-                                    ToolDispatchEvent::OutputDelta { id, chunk } => {
-                                        yield AgentEvent::ToolOutputDelta(ToolOutputDeltaView { id, chunk });
+                                    ToolDispatchEvent::OutputDelta { id, stream, chunk } => {
+                                        yield AgentEvent::ToolOutputDelta(ToolOutputDeltaView { id, stream, chunk });
                                     }
                                     ToolDispatchEvent::Plan(view) => {
                                         yield AgentEvent::Plan(view);
                                     }
+                                        ToolDispatchEvent::Hook(view) => {
+                                            yield AgentEvent::Hook(view);
+                                        }
                                 }
                             }
                             if let Err(e) = validate_tool_outcomes(&expected_ids, &outcomes) {
@@ -1610,27 +1640,16 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 return;
                             }
                             for o in &outcomes {
-                                yield AgentEvent::ToolResult(ToolResultView::from_model(o));
-                                messages.push(Message::tool_result_from_model(o));
-                                // US-011: a `tool_result` block carries text only. The
-                                // images the tool read therefore enter as a user message
-                                // right after it, which is also what makes them
-                                // strippable by the full compaction (already
-                                // implemented, section 5).
-                                if !o.images.is_empty() {
-                                    let mut blocks: Vec<crate::message::ContentBlock> =
-                                        Vec::with_capacity(o.images.len());
-                                    for image in &o.images {
-                                        blocks.push(crate::message::ContentBlock::Image {
-                                            media_type: image.media_type.clone(),
-                                            data: image.data.clone(),
-                                        });
-                                    }
-                                    messages.push(Message {
-                                        role: crate::message::Role::User,
-                                        content: blocks,
-                                    });
+                                if o.aborts_turn {
+                                    pending_abort = Some(InterruptReason::ToolAborted);
                                 }
+                                yield AgentEvent::ToolResult(ToolResultView::from_model(o));
+                                // US-011: images ride INSIDE the result now. They
+                                // used to enter as a user message right after it,
+                                // which put a turn the user never took between two
+                                // tool turns. The full compaction still strips them
+                                // (`Message::strip_images`).
+                                messages.push(Message::tool_result_from_model(o));
                             }
                             // US-030 MidTurn: the tool_results we just added are NOT
                             // in the budget yet (it is based on the previous turn's
@@ -1750,11 +1769,13 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         }
                     }
                 }
-                Transition::Interrupted => {
+                Transition::Interrupted(reason) => {
                     // US-002: reconciliation BEFORE persistence, every call left
                     // unanswered gets an explicit result, otherwise the next turn
                     // re-emits an orphan `function_call` that the backend rejects.
+                    let mut reconciled_tool_calls = 0u32;
                     for view in reconcile_interrupted_calls(&mut messages) {
+                        reconciled_tool_calls = reconciled_tool_calls.saturating_add(1);
                         yield AgentEvent::ToolResult(view);
                     }
                     if let Err(e) = deps.session.sync(&messages).await {
@@ -1763,7 +1784,14 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     }
                     // US-001: the event is emitted by the CORE, the client no longer
                     // has to build it after an abort decided from the outside.
-                    yield AgentEvent::Interrupted;
+                    let completed_at_ms = deps.clock.now_ms();
+                    yield AgentEvent::Interrupted(crate::event::InterruptedView {
+                        reason,
+                        started_at_ms: Some(run_started_ms),
+                        completed_at_ms: Some(completed_at_ms),
+                        duration_ms: Some(completed_at_ms.saturating_sub(run_started_ms)),
+                        reconciled_tool_calls,
+                    });
                     return;
                 }
                 Transition::Exhausted(reason) => {

@@ -80,6 +80,17 @@ pub enum StreamEvent {
     Quota {
         snapshot: crate::quota::QuotaSnapshot,
     },
+    /// The backend produced a response item this adapter does not map. The
+    /// content is genuinely lost, so the LOSS is reported instead of being
+    /// swallowed: Codex keeps such an item as `ResponseItem::Other`
+    /// (`codex-rs/protocol/src/models.rs:1041`), which is how a newly served
+    /// item type stays visible rather than vanishing from the stream.
+    ///
+    /// `item_type` is the wire tag and nothing else: the payload is not carried,
+    /// because an unmapped item is by definition one we cannot interpret.
+    UnmappedItem {
+        item_type: String,
+    },
 }
 
 impl StreamEvent {
@@ -102,15 +113,78 @@ impl StreamEvent {
     }
 }
 
+/// Token counts of one model round-trip.
+///
+/// `input` INCLUDES the cached prefix: it is the size of the context actually
+/// submitted, which is what the compaction threshold reads (ARCHITECTURE 3.3).
+/// The breakdown fields answer a different question, cost and cache efficiency,
+/// and never feed the budget. Every one of them defaults to zero so a provider
+/// that reports nothing but the two totals stays valid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input: u32,
+    /// Share of `input` served from the backend prefix cache.
+    #[serde(default)]
+    pub cached_input: u32,
+    /// Share of `input` written to the cache by this round-trip (billed apart
+    /// on the backends that meter it).
+    #[serde(default)]
+    pub cache_write_input: u32,
     pub output: u32,
+    /// Share of `output` spent on reasoning rather than on visible text.
+    #[serde(default)]
+    pub reasoning_output: u32,
+    /// Total as the backend reports it. Zero means "not reported", which is why
+    /// [`TokenUsage::total`] falls back on the sum rather than trusting it blind.
+    #[serde(default)]
+    pub total: u32,
 }
 
 impl TokenUsage {
+    /// Counts of a provider that reports nothing but the two totals.
+    pub fn new(input: u32, output: u32) -> Self {
+        Self {
+            input,
+            output,
+            ..Self::default()
+        }
+    }
+
+    /// Backend total when it serves one, the local sum otherwise. The two can
+    /// differ: a backend may count tokens we never see.
     pub fn total(&self) -> u32 {
-        self.input.saturating_add(self.output)
+        match self.total {
+            0 => self.input.saturating_add(self.output),
+            reported => reported,
+        }
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.total() == 0
+    }
+
+    /// Input actually paid for at full price.
+    pub fn non_cached_input(&self) -> u32 {
+        self.input.saturating_sub(self.cached_input)
+    }
+
+    /// Single absolute value worth displaying: what this round-trip cost beyond
+    /// the cache. Ported from Codex `TokenUsage::blended_total`
+    /// (`codex-rs/protocol/src/protocol.rs:2231`).
+    pub fn blended_total(&self) -> u32 {
+        self.non_cached_input().saturating_add(self.output)
+    }
+
+    /// Element-wise accumulation, so a run total is the sum of its round-trips.
+    pub fn add_assign(&mut self, other: &Self) {
+        self.input = self.input.saturating_add(other.input);
+        self.cached_input = self.cached_input.saturating_add(other.cached_input);
+        self.cache_write_input = self.cache_write_input.saturating_add(other.cache_write_input);
+        self.output = self.output.saturating_add(other.output);
+        self.reasoning_output = self.reasoning_output.saturating_add(other.reasoning_output);
+        // `total()` and not `total`: a backend that reports no total must not
+        // make the accumulated one collapse to zero.
+        self.total = self.total().saturating_add(other.total());
     }
 }
 
@@ -799,6 +873,7 @@ mod tests {
                 duration_ms: None,
                 truncation: None,
                 execution: None,
+                images: Vec::new(),
             }],
         };
         let req = CanonicalRequest {

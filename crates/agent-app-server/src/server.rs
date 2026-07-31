@@ -752,7 +752,7 @@ impl Pump {
                     command: request.input_summary.clone(),
                     reason: request.reason.clone(),
                     taint_forced: request.taint_forced,
-                    mode: request.mode.clone(),
+                    mode: request.mode.to_string(),
                     memoizable: request.memoizable,
                     memo_refused: request.memo_refused.clone(),
                 })
@@ -765,7 +765,7 @@ impl Pump {
                     input: request.input.clone(),
                     reason: request.reason.clone(),
                     taint_forced: request.taint_forced,
-                    mode: request.mode.clone(),
+                    mode: request.mode.to_string(),
                     memoizable: request.memoizable,
                     memo_refused: request.memo_refused.clone(),
                 })
@@ -777,7 +777,7 @@ impl Pump {
                 summary: request.input_summary.clone(),
                 reason: request.reason.clone(),
                 taint_forced: request.taint_forced,
-                mode: request.mode.clone(),
+                mode: request.mode.to_string(),
                 memoizable: request.memoizable,
                 memo_refused: request.memo_refused.clone(),
             }),

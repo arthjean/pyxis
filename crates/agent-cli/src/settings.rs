@@ -711,14 +711,10 @@ fn positive_u64(value: &toml::Value) -> Result<u64, String> {
         .ok_or_else(|| "expected an integer > 0".to_string())
 }
 
+/// Single spelling, owned by the mode itself so the CLI, the picker and the
+/// event payload can never drift apart.
 pub fn permission_mode_id(mode: PermissionMode) -> &'static str {
-    match mode {
-        PermissionMode::Default => "ask",
-        PermissionMode::AcceptEdits => "accept-edits",
-        PermissionMode::DontAsk => "auto",
-        PermissionMode::BypassPermissions => "full-access",
-        PermissionMode::Plan => "read-only",
-    }
+    mode.id()
 }
 
 pub fn permission_mode_from_arg(arg: &str) -> Option<PermissionMode> {

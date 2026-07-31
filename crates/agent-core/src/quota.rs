@@ -49,8 +49,65 @@ impl QuotaWindow {
     }
 }
 
+/// Pay-as-you-go balance, when the account has one on top of its windows.
+///
+/// Ported from Codex `CreditsSnapshot` (`codex-rs/protocol/src/protocol.rs:2200`).
+/// `balance` stays a STRING: it is a formatted amount served by the backend, and
+/// parsing it into a number here would invent a currency and a precision the
+/// wire never stated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaCredits {
+    pub has_credits: bool,
+    pub unlimited: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<String>,
+}
+
+/// Why the account is blocked, when the backend names it. Ported from Codex
+/// `RateLimitReachedType` (`codex-rs/protocol/src/protocol.rs:2164`): the wire
+/// spellings are the contract, so they are kept verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaReachedKind {
+    RateLimitReached,
+    WorkspaceOwnerCreditsDepleted,
+    WorkspaceMemberCreditsDepleted,
+    WorkspaceOwnerUsageLimitReached,
+    WorkspaceMemberUsageLimitReached,
+}
+
+impl std::str::FromStr for QuotaReachedKind {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "rate_limit_reached" => Ok(Self::RateLimitReached),
+            "workspace_owner_credits_depleted" => Ok(Self::WorkspaceOwnerCreditsDepleted),
+            "workspace_member_credits_depleted" => Ok(Self::WorkspaceMemberCreditsDepleted),
+            "workspace_owner_usage_limit_reached" => Ok(Self::WorkspaceOwnerUsageLimitReached),
+            "workspace_member_usage_limit_reached" => Ok(Self::WorkspaceMemberUsageLimitReached),
+            _ => Err(()),
+        }
+    }
+}
+
+impl QuotaReachedKind {
+    /// Readable cause, for a client that would otherwise print a wire tag.
+    /// Sentence-initial capitalization: this is the opening of a refusal
+    /// message, not a fragment.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RateLimitReached => "Rate limit reached",
+            Self::WorkspaceOwnerCreditsDepleted => "Workspace owner credits depleted",
+            Self::WorkspaceMemberCreditsDepleted => "Workspace member credits depleted",
+            Self::WorkspaceOwnerUsageLimitReached => "Workspace owner usage limit reached",
+            Self::WorkspaceMemberUsageLimitReached => "Workspace member usage limit reached",
+        }
+    }
+}
+
 /// Quota state of the connected account at a given instant.
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct QuotaSnapshot {
     /// Short window (the one that usually blocks first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -58,13 +115,28 @@ pub struct QuotaSnapshot {
     /// Long window (weekly or monthly plan).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secondary: Option<QuotaWindow>,
+    /// Credit balance, on the accounts that have one. Independent of the
+    /// windows: an account can be within its windows and out of credits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<QuotaCredits>,
+    /// Subscription plan the backend reports for the account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    /// Named cause when a limit is actually reached. `None` is "not blocked, or
+    /// blocked without a stated reason", never "fine".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reached: Option<QuotaReachedKind>,
 }
 
 impl QuotaSnapshot {
     /// True when the backend served nothing usable: the client must then display
     /// no indicator at all rather than an empty one.
     pub fn is_empty(&self) -> bool {
-        self.primary.is_none() && self.secondary.is_none()
+        self.primary.is_none()
+            && self.secondary.is_none()
+            && self.credits.is_none()
+            && self.plan.is_none()
+            && self.reached.is_none()
     }
 
     /// The window closest to exhaustion, which is the one worth naming in a
@@ -128,9 +200,20 @@ mod tests {
                 window_minutes: Some(300),
                 resets_at_unix: Some(1_784_989_920),
             }),
-            secondary: None,
+            ..QuotaSnapshot::default()
         };
         assert!(!filled.is_empty());
+        // Credits alone make a snapshot worth showing: an account can sit well
+        // inside its windows and still be unable to spend.
+        let credits_only = QuotaSnapshot {
+            credits: Some(QuotaCredits {
+                has_credits: false,
+                unlimited: false,
+                balance: Some("0.00".into()),
+            }),
+            ..QuotaSnapshot::default()
+        };
+        assert!(!credits_only.is_empty());
     }
 
     #[test]
@@ -176,6 +259,7 @@ mod tests {
         let snapshot = QuotaSnapshot {
             primary: window(10.0),
             secondary: window(90.0),
+            ..QuotaSnapshot::default()
         };
         assert_eq!(
             snapshot.most_consumed().map(|w| w.used_percent),
@@ -185,6 +269,7 @@ mod tests {
         let only_primary = QuotaSnapshot {
             primary: window(10.0),
             secondary: None,
+            ..QuotaSnapshot::default()
         };
         assert_eq!(
             only_primary.most_consumed().map(|w| w.used_percent),

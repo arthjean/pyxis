@@ -295,7 +295,7 @@ mod tests {
             tool: "bash".into(),
             reason: "test".into(),
             taint_forced: false,
-            mode: "Default".into(),
+            mode: agent_core::PermissionMode::Default,
             input_summary: "ls".into(),
             input: serde_json::json!({"command": "ls"}),
             memoizable: false,
@@ -337,8 +337,8 @@ mod tests {
         bridge.bind(Arc::new(Silent));
         let approver = BridgeApprover::new(Arc::clone(&bridge));
         let answer = approver.approve(&request()).await;
-        assert!(!answer.allow);
-        assert!(!answer.remember);
+        assert!(!answer.allows());
+        assert!(!answer.remembers());
     }
 
     #[test]

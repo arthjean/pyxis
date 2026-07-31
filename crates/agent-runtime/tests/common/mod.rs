@@ -667,7 +667,7 @@ pub fn engine_labels(events: &[RuntimeEvent]) -> Vec<String> {
                 AgentEvent::ToolCall(_) => "tool_call".to_string(),
                 AgentEvent::ToolResult(view) => format!("tool_result:{}", view.content),
                 AgentEvent::EndTurn => "end_turn".to_string(),
-                AgentEvent::Interrupted => "interrupted".to_string(),
+                AgentEvent::Interrupted(..) => "interrupted".to_string(),
                 AgentEvent::Error(_) => "error".to_string(),
                 other => format!("{other:?}"),
             }),

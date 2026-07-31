@@ -73,6 +73,16 @@ impl DynTool for McpTool {
         self.input_schema.clone()
     }
 
+    /// The server and the tool as the SERVER names it, not the mangled name the
+    /// model calls. A client showing `mcp__github__create_issue` shows our
+    /// encoding; this shows the fact.
+    fn call_kind(&self, _raw: &Value) -> agent_core::event::ToolCallKind {
+        agent_core::event::ToolCallKind::Mcp {
+            server: self.server.clone(),
+            tool: self.original_name.clone(),
+        }
+    }
+
     // ───── Fail-closed metadata (invariant 4). Nothing here is *relaxed* by the
     // server's `annotations`: a hint from a remote party may aggravate its own
     // treatment (see `effective_approval`), never soften it.

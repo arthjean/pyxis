@@ -17,6 +17,7 @@ pub mod guardrail;
 pub mod input;
 pub mod message;
 pub mod model;
+pub mod permission;
 pub mod prompt;
 pub mod provider;
 pub mod quota;
@@ -37,10 +38,12 @@ pub use deps::Deps;
 pub use error::{AgentError, ProviderFailure, ProviderFailureKind};
 pub use event::{
     AgentEvent, CredentialRefreshOutcome, CredentialRefreshView, FileChange, FileDiffView,
-    ModelTurnView, PlanStatus, PlanStep, PlanView, RetryScheduledView, TurnDiffView,
+    InterruptReason, InterruptedView, ModelTurnView, PlanStatus, PlanStep, PlanView,
+    RetryScheduledView, TurnDiffView,
 };
 pub use guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget};
 pub use input::InputQueue;
+pub use permission::PermissionMode;
 pub use message::{
     ContentBlock, INTERRUPTED_TOOL_RESULT, Message, Role, ToolErrorKind, unanswered_tool_calls,
 };
@@ -361,7 +364,8 @@ mod loop_tests {
                 .map(|c| {
                     events.emit(crate::tools::ToolDispatchEvent::OutputDelta {
                         id: c.id.clone(),
-                        chunk: "progression...\n".into(),
+                        stream: crate::event::OutputStream::Stdout,
+                        chunk: b"progression...\n".to_vec(),
                     });
                     ToolOutcome {
                         images: Vec::new(),
@@ -1362,7 +1366,7 @@ mod loop_tests {
             AgentEvent::CredentialRefresh(view)
                 if view.outcome == crate::CredentialRefreshOutcome::Cancelled
         )));
-        assert!(matches!(events.last(), Some(AgentEvent::Interrupted)));
+        assert!(matches!(events.last(), Some(AgentEvent::Interrupted(..))));
     }
 
     #[tokio::test]
@@ -1407,7 +1411,7 @@ mod loop_tests {
                 .iter()
                 .any(|event| matches!(event, AgentEvent::RetryScheduled(_)))
         );
-        assert!(matches!(events.last(), Some(AgentEvent::Interrupted)));
+        assert!(matches!(events.last(), Some(AgentEvent::Interrupted(..))));
     }
 
     #[tokio::test]
@@ -1779,10 +1783,7 @@ mod loop_tests {
         // window 1000, reserve 200 -> micro 560, auto 640. usage=600 ∈ [560,640).
         let turn = MockTurn::Stream(vec![
             StreamEvent::Usage {
-                usage: TokenUsage {
-                    input: 600,
-                    output: 5,
-                },
+                usage: TokenUsage::new(600, 5),
             },
             StreamEvent::tool_call_start("c1", "bash"),
             StreamEvent::ToolCallDelta {
@@ -1846,10 +1847,7 @@ mod loop_tests {
     async fn model_turn_carries_backend_usage_and_model_window() {
         let h = harness(
             vec![text_turn_with(vec![StreamEvent::Usage {
-                usage: TokenUsage {
-                    input: 600,
-                    output: 5,
-                },
+                usage: TokenUsage::new(600, 5),
             }])],
             false,
             10_000,
@@ -1895,10 +1893,7 @@ mod loop_tests {
     async fn usage_probe_travels_as_data_when_enabled() {
         let h = harness(
             vec![text_turn_with(vec![StreamEvent::Usage {
-                usage: TokenUsage {
-                    input: 600,
-                    output: 5,
-                },
+                usage: TokenUsage::new(600, 5),
             }])],
             false,
             10_000,
@@ -1926,7 +1921,7 @@ mod loop_tests {
                 window_minutes: Some(300),
                 resets_at_unix: Some(1_784_989_920),
             }),
-            secondary: None,
+            ..crate::quota::QuotaSnapshot::default()
         };
         let h = harness(
             vec![text_turn_with(vec![StreamEvent::Quota { snapshot }])],
@@ -1937,7 +1932,7 @@ mod loop_tests {
         let quotas: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                AgentEvent::Quota(snapshot) => Some(*snapshot),
+                AgentEvent::Quota(snapshot) => Some(snapshot.clone()),
                 _ => None,
             })
             .collect();
@@ -1966,7 +1961,7 @@ mod loop_tests {
     fn tool_turn_usage(id: &str, input: u32, output: u32) -> MockTurn {
         MockTurn::Stream(vec![
             StreamEvent::Usage {
-                usage: TokenUsage { input, output },
+                usage: TokenUsage::new(input, output),
             },
             StreamEvent::tool_call_start(id, "bash"),
             StreamEvent::ToolCallDelta {
@@ -2095,10 +2090,7 @@ mod loop_tests {
             vec![
                 MockTurn::StreamThenErr(
                     vec![StreamEvent::Usage {
-                        usage: TokenUsage {
-                            input: 100,
-                            output: 50,
-                        },
+                        usage: TokenUsage::new(100, 50),
                     }],
                     ProviderError::Stream("reset".into()),
                 ),
@@ -2148,10 +2140,7 @@ mod loop_tests {
             ],
             false,
             100_000,
-            TokenUsage {
-                input: 100,
-                output: 50,
-            },
+            TokenUsage::new(100, 50),
         );
         let log = Arc::clone(&h.log);
         let ctx = AgentContext::new("mock")
@@ -2253,7 +2242,7 @@ mod loop_tests {
         deps.cancel = cancel;
         let events = drive(AgentContext::new("mock").push(Message::user("hello")), deps).await;
         assert!(
-            matches!(events.as_slice(), [AgentEvent::Interrupted]),
+            matches!(events.as_slice(), [AgentEvent::Interrupted(..)]),
             "single Interrupted expected: {events:?}"
         );
         assert!(
@@ -2298,7 +2287,7 @@ mod loop_tests {
             .collect();
         assert_eq!(texts, vec!["premier"], "stream drained after cancel");
         assert!(
-            matches!(events.last(), Some(AgentEvent::Interrupted)),
+            matches!(events.last(), Some(AgentEvent::Interrupted(..))),
             "{events:?}"
         );
         let synced = h.boundaries.synced.lock().unwrap().clone();
@@ -2321,7 +2310,7 @@ mod loop_tests {
         let events = drive(AgentContext::new("mock").push(Message::user("ls")), deps).await;
 
         assert!(
-            matches!(events.last(), Some(AgentEvent::Interrupted)),
+            matches!(events.last(), Some(AgentEvent::Interrupted(..))),
             "{events:?}"
         );
         let results = tool_results(&events);
@@ -2391,7 +2380,7 @@ mod loop_tests {
             vec!["real output".to_string()],
             "no synthetic result over a real one: {synced:?}"
         );
-        assert!(matches!(events.last(), Some(AgentEvent::Interrupted)));
+        assert!(matches!(events.last(), Some(AgentEvent::Interrupted(..))));
     }
 
     // PRD reliability metric: 0 corrupted sessions out of 50 interruptions
@@ -2415,7 +2404,7 @@ mod loop_tests {
             let events = drive(AgentContext::new("mock").push(Message::user("go")), deps).await;
 
             assert!(
-                matches!(events.last(), Some(AgentEvent::Interrupted)),
+                matches!(events.last(), Some(AgentEvent::Interrupted(..))),
                 "run {run}: the loop must stop on its own: {events:?}"
             );
             let synced = h.boundaries.synced.lock().unwrap().clone();
@@ -2443,7 +2432,7 @@ mod loop_tests {
         assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
         cancel.cancel();
         assert!(
-            !events.iter().any(|e| matches!(e, AgentEvent::Interrupted)),
+            !events.iter().any(|e| matches!(e, AgentEvent::Interrupted(..))),
             "{events:?}"
         );
     }
@@ -2480,8 +2469,10 @@ mod loop_tests {
         }
     }
 
-    /// US-011 AC1: an image read by a tool enters the transcript as an image
-    /// block and is therefore sent to the provider on the next round-trip.
+    /// US-011 AC1: an image read by a tool enters the transcript and is
+    /// therefore sent to the provider on the next round-trip. It rides INSIDE
+    /// the tool result: a separate user message would insert a turn the user
+    /// never took between two tool turns.
     /// US-009 AC3: the plan reaches the client as an `AgentEvent`.
     #[tokio::test]
     async fn tool_images_reach_the_provider_and_the_plan_reaches_the_client() {
@@ -2503,17 +2494,18 @@ mod loop_tests {
             .iter()
             .flat_map(|m| m.content.iter())
             .find_map(|b| match b {
-                ContentBlock::Image { media_type, data } => Some((media_type, data)),
+                ContentBlock::ToolResult { images, .. } => images.first(),
                 _ => None,
             })
             .expect("the image must have entered the transcript");
-        assert_eq!(image.0, "image/png");
-        assert_eq!(image.1, "QUJD");
+        assert_eq!(image.media_type, "image/png");
+        assert_eq!(image.data, "QUJD");
         assert!(
-            second
-                .iter()
-                .any(|m| matches!(m.role, crate::Role::User) && m.has_images()),
-            "the image travels as a user message, next to the textual result"
+            !second.iter().any(|m| matches!(m.role, crate::Role::User)
+                && m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Image { .. }))),
+            "no phantom user message carries the image: {second:?}"
         );
     }
 }

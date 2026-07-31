@@ -497,6 +497,18 @@ impl Tool for ExecCommand {
     fn name(&self) -> &str {
         "exec_command"
     }
+    fn call_kind(&self, input: &serde_json::Value) -> agent_core::event::ToolCallKind {
+        match input.get("cmd").and_then(serde_json::Value::as_str) {
+            Some(command) => agent_core::event::ToolCallKind::Exec {
+                command: command.to_string(),
+                cwd: input
+                    .get("workdir")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            },
+            None => agent_core::event::ToolCallKind::Other,
+        }
+    }
     fn description(&self) -> String {
         format!(
             "Run a command in a PERSISTENT terminal session whose standard input \
@@ -1080,7 +1092,13 @@ async fn collect(
 
 fn emit(ctx: &ToolCtx, chunk: &OutputBuffer, accumulated: &mut OutputBuffer) {
     if !chunk.bytes.is_empty() {
-        ctx.emit_output(String::from_utf8_lossy(&chunk.bytes).into_owned());
+        // A session multiplexes both streams onto one PTY or one pipe pair and
+        // no longer knows which produced what, so everything is reported as
+        // stdout rather than guessed.
+        ctx.emit_output(
+            agent_core::event::OutputStream::Stdout,
+            chunk.bytes.clone(),
+        );
     }
     accumulated.absorb(chunk);
 }
@@ -1706,11 +1724,13 @@ mod tests {
         let chunks: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = {
             let chunks = Arc::clone(&chunks);
-            Arc::new(move |chunk: String| {
-                if let Ok(mut c) = chunks.lock() {
-                    c.push(chunk);
-                }
-            })
+            Arc::new(
+                move |_stream: agent_core::event::OutputStream, chunk: Vec<u8>| {
+                    if let Ok(mut c) = chunks.lock() {
+                        c.push(String::from_utf8_lossy(&chunk).into_owned());
+                    }
+                },
+            )
         };
         let ctx = ctx().for_call(
             agent_core::message::ToolCallId::from("c1".to_string()),

@@ -1242,6 +1242,7 @@ mod tests {
                 added_lines: 2,
                 removed_lines: 1,
                 unified: Some("--- a\n+++ b\n".into()),
+                moved_from: None,
             }],
         })));
         let taken = draft.take();

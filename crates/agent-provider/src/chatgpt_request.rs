@@ -323,6 +323,7 @@ fn tool_result_items(
             untrusted,
             is_error,
             error_kind,
+            images,
             ..
         } = b
         {
@@ -334,10 +335,26 @@ fn tool_result_items(
                 ));
                 continue;
             };
-            let output = if *untrusted {
+            let text = if *untrusted {
                 untrusted_tool_output_payload(content, *is_error, error_kind.as_ref())
             } else {
                 content.clone()
+            };
+            // `output` is a plain string when there is only text, and an array
+            // of content items as soon as an image rides along. Both shapes are
+            // what the API accepts on this field, and the array is the only one
+            // that keeps an image attached to the call that produced it.
+            let output = if images.is_empty() {
+                Value::String(text)
+            } else {
+                let mut items = vec![json!({ "type": "input_text", "text": text })];
+                items.extend(images.iter().map(|image| {
+                    json!({
+                        "type": "input_image",
+                        "image_url": format!("data:{};base64,{}", image.media_type, image.data),
+                    })
+                }));
+                Value::Array(items)
             };
             input.push(json!({
                 "type": output_item_type(format),
@@ -632,6 +649,58 @@ mod tests {
             .find(|i| i["type"] == "function_call_output")
             .unwrap();
         assert_eq!(out["output"], "confirmed");
+    }
+
+    /// An image read by a tool travels INSIDE `function_call_output.output`, as
+    /// the array form the API accepts, so it stays attached to the call that
+    /// produced it instead of becoming a separate user turn.
+    #[test]
+    fn tool_result_images_ride_in_the_output_content_items() {
+        let assistant = Message::assistant(vec![tool_use("call_1")]);
+        let mut result =
+            agent_core::tools::ModelToolResult::new("call_1".into(), "seen".into(), false, false, None);
+        result.images = vec![agent_core::tools::ToolImage {
+            media_type: "image/png".into(),
+            data: "QUJD".into(),
+        }];
+        let tool = Message::tool_result_from_model(&result);
+        let body = request_body(&req(vec![assistant, tool], vec![], None));
+        let out = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "function_call_output")
+            .unwrap();
+        let items = out["output"].as_array().expect("an array carries the image");
+        assert_eq!(items[0]["type"], "input_text");
+        assert_eq!(items[0]["text"], "seen");
+        assert_eq!(items[1]["type"], "input_image");
+        assert_eq!(items[1]["image_url"], "data:image/png;base64,QUJD");
+        // No user message was fabricated to carry it.
+        assert!(
+            !body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["role"] == "user"),
+            "{body}"
+        );
+    }
+
+    /// Without an image the field stays a plain string: the array form is not
+    /// forced onto every result.
+    #[test]
+    fn a_result_without_image_stays_a_string() {
+        let assistant = Message::assistant(vec![tool_use("call_1")]);
+        let tool = Message::tool_result_with_trust("call_1", "plain", false, false);
+        let body = request_body(&req(vec![assistant, tool], vec![], None));
+        let out = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "function_call_output")
+            .unwrap();
+        assert!(out["output"].is_string(), "{out}");
     }
 
     #[test]

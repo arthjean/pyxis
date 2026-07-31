@@ -147,6 +147,17 @@ pub enum ContentBlock {
         truncation: Option<ToolResultTruncation>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         execution: Option<ToolExecution>,
+        /// Images the tool read, attached to the RESULT rather than injected as
+        /// a separate user message. The Responses API accepts a structured
+        /// `function_call_output.output` for exactly this
+        /// (`codex-rs/protocol/src/models.rs:1843`); splitting them out inserted
+        /// a phantom user turn between two tool turns, which shifted every
+        /// downstream count of user messages.
+        ///
+        /// Additive: JSONL written before this field is read back with no image,
+        /// which is what those transcripts actually held.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<crate::tools::ToolImage>,
     },
     Image {
         media_type: String,
@@ -237,6 +248,7 @@ impl Message {
                 duration_ms: result.duration_ms,
                 truncation: result.truncation.clone(),
                 execution: result.execution.clone(),
+                images: result.images.clone(),
             },
         )
     }
@@ -271,18 +283,29 @@ impl Message {
     }
 
     pub fn has_images(&self) -> bool {
-        self.content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::Image { .. }))
+        self.content.iter().any(|b| match b {
+            ContentBlock::Image { .. } => true,
+            ContentBlock::ToolResult { images, .. } => !images.is_empty(),
+            _ => false,
+        })
     }
 
-    /// Removes `Image` blocks (full compaction: we do not pay for vision twice).
-    /// Returns the number of removed blocks.
+    /// Removes every image (full compaction: we do not pay for vision twice).
+    /// Returns how many were removed, counting those carried by a tool result:
+    /// leaving those behind would keep the exact cost this compaction exists to
+    /// drop.
     pub fn strip_images(&mut self) -> usize {
         let before = self.content.len();
         self.content
             .retain(|b| !matches!(b, ContentBlock::Image { .. }));
-        before - self.content.len()
+        let mut removed = before - self.content.len();
+        for block in &mut self.content {
+            if let ContentBlock::ToolResult { images, .. } = block {
+                removed += images.len();
+                images.clear();
+            }
+        }
+        removed
     }
 
     /// Does the message carry content that must stay treated as untrusted
@@ -547,6 +570,7 @@ mod tests {
             duration_ms: None,
             truncation: None,
             execution: None,
+            images: Vec::new(),
         }]);
         assert!(msg.validate().is_err());
     }

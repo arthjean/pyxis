@@ -25,6 +25,13 @@ pub enum AgentEvent {
     ReasoningReplayDisabled {
         reason: String,
     },
+    /// The backend served a response item the provider adapter does not map, so
+    /// its content never reached the transcript. Reported rather than dropped:
+    /// silence here reads as "the model produced nothing", which is false.
+    /// Carries the wire tag only, since an unmapped item is one we cannot read.
+    UnmappedResponseItem {
+        item_type: String,
+    },
     /// A provider reopening planned from the single sampling-scoped attempt
     /// budget. It carries identifiers and allow-listed classifications only.
     RetryScheduled(RetryScheduledView),
@@ -61,10 +68,60 @@ pub enum AgentEvent {
     /// Permission request (emitted by the tool pipeline, US-013, not by the
     /// core in EP-002; present to pin down the contract).
     PermissionAsk(PermissionReq),
+    /// A hook ran. Hooks decide whether a tool call happens at all, so a run
+    /// that blocks one has to be visible: without this event a refusal reads as
+    /// the agent silently choosing not to act.
+    Hook(HookRunView),
     EndTurn,
-    Interrupted,
+    Interrupted(InterruptedView),
     Exhausted(ExhaustReason),
     Error(AgentError),
+}
+
+/// Why a turn stopped short, and what it cost before stopping.
+///
+/// Ported from Codex `TurnAbortedEvent` (`codex-rs/protocol/src/protocol.rs:4200`).
+/// Only the causes Pyxis can actually reach are modelled: budget exhaustion
+/// already travels as [`AgentEvent::Exhausted`], and a steer replaces a sampling
+/// without aborting the turn, so neither has a variant here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterruptedView {
+    pub reason: InterruptReason,
+    /// Epoch ms, from the injected clock. Absent when the turn start was not
+    /// observed, which a client must render as "unknown", not as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Tool calls that were left without a result and had one written for them
+    /// during reconciliation. Non-zero means the model may have half-applied
+    /// effects it never saw reported.
+    pub reconciled_tool_calls: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptReason {
+    /// The client signalled cooperative cancellation.
+    Cancelled,
+    /// The user refused a tool call and ended the turn with that refusal.
+    ToolAborted,
+}
+
+impl InterruptedView {
+    /// A cancellation with no timing observed. The shape a client builds when it
+    /// aborts a turn locally and has nothing to report but the cause.
+    pub fn cancelled() -> Self {
+        Self {
+            reason: InterruptReason::Cancelled,
+            started_at_ms: None,
+            completed_at_ms: None,
+            duration_ms: None,
+            reconciled_tool_calls: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,19 +161,98 @@ pub struct CredentialRefreshView {
     pub outcome: CredentialRefreshOutcome,
 }
 
+/// What KIND of act a tool call is, as the pipeline knows it.
+///
+/// Codex models these as separate event families: `ExecCommandBegin/End`
+/// (`codex-rs/protocol/src/protocol.rs:3518`), `PatchApplyBegin/End` (`:3678`)
+/// and `McpToolCallBegin/End` (`:2411`). Pyxis keeps ONE call event and
+/// qualifies it, which gives clients the same information without a family per
+/// tool. The qualification comes from the tool itself: deriving it from the
+/// name, as the TUI used to, misreads any MCP tool that happens to be called
+/// `bash` and has to be reimplemented by every client.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolCallKind {
+    /// Nothing more specific: a plain function call.
+    #[default]
+    Other,
+    /// Runs a command. `command` is what will actually be executed.
+    Exec {
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    /// Edits files. The changed paths, when they are known before the run.
+    Patch {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        paths: Vec<String>,
+    },
+    /// Served by an MCP server rather than built in.
+    Mcp { server: String, tool: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallView {
     pub id: ToolCallId,
     pub name: String,
     pub input: serde_json::Value,
+    /// Nature of the call. Defaults to `Other`, so a client that ignores it
+    /// behaves exactly as before.
+    #[serde(default)]
+    pub kind: ToolCallKind,
+}
+
+/// Which of a process's two streams produced a fragment. Ported from Codex
+/// `ExecOutputStream` (`codex-rs/protocol/src/protocol.rs:3615`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
 }
 
 /// Output fragment produced by a tool before it ends (US-015). `chunk` is
 /// external content: untrusted by construction, like the final result.
+///
+/// The bytes are carried RAW, exactly as the process wrote them. Decoding them
+/// to text is a presentation decision (invariant 1): a command may emit a
+/// binary payload or a partial UTF-8 sequence split across two fragments, and
+/// replacing those with U+FFFD inside the core would destroy them for every
+/// client at once. [`ToolOutputDeltaView::chunk_lossy`] is there for the clients
+/// that just want a string.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutputDeltaView {
     pub id: ToolCallId,
-    pub chunk: String,
+    /// Stream of origin, so a client can tell a diagnostic from a result.
+    pub stream: OutputStream,
+    #[serde(with = "base64_bytes")]
+    pub chunk: Vec<u8>,
+}
+
+impl ToolOutputDeltaView {
+    /// The fragment as text, invalid sequences replaced. For display only.
+    pub fn chunk_lossy(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.chunk)
+    }
+}
+
+/// Base64 on the wire: an event is JSON, and a raw byte array would otherwise
+/// serialize as a list of numbers several times its size.
+mod base64_bytes {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        STANDARD
+            .decode(encoded.as_bytes())
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +302,17 @@ pub struct ModelTurnView {
     pub index: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Counters of THIS round-trip as the backend reported them. `None` when it
+    /// reported no usage: the two fields above then carry a local estimate, and
+    /// conflating the two would make a cost read as measured when it is guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_usage: Option<crate::provider::TokenUsage>,
+    /// Element-wise sum of every REPORTED round-trip since the start of the run.
+    /// It is what makes cache efficiency and reasoning share computable, which
+    /// the two flat totals cannot express. Mirrors Codex `TokenUsageInfo`
+    /// (`codex-rs/protocol/src/protocol.rs:2075`).
+    #[serde(default)]
+    pub total_usage: crate::provider::TokenUsage,
     /// Input tokens of THIS round-trip as reported by the backend, i.e. the
     /// context actually occupied (US-002). `None` when the provider reported no
     /// usage: the measure is absent, which is not the same as zero, and a client
@@ -211,7 +358,7 @@ impl TurnDiffView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileDiffView {
-    /// Path relative to the workspace root.
+    /// Path relative to the workspace root. For a rename, the DESTINATION.
     pub path: String,
     pub change: FileChange,
     pub added_lines: u32,
@@ -220,6 +367,13 @@ pub struct FileDiffView {
     /// threshold: the file stays listed, its content is not compared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unified: Option<String>,
+    /// Where the file came from, when this change is a rename. Mirrors Codex
+    /// `FileChange::Update { move_path }`
+    /// (`codex-rs/protocol/src/protocol.rs:4189`). Without it a rename reads as
+    /// an unrelated delete plus an unrelated create, which is what a reviewer
+    /// must not be shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +382,10 @@ pub enum FileChange {
     Added,
     Modified,
     Deleted,
+    /// Same content, new path. A rename that also changed the content stays
+    /// reported as a delete plus an add: pairing those would require a
+    /// similarity threshold, which is a judgement call this layer does not make.
+    Renamed,
 }
 
 /// Plan of the current task (US-009), as the model states it. Pure data: the
@@ -257,6 +415,36 @@ pub enum PlanStatus {
     Completed,
 }
 
+/// How a hook run ended. Ported from Codex `HookRunStatus`
+/// (`codex-rs/protocol/src/protocol.rs:1556`), minus the states Pyxis cannot
+/// reach: hooks run to completion before the pipeline continues, so there is no
+/// `Running` to report, and nothing here can stop the session outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookRunStatus {
+    /// Ran, and raised no objection.
+    Completed,
+    /// Refused the action, or forced a confirmation for it.
+    Blocked,
+    /// Could not run, or exited on an error. Fail-closed on a gating event.
+    Failed,
+}
+
+/// One hook run, as the clients see it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HookRunView {
+    /// Event name of the reference contract (`PreToolUse`, `SessionStart`, ...).
+    pub event: String,
+    /// Tool the run concerns, absent on a lifecycle event, which names none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    pub status: HookRunStatus,
+    /// Why it blocked or failed. Absent on a plain completion, which has nothing
+    /// to explain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionReq {
     pub call_id: ToolCallId,
@@ -265,7 +453,10 @@ pub struct PermissionReq {
     pub taint_forced: bool,
     pub input_summary: String,
     pub input: serde_json::Value,
-    pub mode: String,
+    /// Mode the request was raised under, as a value. It used to be a
+    /// debug-formatted string, which forced every consumer to parse prose to
+    /// recover one of five known values.
+    pub mode: crate::permission::PermissionMode,
 }
 
 #[cfg(test)]

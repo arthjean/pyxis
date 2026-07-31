@@ -134,6 +134,11 @@ impl CodexEventMapper {
             "response.completed" | "response.done" | "response.incomplete" => {
                 self.on_terminal(&v, typ)
             }
+            // Quota state pushed mid-stream. Richer than the response headers,
+            // which never name the plan, so it is read here as well.
+            "codex.rate_limits" => Ok(crate::quota::parse_quota_event(&v)
+                .map(|snapshot| vec![StreamEvent::Quota { snapshot }])
+                .unwrap_or_default()),
             "error" => Err(stream_error(&v)),
             "response.failed" => Err(failed_error(&v)),
             // created, content_part.added, reasoning_summary_part.added, ... -> ignored.
@@ -215,7 +220,10 @@ impl CodexEventMapper {
             return Ok(Vec::new());
         };
         let Some(format) = call_format(item) else {
-            return Ok(Vec::new());
+            // Everything outside the mapped set is content we cannot read. It is
+            // REPORTED rather than dropped: a web search or an image generation
+            // served by the backend would otherwise leave no trace at all.
+            return Ok(unmapped_item_event(item));
         };
         // The terminal item is authoritative over every delta that preceded it.
         let item_args = terminal_call_input(item, format);
@@ -433,6 +441,24 @@ fn call_format(item: &Value) -> Option<ToolCallFormat> {
     }
 }
 
+/// Reports an output item this mapper cannot read, and nothing at all for the
+/// types it handles elsewhere (`message` travels through its own text deltas,
+/// `reasoning` is captured before this point). An item with no readable `type`
+/// is reported under a placeholder rather than ignored: a malformed item is
+/// still an item we dropped.
+fn unmapped_item_event(item: &Value) -> Vec<StreamEvent> {
+    let item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("<untyped>");
+    if MAPPED_OUTPUT_ITEM_TYPES.contains(&item_type) {
+        return Vec::new();
+    }
+    vec![StreamEvent::UnmappedItem {
+        item_type: item_type.to_string(),
+    }]
+}
+
 /// Input carried by an opening item: `arguments` for a function call,
 /// `input` for a custom one. Never mixed, so a freeform payload can never be
 /// read back as JSON arguments.
@@ -450,10 +476,36 @@ fn terminal_call_input(item: &Value, format: ToolCallFormat) -> Option<&str> {
 
 /// `response.usage` -> `TokenUsage`. `input_tokens` includes the cached ones (we keep the
 /// full context size for the compaction threshold, ARCHITECTURE 3.3).
+///
+/// The breakdown lives in the `*_tokens_details` sub-objects, exactly where the
+/// Responses API puts it (baseline: `codex-rs/codex-api/src/sse/responses.rs:131`).
+/// Each one is optional: a backend that reports only the two totals still yields
+/// a valid usage, with a zeroed breakdown.
 fn parse_usage(usage: &Value) -> Option<TokenUsage> {
     let input = usage.get("input_tokens").and_then(Value::as_u64)? as u32;
     let output = usage.get("output_tokens").and_then(Value::as_u64)? as u32;
-    Some(TokenUsage { input, output })
+    Some(TokenUsage {
+        input,
+        cached_input: detail(usage, "input_tokens_details", "cached_tokens"),
+        cache_write_input: detail(usage, "input_tokens_details", "cache_write_tokens"),
+        output,
+        reasoning_output: detail(usage, "output_tokens_details", "reasoning_tokens"),
+        total: usage
+            .get("total_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or_default() as u32,
+    })
+}
+
+/// One counter of a `*_tokens_details` sub-object. Absent or malformed reads as
+/// zero: a missing breakdown must never invalidate the totals that carry the
+/// budget.
+fn detail(usage: &Value, group: &str, field: &str) -> u32 {
+    usage
+        .get(group)
+        .and_then(|group| group.get(field))
+        .and_then(Value::as_u64)
+        .unwrap_or_default() as u32
 }
 
 fn stream_error(v: &Value) -> ProviderError {
@@ -593,10 +645,7 @@ mod tests {
             r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":120,"output_tokens":8}}}"#,
         ]);
         assert!(ev.contains(&StreamEvent::Usage {
-            usage: TokenUsage {
-                input: 120,
-                output: 8
-            }
+            usage: TokenUsage::new(120, 8)
         }));
         assert_eq!(
             ev.last(),

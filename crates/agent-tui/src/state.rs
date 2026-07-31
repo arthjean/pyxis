@@ -1239,6 +1239,28 @@ impl AppState {
                     "reasoning replay disabled: {reason}"
                 )));
             }
+            AgentEvent::UnmappedResponseItem { item_type } => {
+                self.blocks.push(Block::Notice(format!(
+                    "the backend sent a `{item_type}` item this build does not render"
+                )));
+            }
+            AgentEvent::Hook(run) => {
+                // Only a run that changed something is worth a line: reporting
+                // every silent pass would bury the transcript under a hook the
+                // user configured once and no longer thinks about.
+                if run.status != agent_core::event::HookRunStatus::Completed {
+                    let scope = match &run.tool {
+                        Some(tool) => format!("{} on {tool}", run.event),
+                        None => run.event.clone(),
+                    };
+                    let detail = match &run.message {
+                        Some(message) => format!(": {message}"),
+                        None => String::new(),
+                    };
+                    self.blocks
+                        .push(Block::Notice(format!("hook {scope}{detail}")));
+                }
+            }
             AgentEvent::RetryScheduled(view) => {
                 self.blocks.push(Block::Notice(format!(
                     "retry {}/{} in {} ms ({:?})",
@@ -1262,7 +1284,10 @@ impl AppState {
                 });
             }
             AgentEvent::ToolOutputDelta(view) => {
-                self.push_live_output(&view.id, &view.chunk);
+                // Decoding happens HERE, at the display boundary: the core hands
+                // over the bytes the process wrote, and turning an unreadable
+                // one into U+FFFD is a rendering call.
+                self.push_live_output(&view.id, &view.chunk_lossy());
             }
             AgentEvent::ToolResult(view) => {
                 // AC4: on interruption, the output already produced stays displayed;
@@ -1300,7 +1325,7 @@ impl AppState {
             // Turn accounting (US-017, US-004): no block in the transcript, but
             // this IS the source of the consumption indicator.
             AgentEvent::ModelTurn(view) => self.observe_model_turn(view),
-            AgentEvent::Quota(snapshot) => self.quota = Some(*snapshot),
+            AgentEvent::Quota(snapshot) => self.quota = Some(snapshot.clone()),
             AgentEvent::TurnDiff(view) => self.blocks.push(Block::Notice(turn_diff_summary(view))),
             AgentEvent::PermissionAsk(req) => self
                 .blocks
@@ -1309,7 +1334,7 @@ impl AppState {
                 self.finalize_streaming();
                 self.status = Status::Idle;
             }
-            AgentEvent::Interrupted => {
+            AgentEvent::Interrupted(..) => {
                 self.finalize_streaming();
                 self.pending = None;
                 self.blocks.push(Block::Notice("interrupted".into()));
@@ -2625,6 +2650,7 @@ mod tests {
             id: "c1".into(),
             name: "bash".into(),
             input: serde_json::json!({ "command": "ls -la" }),
+            kind: Default::default(),
         }));
         assert!(matches!(
             s.blocks[0],
@@ -2647,7 +2673,8 @@ mod tests {
     fn delta(id: &str, chunk: &str) -> AgentEvent {
         AgentEvent::ToolOutputDelta(ToolOutputDeltaView {
             id: id.into(),
-            chunk: chunk.into(),
+            stream: agent_core::event::OutputStream::Stdout,
+            chunk: chunk.as_bytes().to_vec(),
         })
     }
 
@@ -2656,6 +2683,7 @@ mod tests {
             id: id.into(),
             name: "bash".into(),
             input: serde_json::json!({ "command": "cargo build" }),
+            kind: Default::default(),
         })
     }
 
@@ -2708,7 +2736,7 @@ mod tests {
             truncation: None,
             execution: None,
         }));
-        s.apply(&AgentEvent::Interrupted);
+        s.apply(&AgentEvent::Interrupted(agent_core::InterruptedView::cancelled()));
         assert_eq!(s.live_output_lines(), vec!["warning: unused".to_string()]);
     }
 
@@ -3536,7 +3564,7 @@ mod tests {
             crate::diff::Diff::default(),
         ));
 
-        s.apply(&AgentEvent::Interrupted);
+        s.apply(&AgentEvent::Interrupted(agent_core::InterruptedView::cancelled()));
 
         assert!(s.pending.is_none());
         assert_eq!(s.status, Status::Idle);
@@ -3596,7 +3624,7 @@ mod tests {
         assert!(s.quit_shortcut_hint_visible());
         assert!(!s.should_quit);
 
-        s.apply(&AgentEvent::Interrupted);
+        s.apply(&AgentEvent::Interrupted(agent_core::InterruptedView::cancelled()));
         let action = s.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(action, InputAction::Quit);
         assert!(s.should_quit);
@@ -3727,6 +3755,7 @@ mod tests {
             context_window: window,
             auto_compact_token_limit: window.map(|window| window * 9 / 10),
             estimated_context_tokens: None,
+            ..agent_core::ModelTurnView::default()
         })
     }
 
@@ -3849,7 +3878,7 @@ mod tests {
                 window_minutes: Some(300),
                 resets_at_unix: Some(1_784_989_920),
             }),
-            secondary: None,
+            ..agent_core::quota::QuotaSnapshot::default()
         }));
 
         let usage = session_usage_report(&s);
