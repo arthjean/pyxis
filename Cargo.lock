@@ -129,6 +129,7 @@ dependencies = [
  "agent-core",
  "agent-tools",
  "async-trait",
+ "base64",
  "futures-util",
  "reqwest",
  "rmcp",

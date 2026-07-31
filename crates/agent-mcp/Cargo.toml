@@ -27,3 +27,8 @@ thiserror = { workspace = true }
 agent-tools = { workspace = true }
 agent-core = { workspace = true }
 async-trait = { workspace = true }
+
+[dev-dependencies]
+# Building the base64 payloads the image tests feed to the renderer.
+base64 = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
