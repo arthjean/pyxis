@@ -1,21 +1,14 @@
-//! MCP tools exposed to the model as `DynTool` (US-011). Three problems are
-//! solved here, in this order, because each one silently breaks the turn when it
-//! is not:
+//! MCP tools exposed to the model as `DynTool` (US-011).
 //!
-//! 1. **Naming.** The model API accepts `^[A-Za-z0-9_-]+$` over at most 64 bytes.
-//!    `mcp__{server}__{tool}` overflows as soon as both names are long, so the
-//!    composed name is sanitized, then shortened deterministically with a
-//!    fingerprint of the pair, and uniqueness is verified at registration. The
-//!    mapping back to the origin server and tool is kept on the tool itself, so a
-//!    shortened name still reaches the right server.
-//! 2. **Schema.** The provider emits `strict: true` and `ToolSpec::validate`
-//!    enforces it (`additionalProperties: false`, every property in `required`).
-//!    An MCP schema almost never complies, and an invalid spec kills the whole
-//!    turn. Schemas are therefore rewritten into the strict form, and a tool whose
-//!    schema resists is dropped with a diagnostic rather than left to break the
-//!    session.
-//! 3. **Trust.** Everything coming from a server is untrusted (CVE-2025-6514):
-//!    fail-closed metadata, `Ask` baseline, taint propagated in full.
+//! What lives here is **trust**: everything coming from a server is untrusted
+//! (CVE-2025-6514), so the metadata is fail-closed, the baseline is `Ask`, an
+//! approval is remembered per act rather than per tool name, the taint is
+//! propagated in full, and server prose never reaches a tool description.
+//!
+//! The two mechanical problems that also have to be solved before a tool can be
+//! registered live next door, because neither is a trust decision: `naming`
+//! (the 64-byte `^[A-Za-z0-9_-]+$` name) and `schema` (the strict form the
+//! provider validates).
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -29,20 +22,10 @@ use serde_json::{Map, Value};
 
 use crate::call::McpClient;
 use crate::client::McpToolInfo;
-use crate::config::{McpApproval, McpToolPolicy};
+use crate::config::{McpApproval, McpServerPolicy, McpToolPolicy};
+use crate::naming::qualified_name;
+use crate::schema::{MAX_SCHEMA_BYTES, strict_input_schema};
 
-/// Prefix of every registered MCP tool. Its presence makes a collision with a
-/// native tool impossible.
-pub const NAME_PREFIX: &str = "mcp__";
-/// Name cap imposed by the model API (`ToolSpec::validate`).
-pub const MAX_NAME_BYTES: usize = 64;
-/// Bound of an exposed input schema: a server must not be able to flood the
-/// prompt through its schemas any more than through its descriptions
-/// (ARCHITECTURE 6).
-pub const MAX_SCHEMA_BYTES: usize = 16_384;
-/// Depth bound of the schema rewrite: a hostile server does not get to blow the
-/// stack with nesting.
-const MAX_SCHEMA_DEPTH: u32 = 24;
 /// Grace added on top of the client bound so OUR error (which names the server)
 /// wins over the Registry's generic timeout.
 const REGISTRY_TIMEOUT_GRACE: Duration = Duration::from_secs(2);
@@ -57,10 +40,12 @@ pub struct McpTool {
     original_name: String,
     description: String,
     input_schema: Value,
-    /// Approval level resolved from the server policy (US-015). It is a
-    /// *baseline*: the permission mode, the hooks and the taint defense sit above
-    /// it and can only tighten it.
+    /// Approval level resolved from the server policy (US-015), already hardened
+    /// by the server's own annotation. It is a *baseline*: the permission mode,
+    /// the hooks and the taint defense sit above it and can only tighten it.
     approval: McpApproval,
+    /// The server declared its calls safe to run beside one another.
+    supports_parallel: bool,
     client: McpClient,
 }
 
@@ -88,11 +73,13 @@ impl DynTool for McpTool {
         self.input_schema.clone()
     }
 
-    // ───── Fail-closed metadata (invariant 4). None of it is derived from the
-    // server's `annotations`: those are hints from a remote party, never a
-    // security decision on our side.
+    // ───── Fail-closed metadata (invariant 4). Nothing here is *relaxed* by the
+    // server's `annotations`: a hint from a remote party may aggravate its own
+    // treatment (see `effective_approval`), never soften it.
+    /// Serialized by default. Only the human-written per-server
+    /// `supportsParallelToolCalls` lifts it, and a workspace file cannot set it.
     fn is_concurrency_safe(&self) -> bool {
-        false
+        self.supports_parallel
     }
 
     fn is_read_only(&self) -> bool {
@@ -144,10 +131,28 @@ impl DynTool for McpTool {
         baseline_permission(self.approval)
     }
 
-    /// No answer is ever remembered for an MCP call: the arguments are free-form,
-    /// so no token sequence identifies "the same act" the way an argv does.
-    fn approval_memo(&self, _raw: &Value) -> ApprovalMemo {
-        ApprovalMemo::NotApplicable
+    /// The unit of approval is the (server, tool, arguments) triple.
+    ///
+    /// The arguments belong IN the key. An MCP call has no argv, but its
+    /// arguments are its entire security surface: `write_file {path: "notes.md"}`
+    /// and `write_file {path: "~/.ssh/authorized_keys"}` are not the same act,
+    /// and a key that stops at the tool name would let one answer authorize
+    /// both. That is exactly the reasoning that makes `bash` remember an exact
+    /// token sequence and never a prefix (CVE-2026-22708); nothing about MCP
+    /// weakens it. What the memory buys is still the case that matters: a server
+    /// called fifteen times on the same arguments asks once.
+    ///
+    /// The taint defense sits above this, not under it: `is_taint_sensitive` is
+    /// true for every MCP tool, so the Registry refuses to read OR write a
+    /// remembered answer while the turn carries recent untrusted content
+    /// (US-008). That is a second line. Its window decays over a few dispatch
+    /// cycles, so a remembered answer has to be safe on its own.
+    fn approval_memo(&self, raw: &Value) -> ApprovalMemo {
+        ApprovalMemo::Key(vec![
+            self.server.clone(),
+            self.original_name.clone(),
+            canonical_arguments(raw),
+        ])
     }
 
     fn timeout(&self, _ctx: &ToolCtx) -> Duration {
@@ -157,24 +162,31 @@ impl DynTool for McpTool {
             .unwrap_or(self.client.timeout())
     }
 
-    async fn invoke(&self, raw: Value, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+    async fn invoke(&self, raw: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let arguments = match raw {
             Value::Object(map) => Some(strip_nulls_object(map)),
             _ => None,
         };
-        match self.client.call(&self.original_name, arguments).await {
+        // `ctx.vision` decides whether an image can leave the call as a content
+        // block (US-011). Fail-closed: a model that does not declare vision never
+        // gets one sent on its behalf.
+        match self
+            .client
+            .call(&self.original_name, arguments, ctx.vision)
+            .await
+        {
             // Functional failure: the model sees it and can react.
-            Ok(outcome) if outcome.is_error => {
-                let mut output = ToolOutput::error(outcome.text);
+            Ok(outcome) => {
+                let mut output = if outcome.is_error {
+                    ToolOutput::error(outcome.text)
+                } else {
+                    ToolOutput::text(outcome.text)
+                };
                 if let Some(structured) = outcome.structured_content {
                     output = output.with_structured_content(structured);
                 }
-                Ok(output)
-            }
-            Ok(outcome) => {
-                let mut output = ToolOutput::text(outcome.text);
-                if let Some(structured) = outcome.structured_content {
-                    output = output.with_structured_content(structured);
+                if !outcome.images.is_empty() {
+                    output = output.with_images(outcome.images);
                 }
                 Ok(output)
             }
@@ -182,6 +194,37 @@ impl DynTool for McpTool {
             // the server (`McpError::Call`).
             Err(err) => Err(ToolError::Io(err.to_string())),
         }
+    }
+}
+
+/// Stable rendering of a call's arguments, used as the tail of the approval key.
+///
+/// Two properties are load-bearing. Nulls are stripped exactly as `invoke`
+/// strips them, so what is remembered is what was actually sent. And the
+/// rendering is order-independent: `serde_json::Map` is a `BTreeMap` (the
+/// `preserve_order` feature is off), so the same object always serializes the
+/// same way whatever order the model emitted its fields in. The test below is
+/// what keeps that second property from silently disappearing behind a feature
+/// flag enabled elsewhere in the dependency graph.
+fn canonical_arguments(raw: &Value) -> String {
+    strip_nulls(raw.clone()).to_string()
+}
+
+/// Approval level a tool actually starts from: the configured level, hardened by
+/// the server's own `destructiveHint`.
+///
+/// This is the ONE place an MCP annotation is read, and it is read in a single
+/// direction. `destructiveHint: true` forces the confirmation back on even when
+/// the configuration auto-approved the tool: a server is allowed to say "this
+/// one is dangerous". The reverse (`readOnlyHint: true` granting an
+/// auto-approval) is deliberately not implemented, because that is the exact
+/// shape of CVE-2025-6514: a compromised server would relabel its own tools to
+/// escape the prompt.
+fn effective_approval(configured: McpApproval, destructive_hint: Option<bool>) -> McpApproval {
+    if destructive_hint == Some(true) {
+        McpApproval::Ask
+    } else {
+        configured
     }
 }
 
@@ -221,6 +264,10 @@ pub struct McpToolPlan {
     pub original_name: String,
     pub description: String,
     pub input_schema: Value,
+    /// `annotations.destructiveHint`, carried through so the approval level can
+    /// be resolved from the plan alone. Read in one direction only, see
+    /// `effective_approval`.
+    pub destructive_hint: Option<bool>,
 }
 
 /// Applies the server policy to the listed tools (US-014): the allow-list runs
@@ -263,13 +310,14 @@ pub fn filter_tools(
     (kept, notices)
 }
 
-/// Wraps the tools of one connected server as `DynTool`. `tools` is expected to be
-/// the already filtered list (`filter_tools`); `policy` is read here for the
-/// approval level alone.
+/// Wraps the tools of one connected server as `DynTool`. `tools` is expected to
+/// be the already filtered list (`filter_tools`); `policy` carries the approval
+/// levels and the parallelism declaration, and nothing about the transport,
+/// which this layer has no business knowing.
 pub fn dyn_tools(
     server: &str,
     tools: &[McpToolInfo],
-    policy: &McpToolPolicy,
+    policy: &McpServerPolicy,
     client: &McpClient,
     taken: &mut BTreeSet<String>,
 ) -> (Vec<Box<dyn DynTool>>, Vec<McpToolSkipped>) {
@@ -277,7 +325,10 @@ pub fn dyn_tools(
     let registered = plans
         .into_iter()
         .map(|plan| {
-            let approval = policy.approval_for(&plan.original_name);
+            let approval = effective_approval(
+                policy.tools.approval_for(&plan.original_name),
+                plan.destructive_hint,
+            );
             Box::new(McpTool {
                 name: plan.name,
                 server: server.to_string(),
@@ -285,6 +336,7 @@ pub fn dyn_tools(
                 description: plan.description,
                 input_schema: plan.input_schema,
                 approval,
+                supports_parallel: policy.supports_parallel_tool_calls,
                 client: client.clone(),
             }) as Box<dyn DynTool>
         })
@@ -320,6 +372,11 @@ pub fn plan_tools(
             continue;
         }
         let name = qualified_name(server, &info.original_name, taken);
+        // `initialize.instructions` is deliberately NOT folded in here. A
+        // description reaches the model inside the tool definitions, which no
+        // tool output ever taints, so server prose smuggled into one would be
+        // injection with the taint defense structurally unable to see it. Like
+        // resources, it is offered to inspection instead (`/mcp <server> info`).
         let description = if info.description.trim().is_empty() {
             format!(
                 "Tool \"{}\" exposed by the MCP server \"{server}\".",
@@ -342,205 +399,10 @@ pub fn plan_tools(
             original_name: info.original_name.clone(),
             description,
             input_schema: schema,
+            destructive_hint: info.destructive_hint,
         });
     }
     (plans, skipped)
-}
-
-/// Composes the exposed name: `mcp__{server}__{tool}`, sanitized, shortened
-/// deterministically when it overflows, and unique within `taken`.
-pub fn qualified_name(server: &str, tool: &str, taken: &BTreeSet<String>) -> String {
-    let base = format!(
-        "{NAME_PREFIX}{}__{}",
-        sanitize_part(server),
-        sanitize_part(tool)
-    );
-    let fingerprint = fingerprint(server, tool);
-    // Bounded by construction: `taken` is finite, so a free name is reached in at
-    // most `taken.len() + 1` attempts.
-    let mut attempt = 0_usize;
-    loop {
-        let candidate = if attempt == 0 && base.len() <= MAX_NAME_BYTES {
-            base.clone()
-        } else if attempt == 0 {
-            shorten(&base, &format!("_{fingerprint}"))
-        } else {
-            shorten(&base, &format!("_{fingerprint}_{attempt}"))
-        };
-        if !taken.contains(&candidate) {
-            return candidate;
-        }
-        attempt += 1;
-    }
-}
-
-/// Keeps only what the model API accepts; anything else becomes `_`. The result
-/// is pure ASCII, hence safe to cut on a byte boundary.
-fn sanitize_part(part: &str) -> String {
-    let sanitized: String = part
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        "_".to_string()
-    } else {
-        sanitized
-    }
-}
-
-/// Cuts `base` so that `base_prefix + suffix` fits in `MAX_NAME_BYTES`. `base` is
-/// ASCII (post-sanitize), so a byte cut is a character cut.
-fn shorten(base: &str, suffix: &str) -> String {
-    let keep = MAX_NAME_BYTES.saturating_sub(suffix.len());
-    let mut out: String = base.chars().take(keep).collect();
-    out.push_str(suffix);
-    out
-}
-
-/// FNV-1a over `server\0tool`. Hand-rolled on purpose: `DefaultHasher` is not
-/// stable across Rust versions, and "deterministic" is the property the shortened
-/// name depends on.
-fn fingerprint(server: &str, tool: &str) -> String {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in server
-        .as_bytes()
-        .iter()
-        .chain(std::iter::once(&0_u8))
-        .chain(tool.as_bytes())
-    {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{:08x}", (hash >> 32) as u32)
-}
-
-/// Rewrites an MCP input schema into the strict form the model API requires.
-/// Returns `None` when the schema cannot be exposed at all (non-object root,
-/// nesting past the depth bound).
-///
-/// A property that was optional is widened to accept `null`, the documented way
-/// to keep it optional while `required` lists everything; `invoke` strips those
-/// nulls again before the call, so the server never sees an argument the model
-/// meant to omit.
-pub fn strict_input_schema(schema: &Value) -> Option<Value> {
-    let obj = schema.as_object()?;
-    let mut root = obj.clone();
-    match root.get("type") {
-        // MCP mandates an object schema; a missing type is tolerated and pinned.
-        None => {
-            root.insert("type".to_string(), Value::String("object".to_string()));
-        }
-        Some(_) if type_includes_object(&root) => {}
-        Some(_) => return None,
-    }
-    normalize(&Value::Object(root), 0)
-}
-
-fn normalize(node: &Value, depth: u32) -> Option<Value> {
-    if depth > MAX_SCHEMA_DEPTH {
-        return None;
-    }
-    let Some(obj) = node.as_object() else {
-        return Some(node.clone());
-    };
-    let mut out = obj.clone();
-    let originally_required: BTreeSet<String> = obj
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(Value::Object(props)) = obj.get("properties") {
-        let mut rewritten = Map::new();
-        for (key, value) in props {
-            let mut child = normalize(value, depth + 1)?;
-            if !originally_required.contains(key) {
-                child = widen_nullable(child);
-            }
-            rewritten.insert(key.clone(), child);
-        }
-        out.insert("properties".to_string(), Value::Object(rewritten));
-    }
-    for key in ["items", "additionalItems", "contains"] {
-        if let Some(value) = obj.get(key) {
-            out.insert(key.to_string(), normalize(value, depth + 1)?);
-        }
-    }
-    for key in ["anyOf", "oneOf", "allOf"] {
-        if let Some(Value::Array(items)) = obj.get(key) {
-            let mut rewritten = Vec::with_capacity(items.len());
-            for item in items {
-                rewritten.push(normalize(item, depth + 1)?);
-            }
-            out.insert(key.to_string(), Value::Array(rewritten));
-        }
-    }
-    for key in ["$defs", "definitions"] {
-        if let Some(Value::Object(defs)) = obj.get(key) {
-            let mut rewritten = Map::new();
-            for (name, value) in defs {
-                rewritten.insert(name.clone(), normalize(value, depth + 1)?);
-            }
-            out.insert(key.to_string(), Value::Object(rewritten));
-        }
-    }
-    if type_includes_object(&out) {
-        let names: Vec<Value> = out
-            .get("properties")
-            .and_then(Value::as_object)
-            .map(|props| props.keys().cloned().map(Value::String).collect())
-            .unwrap_or_default();
-        if !out.contains_key("properties") {
-            out.insert("properties".to_string(), Value::Object(Map::new()));
-        }
-        out.insert("additionalProperties".to_string(), Value::Bool(false));
-        out.insert("required".to_string(), Value::Array(names));
-    }
-    Some(Value::Object(out))
-}
-
-/// Adds `null` to the declared type of an optional property. A property without a
-/// declared type (a `$ref`, a bare `enum`) is left untouched: widening it would
-/// mean guessing its shape.
-fn widen_nullable(node: Value) -> Value {
-    let Value::Object(mut obj) = node else {
-        return node;
-    };
-    let widened = match obj.get("type") {
-        Some(Value::String(single)) if single != "null" => Some(Value::Array(vec![
-            Value::String(single.clone()),
-            Value::String("null".to_string()),
-        ])),
-        Some(Value::Array(kinds)) if !kinds.iter().any(|kind| kind.as_str() == Some("null")) => {
-            let mut kinds = kinds.clone();
-            kinds.push(Value::String("null".to_string()));
-            Some(Value::Array(kinds))
-        }
-        _ => None,
-    };
-    if let Some(widened) = widened {
-        obj.insert("type".to_string(), widened);
-    }
-    Value::Object(obj)
-}
-
-fn type_includes_object(schema: &Map<String, Value>) -> bool {
-    match schema.get("type") {
-        Some(Value::String(kind)) => kind == "object",
-        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind.as_str() == Some("object")),
-        _ => false,
-    }
 }
 
 /// Drops the `null` entries the strict rewrite made possible, so an omitted
@@ -573,6 +435,7 @@ mod tests {
             input_schema: schema,
             output_schema: None,
             annotations_untrusted: true,
+            destructive_hint: None,
         }
     }
 
@@ -585,131 +448,6 @@ mod tests {
             },
             "required": ["path"]
         })
-    }
-
-    #[test]
-    fn name_is_prefixed_by_its_server() {
-        let taken = BTreeSet::new();
-        assert_eq!(qualified_name("files", "read", &taken), "mcp__files__read");
-    }
-
-    #[test]
-    fn same_tool_on_two_servers_gets_two_names() {
-        let mut taken = BTreeSet::new();
-        let a = qualified_name("alpha", "search", &taken);
-        taken.insert(a.clone());
-        let b = qualified_name("beta", "search", &taken);
-        assert_ne!(a, b);
-        assert_eq!(a, "mcp__alpha__search");
-        assert_eq!(b, "mcp__beta__search");
-    }
-
-    #[test]
-    fn long_names_are_shortened_deterministically_and_stay_unique() {
-        let server = "a".repeat(60);
-        let taken = BTreeSet::new();
-        let first = qualified_name(&server, &"b".repeat(60), &taken);
-        let second = qualified_name(&server, &"b".repeat(61), &taken);
-        assert!(first.len() <= MAX_NAME_BYTES, "{} bytes", first.len());
-        assert!(second.len() <= MAX_NAME_BYTES);
-        // Same shared prefix, different fingerprint -> no silent collision.
-        assert_ne!(first, second);
-        assert_eq!(first, qualified_name(&server, &"b".repeat(60), &taken));
-    }
-
-    #[test]
-    fn a_taken_name_forces_a_distinct_candidate() {
-        let mut taken = BTreeSet::new();
-        taken.insert("mcp__files__read".to_string());
-        let name = qualified_name("files", "read", &taken);
-        assert_ne!(name, "mcp__files__read");
-        assert!(name.starts_with("mcp__files__read"));
-        assert!(name.len() <= MAX_NAME_BYTES);
-    }
-
-    #[test]
-    fn out_of_charset_characters_are_sanitized() {
-        let taken = BTreeSet::new();
-        let name = qualified_name("my server", "tool.v2:beta", &taken);
-        assert_eq!(name, "mcp__my_server__tool_v2_beta");
-        assert!(
-            name.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        );
-    }
-
-    #[test]
-    fn sanitizing_does_not_create_a_silent_collision() {
-        let mut taken = BTreeSet::new();
-        let a = qualified_name("srv", "tool.v2", &taken);
-        taken.insert(a.clone());
-        let b = qualified_name("srv", "tool:v2", &taken);
-        assert_ne!(a, b, "two distinct tools must keep two names");
-    }
-
-    #[test]
-    fn strict_schema_requires_every_property_and_denies_extras() {
-        let schema = strict_input_schema(&object_schema()).unwrap();
-        assert_eq!(schema["additionalProperties"], Value::Bool(false));
-        let required: BTreeSet<&str> = schema["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
-        assert_eq!(required, BTreeSet::from(["path", "limit"]));
-        // Originally optional -> nullable, so the model can still omit it.
-        assert_eq!(
-            schema["properties"]["limit"]["type"],
-            serde_json::json!(["integer", "null"])
-        );
-        assert_eq!(schema["properties"]["path"]["type"], "string");
-    }
-
-    #[test]
-    fn strict_schema_recurses_into_nested_objects() {
-        let schema = strict_input_schema(&serde_json::json!({
-            "type": "object",
-            "properties": {
-                "filter": {
-                    "type": "object",
-                    "properties": { "kind": { "type": "string" } }
-                }
-            },
-            "required": ["filter"]
-        }))
-        .unwrap();
-        let nested = &schema["properties"]["filter"];
-        assert_eq!(nested["additionalProperties"], Value::Bool(false));
-        assert_eq!(nested["required"], serde_json::json!(["kind"]));
-    }
-
-    #[test]
-    fn missing_type_is_pinned_and_non_object_root_is_refused() {
-        let pinned = strict_input_schema(&serde_json::json!({"properties": {}})).unwrap();
-        assert_eq!(pinned["type"], "object");
-        assert!(strict_input_schema(&serde_json::json!({"type": "string"})).is_none());
-        assert!(strict_input_schema(&serde_json::json!("nope")).is_none());
-    }
-
-    #[test]
-    fn deep_nesting_is_refused_instead_of_blowing_the_stack() {
-        let mut schema = serde_json::json!({"type": "object", "properties": {}});
-        for _ in 0..(MAX_SCHEMA_DEPTH + 4) {
-            schema = serde_json::json!({
-                "type": "object",
-                "properties": { "next": schema },
-                "required": ["next"]
-            });
-        }
-        assert!(strict_input_schema(&schema).is_none());
-    }
-
-    #[test]
-    fn normalized_schemas_pass_the_provider_validation() {
-        let schema = strict_input_schema(&object_schema()).unwrap();
-        let spec = ToolSpec::function("mcp__files__read".to_string(), "d".to_string(), schema);
-        spec.validate().unwrap();
     }
 
     #[test]
@@ -854,6 +592,95 @@ mod tests {
             resolve_permission(PermissionMode::Default, allow, false, true, true, true),
             Resolved::Ask
         );
+    }
+
+    #[test]
+    fn a_destructive_hint_hardens_an_auto_approved_tool() {
+        // The configuration auto-approved it; the server says it is destructive.
+        // The confirmation comes back: an annotation may aggravate.
+        assert_eq!(
+            effective_approval(McpApproval::Allow, Some(true)),
+            McpApproval::Ask
+        );
+        // The reverse is refused by construction: nothing a server declares can
+        // grant an auto-approval (CVE-2025-6514).
+        assert_eq!(
+            effective_approval(McpApproval::Ask, Some(false)),
+            McpApproval::Ask
+        );
+        assert_eq!(effective_approval(McpApproval::Ask, None), McpApproval::Ask);
+        // No annotation, configured allow: the human decision stands.
+        assert_eq!(
+            effective_approval(McpApproval::Allow, None),
+            McpApproval::Allow
+        );
+    }
+
+    /// A description is what the tool itself said, and nothing else. Server prose
+    /// (`initialize.instructions`) reaches the model nowhere, because a tool
+    /// definition is not a tool output and therefore never taints the turn: text
+    /// smuggled in here would be injection the taint defense cannot see.
+    #[test]
+    fn a_description_carries_only_what_the_tool_declared() {
+        let mut taken = BTreeSet::new();
+        let (plans, _) = plan_tools("docs", &[info("search", object_schema())], &mut taken);
+        assert_eq!(plans[0].description, "desc");
+    }
+
+    /// The arguments are part of the approval key, so one answer authorizes one
+    /// act rather than a tool name (CVE-2026-22708 transposed to MCP).
+    #[test]
+    fn the_approval_key_separates_two_calls_of_the_same_tool() {
+        let benign = canonical_arguments(&serde_json::json!({"path": "notes.md"}));
+        let hostile = canonical_arguments(&serde_json::json!({"path": "~/.ssh/authorized_keys"}));
+        assert_ne!(benign, hostile);
+        // Field order is not part of the act: the model emitting the same call
+        // twice in a different order must not be asked twice.
+        assert_eq!(
+            canonical_arguments(&serde_json::json!({"a": 1, "b": 2})),
+            canonical_arguments(&serde_json::json!({"b": 2, "a": 1}))
+        );
+        // An omitted field and an explicit null are the same act, because
+        // `invoke` strips nulls before sending.
+        assert_eq!(
+            canonical_arguments(&serde_json::json!({"a": 1, "b": null})),
+            canonical_arguments(&serde_json::json!({"a": 1}))
+        );
+    }
+
+    #[test]
+    fn parallelism_and_approval_come_from_the_server_entry() {
+        let listed = [
+            info("read", object_schema()),
+            McpToolInfo {
+                destructive_hint: Some(true),
+                ..info("wipe", object_schema())
+            },
+        ];
+        let policy = McpServerPolicy {
+            supports_parallel_tool_calls: true,
+            tools: McpToolPolicy {
+                default_approval: McpApproval::Allow,
+                ..McpToolPolicy::default()
+            },
+            ..McpServerPolicy::default()
+        };
+        let plans = plan_tools("srv", &listed, &mut BTreeSet::new()).0;
+        assert_eq!(plans.len(), 2);
+        // The plan carries the hint, so the approval is resolved from the plan
+        // alone: no second lookup against the listing, hence no way for the two
+        // to drift apart.
+        let approvals: Vec<McpApproval> = plans
+            .iter()
+            .map(|plan| {
+                effective_approval(
+                    policy.tools.approval_for(&plan.original_name),
+                    plan.destructive_hint,
+                )
+            })
+            .collect();
+        assert_eq!(approvals, vec![McpApproval::Allow, McpApproval::Ask]);
+        assert!(policy.supports_parallel_tool_calls);
     }
 
     #[test]

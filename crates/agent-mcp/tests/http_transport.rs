@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use agent_mcp::{McpConnection, McpServerConfig, McpToolPolicy, McpTransport};
+use agent_mcp::{McpConnection, McpServerConfig, McpServerPolicy, McpToolPolicy, McpTransport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -196,8 +196,11 @@ fn http_config(url: &str, bearer_token_env_var: Option<&str>) -> McpServerConfig
         transport: McpTransport::Http {
             url: url.to_string(),
             bearer_token_env_var: bearer_token_env_var.map(str::to_string),
+            http_headers: Default::default(),
+            env_http_headers: Default::default(),
+            oauth: Default::default(),
         },
-        tools: McpToolPolicy::default(),
+        policy: McpServerPolicy::default(),
         source: Default::default(),
         shadows_lower_priority: false,
     }
@@ -242,7 +245,12 @@ async fn a_remote_tool_is_exposed_filtered_and_callable() {
 
     let client = conn.client("remote");
     let mut taken = std::collections::BTreeSet::new();
-    let (tools, skipped) = agent_mcp::dyn_tools("remote", &kept, &policy, &client, &mut taken);
+    let server_policy = McpServerPolicy {
+        tools: policy.clone(),
+        ..McpServerPolicy::default()
+    };
+    let (tools, skipped) =
+        agent_mcp::dyn_tools("remote", &kept, &server_policy, &client, &mut taken);
     assert!(skipped.is_empty(), "{skipped:?}");
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0].name(), "mcp__remote__remote_search");
@@ -258,6 +266,7 @@ async fn a_remote_tool_is_exposed_filtered_and_callable() {
                     .unwrap()
                     .clone(),
             ),
+            /*vision*/ false,
         )
         .await
         .expect("the remote call must succeed");

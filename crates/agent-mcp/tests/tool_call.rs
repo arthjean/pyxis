@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use agent_core::tools::ToolInvocation;
-use agent_mcp::{McpConnection, McpServerConfig, McpToolInfo};
+use agent_mcp::{McpConnection, McpServerConfig, McpServerPolicy, McpToolInfo};
 use agent_tools::Registry;
 use agent_tools::permission::{
     ApprovalResponse, Approver, PermissionMode, PermissionRequest, Resolved, resolve_permission,
@@ -64,11 +64,6 @@ fn config(exe: &Path) -> McpServerConfig {
     McpServerConfig::stdio(exe.to_string_lossy().into_owned(), Vec::new())
 }
 
-/// No filter, no auto-approval: the behavior these tests were written against.
-fn policy() -> agent_mcp::McpToolPolicy {
-    agent_mcp::McpToolPolicy::default()
-}
-
 async fn connect(exe: &Path, name: &str) -> (McpConnection, Vec<McpToolInfo>) {
     let conn = McpConnection::connect(name, &config(exe)).await.unwrap();
     let tools = conn.list_tools(name).await.unwrap();
@@ -80,6 +75,7 @@ async fn connect(exe: &Path, name: &str) -> (McpConnection, Vec<McpToolInfo>) {
 struct RecordingApprover {
     asked: AtomicUsize,
     tainted: AtomicUsize,
+    memoizable: AtomicUsize,
 }
 
 #[async_trait]
@@ -89,11 +85,9 @@ impl Approver for RecordingApprover {
         if req.taint_forced {
             self.tainted.fetch_add(1, Ordering::SeqCst);
         }
-        // An MCP call must never be rememberable (free-form arguments).
-        assert!(
-            !req.memoizable,
-            "an MCP call must not be memoizable: {req:?}"
-        );
+        if req.memoizable {
+            self.memoizable.fetch_add(1, Ordering::SeqCst);
+        }
         ApprovalResponse::ALLOW_ONCE
     }
 }
@@ -111,7 +105,13 @@ async fn mcp_tools_are_registered_and_callable_by_the_model() {
 
     let client = conn.client("fixture");
     let mut taken = BTreeSet::new();
-    let (tools, skipped) = agent_mcp::dyn_tools("fixture", &listed, &policy(), &client, &mut taken);
+    let (tools, skipped) = agent_mcp::dyn_tools(
+        "fixture",
+        &listed,
+        &McpServerPolicy::default(),
+        &client,
+        &mut taken,
+    );
     assert!(skipped.is_empty(), "unexpected skips: {skipped:?}");
     assert_eq!(tools.len(), 4);
 
@@ -191,14 +191,14 @@ async fn a_stalled_server_expires_and_the_error_names_it() {
         .with_timeout(Duration::from_millis(300));
 
     let started = std::time::Instant::now();
-    let err = client.call("stall", None).await.unwrap_err();
+    let err = client.call("stall", None, false).await.unwrap_err();
     assert!(started.elapsed() < Duration::from_secs(5), "bounded wait");
     let message = err.to_string();
     assert!(message.contains("sleepy"), "{message}");
     assert!(message.contains("timeout"), "{message}");
 
     // The connection stays usable after an expiry.
-    let ok = client.call("echo", None).await.unwrap();
+    let ok = client.call("echo", None, false).await.unwrap();
     assert!(ok.text.starts_with("echo: "), "{}", ok.text);
 
     conn.cancel().await;
@@ -212,12 +212,12 @@ async fn a_server_dying_in_flight_errors_without_panicking() {
     let (conn, _listed) = connect(&exe, "doomed").await;
     let client = conn.client("doomed");
 
-    let err = client.call("die", None).await.unwrap_err();
+    let err = client.call("die", None, false).await.unwrap_err();
     let message = err.to_string();
     assert!(message.contains("doomed"), "{message}");
 
     // Any later call fails the same way rather than hanging.
-    let again = client.call("echo", None).await.unwrap_err();
+    let again = client.call("echo", None, false).await.unwrap_err();
     assert!(again.to_string().contains("doomed"));
 
     conn.cancel().await;
@@ -234,10 +234,20 @@ async fn two_servers_exposing_the_same_tool_each_get_their_own_call() {
     let mut taken = BTreeSet::new();
     let alpha_client = alpha_conn.client("alpha");
     let beta_client = beta_conn.client("beta");
-    let (alpha_tools, _) =
-        agent_mcp::dyn_tools("alpha", &alpha_listed, &policy(), &alpha_client, &mut taken);
-    let (beta_tools, _) =
-        agent_mcp::dyn_tools("beta", &beta_listed, &policy(), &beta_client, &mut taken);
+    let (alpha_tools, _) = agent_mcp::dyn_tools(
+        "alpha",
+        &alpha_listed,
+        &McpServerPolicy::default(),
+        &alpha_client,
+        &mut taken,
+    );
+    let (beta_tools, _) = agent_mcp::dyn_tools(
+        "beta",
+        &beta_listed,
+        &McpServerPolicy::default(),
+        &beta_client,
+        &mut taken,
+    );
 
     let mut builder = Registry::builder(&dir)
         .mode(PermissionMode::Default)
@@ -273,6 +283,167 @@ async fn two_servers_exposing_the_same_tool_each_get_their_own_call() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Trivial trusted tool, used to run the dispatch cycles that let the taint
+/// window expire. It has to succeed and return trusted content: a batch of pure
+/// failures deliberately re-marks the taint, so the model cannot wash the window
+/// with bogus calls.
+struct Trusted;
+
+#[async_trait]
+impl agent_tools::tool::Tool for Trusted {
+    type Input = serde_json::Value;
+
+    fn name(&self) -> &str {
+        "trusted_noop"
+    }
+    fn description(&self) -> String {
+        "test-only no-op".to_string()
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false, "required": []})
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    fn is_sensitive(&self) -> bool {
+        false
+    }
+    fn returns_untrusted(&self) -> bool {
+        false
+    }
+    fn permission(
+        &self,
+        _input: &Self::Input,
+        _ctx: &agent_tools::permission::PermCtx,
+    ) -> agent_tools::permission::PermissionDecision {
+        agent_tools::permission::PermissionDecision::Allow
+    }
+    async fn call(
+        &self,
+        _input: Self::Input,
+        _ctx: &agent_tools::tool::ToolCtx,
+    ) -> Result<agent_tools::tool::ToolOutput, agent_tools::error::ToolError> {
+        Ok(agent_tools::tool::ToolOutput::text("ok"))
+    }
+}
+
+/// Runs trusted dispatch cycles until the taint window has expired, so what is
+/// under test is the approval memory and not the taint defense that outranks it.
+async fn drain_taint(registry: &Registry) {
+    for _ in 0..8 {
+        if !registry.taint_recent() {
+            return;
+        }
+        let outcomes = registry
+            .dispatch(vec![call("drain", "trusted_noop", serde_json::json!({}))])
+            .await;
+        assert!(!outcomes[0].is_error, "{}", outcomes[0].content);
+    }
+    assert!(
+        !registry.taint_recent(),
+        "the taint window must expire within the bound"
+    );
+}
+
+/// A remembered answer applies to the (server, tool, arguments) triple: the same
+/// act is not re-asked, a different one is. Three guardrails, all load-bearing:
+/// the answer does not carry over to other arguments, it does not leak to
+/// another tool of the same server, and the taint defense outranks it, which is
+/// why the window is drained between calls here.
+#[tokio::test]
+async fn an_answer_is_remembered_per_act_not_per_tool_name() {
+    let dir = temp_dir("call-memo");
+    let exe = compile_fixture(&dir);
+    let (conn, listed) = connect(&exe, "fixture").await;
+    let client = conn.client("fixture");
+    let mut taken = BTreeSet::new();
+    let (tools, _) = agent_mcp::dyn_tools(
+        "fixture",
+        &listed,
+        &McpServerPolicy::default(),
+        &client,
+        &mut taken,
+    );
+
+    // Answers "allow and remember" the first time it is asked.
+    #[derive(Default)]
+    struct RememberingApprover {
+        asked: AtomicUsize,
+    }
+    #[async_trait]
+    impl Approver for RememberingApprover {
+        async fn approve(&self, req: &PermissionRequest) -> ApprovalResponse {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                req.memoizable,
+                "an MCP call is answered per (server, tool, arguments): {req:?}"
+            );
+            ApprovalResponse::ALLOW_SESSION
+        }
+    }
+
+    let approver = Arc::new(RememberingApprover::default());
+    let mut builder = Registry::builder(&dir)
+        .mode(PermissionMode::Default)
+        .approver(approver.clone())
+        .register(Trusted);
+    for tool in tools {
+        builder = builder.register_dyn(tool);
+    }
+    let registry = builder.build();
+
+    // First call: asked once, and the answer is remembered.
+    let echo = |id: &str, text: &str| {
+        call(
+            id,
+            "mcp__fixture__echo",
+            serde_json::json!({"text": text, "loud": null}),
+        )
+    };
+    let outcomes = registry.dispatch(vec![echo("1", "a")]).await;
+    assert_eq!(outcomes[0].content, "echo: a");
+    assert_eq!(approver.asked.load(Ordering::SeqCst), 1);
+
+    // The SAME act again: no new question. This is what the memory buys, and the
+    // taint window from the first result is cleared first, since the taint
+    // defense deliberately outranks the memory (US-008).
+    drain_taint(&registry).await;
+    let outcomes = registry.dispatch(vec![echo("2", "a")]).await;
+    assert_eq!(outcomes[0].content, "echo: a");
+    assert_eq!(
+        approver.asked.load(Ordering::SeqCst),
+        1,
+        "a remembered answer must not be asked again for the same act"
+    );
+
+    // Same tool, DIFFERENT arguments: a different act, so it is asked. An MCP
+    // call has no argv, but its arguments are its entire security surface, and
+    // one answer must never authorize a target the human never saw.
+    drain_taint(&registry).await;
+    let outcomes = registry.dispatch(vec![echo("3", "b")]).await;
+    assert_eq!(outcomes[0].content, "echo: b");
+    assert_eq!(
+        approver.asked.load(Ordering::SeqCst),
+        2,
+        "the memory of one act must not cover another target"
+    );
+
+    // ANOTHER tool of the same server is a different act too.
+    drain_taint(&registry).await;
+    let outcomes = registry
+        .dispatch(vec![call("4", "mcp__fixture__pid", serde_json::json!({}))])
+        .await;
+    assert!(!outcomes[0].is_error);
+    assert_eq!(
+        approver.asked.load(Ordering::SeqCst),
+        3,
+        "the memory of one tool must not cover another"
+    );
+
+    conn.cancel().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn an_mcp_result_taints_the_rest_of_the_turn() {
     let dir = temp_dir("call-taint");
@@ -280,7 +451,13 @@ async fn an_mcp_result_taints_the_rest_of_the_turn() {
     let (conn, listed) = connect(&exe, "fixture").await;
     let client = conn.client("fixture");
     let mut taken = BTreeSet::new();
-    let (tools, _) = agent_mcp::dyn_tools("fixture", &listed, &policy(), &client, &mut taken);
+    let (tools, _) = agent_mcp::dyn_tools(
+        "fixture",
+        &listed,
+        &McpServerPolicy::default(),
+        &client,
+        &mut taken,
+    );
 
     let approver = Arc::new(RecordingApprover::default());
     let mut builder = Registry::builder(&dir)
