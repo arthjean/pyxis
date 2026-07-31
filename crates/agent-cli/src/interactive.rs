@@ -60,6 +60,31 @@ enum McpEvent {
         name: String,
         error: String,
     },
+    /// The authorization URL of a login in flight. Emitted as soon as it is
+    /// known, not at the end: a browser that failed to open must not leave the
+    /// user waiting on a URL they never see (FR-15).
+    LoginUrl {
+        name: String,
+        url: String,
+        opened: bool,
+    },
+    /// A per-server OAuth login completed: the credential is in the keyring and
+    /// the next connection will pick it up.
+    LoggedIn {
+        name: String,
+    },
+    LoggedOut {
+        name: String,
+    },
+    LoginFailed {
+        name: String,
+        error: String,
+    },
+    /// Result of `/mcp <server> resources`, already rendered.
+    Resources {
+        name: String,
+        summary: String,
+    },
 }
 
 pub struct InteractiveConfig {
@@ -1984,13 +2009,16 @@ async fn event_loop(
                 if let Some(ev) = ev {
                     match ev {
                         McpEvent::Connected { name, conn, tools } => {
-                            // US-014: the policy of THIS server shapes what is exposed,
+                            // US-014: the entry of THIS server shapes what is exposed,
                             // before anything reaches the tool registry.
+                            // No entry left (the server was removed mid-connect):
+                            // the default policy is the fail-closed one, so an
+                            // orphan connection exposes nothing auto-approved.
                             let policy = mcp_config_for(&mcp, &name)
-                                .map(|cfg| cfg.tools)
+                                .map(|cfg| cfg.policy)
                                 .unwrap_or_default();
                             let (tools, filter_notices) =
-                                agent_mcp::filter_tools(&name, &tools, &policy);
+                                agent_mcp::filter_tools(&name, &tools, &policy.tools);
                             for notice in filter_notices {
                                 state.blocks.push(Block::Notice(notice));
                             }
@@ -2046,6 +2074,36 @@ async fn event_loop(
                             state
                                 .blocks
                                 .push(Block::Error(format!("MCP \"{name}\": {error}")));
+                        }
+                        McpEvent::LoginUrl { name, url, opened } => {
+                            let lead = if opened {
+                                "browser opened. If nothing appears, open this URL"
+                            } else {
+                                "open this URL to authorize"
+                            };
+                            state
+                                .blocks
+                                .push(Block::Notice(format!("MCP \"{name}\": {lead}:\n{url}")));
+                        }
+                        McpEvent::LoggedIn { name } => {
+                            state.blocks.push(Block::Notice(format!(
+                                "MCP \"{name}\": authorized. Run /mcp {name} connect to use it."
+                            )));
+                        }
+                        McpEvent::LoggedOut { name } => {
+                            state.blocks.push(Block::Notice(format!(
+                                "MCP \"{name}\": stored authorization forgotten (reconnect to apply)."
+                            )));
+                        }
+                        McpEvent::LoginFailed { name, error } => {
+                            state
+                                .blocks
+                                .push(Block::Error(format!("MCP \"{name}\" login: {error}")));
+                        }
+                        McpEvent::Resources { name, summary } => {
+                            state
+                                .blocks
+                                .push(Block::Notice(format!("MCP \"{name}\": {summary}")));
                         }
                     }
                     state.mcp_servers = mcp_metas(&mcp);
@@ -2187,9 +2245,207 @@ fn handle_mcp(
                 }
             }
         }
+        // `initialize.instructions` is inspected here and reaches the model
+        // nowhere. A tool description travels inside the tool definitions, which
+        // no tool output ever taints, so server prose folded in there would be
+        // injection the taint defense is structurally unable to see.
+        "info" => {
+            let notice = match mcp.lock().ok().and_then(|reg| {
+                reg.get(server)
+                    .map(|srv| srv.instructions().map(str::to_string))
+            }) {
+                Some(Some(text)) => {
+                    format!("MCP \"{server}\" states (untrusted, server-authored):\n{text}")
+                }
+                Some(None) => format!("MCP \"{server}\": the server declared no instructions."),
+                None => format!("Unknown MCP server: {server}."),
+            };
+            state.blocks.push(Block::Notice(notice));
+        }
+        // Resources are inspected, never handed to the model: a server does not
+        // get to push content into a turn nobody asked for.
+        "resources" => {
+            let connected = mcp.lock().ok().is_some_and(|reg| {
+                matches!(
+                    reg.get(server),
+                    Some(agent_mcp::McpServer::Connected { .. })
+                )
+            });
+            if !connected {
+                state
+                    .blocks
+                    .push(Block::Notice(format!("MCP \"{server}\" is not connected.")));
+                return;
+            }
+            // The call handle is cloned out of the registry, so the lock is
+            // released before the listing is awaited.
+            let client = {
+                let Ok(reg) = mcp.lock() else { return };
+                match reg.get(server) {
+                    Some(agent_mcp::McpServer::Connected { conn, .. }) => conn.client(server),
+                    _ => return,
+                }
+            };
+            let tx = mcp_tx.clone();
+            let name = server.to_string();
+            tokio::spawn(async move {
+                let listed = client.list_resources().await;
+                let ev = match listed {
+                    Ok(resources) if resources.is_empty() => McpEvent::Resources {
+                        name,
+                        summary: "no resources advertised".to_string(),
+                    },
+                    Ok(resources) => {
+                        let shown = resources
+                            .iter()
+                            .take(20)
+                            .map(|resource| match &resource.description {
+                                Some(description) => {
+                                    format!("  {} - {}", resource.uri, description)
+                                }
+                                None => format!("  {}", resource.uri),
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let more = resources.len().saturating_sub(20);
+                        let summary = if more > 0 {
+                            format!("{} resources:\n{shown}\n  ... {more} more", resources.len())
+                        } else {
+                            format!("{} resources:\n{shown}", resources.len())
+                        };
+                        McpEvent::Resources { name, summary }
+                    }
+                    Err(err) => McpEvent::Resources {
+                        name,
+                        summary: err.to_string(),
+                    },
+                };
+                let _ = tx.send(ev).await;
+            });
+        }
+        // Per-server OAuth (MCP authorization). The browser round trip runs in the
+        // background: the TUI owns the terminal and must not block on it. Its
+        // result comes back through the same channel as a connection.
+        "login" => {
+            let Some(cfg) = mcp_config_for(mcp, server) else {
+                state
+                    .blocks
+                    .push(Block::Notice(format!("Unknown MCP server: {server}.")));
+                return;
+            };
+            let agent_mcp::McpTransport::Http { url, oauth, .. } = &cfg.transport else {
+                state.blocks.push(Block::Notice(format!(
+                    "MCP \"{server}\" is a stdio server: it has no OAuth endpoint to log in to."
+                )));
+                return;
+            };
+            let request = agent_auth::oauth::mcp::McpOAuthRequest {
+                server: server.to_string(),
+                url: url.clone(),
+                client_id: oauth.client_id.clone(),
+                scopes: oauth.scopes.clone(),
+                resource: oauth.resource.clone(),
+            };
+            state.blocks.push(Block::Notice(format!(
+                "MCP \"{server}\": opening the browser to authorize..."
+            )));
+            let tx = mcp_tx.clone();
+            let name = server.to_string();
+            tokio::spawn(async move {
+                let ev = run_mcp_login(&name, request, &tx).await;
+                let _ = tx.send(ev).await;
+            });
+        }
+        "logout" => {
+            let tx = mcp_tx.clone();
+            let name = server.to_string();
+            tokio::spawn(async move {
+                let outcome = tokio::task::spawn_blocking({
+                    let name = name.clone();
+                    move || agent_auth::oauth::mcp::delete(&name)
+                })
+                .await;
+                let ev = match outcome {
+                    Ok(Ok(())) => McpEvent::LoggedOut { name },
+                    Ok(Err(err)) => McpEvent::LoginFailed {
+                        name,
+                        error: format!("logout failed: {err}"),
+                    },
+                    Err(err) => McpEvent::LoginFailed {
+                        name,
+                        error: format!("logout task: {err}"),
+                    },
+                };
+                let _ = tx.send(ev).await;
+            });
+        }
         other => state
             .blocks
             .push(Block::Notice(format!("Unknown MCP action: {other}"))),
+    }
+}
+
+/// Runs one OAuth login to completion and reports it as an `McpEvent`.
+///
+/// The authorization URL is printed as a notice rather than by the auth crate:
+/// only the binary knows a TUI owns the terminal (FR-15, US-020).
+async fn run_mcp_login(
+    server: &str,
+    request: agent_auth::oauth::mcp::McpOAuthRequest,
+    tx: &mpsc::Sender<McpEvent>,
+) -> McpEvent {
+    let client = match reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            return McpEvent::LoginFailed {
+                name: server.to_string(),
+                error: format!("http client: {err}"),
+            };
+        }
+    };
+    let announce = tx.clone();
+    let name = server.to_string();
+    let outcome = agent_auth::oauth::mcp::login(
+        &client,
+        &request,
+        agent_auth::oauth::mcp::now_ms(),
+        move |url, opened| {
+            // `try_send` rather than an await: the callback is synchronous, and a
+            // full channel is not a reason to abort a login already in flight.
+            let _ = announce.try_send(McpEvent::LoginUrl {
+                name,
+                url: url.to_string(),
+                opened,
+            });
+        },
+    )
+    .await;
+    match outcome {
+        Ok(cred) => {
+            // The keyring is blocking: it must not run on the async runtime.
+            let stored =
+                tokio::task::spawn_blocking(move || agent_auth::oauth::mcp::save(&cred)).await;
+            match stored {
+                Ok(Ok(())) => McpEvent::LoggedIn {
+                    name: server.to_string(),
+                },
+                Ok(Err(err)) => McpEvent::LoginFailed {
+                    name: server.to_string(),
+                    error: format!("keyring: {err}"),
+                },
+                Err(err) => McpEvent::LoginFailed {
+                    name: server.to_string(),
+                    error: format!("keyring task: {err}"),
+                },
+            }
+        }
+        Err(err) => McpEvent::LoginFailed {
+            name: server.to_string(),
+            error: err.to_string(),
+        },
     }
 }
 
@@ -2236,10 +2492,12 @@ fn start_mcp_connect(
             let name = server.to_string();
             let harden = Arc::clone(command_hardener);
             tokio::spawn(async move {
-                let ev = match agent_mcp::McpConnection::connect_hardened(
+                let token = crate::mcp_oauth_token(&cfg_srv, &name).await;
+                let ev = match agent_mcp::McpConnection::connect_with(
                     &name,
                     &cfg_srv,
                     Some(&harden),
+                    token.as_deref(),
                 )
                 .await
                 {
@@ -2345,8 +2603,20 @@ fn mcp_sensitive_env_keys(cfg: &agent_mcp::McpServerConfig) -> Vec<&str> {
 }
 
 fn mcp_trust_notice(server: &str, cfg: &agent_mcp::McpServerConfig, lead: &str) -> String {
+    // The NAMES of the variables a connection would read are shown: they say
+    // which credentials of the machine would reach that server. No value is read.
+    let credentials = match cfg.transport.credential_env_names() {
+        names if names.is_empty() => "(none)".to_string(),
+        names => names.join(", "),
+    };
     let detail = match &cfg.transport {
-        agent_mcp::McpTransport::Stdio { command, args, env } => {
+        agent_mcp::McpTransport::Stdio {
+            command,
+            args,
+            env,
+            cwd,
+            ..
+        } => {
             let args = if args.is_empty() {
                 "(none)".to_string()
             } else {
@@ -2363,18 +2633,25 @@ fn mcp_trust_notice(server: &str, cfg: &agent_mcp::McpServerConfig, lead: &str) 
             } else {
                 sensitive.join(", ")
             };
+            let cwd = match cwd {
+                Some(cwd) => format!("\nWorking directory: {}", cwd.display()),
+                None => String::new(),
+            };
             format!(
-                "Command: {command}\nArgs: {args}\nEnv: {env_keys} (values masked)\nSensitive env: {sensitive}"
+                "Command: {command}\nArgs: {args}\nEnv: {env_keys} (values masked)\nSensitive env: {sensitive}\nForwarded from your environment: {credentials}{cwd}"
             )
         }
         agent_mcp::McpTransport::Http {
-            url,
-            bearer_token_env_var,
+            url, http_headers, ..
         } => {
-            // The NAME of the variable is shown so the user knows which credential
-            // this connection would hand over; its value is never read here.
-            let token = bearer_token_env_var.as_deref().unwrap_or("(none)");
-            format!("Endpoint: {url}\nBearer token from: {token}")
+            let headers = if http_headers.is_empty() {
+                "(none)".to_string()
+            } else {
+                http_headers.keys().cloned().collect::<Vec<_>>().join(", ")
+            };
+            format!(
+                "Endpoint: {url}\nCredentials read from your environment: {credentials}\nExtra headers: {headers}"
+            )
         }
     };
     let shadow = if cfg.shadows_lower_priority {
@@ -2406,6 +2683,10 @@ fn mcp_metas(mcp: &Arc<Mutex<agent_mcp::McpRegistry>>) -> Vec<McpServerMeta> {
             source: server.config().source.short_label().to_string(),
             needs_trust: mcp_requires_trust(server.config()),
             tool_count: server.tool_count(),
+            remote: matches!(
+                server.config().transport,
+                agent_mcp::McpTransport::Http { .. }
+            ),
         })
         .collect()
 }
@@ -2646,7 +2927,7 @@ mod tests {
     #[test]
     fn a_workspace_controlled_server_stays_behind_the_trust_gate() {
         use agent_mcp::{
-            McpConfigOrigin, McpConfigSource, McpServerConfig, McpToolPolicy, McpTransport,
+            McpConfigOrigin, McpConfigSource, McpServerConfig, McpServerPolicy, McpTransport,
         };
         use std::collections::BTreeMap;
 
@@ -2656,8 +2937,10 @@ mod tests {
                     command: "srv".into(),
                     args: Vec::new(),
                     env,
+                    env_vars: Vec::new(),
+                    cwd: None,
                 },
-                tools: McpToolPolicy::default(),
+                policy: McpServerPolicy::default(),
                 source: McpConfigSource::new(origin, ""),
                 shadows_lower_priority: shadows,
             }
@@ -2697,8 +2980,11 @@ mod tests {
             transport: McpTransport::Http {
                 url: "https://mcp.example.com/mcp".into(),
                 bearer_token_env_var: Some("EXAMPLE_TOKEN".into()),
+                http_headers: BTreeMap::new(),
+                env_http_headers: BTreeMap::new(),
+                oauth: Default::default(),
             },
-            tools: McpToolPolicy::default(),
+            policy: McpServerPolicy::default(),
             source: McpConfigSource::new(origin, ""),
             shadows_lower_priority: false,
         };
