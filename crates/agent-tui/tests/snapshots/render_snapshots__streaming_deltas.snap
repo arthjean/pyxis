@@ -23,6 +23,6 @@ expression: "harness::frame(\"streaming_deltas\", &s, W, H)"
 • Working (4s • esc to interrupt)
 
 ────────────────────────────────────────────────────────────────────────────────
-›
+› Ask Pyxis to do anything
 ────────────────────────────────────────────────────────────────────────────────
   gpt-5 · pyxis

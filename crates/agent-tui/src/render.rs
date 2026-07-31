@@ -28,6 +28,8 @@ use crate::tool;
 const INDENT: &str = "  ";
 /// Composer collapsed when the session stops: rule + line + rule.
 const SHUTDOWN_INPUT_HEIGHT: u16 = 3;
+/// Invitation shown in place of an empty draft (Codex `Ask Codex to do anything`).
+const COMPOSER_PLACEHOLDER: &str = "Ask Pyxis to do anything";
 /// Height cap of the composer, in text lines (US-010 AC2). Past it, the
 /// area scrolls to keep the cursor line visible.
 const COMPOSER_MAX_ROWS: u16 = 10;
@@ -1519,6 +1521,30 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         return;
     }
 
+    // Empty composer: the placeholder occupies the text row, the cursor stays
+    // on the gutter. It is NOT part of `state.input`, so nothing can submit it.
+    if state.input.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("› ", theme.fg().add_modifier(Modifier::BOLD)),
+                Span::styled(COMPOSER_PLACEHOLDER, theme.faint()),
+            ])),
+            Rect {
+                height: 1,
+                ..text_area
+            },
+        );
+        frame.set_cursor_position((
+            text_area
+                .x
+                .saturating_add(COMPOSER_GUTTER)
+                .min(text_area.right().saturating_sub(1)),
+            text_area.y,
+        ));
+        footer::render(frame, footer_area, &props, theme);
+        return;
+    }
+
     let text_width = composer_text_width(text_area.width);
     let layout = composer::layout(&state.input, state.cursor, text_width);
     let visible = text_area.height as usize;
@@ -2762,6 +2788,18 @@ mod tests {
             !out.contains("for commands"),
             "a typed `?` must not open the overlay:\n{out}"
         );
+    }
+
+    /// The placeholder is a rendering affordance only: it never becomes input.
+    #[test]
+    fn empty_composer_shows_the_placeholder_without_filling_the_draft() {
+        let s = AppState::new("gpt-5", true);
+        let out = draw(&s, 80, 12);
+        assert!(
+            out.contains("› Ask Pyxis to do anything"),
+            "placeholder missing:\n{out}"
+        );
+        assert!(s.input.is_empty());
     }
 
     /// Codex reserves the right half for the mode indicator, and only shows it

@@ -23,6 +23,6 @@ expression: "harness::frame(\"scrolled_transcript\", &s, W, H)"
 ● Réponse numéro 4, assez longue pour occuper la largeur du terminal.
                                                               ↓ 2 new items · ⇟
 ────────────────────────────────────────────────────────────────────────────────
-›
+› Ask Pyxis to do anything
 ────────────────────────────────────────────────────────────────────────────────
   gpt-5 · pyxis

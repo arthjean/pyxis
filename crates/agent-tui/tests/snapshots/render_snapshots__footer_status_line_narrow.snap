@@ -23,6 +23,6 @@ expression: "harness::frame(\"footer_status_line_narrow\", &s, NARROW, H)"
 
 
 ────────────────────────────────────────
-›
+› Ask Pyxis to do anything
 ────────────────────────────────────────
   gpt-5 high · pyxis

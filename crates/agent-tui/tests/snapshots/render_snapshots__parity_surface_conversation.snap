@@ -23,6 +23,6 @@ expression: "harness::chat_frame(\"parity_surface_conversation\", &s, &chat, W, 
 • La fin d'événement de stream et le retour de dispatch.
 
 ────────────────────────────────────────────────────────────────────────────────
-›
+› Ask Pyxis to do anything
 ────────────────────────────────────────────────────────────────────────────────
   gpt-5 · pyxis

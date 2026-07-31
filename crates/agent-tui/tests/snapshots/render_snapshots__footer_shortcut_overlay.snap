@@ -16,7 +16,7 @@ expression: "harness::frame(\"footer_shortcut_overlay\", &s, W, H)"
 
 
 ────────────────────────────────────────────────────────────────────────────────
-›
+› Ask Pyxis to do anything
 ────────────────────────────────────────────────────────────────────────────────
   / for commands                      @ for file paths
   ctrl + j for newline                enter to send

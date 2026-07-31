@@ -31,6 +31,6 @@ expression: "harness::frame(\"runtime_status_narrow\", &s, NARROW, 32)"
 
 
 ────────────────────────────────────────
-›
+› Ask Pyxis to do anything
 ────────────────────────────────────────
   gpt-5 · pyxis

@@ -23,6 +23,6 @@ expression: "harness::frame(\"turn_failure_cause\", &s, W, H)"
 • Working (0s • esc to interrupt)
 
 ────────────────────────────────────────────────────────────────────────────────
-›
+› Ask Pyxis to do anything
 ────────────────────────────────────────────────────────────────────────────────
   gpt-5 · pyxis
