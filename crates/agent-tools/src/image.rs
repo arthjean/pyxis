@@ -147,6 +147,34 @@ impl Tool for ViewImage {
     }
 }
 
+/// Validates a base64 payload a third party announced as an image (an MCP
+/// server's `image` content). Returns the media type and the decoded size.
+///
+/// The announced mime type is deliberately ignored: it is a claim by the party
+/// that also supplies the bytes. The rule of `view_image` applies unchanged, the
+/// magic bytes decide, so a provider is never handed something it was told is a
+/// PNG and is not.
+///
+/// `Err` carries a reason short enough to become a descriptor in the tool text.
+pub fn sniff_base64_image(data: &str, max_bytes: usize) -> Result<(&'static str, usize), String> {
+    // Rejected on the estimate first: an oversized payload never becomes an
+    // allocation. Base64 encodes 3 bytes per 4 chars.
+    let estimated = data.len() / 4 * 3;
+    if estimated > max_bytes {
+        return Err(format!("too large: ~{estimated} bytes > {max_bytes}"));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|_| "invalid base64".to_string())?;
+    if bytes.len() > max_bytes {
+        return Err(format!("too large: {} bytes > {max_bytes}", bytes.len()));
+    }
+    match sniff_media_type(&bytes) {
+        Some(media_type) => Ok((media_type, bytes.len())),
+        None => Err("not a PNG, JPEG, GIF or WebP".to_string()),
+    }
+}
+
 /// Media type decided by the file's magic bytes. `None` = not an image we know
 /// how to announce, so we refuse rather than let the provider guess.
 fn sniff_media_type(bytes: &[u8]) -> Option<&'static str> {
@@ -196,6 +224,35 @@ mod tests {
         assert_eq!(sniff_media_type(b"%PDF-1.7"), None);
         assert_eq!(sniff_media_type(b""), None);
         assert_eq!(sniff_media_type(b"RIFF____AVI "), None);
+    }
+
+    #[test]
+    fn a_third_party_payload_is_decided_by_its_bytes() {
+        let png = base64::engine::general_purpose::STANDARD.encode(png_bytes());
+        assert_eq!(
+            sniff_base64_image(&png, MAX_IMAGE_BYTES),
+            Ok(("image/png", png_bytes().len()))
+        );
+        // A PDF announced as an image is refused, whatever the server claims.
+        let pdf = base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.7 nope");
+        assert!(
+            sniff_base64_image(&pdf, MAX_IMAGE_BYTES)
+                .unwrap_err()
+                .contains("not a PNG")
+        );
+        assert!(
+            sniff_base64_image("!!not base64!!", MAX_IMAGE_BYTES)
+                .unwrap_err()
+                .contains("invalid base64")
+        );
+    }
+
+    #[test]
+    fn an_oversized_payload_is_refused_on_the_estimate() {
+        // 4 chars per 3 bytes: this never gets decoded.
+        let huge = "A".repeat(64);
+        let err = sniff_base64_image(&huge, 8).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
     }
 
     #[tokio::test]
