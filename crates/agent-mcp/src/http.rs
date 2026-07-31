@@ -13,6 +13,11 @@
 //! an SSE stream; `GET` opens the server-to-client stream; `DELETE` ends the
 //! session. The security decisions (https-only, token by env var name, untrusted
 //! results) live in `config.rs` and `tool.rs`, not here.
+//!
+//! One exception, and it belongs here because this is where the bytes arrive:
+//! **every body is read under the frame bound**. `reqwest` and `sse_stream` both
+//! decode with no ceiling of their own, which would leave the remote transport
+//! with the unbounded-allocation hole the stdio one was fixed for.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,6 +30,8 @@ use rmcp::transport::streamable_http_client::{
     SseError, StreamableHttpClient, StreamableHttpError, StreamableHttpPostResponse,
 };
 use sse_stream::{Sse, SseStream};
+
+use crate::frame::{FrameCounter, MAX_FRAME_BYTES};
 
 const EVENT_STREAM_MIME: &str = "text/event-stream";
 const JSON_MIME: &str = "application/json";
@@ -105,11 +112,11 @@ impl StreamableHttpClient for StreamableHttpAdapter {
         }
         match content_type.as_deref() {
             Some(ct) if ct.starts_with(EVENT_STREAM_MIME) => Ok(StreamableHttpPostResponse::Sse(
-                SseStream::from_bytes_stream(response.bytes_stream()).boxed(),
+                bounded_sse(response),
                 session_id,
             )),
             Some(ct) if ct.starts_with(JSON_MIME) => {
-                let message = response.json().await.map_err(StreamableHttpError::Client)?;
+                let message = bounded_json(response).await?;
                 Ok(StreamableHttpPostResponse::Json(message, session_id))
             }
             other => Err(StreamableHttpError::UnexpectedContentType(
@@ -178,11 +185,56 @@ impl StreamableHttpClient for StreamableHttpAdapter {
         }
         match content_type_of(&response) {
             Some(ct) if ct.starts_with(EVENT_STREAM_MIME) || ct.starts_with(JSON_MIME) => {
-                Ok(SseStream::from_bytes_stream(response.bytes_stream()).boxed())
+                Ok(bounded_sse(response))
             }
             other => Err(StreamableHttpError::UnexpectedContentType(other)),
         }
     }
+}
+
+/// Decodes an SSE body under the frame bound. An SSE event is newline-delimited
+/// exactly like a stdio frame, so the same counter applies: a server streaming a
+/// field line without end is cut off instead of being allowed to allocate.
+fn bounded_sse(response: reqwest::Response) -> BoxStream<'static, Result<Sse, SseError>> {
+    let mut counter = FrameCounter::default();
+    let bytes = response.bytes_stream().map(move |chunk| {
+        let chunk = chunk.map_err(std::io::Error::other)?;
+        counter.accept(&chunk, MAX_FRAME_BYTES)?;
+        Ok::<_, std::io::Error>(chunk)
+    });
+    SseStream::from_bytes_stream(bytes).boxed()
+}
+
+/// Reads a JSON body under the frame bound, refusing as soon as the cap is
+/// passed rather than after the whole answer has been allocated.
+async fn bounded_json<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+) -> HttpResult<T> {
+    let too_large = || {
+        StreamableHttpError::UnexpectedServerResponse(
+            format!("response body larger than {MAX_FRAME_BYTES} bytes").into(),
+        )
+    };
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_FRAME_BYTES as u64)
+    {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(StreamableHttpError::Client)?
+    {
+        if body.len().saturating_add(chunk.len()) > MAX_FRAME_BYTES {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|e| {
+        StreamableHttpError::UnexpectedServerResponse(format!("malformed JSON body: {e}").into())
+    })
 }
 
 fn apply_custom_headers(
