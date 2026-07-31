@@ -24,6 +24,7 @@ serde_json.workspace = true
 pulldown-cmark.workspace = true
 unicode-width.workspace = true
 unicode-segmentation.workspace = true
+textwrap.workspace = true
 similar.workspace = true
 syntect.workspace = true
 two-face.workspace = true

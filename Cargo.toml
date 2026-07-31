@@ -66,12 +66,22 @@ walkdir = "2"
 # terminal frontend (US-019) + sandbox (US-020). `unstable-rendered-line-info`:
 # exposes `Paragraph::line_count` to bound the scroll to the number of lines AFTER
 # wrapping (otherwise it is impossible to scroll all the way up when lines wrap).
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+ratatui = { version = "0.29", features = [
+    "unstable-rendered-line-info",
+    # `scrolling-regions`: the parity renderer owns an inline viewport and writes
+    # finalized history above it. Without DECSTBM the insertion would have to
+    # repaint the whole screen on every committed line.
+    "scrolling-regions",
+] }
 crossterm = { version = "0.28", features = ["bracketed-paste"] }
 # markdown rendering of the replies (CommonMark + GFM) -> ratatui spans.
 pulldown-cmark = { version = "0.12", default-features = false }
 unicode-width = "0.2"
 unicode-segmentation = "1"
+# `wrap_optimal_fit`: paragraph-level line breaking (Knuth-Plass). A greedy wrap
+# leaves a ragged right edge and the occasional one-word last line; the optimal
+# fit balances the whole paragraph, which is what the transcript is made of.
+textwrap = { version = "0.16", default-features = false, features = ["smawk", "unicode-width"] }
 # inline diff of the edits (EP-011): lines + intra-line emphasis (word-diff). The
 # `inline` feature exposes `iter_inline_changes`; `unicode` aligns the word
 # segmentation on graphemes.
