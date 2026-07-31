@@ -1098,12 +1098,61 @@ struct McpStartup {
     tools: Vec<Box<dyn DynTool>>,
     notices: Vec<String>,
     names: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// Servers the user marked `required` that did not come up. A non-empty list
+    /// aborts the session rather than starting one silently short of a tool the
+    /// user declared indispensable.
+    required_failures: Vec<String>,
 }
 
-/// Per-server bound of the startup connection (spawn + handshake + `tools/list`).
-/// Every server is dialed concurrently, so this is also the ceiling this step adds
-/// to the total launch time (US-012 AC3).
-const MCP_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Bound of the keyring-side HTTP client used to refresh an MCP credential.
+const MCP_OAUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Resolves the stored OAuth credential of a remote MCP server, refreshing it
+/// when it is about to expire. `None` = connect anonymously and let the server
+/// decide, which is right for a server that accepts it and produces an
+/// actionable `401` for one that does not.
+///
+/// This is the caller's job rather than `agent-mcp`'s. Reading the OS secret
+/// store is an authentication concern, and folding it into the transport would
+/// make a broken keyring indistinguishable from a broken connection, on top of
+/// pulling the whole auth crate into the protocol one.
+pub(crate) async fn mcp_oauth_token(
+    cfg: &agent_mcp::McpServerConfig,
+    name: &str,
+) -> Option<String> {
+    // A stdio server has no authorization server, and an explicit
+    // `bearerTokenEnvVar` is the auditable path the transport resolves itself.
+    if !matches!(
+        &cfg.transport,
+        agent_mcp::McpTransport::Http {
+            bearer_token_env_var: None,
+            ..
+        }
+    ) {
+        return None;
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(MCP_OAUTH_TIMEOUT)
+        .build()
+        .ok()?;
+    match agent_auth::oauth::mcp::access_token(&client, name, agent_auth::oauth::mcp::now_ms())
+        .await
+    {
+        Ok(token) => token,
+        Err(err) => {
+            // Not fatal: a stale or unreadable credential must not make an
+            // anonymous-capable server unreachable. It is traced rather than
+            // swallowed, so the cause is recoverable from the log.
+            tracing::debug!(
+                target: "pyxis::mcp",
+                server = %name,
+                error = %err,
+                "stored MCP credential unusable, connecting anonymously"
+            );
+            None
+        }
+    }
+}
 
 /// Connects the configured MCP servers and wraps their tools as `DynTool`
 /// (US-012). Returns the tools to register and the notices the session must show.
@@ -1128,6 +1177,15 @@ async fn connect_mcp_at_startup(
                     notices.push(format!(
                         "MCP \"{name}\" not connected: explicit trust required (/mcp {name} trust)."
                     ));
+                    // `required` cannot be honored on a server that is not dialed
+                    // here: it would make the session unstartable behind its own
+                    // trust gate, which is exactly how a workspace file would turn
+                    // a refused spawn into a refused session.
+                    if server.config().policy.required {
+                        notices.push(format!(
+                            "MCP \"{name}\": required ignored, this server is only dialed after an explicit trust."
+                        ));
+                    }
                 } else {
                     candidates.push(name.clone());
                 }
@@ -1164,13 +1222,26 @@ async fn connect_mcp_at_startup(
             tokio::spawn(async move { old.cancel().await });
         }
         let harden = Arc::clone(harden);
-        // The policy travels with the task: the registry lock is not held while
+        // The config travels with the task: the registry lock is not held while
         // the connection is in flight.
-        let policy = cfg.tools.clone();
+        let task_cfg = cfg.clone();
+        // No outer bound here on purpose. `startupTimeoutMs` is ONE deadline taken
+        // inside the connection, covering spawn, handshake, retries and
+        // `tools/list` together; wrapping a second bound around it would cut the
+        // remote retry policy off mid-attempt and make the declared value mean
+        // something different depending on the transport. Every server is dialed
+        // concurrently, so the slowest one is still the ceiling this step adds to
+        // the launch, not the sum (US-012 AC3).
         pending.spawn(async move {
+            let token = mcp_oauth_token(&cfg, &name).await;
             let attempt = async {
-                let conn =
-                    agent_mcp::McpConnection::connect_hardened(&name, &cfg, Some(&harden)).await?;
+                let conn = agent_mcp::McpConnection::connect_with(
+                    &name,
+                    &cfg,
+                    Some(&harden),
+                    token.as_deref(),
+                )
+                .await?;
                 match conn.list_tools(&name).await {
                     Ok(tools) => Ok((conn, tools)),
                     Err(err) => {
@@ -1179,19 +1250,9 @@ async fn connect_mcp_at_startup(
                     }
                 }
             };
-            // On expiry the future is dropped: the transport `Drop` kills the
-            // subprocess (or the HTTP session), so a slow server leaves nothing behind.
-            match tokio::time::timeout(MCP_STARTUP_TIMEOUT, attempt).await {
-                Ok(Ok(connected)) => (name, policy, Ok(connected)),
-                Ok(Err(err)) => (name, policy, Err(err.to_string())),
-                Err(_) => (
-                    name,
-                    policy,
-                    Err(format!(
-                        "connection timeout after {}s",
-                        MCP_STARTUP_TIMEOUT.as_secs()
-                    )),
-                ),
+            match attempt.await {
+                Ok(connected) => (name, task_cfg, Ok(connected)),
+                Err(err) => (name, task_cfg, Err(err.to_string())),
             }
         });
     }
@@ -1201,7 +1262,7 @@ async fn connect_mcp_at_startup(
     // the whole set (US-011 AC1).
     let mut taken = std::collections::BTreeSet::new();
     while let Some(joined) = pending.join_next().await {
-        let (name, policy, outcome) = match joined {
+        let (name, cfg, outcome) = match joined {
             Ok(triple) => triple,
             Err(err) => {
                 notices.push(format!("MCP: connection task failed: {err}"));
@@ -1214,19 +1275,27 @@ async fn connect_mcp_at_startup(
                 if let Ok(mut reg) = mcp.lock() {
                     reg.fail(&name, err.clone());
                 }
-                notices.push(format!(
-                    "MCP \"{name}\" unavailable: {err} (its tools are absent)."
-                ));
+                // `required`: the user stated the session is not worth starting
+                // without this server, so the failure is fatal instead of a notice.
+                if cfg.policy.required {
+                    startup
+                        .required_failures
+                        .push(format!("MCP \"{name}\" (required): {err}"));
+                } else {
+                    notices.push(format!(
+                        "MCP \"{name}\" unavailable: {err} (its tools are absent)."
+                    ));
+                }
                 continue;
             }
         };
         let client = conn.client(&name);
         // US-014: the policy shapes the exposed surface BEFORE anything reaches the
         // registry, and the filtered list is what `/mcp` shows.
-        let (listed, filter_notices) = agent_mcp::filter_tools(&name, &listed, &policy);
+        let (listed, filter_notices) = agent_mcp::filter_tools(&name, &listed, &cfg.policy.tools);
         notices.extend(filter_notices);
         let (mut exposed, skipped) =
-            agent_mcp::dyn_tools(&name, &listed, &policy, &client, &mut taken);
+            agent_mcp::dyn_tools(&name, &listed, &cfg.policy, &client, &mut taken);
         for skip in skipped {
             notices.push(skip.summary());
         }
@@ -1519,6 +1588,14 @@ async fn run(
     } else {
         connect_mcp_at_startup(&mcp, &mcp_harden).await
     };
+    // A server the user marked `required` did not come up: refuse to start rather
+    // than open a session that silently lacks a tool declared indispensable.
+    if !mcp_startup.required_failures.is_empty() {
+        anyhow::bail!(
+            "required MCP server(s) failed to start:\n  {}",
+            mcp_startup.required_failures.join("\n  ")
+        );
+    }
 
     // US-017: hooks come from the GLOBAL configuration alone (`settings.rs` drops
     // the key from a workspace file). Without a declaration the registry keeps
