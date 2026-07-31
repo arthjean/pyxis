@@ -6,7 +6,26 @@
 //!
 //! Extracted from `render.rs` to centralize the colors and keep the rendering pure.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use ratatui::style::{Color, Modifier, Style};
+
+/// Colour depth of the terminal this process is attached to.
+///
+/// A history cell renders from `display_lines(width)` alone, with no route back
+/// to application state, so the one property it needs about the terminal lives
+/// where the terminal itself does: in the process. Set once at startup by the
+/// app loop; the default suits the snapshot tests, which assert on full colour.
+static TRUECOLOR: AtomicBool = AtomicBool::new(true);
+
+/// Records what the terminal supports. Call once, before the first render.
+pub fn set_truecolor(enabled: bool) {
+    TRUECOLOR.store(enabled, Ordering::Relaxed);
+}
+
+pub fn truecolor_enabled() -> bool {
+    TRUECOLOR.load(Ordering::Relaxed)
+}
 
 /// Palette: graphite + one sky-blue accent + functional tones (error, diff,
 /// success). `truecolor` drives the degradation.
@@ -17,6 +36,11 @@ pub struct Theme {
 impl Theme {
     pub fn new(truecolor: bool) -> Self {
         Self { truecolor }
+    }
+
+    /// Palette matching the terminal this process is attached to.
+    pub fn current() -> Self {
+        Self::new(truecolor_enabled())
     }
 
     /// Does the terminal support 24-bit color? (consumed by the logo rendering, which

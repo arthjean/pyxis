@@ -19,6 +19,7 @@ use crate::cache::fingerprint;
 use crate::composer;
 use crate::footer::{self, FooterProps, StatusSegment};
 use crate::measure;
+use crate::history_cell::ActivityHeader;
 use crate::state::{
     AppState, Block, COMMANDS, DEFAULT_PERMISSION_MODE_ID, MenuItem, PermissionPrompt, Status,
 };
@@ -1540,7 +1541,13 @@ fn strip_md(line: &str) -> String {
         .to_string()
 }
 
-fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+fn render_input(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    activity: Option<ActivityHeader>,
+) {
     let props = footer_props(state);
     // Codex frames the composer with blank rows; Pyxis keeps its two full-width
     // rules instead, so the input reads as a bounded field and the status line
@@ -1569,7 +1576,7 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     };
 
     if let Some(progress_area) = progress_area {
-        render_progress_line(frame, progress_area, state, theme);
+        render_progress_line(frame, progress_area, state, theme, activity);
     }
 
     // Rules only when a text line survives between them; on a crushed terminal
@@ -1785,16 +1792,26 @@ fn input_spans(
     spans
 }
 
-fn render_progress_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+fn render_progress_line(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    activity: Option<ActivityHeader>,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
 
-    let line = clip(progress_spans(state, theme), area.width as usize);
+    let line = clip(progress_spans(state, theme, activity), area.width as usize);
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn progress_spans(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
+fn progress_spans(
+    state: &AppState,
+    theme: &Theme,
+    activity: Option<ActivityHeader>,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     if !state.reduced_motion {
         spans.extend(crate::spinner::shimmer_text(
@@ -1805,8 +1822,12 @@ fn progress_spans(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
         ));
         spans.push(Span::raw(" "));
     }
+    // Naming the current activity turns a generic "Working" into something the
+    // reader can act on: whether the turn is thinking, running a command or
+    // writing its answer.
+    let header = activity.map(ActivityHeader::label).unwrap_or("Working");
     spans.extend(crate::spinner::shimmer_text(
-        "Working",
+        header,
         state.spinner_tick,
         state.reduced_motion,
         theme,

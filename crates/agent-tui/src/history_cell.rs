@@ -510,11 +510,71 @@ fn style_user_message_lines(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Memoizes the rendered form of a finalized markdown cell.
+///
+/// Rendering an answer means parsing markdown and running the syntax
+/// highlighter. Nothing about a finalized cell changes between frames, but the
+/// commit tick redraws at up to 20 fps for as long as a turn runs, so without
+/// this the whole in-flight message is reparsed on every frame.
+///
+/// Keyed on width and colour depth, the two inputs that change what the render
+/// produces. Only the latest entry is kept: a resize invalidates it anyway.
+#[derive(Debug, Default)]
+struct MarkdownRenderCache {
+    cached: std::sync::Mutex<Option<(u16, bool, Vec<Line<'static>>)>>,
+}
+
+impl MarkdownRenderCache {
+    fn render(
+        &self,
+        width: u16,
+        render: impl FnOnce() -> Vec<Line<'static>>,
+    ) -> Vec<Line<'static>> {
+        let truecolor = crate::theme::truecolor_enabled();
+        let mut cached = self
+            .cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((cached_width, cached_truecolor, lines)) = cached.as_ref()
+            && *cached_width == width
+            && *cached_truecolor == truecolor
+        {
+            return lines.clone();
+        }
+        let lines = render();
+        *cached = Some((width, truecolor, lines.clone()));
+        lines
+    }
+
+    fn clear(&self) {
+        if let Ok(mut cached) = self.cached.lock() {
+            *cached = None;
+        }
+    }
+}
+
+impl Clone for MarkdownRenderCache {
+    /// A clone starts cold rather than carrying a lock across copies.
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+/// Two cells are equal when their content is, whatever either has memoized.
+impl PartialEq for MarkdownRenderCache {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for MarkdownRenderCache {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentMarkdownCell {
     pub markdown: String,
     pub streaming: bool,
     controller: StreamController,
+    stable_cache: MarkdownRenderCache,
 }
 
 impl AgentMarkdownCell {
@@ -751,7 +811,7 @@ fn reasoning_summary_lines(text: &str, width: u16) -> Vec<Line<'static>> {
         ))];
     }
 
-    let theme = Theme::new(true);
+    let theme = Theme::current();
     let content_width = safe_width_usize(width).saturating_sub(2).max(1);
     crate::markdown::render_markdown(text, &theme, content_width)
         .into_iter()
@@ -2805,7 +2865,7 @@ impl PatchSummaryCell {
 
 impl HistoryCell for PatchSummaryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let theme = Theme::new(true);
+        let theme = Theme::current();
         let mut lines = vec![self.header_line()];
         let skip_single_header = self.changes.len() == 1;
 
@@ -3079,7 +3139,7 @@ impl FileChangeCell {
 
 impl HistoryCell for FileChangeCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let theme = Theme::new(true);
+        let theme = Theme::current();
         let mut lines = vec![Line::from(vec![
             Span::styled("  ", theme.faint()),
             Span::styled(
@@ -3211,13 +3271,59 @@ impl ActiveHistoryCell {
     }
 }
 
+/// What the status row announces while a turn runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityHeader {
+    Thinking,
+    Exploring,
+    Running,
+    UsingTool,
+    Responding,
+    Working,
+}
+
+impl ActivityHeader {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Thinking => "Thinking",
+            Self::Exploring => "Exploring",
+            Self::Running => "Running",
+            Self::UsingTool => "Using tool",
+            Self::Responding => "Responding",
+            Self::Working => "Working",
+        }
+    }
+}
+
+/// One unit of history waiting to be written to the terminal scrollback.
+///
+/// Finalized cells and paced stream lines share the same queue so they reach the
+/// terminal in the order they were produced. `leading_blank` carries the blank
+/// row that separates two blocks; stream lines of one message only carry it on
+/// the first line, so a streamed answer does not grow blank rows as it commits.
+#[derive(Debug, Clone, PartialEq)]
+struct PendingInsert {
+    payload: PendingInsertPayload,
+    leading_blank: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum PendingInsertPayload {
+    Cell(HistoryCellKind),
+    Lines(Vec<Line<'static>>),
+}
+
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct ChatSurface {
     transcript_cells: Vec<HistoryCellKind>,
     active_cell: Option<ActiveHistoryCell>,
     active_tools: Vec<ActiveHistoryCell>,
-    pending_insert_cells: Vec<HistoryCellKind>,
-    pending_insert_needs_leading_separator: bool,
+    pending_inserts: Vec<PendingInsert>,
+    /// Blocks already queued or written. Drives the blank row between blocks.
+    history_blocks: usize,
+    /// Whether the last queued block is a stream still emitting lines.
+    stream_open: bool,
+    chunking: ChunkingPolicy,
 }
 
 impl ChatSurface {

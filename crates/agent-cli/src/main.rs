@@ -1825,7 +1825,13 @@ async fn run(
                 model: args.model,
                 reasoning_effort: initial_reasoning_effort,
                 goal,
-                truecolor: agent_tui::supports_truecolor(),
+                truecolor: {
+                    // History cells render without access to this state, so the
+                    // terminal's colour depth is also recorded process-wide.
+                    let truecolor = agent_tui::supports_truecolor();
+                    agent_tui::theme::set_truecolor(truecolor);
+                    truecolor
+                },
                 // Reduced motion: spinner degraded to a pulsing dot (US-044).
                 reduced_motion: std::env::var_os("NO_COLOR").is_some()
                     || std::env::var_os("PYXIS_REDUCED_MOTION").is_some(),
