@@ -49,8 +49,15 @@ impl std::fmt::Debug for Secret {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Credential {
-    ApiKey { provider: ProviderId, key: Secret },
+    ApiKey {
+        provider: ProviderId,
+        key: Secret,
+    },
     Oauth(OAuthCredential),
+    /// Per-server MCP authorization (MCP spec 2025-06-18). Kept apart from
+    /// `Oauth` because it belongs to a named server rather than to a provider,
+    /// and it carries what a refresh needs without redoing discovery.
+    McpOauth(oauth::mcp::McpOAuthCredential),
 }
 
 /// OAuth credential (sliding refresh). `account_id` carries the `chatgpt_account_id`
