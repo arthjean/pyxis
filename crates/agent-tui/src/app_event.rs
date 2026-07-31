@@ -222,6 +222,8 @@ pub enum TranscriptPayload {
         is_error: bool,
         stream: TranscriptExecStream,
         untrusted: bool,
+        /// Wall-clock time reported by the runtime, when it measured one.
+        duration_ms: Option<u64>,
     },
     ToolCall {
         name: String,
@@ -514,6 +516,7 @@ impl TranscriptMapper {
                                 is_error: view.is_error,
                                 stream: TranscriptExecStream::Combined,
                                 untrusted: view.untrusted,
+                                duration_ms: view.duration_ms,
                             },
                         ),
                     ));
@@ -1078,6 +1081,7 @@ mod tests {
                 is_error: false,
                 stream: TranscriptExecStream::Combined,
                 untrusted: true,
+                duration_ms: None,
             }
         );
     }
@@ -1114,6 +1118,7 @@ mod tests {
                 is_error: false,
                 stream: TranscriptExecStream::Combined,
                 untrusted: true,
+                duration_ms: None,
             }
         );
         assert_eq!(

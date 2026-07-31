@@ -847,11 +847,18 @@ pub struct ExecCell {
 struct ExecCall {
     id: Option<TranscriptItemId>,
     command: String,
+    /// What the command line does, for the `Explored` summary. Empty when the
+    /// command could not be classified.
+    parsed: Vec<ParsedCommand>,
     source: TranscriptExecSource,
     status: TranscriptItemStatus,
     output: String,
     is_error: bool,
     stream: TranscriptExecStream,
+    /// Wall-clock time reported by the runtime, once the call has ended.
+    duration: Option<Duration>,
+    /// Process exit code, when the output carried one.
+    exit_code: Option<i32>,
 }
 
 impl ExecCell {
@@ -894,9 +901,11 @@ impl ExecCell {
                 content,
                 is_error,
                 stream,
+                duration_ms,
                 ..
             } => {
                 if let Some(existing) = self.call_mut(item.id.as_ref()) {
+                    existing.duration = duration_ms.map(Duration::from_millis);
                     existing.append_output(content, *is_error, *stream, item.status);
                 } else {
                     let mut orphan = ExecCall::new(
@@ -931,12 +940,27 @@ impl ExecCell {
         self.can_group_with(&call)
     }
 
-    fn can_group_with(&self, _call: &ExecCall) -> bool {
-        false
+    /// Consecutive read-only calls collapse into one `Explored` block.
+    ///
+    /// A turn spends most of its commands looking around. Printing each `cat`
+    /// and `rg` as its own block buries the one command that changed something.
+    /// Anything that is not provably read-only keeps its own cell.
+    fn can_group_with(&self, call: &ExecCall) -> bool {
+        self.is_exploring() && call.is_exploring()
     }
 
+    fn is_exploring(&self) -> bool {
+        !self.calls.is_empty() && self.calls.iter().all(ExecCall::is_exploring)
+    }
+
+    fn is_active(&self) -> bool {
+        self.calls.iter().any(ExecCall::is_running)
+    }
+
+    /// An exploring cell waits for the next command before finalizing: the group
+    /// is only complete once something that is not a read shows up.
     fn should_defer_finalization(&self) -> bool {
-        false
+        self.is_exploring() && !self.is_active()
     }
 
     fn call_mut(&mut self, id: Option<&TranscriptItemId>) -> Option<&mut ExecCall> {
@@ -957,10 +981,100 @@ impl ExecCell {
         }
         out
     }
+
+    /// Renders a run of read-only calls as one block naming what was looked at,
+    /// rather than one block per command line.
+    fn exploring_display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let title = if self.is_active() {
+            "Exploring"
+        } else {
+            "Explored"
+        };
+        let bullet_style = if self.calls.iter().any(ExecCall::failed) {
+            fault_style().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        let mut header = vec![Line::from(vec![
+            Span::styled("• ", bullet_style),
+            Span::styled(title, Style::default().add_modifier(Modifier::BOLD)),
+        ])];
+
+        let mut entries: Vec<Line<'static>> = Vec::new();
+        // Successive reads merge into one row: "Read a.rs, b.rs" says the same
+        // thing as three rows, in a third of the height.
+        let mut read_names: Vec<String> = Vec::new();
+        let flush_reads = |names: &mut Vec<String>, out: &mut Vec<Line<'static>>| {
+            if names.is_empty() {
+                return;
+            }
+            let mut spans = vec![Span::styled("Read ", accent_style())];
+            for (idx, name) in names.drain(..).enumerate() {
+                if idx > 0 {
+                    spans.push(Span::styled(", ", Style::default().add_modifier(Modifier::DIM)));
+                }
+                spans.push(Span::raw(name));
+            }
+            out.push(Line::from(spans));
+        };
+
+        for parsed in self.calls.iter().flat_map(|call| call.parsed.iter()) {
+            match parsed {
+                ParsedCommand::Read { name, .. } => {
+                    if !read_names.iter().any(|existing| existing == name) {
+                        read_names.push(name.clone());
+                    }
+                }
+                ParsedCommand::ListFiles { cmd, path } => {
+                    flush_reads(&mut read_names, &mut entries);
+                    entries.push(Line::from(vec![
+                        Span::styled("List ", accent_style()),
+                        Span::raw(path.clone().unwrap_or_else(|| cmd.clone())),
+                    ]));
+                }
+                ParsedCommand::Search { cmd, query, path } => {
+                    flush_reads(&mut read_names, &mut entries);
+                    let mut spans = vec![Span::styled("Search ", accent_style())];
+                    match (query, path) {
+                        (Some(query), Some(path)) => {
+                            spans.push(Span::raw(query.clone()));
+                            spans.push(Span::styled(
+                                " in ",
+                                Style::default().add_modifier(Modifier::DIM),
+                            ));
+                            spans.push(Span::raw(path.clone()));
+                        }
+                        (Some(query), None) => spans.push(Span::raw(query.clone())),
+                        _ => spans.push(Span::raw(cmd.clone())),
+                    }
+                    entries.push(Line::from(spans));
+                }
+                ParsedCommand::Unknown { cmd } => {
+                    flush_reads(&mut read_names, &mut entries);
+                    entries.push(Line::from(vec![
+                        Span::styled("Run ", accent_style()),
+                        Span::raw(cmd.clone()),
+                    ]));
+                }
+            }
+        }
+        flush_reads(&mut read_names, &mut entries);
+
+        header.extend(render_prefixed(
+            &entries,
+            Span::styled("  └ ", exec_output_chrome_style()),
+            Span::styled("    ", exec_output_chrome_style()),
+            width,
+        ));
+        header
+    }
 }
 
 impl HistoryCell for ExecCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        if self.is_exploring() {
+            return self.exploring_display_lines(width);
+        }
         self.command_display_lines(width)
     }
 
@@ -990,14 +1104,23 @@ impl ExecCall {
         status: TranscriptItemStatus,
     ) -> Self {
         let command = clean_exec_command(command);
+        // A command the user typed is theirs to read as typed; only agent
+        // commands are summarized.
+        let parsed = match source {
+            TranscriptExecSource::User => Vec::new(),
+            TranscriptExecSource::Agent => crate::parse_command::parse_command(&command),
+        };
         Self {
             id,
             command,
+            parsed,
             source,
             status,
             output: String::new(),
             is_error: false,
             stream: TranscriptExecStream::Combined,
+            duration: None,
+            exit_code: None,
         }
     }
 
@@ -1012,6 +1135,17 @@ impl ExecCall {
         self.is_error || self.status == TranscriptItemStatus::Failed
     }
 
+    /// Whether the call belongs in a collapsed `Explored` group.
+    ///
+    /// A failed call never does: the group shows what was looked at, not what
+    /// came back, so folding a failure into it would hide the error message.
+    fn is_exploring(&self) -> bool {
+        self.source == TranscriptExecSource::Agent
+            && !self.failed()
+            && !self.parsed.is_empty()
+            && self.parsed.iter().all(ParsedCommand::is_read_only)
+    }
+
     fn append_output(
         &mut self,
         content: &str,
@@ -1022,6 +1156,7 @@ impl ExecCall {
         self.is_error = self.is_error || is_error;
         self.stream = stream;
         self.status = status;
+        self.exit_code = self.exit_code.or_else(|| parse_exit_code(content));
         let clean = bounded_exec_text(content);
         if clean.is_empty() {
             return;
@@ -1040,9 +1175,11 @@ impl ExecCall {
             _ => "Ran",
         };
         let bullet_style = if self.is_error || self.status == TranscriptItemStatus::Failed {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else {
+            fault_style().add_modifier(Modifier::BOLD)
+        } else if self.is_running() {
             Style::default().add_modifier(Modifier::DIM)
+        } else {
+            accent_style().add_modifier(Modifier::BOLD)
         };
         let command_lines = command_logical_lines(title, &self.command);
         let mut out = render_prefixed(
@@ -1052,7 +1189,43 @@ impl ExecCall {
             width,
         );
         out.extend(self.output_display_lines(width));
+        out.extend(self.outcome_line());
         out
+    }
+
+    /// Closing row of a finished call: how it ended and how long it took.
+    ///
+    /// Without it a failed command is indistinguishable from a successful one
+    /// whose output happened to be empty.
+    fn outcome_line(&self) -> Option<Line<'static>> {
+        if self.is_running() {
+            return None;
+        }
+        let mut spans = if self.failed() {
+            let mut spans = vec![Span::styled(
+                "  ✗",
+                fault_style().add_modifier(Modifier::BOLD),
+            )];
+            if let Some(code) = self.exit_code {
+                spans.push(Span::styled(
+                    format!(" ({code})"),
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
+            spans
+        } else {
+            vec![Span::styled(
+                "  ✓",
+                accent_style().add_modifier(Modifier::BOLD),
+            )]
+        };
+        if let Some(duration) = self.duration {
+            spans.push(Span::styled(
+                format!(" • {}", crate::spinner::fmt_duration(duration)),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        Some(Line::from(spans))
     }
 
     fn output_display_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -3597,6 +3770,9 @@ pub fn cells_from_messages(messages: &[Message]) -> Vec<HistoryCellKind> {
                                     is_error: *is_error,
                                     stream: TranscriptExecStream::Combined,
                                     untrusted: true,
+                                    // Replayed history carries no timing: the
+                                    // durations were never persisted.
+                                    duration_ms: None,
                                 },
                             );
                             cell.apply_item(&item);
@@ -4248,6 +4424,13 @@ fn first_non_empty_line(content: &str) -> String {
     measure::truncate(line.trim(), MAX_TOOL_DETAIL_WIDTH)
 }
 
+/// Reads the `[exit code N]` marker the shell tool appends on a non-zero exit.
+fn parse_exit_code(content: &str) -> Option<i32> {
+    let start = content.rfind("[exit code ")? + "[exit code ".len();
+    let end = content[start..].find(']')? + start;
+    content[start..end].trim().parse().ok()
+}
+
 fn clean_exec_command(command: &str) -> String {
     let clean = bounded_exec_text(command);
     let lines = clean
@@ -4277,7 +4460,24 @@ fn command_logical_lines(title: &str, command: &str) -> Vec<Line<'static>> {
     lines
 }
 
+/// Colors a command line, preferring the real shell grammar.
+///
+/// The token heuristic below cannot tell a quoted string from a path, which is
+/// exactly what makes a long `bash -lc "…"` hard to scan. Syntect knows; it only
+/// declines outside truecolor, where the heuristic still separates the program
+/// from its flags.
 fn command_spans(command: &str) -> Vec<Span<'static>> {
+    let theme = Theme::current();
+    if let Some(mut lines) = crate::highlight::code_block(command, "bash", &theme)
+        && let Some(first) = lines.drain(..).next()
+        && !first.is_empty()
+    {
+        return first;
+    }
+    command_token_spans(command)
+}
+
+fn command_token_spans(command: &str) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut first_token = true;
     for token in command.split_inclusive(char::is_whitespace) {
@@ -5107,6 +5307,7 @@ mod tests {
                 is_error: false,
                 stream: TranscriptExecStream::Combined,
                 untrusted: true,
+                duration_ms: None,
             },
         ));
 
@@ -5636,7 +5837,7 @@ mod tests {
         surface.apply_update(exec_command_update(
             TranscriptLifecycle::Started,
             Some(id.clone()),
-            "cat huge.log",
+            "make build",
             TranscriptItemStatus::Running,
         ));
         surface.apply_update(exec_output_update(
@@ -5650,8 +5851,9 @@ mod tests {
         let lines = surface.display_lines(24);
         let text = flatten(&lines).join("\n");
 
+        // Header, capped output, then the outcome row.
         assert!(
-            lines.len() <= TOOL_CALL_MAX_LINES + 1,
+            lines.len() <= TOOL_CALL_MAX_LINES + 2,
             "wrapped output should stay capped: {text}"
         );
         assert!(text.contains("ctrl + t to view transcript"));
@@ -5664,7 +5866,7 @@ mod tests {
         surface.apply_update(exec_command_update(
             TranscriptLifecycle::Started,
             Some(id.clone()),
-            "cat huge.log",
+            "make build",
             TranscriptItemStatus::Running,
         ));
         for chunk in 0..4 {
@@ -5723,9 +5925,9 @@ mod tests {
         ));
 
         let text = flatten(&surface.display_lines(100)).join("\n");
-        let search = text.find("Ran rg shimmer").expect("search cell");
+        let search = text.find("Search shimmer").expect("search cell");
         let ran = text.find("Ran echo after").expect("run cell");
-        assert!(search < ran);
+        assert!(search < ran, "{text}");
     }
 
     #[test]
@@ -5754,11 +5956,14 @@ mod tests {
         assert!(!text.contains("Explored"));
     }
 
+    /// A turn spends most of its commands looking around. Those collapse into a
+    /// single block naming the files and queries, instead of one block per
+    /// command line burying the command that actually did something.
     #[test]
-    fn exploratory_exec_commands_render_as_individual_runs() {
+    fn read_only_exec_commands_collapse_into_one_explored_block() {
         let mut surface = ChatSurface::new();
         for (id, command) in [
-            ("call-1", "rg shimmer_spans"),
+            ("call-1", "rg shimmer_spans crates"),
             ("call-2", "cat shimmer.rs"),
             ("call-3", "cat status_indicator_widget.rs"),
         ] {
@@ -5778,14 +5983,16 @@ mod tests {
             ));
         }
 
-        assert_eq!(surface.transcript_cells().len(), 3);
-        let active = flatten(&surface.active_display_lines(100)).join("\n");
-        assert!(active.is_empty());
-        let text = flatten(&surface.display_lines(100)).join("\n");
-        assert!(text.contains("Ran rg shimmer_spans"));
-        assert!(text.contains("Ran cat shimmer.rs"));
-        assert!(text.contains("Ran cat status_indicator_widget.rs"));
+        let text = flatten(&surface.active_display_lines(100)).join("\n");
+        assert!(text.contains("Explored"), "{text}");
+        assert!(text.contains("Search shimmer_spans in crates"), "{text}");
+        assert!(
+            text.contains("Read shimmer.rs, status_indicator_widget.rs"),
+            "les lectures successives tiennent sur une ligne :\n{text}"
+        );
 
+        // The group only closes at the turn boundary: another read would still
+        // join it.
         surface.apply_update(TranscriptUpdate {
             lifecycle: TranscriptLifecycle::Completed,
             item: TranscriptItem::new(
@@ -5797,8 +6004,10 @@ mod tests {
             ),
         });
 
-        assert_eq!(surface.transcript_cells().len(), 3);
+        assert_eq!(surface.transcript_cells().len(), 1);
         assert!(surface.active_cell().is_none());
+        let text = flatten(&surface.display_lines(100)).join("\n");
+        assert!(text.contains("Explored"), "{text}");
     }
 
     #[test]
@@ -5892,7 +6101,11 @@ mod tests {
         let view = cell.stream_view();
         assert_eq!(view.stable_prefix, "stable line\n");
         assert!(view.mutable_tail.contains("| A | B |"));
-        assert!(flatten(&cell.display_lines(80)).join("\n").contains("…"));
+        // Both halves are rendered: the reader sees the incomplete table being
+        // typed, and it stays out of the scrollback until it is confirmed.
+        let rendered = flatten(&cell.display_lines(80)).join("\n");
+        assert!(rendered.contains("stable line"), "{rendered}");
+        assert!(rendered.contains('A') && rendered.contains('B'), "{rendered}");
     }
 
     #[test]

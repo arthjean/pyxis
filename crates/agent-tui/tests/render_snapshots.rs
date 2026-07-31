@@ -698,7 +698,7 @@ fn parity_surface_conversation() {
     chat.sync_local_blocks(&s);
     insta::assert_snapshot!(
         "parity_surface_conversation",
-        harness::chat_frame("parity_surface_conversation", &s, &chat, W, H)
+        harness::chat_frame("parity_surface_conversation", &s, &mut chat, W, H)
     );
 }
 
@@ -716,7 +716,7 @@ fn parity_surface_pending_input() {
     chat.sync_local_blocks(&s);
     insta::assert_snapshot!(
         "parity_surface_pending_input",
-        harness::chat_frame("parity_surface_pending_input", &s, &chat, W, H)
+        harness::chat_frame("parity_surface_pending_input", &s, &mut chat, W, H)
     );
 }
 
@@ -774,5 +774,38 @@ fn runtime_steering_notice() {
     insta::assert_snapshot!(
         "runtime_steering_notice",
         harness::frame("runtime_steering_notice", &s, W, H)
+    );
+}
+
+/// The shape the parity path actually ships: read-only commands collapsed into
+/// one `Explored` block in the scrollback, a streamed answer above the composer,
+/// and a status row naming what the turn is doing.
+#[cfg(feature = "codex_tui_parity")]
+#[test]
+fn parity_surface_exploring_then_streaming() {
+    let mut s = state();
+    s.begin_turn();
+    let mut chat = agent_tui::ChatWidget::new(&[]);
+    chat.push_user_message(&s, "Où est décidée la frontière d'arrêt ?");
+
+    for (id, command) in [
+        ("call-1", "rg 'stop boundary' crates"),
+        ("call-2", "cat crates/agent-core/src/lib.rs"),
+    ] {
+        chat.handle_agent_event(
+            &s,
+            &tool_call(id, "bash", serde_json::json!({ "command": command })),
+        );
+        chat.handle_agent_event(&s, &tool_result(id, "", false));
+    }
+    chat.handle_agent_event(
+        &s,
+        &AgentEvent::Text("La frontière tient en deux points.\n\n".into()),
+    );
+    chat.handle_agent_event(&s, &AgentEvent::Text("Le premier est le ".into()));
+
+    insta::assert_snapshot!(
+        "parity_surface_exploring_then_streaming",
+        harness::chat_frame("parity_surface_exploring_then_streaming", &s, &mut chat, W, H)
     );
 }

@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::chat_frame(\"parity_surface_exploring_then_streaming\", &s, &mut chat,\nW, H)"
+---
+
+› Où est décidée la frontière d'arrêt ?
+
+
+• Explored
+  └ Search stop boundary in crates
+    Read src/lib.rs
+
+• La frontière tient en deux points.
+  Le premier est le
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────
+› Ask Pyxis to do anything
+────────────────────────────────────────────────────────────────────────────────
+  gpt-5 · pyxis
