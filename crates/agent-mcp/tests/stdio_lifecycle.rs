@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
-use agent_mcp::{McpConnection, McpServerConfig};
+use agent_mcp::{McpConnection, McpServerConfig, McpServerPolicy};
 
 fn temp_dir(tag: &str) -> PathBuf {
     let millis = SystemTime::now()
@@ -83,6 +83,121 @@ async fn stdio_connect_lists_tools_and_cancel_closes_child() {
         closed.exists(),
         "cancel doit fermer stdin et laisser le child sortir"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A server that dies during the handshake states why on stderr. Discarding it
+/// used to leave the user with a bare timeout; the last words now travel with
+/// the failure.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failing_server_reports_its_last_stderr_lines() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir("stdio-stderr");
+    let script = dir.join("broken-server");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho 'FATAL: EXAMPLE_API_KEY is not set' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let cfg = McpServerConfig::stdio(script.to_string_lossy().into_owned(), Vec::new());
+    let Err(err) = McpConnection::connect("broken", &cfg).await else {
+        unreachable!("a server that exits during the handshake must fail")
+    };
+    let message = err.to_string();
+    assert!(message.contains("broken"), "{message}");
+    assert!(
+        message.contains("EXAMPLE_API_KEY is not set"),
+        "the server's own diagnosis must reach the user: {message}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A server that writes without ever sending a newline is cut off at the frame
+/// bound instead of being allowed to allocate.
+///
+/// This is the primitive that sits UNDER every other bound in the crate: the
+/// listing caps, the item caps and the output caps all assume a message that
+/// already fits in memory. `rmcp`'s own stdio transport reads a frame into an
+/// uncapped `Vec`, which is why the transport is built here rather than taken
+/// from the SDK.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unterminated_frame_is_cut_off_rather_than_allocated() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir("stdio-frame");
+    let script = dir.join("flooding-server");
+    std::fs::write(
+        &script,
+        // 12 MiB on a single line, then silence: over the bound, and the process
+        // stays alive so the failure can only come from the frame check.
+        "#!/bin/sh\nhead -c 12582912 /dev/zero | tr '\\0' 'x'\nsleep 30\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let cfg = McpServerConfig {
+        policy: McpServerPolicy {
+            startup_timeout: Some(Duration::from_secs(20)),
+            ..McpServerPolicy::default()
+        },
+        ..McpServerConfig::stdio(script.to_string_lossy().into_owned(), Vec::new())
+    };
+    let started = std::time::Instant::now();
+    let Err(err) = McpConnection::connect("flood", &cfg).await else {
+        unreachable!("a server that never frames a message cannot hand shake")
+    };
+    // The stream is cut on the bound, so the failure does NOT wait for the
+    // startup deadline: that is exactly the difference the bound makes.
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "the frame bound must end the stream, not let it run to the deadline"
+    );
+    assert!(
+        !err.to_string().contains("timeout"),
+        "expected a severed transport, got: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A per-server bound replaces the former fixed one, so a slow server can be
+/// given room and a hung one still cannot hold the session.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_hung_server_expires_on_its_configured_bound() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir("stdio-timeout");
+    let script = dir.join("hung-server");
+    std::fs::write(&script, "#!/bin/sh\nsleep 60\n").unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let cfg = McpServerConfig {
+        policy: McpServerPolicy {
+            startup_timeout: Some(Duration::from_millis(300)),
+            ..McpServerPolicy::default()
+        },
+        ..McpServerConfig::stdio(script.to_string_lossy().into_owned(), Vec::new())
+    };
+    let started = std::time::Instant::now();
+    let Err(err) = McpConnection::connect("hung", &cfg).await else {
+        unreachable!("a server that never handshakes must expire")
+    };
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the configured bound is what applies"
+    );
+    assert!(err.to_string().contains("timeout"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
