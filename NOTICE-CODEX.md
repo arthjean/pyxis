@@ -96,4 +96,24 @@ counterpart. The only Codex artifacts involved are the ones already recorded:
 the baseline clone, read but never written, and the contract matrix
 `agent-parity` derives from it.
 
+As of the composer and status-line rework (2026-07-31), the TUI adds one
+structurally derived boundary and no verbatim reuse. The baseline is the
+read-only clone at `/home/arthur/dev/codex`, commit
+`f0c30e528a54bdf0fa9a4d52ff74b34383434811`.
+
+Structurally derived, written against Pyxis types:
+
+- `crates/agent-tui/src/footer.rs`, plus `render_input` and `footer_props` in
+  `crates/agent-tui/src/render.rs`, from
+  `codex-rs/tui/src/bottom_pane/footer.rs`,
+  `bottom_pane/chat_composer.rs` (its `layout_areas`, `desired_height`,
+  `render_with_mask`, `footer_mode` and `handle_shortcut_overlay_key`),
+  `bottom_pane/status_line_style.rs` and `ui_consts.rs`. The `FooterMode`
+  waterfall, the two-column gutter shared by composer and footer, the ` · `
+  status line with per-category accents, the right-aligned mode indicator, the
+  collapse order and the `?` shortcut overlay are adapted; every line is
+  written against Pyxis state and its palette. The composer keeps its own
+  full-width rules rather than Codex's blank framing. Divergences are listed
+  in `docs/codex-port-inventory.md`.
+
 Reference source inventory: `docs/codex-port-inventory.md`.
