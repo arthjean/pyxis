@@ -4082,7 +4082,106 @@ fn render_prefixed(
     out
 }
 
+/// Breaks a styled line to `width`, balancing the paragraph as a whole.
+///
+/// Greedy wrapping fills each line to the brim and pushes the leftover onto the
+/// next one, which leaves a ragged right edge and the occasional one-word last
+/// line. Optimal fit (Knuth-Plass, via `textwrap`) minimizes the squared slack
+/// over the whole paragraph instead. It declines on pathological input, where
+/// the greedy pass below takes over.
 fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    optimal_wrap_spans(spans, width).unwrap_or_else(|| greedy_wrap_spans(spans, width))
+}
+
+fn optimal_wrap_spans(spans: &[Span<'static>], width: usize) -> Option<Vec<Vec<Span<'static>>>> {
+    use textwrap::wrap_algorithms::{Penalties, wrap_optimal_fit};
+
+    let fragments = wrap_fragments(spans, width);
+    if fragments.len() < 2 {
+        return None;
+    }
+    let line_widths = [width as f64];
+    let wrapped = wrap_optimal_fit(&fragments, &line_widths, &Penalties::default()).ok()?;
+
+    let mut out = Vec::new();
+    for line in wrapped {
+        let mut units: Vec<WrapUnit> = Vec::new();
+        for (idx, fragment) in line.iter().enumerate() {
+            units.extend(fragment.word.iter().cloned());
+            // Trailing whitespace is a line break, not content: dropping it
+            // keeps the row copy-friendly and avoids a phantom column.
+            if idx + 1 < line.len() {
+                units.extend(fragment.whitespace.iter().cloned());
+            }
+        }
+        out.push(rebuild_spans(&units));
+    }
+    if out.is_empty() {
+        out.push(Vec::new());
+    }
+    Some(out)
+}
+
+/// A word plus the whitespace that follows it, in `textwrap` terms.
+#[derive(Debug)]
+struct WrapFragment {
+    word: Vec<WrapUnit>,
+    whitespace: Vec<WrapUnit>,
+}
+
+impl textwrap::core::Fragment for WrapFragment {
+    fn width(&self) -> f64 {
+        wrap_units_width(&self.word) as f64
+    }
+
+    fn whitespace_width(&self) -> f64 {
+        wrap_units_width(&self.whitespace) as f64
+    }
+
+    /// No hyphenation: a broken path or URL costs the reader more than a short
+    /// line does.
+    fn penalty_width(&self) -> f64 {
+        0.0
+    }
+}
+
+/// Pairs word tokens with their trailing whitespace, hard-splitting any word too
+/// wide for the column so no fragment can overflow on its own.
+fn wrap_fragments(spans: &[Span<'static>], width: usize) -> Vec<WrapFragment> {
+    let mut fragments: Vec<WrapFragment> = Vec::new();
+    for token in wrap_tokens(spans) {
+        let is_whitespace = token
+            .iter()
+            .all(|unit| unit.text.chars().all(char::is_whitespace));
+        if is_whitespace {
+            match fragments.last_mut() {
+                Some(last) if last.whitespace.is_empty() => last.whitespace = token,
+                // Leading or doubled whitespace has no word to attach to.
+                _ => fragments.push(WrapFragment {
+                    word: token,
+                    whitespace: Vec::new(),
+                }),
+            }
+            continue;
+        }
+        if wrap_units_width(&token) > width && !is_url_like_token(&token) {
+            for chunk in wrap_units_hard(&token, width) {
+                fragments.push(WrapFragment {
+                    word: chunk,
+                    whitespace: Vec::new(),
+                });
+            }
+            continue;
+        }
+        fragments.push(WrapFragment {
+            word: token,
+            whitespace: Vec::new(),
+        });
+    }
+    fragments
+}
+
+fn greedy_wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
     let tokens = wrap_tokens(spans);
     if tokens.is_empty() {
         return vec![Vec::new()];
@@ -6730,9 +6829,62 @@ mod tests {
                     is_error,
                     stream: TranscriptExecStream::Combined,
                     untrusted: true,
+                    duration_ms: None,
                 },
             ),
         }
+    }
+
+    fn wrapped(text: &str, width: usize) -> Vec<String> {
+        wrap_spans(&[Span::raw(text.to_string())], width)
+            .into_iter()
+            .map(|spans| {
+                spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Optimal fit spreads the slack over the paragraph instead of dumping it on
+    /// the last line, which is what a greedy pass does.
+    #[test]
+    fn wrapping_balances_the_paragraph_instead_of_filling_greedily() {
+        let lines = wrapped("aaaa bbbb cccc dddd eeee ffff", 14);
+
+        assert!(lines.len() > 1);
+        let widths: Vec<usize> = lines.iter().map(|line| measure::width(line)).collect();
+        let spread = widths.iter().max().copied().unwrap_or(0)
+            - widths.iter().min().copied().unwrap_or(0);
+        assert!(
+            spread <= 5,
+            "les lignes doivent rester de longueur voisine : {widths:?} pour {lines:?}"
+        );
+        for (line, width) in lines.iter().zip(&widths) {
+            assert!(*width <= 14, "débordement sur {line:?}");
+        }
+    }
+
+    /// A URL broken across two rows stops being clickable and stops being
+    /// copyable in one gesture, so it takes the overflow rather than a break.
+    #[test]
+    fn wrapping_never_splits_a_url() {
+        let url = "https://example.com/a/very/long/path/that/exceeds/the/width";
+        let lines = wrapped(&format!("voir {url} pour la suite"), 20);
+
+        assert!(
+            lines.iter().any(|line| line.contains(url)),
+            "l'URL doit rester d'un seul tenant : {lines:?}"
+        );
+    }
+
+    #[test]
+    fn wrapping_hard_splits_a_word_wider_than_the_column() {
+        let lines = wrapped(&"x".repeat(30), 10);
+
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|line| measure::width(line) <= 10));
     }
 
     fn flatten(lines: &[Line<'static>]) -> Vec<String> {

@@ -68,6 +68,65 @@ struct Renderer<'t> {
     /// List stack: `None` = bullets, `Some(n)` = next ordered number.
     list_stack: Vec<Option<u64>>,
     table: Option<TableState>,
+    /// Link currently open, if any.
+    link: Option<LinkState>,
+}
+
+#[derive(Debug, Clone)]
+struct LinkState {
+    destination: String,
+    /// Rendered form of a local path, when the destination is one.
+    local_target: Option<String>,
+    /// Whether the markdown label is dropped in favour of the destination.
+    suppress_label: bool,
+}
+
+/// Normalizes a local file destination for display, or returns `None` for
+/// anything that belongs to the network.
+///
+/// `file://` URLs, `./` prefixes and `#L12` fragments are all ways of writing
+/// the same location; the transcript shows one form, the one a terminal accepts
+/// back: `path:line`.
+fn local_link_target(dest_url: &str) -> Option<String> {
+    if dest_url.is_empty() {
+        return None;
+    }
+    let path = match dest_url.split_once("://") {
+        Some(("file", rest)) => rest.strip_prefix("localhost").unwrap_or(rest),
+        Some(_) => return None,
+        None => dest_url,
+    };
+    // `mailto:`, `tel:` and friends: a scheme, not a path.
+    if path.contains(':') && path.split_once(':').is_some_and(|(head, _)| !head.contains('/'))
+        && !path.starts_with('/')
+        && !path.starts_with('.')
+    {
+        let (head, tail) = path.split_once(':')?;
+        // `src/lib.rs:42` is a location, `mailto` is not.
+        if !tail.chars().next().is_some_and(|ch| ch.is_ascii_digit()) && !head.contains('.') {
+            return None;
+        }
+    }
+
+    let (path, fragment) = match path.split_once('#') {
+        Some((path, fragment)) => (path, Some(fragment)),
+        None => (path, None),
+    };
+    let path = path.strip_prefix("./").unwrap_or(path);
+    if path.is_empty() {
+        return None;
+    }
+
+    // `#L12` / `#L12C3` are GitHub's way of pointing at a line.
+    let location = fragment.and_then(|fragment| {
+        let digits = fragment.strip_prefix('L')?;
+        let line: String = digits.chars().take_while(char::is_ascii_digit).collect();
+        (!line.is_empty()).then_some(line)
+    });
+    Some(match location {
+        Some(line) => format!("{path}:{line}"),
+        None => path.to_string(),
+    })
 }
 
 impl<'t> Renderer<'t> {
@@ -88,6 +147,7 @@ impl<'t> Renderer<'t> {
             highlight_code,
             list_stack: Vec::new(),
             table: None,
+            link: None,
         }
     }
 
@@ -156,6 +216,7 @@ impl<'t> Renderer<'t> {
                 };
                 self.cur.push(Span::styled(marker, self.theme.dim()));
             }
+            Tag::Link { dest_url, .. } => self.start_link(dest_url.into_string()),
             Tag::Table(aligns) => {
                 self.flush();
                 self.blank();
@@ -210,6 +271,7 @@ impl<'t> Renderer<'t> {
                 }
             }
             TagEnd::Item => self.flush(),
+            TagEnd::Link => self.end_link(),
             TagEnd::Table => self.end_table(),
             TagEnd::TableHead => {
                 if let Some(t) = self.table.as_mut() {
@@ -244,6 +306,9 @@ impl<'t> Renderer<'t> {
             self.code_buf.push_str(t);
             return;
         }
+        if self.link.as_ref().is_some_and(|link| link.suppress_label) {
+            return;
+        }
         if self.table.is_some() {
             let st = self.text_style();
             self.emit(Span::styled(t.to_string(), st));
@@ -258,9 +323,43 @@ impl<'t> Renderer<'t> {
         }
     }
 
+    /// Opens a link. Web links keep their label and gain a ` (url)` suffix at
+    /// close; local paths replace the label with the real target.
+    ///
+    /// A label like "the parser" tells the reader nothing they can act on: the
+    /// path is what they will click, type or grep for. Showing the destination
+    /// also makes a mislabelled link visible instead of hiding it.
+    fn start_link(&mut self, dest_url: String) {
+        let local = local_link_target(&dest_url);
+        self.link = Some(LinkState {
+            suppress_label: local.is_some(),
+            destination: dest_url,
+            local_target: local,
+        });
+    }
+
+    fn end_link(&mut self) {
+        let Some(link) = self.link.take() else {
+            return;
+        };
+        let style = self.theme.accent().add_modifier(Modifier::UNDERLINED);
+        match link.local_target {
+            Some(target) => self.emit(Span::styled(target, style)),
+            None => {
+                self.emit(Span::styled(" (", self.theme.faint()));
+                self.emit(Span::styled(link.destination, style));
+                self.emit(Span::styled(")", self.theme.faint()));
+            }
+        }
+    }
+
     /// Routes a span to the active table cell, otherwise to the current line.
-    /// Inside a table but outside a cell (malformed), the span is ignored (best-effort).
+    /// Inside a table but outside a cell (malformed), the span is ignored
+    /// (best-effort).
     fn emit(&mut self, span: Span<'static>) {
+        if self.link.as_ref().is_some_and(|link| link.suppress_label) {
+            return;
+        }
         if let Some(t) = self.table.as_mut() {
             if t.in_cell && t.cur_row.len() < MAX_COLS && cell_width(&t.cur_cell) < MAX_CELL_WIDTH {
                 let remaining = MAX_CELL_WIDTH.saturating_sub(cell_width(&t.cur_cell));
@@ -546,6 +645,51 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    fn rendered(md: &str) -> String {
+        flat(&render_markdown(md, &Theme::new(true), 80)).join("\n")
+    }
+
+    /// The label is prose; the path is what the reader will open. A local link
+    /// therefore shows its target, not its wording.
+    #[test]
+    fn a_local_link_shows_its_path_instead_of_its_label() {
+        let text = rendered("see [the parser](crates/agent-tui/src/markdown.rs)");
+
+        assert!(text.contains("crates/agent-tui/src/markdown.rs"), "{text}");
+        assert!(!text.contains("the parser"), "{text}");
+    }
+
+    #[test]
+    fn a_line_fragment_becomes_a_colon_suffix() {
+        let text = rendered("see [here](src/lib.rs#L42)");
+
+        assert!(text.contains("src/lib.rs:42"), "{text}");
+    }
+
+    #[test]
+    fn a_file_url_is_rendered_as_a_plain_path() {
+        let text = rendered("see [here](file:///home/arthur/notes.md)");
+
+        assert!(text.contains("/home/arthur/notes.md"), "{text}");
+    }
+
+    /// A web link keeps its label: the URL alone rarely says what it points at.
+    #[test]
+    fn a_web_link_keeps_its_label_and_appends_its_url() {
+        let text = rendered("see [ratatui](https://ratatui.rs)");
+
+        assert!(text.contains("ratatui"), "{text}");
+        assert!(text.contains("(https://ratatui.rs)"), "{text}");
+    }
+
+    #[test]
+    fn a_mailto_link_is_not_mistaken_for_a_path() {
+        let text = rendered("write to [me](mailto:arthur@example.com)");
+
+        assert!(text.contains("me"), "{text}");
+        assert!(text.contains("mailto:arthur@example.com"), "{text}");
     }
 
     #[test]
