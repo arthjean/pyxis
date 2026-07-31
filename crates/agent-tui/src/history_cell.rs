@@ -24,8 +24,9 @@ use crate::app_event::{
 };
 use crate::insert_history::{InsertHistoryMode, PendingHistoryInsert};
 use crate::measure;
+use crate::parse_command::ParsedCommand;
 use crate::render::sanitize;
-use crate::streaming::StreamController;
+use crate::streaming::{ChunkingPolicy, StreamController};
 use crate::terminal_hyperlinks::{
     HyperlinkLine, annotate_web_urls, plain_hyperlink_lines, visible_lines,
 };
@@ -528,6 +529,7 @@ impl AgentMarkdownCell {
             markdown,
             streaming,
             controller,
+            stable_cache: MarkdownRenderCache::default(),
         }
     }
 
@@ -538,6 +540,7 @@ impl AgentMarkdownCell {
     fn push_delta(&mut self, delta: &str) {
         self.controller.push_delta(delta);
         self.markdown = self.controller.raw_source().to_string();
+        self.stable_cache.clear();
     }
 
     fn set_streaming(&mut self, streaming: bool) {
@@ -547,34 +550,112 @@ impl AgentMarkdownCell {
         }
         self.controller.finalize();
         self.markdown = self.controller.raw_source().to_string();
+        self.stable_cache.clear();
+    }
+
+    /// Rendered lines of the stable prefix, bullet included.
+    ///
+    /// Rendering the prefix as a whole rather than appending the newest fragment
+    /// is what keeps lists, quotes and fenced blocks correct: their meaning
+    /// depends on an opening that may be several lines back.
+    fn stable_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let stable = self.controller.stable_prefix();
+        if stable.trim().is_empty() {
+            return Vec::new();
+        }
+        self.stable_cache.render(width, || {
+            let theme = Theme::current();
+            let content_width = safe_width_usize(width).saturating_sub(2).max(1);
+            let clean = bounded_sanitize(stable, MAX_MARKDOWN_SOURCE_CHARS);
+            // Syntax highlighting stays on while streaming: a line released to
+            // the scrollback can never be repainted, so rendering the first half
+            // of a message plain and the second half highlighted would be
+            // permanent.
+            let lines = crate::markdown::render_markdown(&clean, &theme, content_width);
+            render_prefixed(&lines, bullet_prefix(), continuation_prefix(), width)
+        })
+    }
+
+    /// Rendered lines of the mutable tail: text too fresh to be committed,
+    /// because the next delta can still change how it renders.
+    fn tail_lines(&self, width: u16, leads: bool) -> Vec<Line<'static>> {
+        let tail = self.controller.mutable_tail();
+        if tail.trim().is_empty() {
+            return Vec::new();
+        }
+        let theme = Theme::current();
+        let content_width = safe_width_usize(width).saturating_sub(2).max(1);
+        let clean = bounded_sanitize(tail, MAX_MARKDOWN_SOURCE_CHARS);
+        let lines = crate::markdown::render_markdown_with_highlight(&clean, &theme, content_width, false);
+        let first = if leads {
+            bullet_prefix()
+        } else {
+            continuation_prefix()
+        };
+        render_prefixed(&lines, first, continuation_prefix(), width)
+    }
+
+    /// Makes the cell owe its rendered lines again, after a width change
+    /// discarded the rows it had already handed over.
+    fn reset_release(&mut self) {
+        self.controller.reset_release();
+        self.stable_cache.clear();
+    }
+
+    /// Queues newly stable lines and releases the ones the pacing policy allows.
+    ///
+    /// The returned lines leave the cell for good: they belong to the terminal
+    /// scrollback from now on, and [`HistoryCell::display_lines`] skips them.
+    pub fn commit_tick(
+        &mut self,
+        width: u16,
+        now: Instant,
+        policy: &mut ChunkingPolicy,
+    ) -> Vec<Line<'static>> {
+        let stable_lines = self.stable_lines(width);
+        self.controller.refill(width, now, |_| stable_lines);
+        if !self.streaming {
+            return self.controller.release_all();
+        }
+        let count = policy.decide(
+            self.controller.queued_lines(),
+            self.controller.oldest_queued_age(now),
+            now,
+        );
+        self.controller.release(count)
     }
 }
 
+fn bullet_prefix() -> Span<'static> {
+    Span::styled("• ", Style::default().add_modifier(Modifier::DIM))
+}
+
+fn continuation_prefix() -> Span<'static> {
+    Span::raw("  ")
+}
+
 impl HistoryCell for AgentMarkdownCell {
+    /// Everything not yet released to the scrollback: the queued tail of the
+    /// stable prefix, then the mutable tail.
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let theme = Theme::new(true);
-        let content_width = safe_width_usize(width).saturating_sub(2).max(1);
-        let lines = if self.streaming {
-            let view = self.controller.view();
-            render_streaming_markdown(view.stable_prefix, view.mutable_tail, &theme, content_width)
-        } else {
+        if !self.streaming && self.controller.released_lines() == 0 {
+            let theme = Theme::current();
+            let content_width = safe_width_usize(width).saturating_sub(2).max(1);
             let clean = bounded_sanitize(&self.markdown, MAX_MARKDOWN_SOURCE_CHARS);
-            crate::markdown::render_markdown(&clean, &theme, content_width)
-        };
-        render_prefixed(
-            &lines,
-            Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
-            Span::raw("  "),
-            width,
-        )
+            let lines = crate::markdown::render_markdown(&clean, &theme, content_width);
+            return render_prefixed(&lines, bullet_prefix(), continuation_prefix(), width);
+        }
+
+        let released = self.controller.released_lines();
+        let stable = self.stable_lines(width);
+        let pending_stable = stable.len().saturating_sub(released);
+        let mut lines: Vec<Line<'static>> = stable.into_iter().skip(released).collect();
+        lines.extend(self.tail_lines(width, released == 0 && pending_stable == 0));
+        lines
     }
 
     fn raw_lines(&self) -> Vec<Line<'static>> {
         raw_lines_from_source(&self.markdown)
-    }
-
-    fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
-        annotate_web_urls(self.display_lines(width))
     }
 
     fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
@@ -4482,38 +4563,6 @@ fn bounded_sanitize(text: &str, max_chars: usize) -> String {
         out.push_str("\n… truncated");
     }
     sanitize(&out)
-}
-
-fn render_streaming_markdown(
-    stable_prefix: &str,
-    mutable_tail: &str,
-    theme: &Theme,
-    width: usize,
-) -> Vec<Line<'static>> {
-    let stable = bounded_sanitize(stable_prefix, MAX_MARKDOWN_SOURCE_CHARS);
-    let tail_budget = MAX_MARKDOWN_SOURCE_CHARS.saturating_sub(stable.chars().count());
-    let tail = bounded_sanitize(mutable_tail, tail_budget);
-    let mut lines = Vec::new();
-
-    if !stable.trim().is_empty() {
-        lines.extend(crate::markdown::render_markdown_with_highlight(
-            &stable, theme, width, false,
-        ));
-    }
-
-    if !tail.trim().is_empty() {
-        let mut tail_lines =
-            crate::markdown::render_markdown_with_highlight(&tail, theme, width, false);
-        if let Some(first) = tail_lines.first_mut() {
-            first.spans.insert(0, Span::styled("… ", theme.faint()));
-        }
-        lines.extend(tail_lines);
-    }
-
-    if lines.is_empty() {
-        lines.push(Line::default());
-    }
-    lines
 }
 
 fn push_preview_char(line: &mut String, line_width: &mut usize, ch: char) {
