@@ -17,8 +17,8 @@ use serde_json::Value;
 
 use crate::jsonrpc::{ErrorObject, error_code};
 pub use crate::protocol_metadata::{
-    ProviderEventNotification, ProviderExtensionView, ReasoningMetadataView, ResponseMetadataView,
-    SafetyMetadataView, TurnMetadataNotification,
+    ProviderErrorCategoryView, ProviderEventNotification, ProviderExtensionView,
+    ReasoningMetadataView, ResponseMetadataView, SafetyMetadataView, TurnMetadataNotification,
 };
 
 /// Protocol version this build speaks. Bumped when an already published shape
@@ -502,7 +502,20 @@ pub enum ThreadItem {
         untrusted: bool,
     },
     #[serde(rename_all = "camelCase")]
-    Error { id: String, message: String },
+    Error {
+        id: String,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_category: Option<ProviderErrorCategoryView>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auth_request_id: Option<String>,
+    },
 }
 
 impl ThreadItem {
@@ -887,6 +900,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_error_items_decode_without_provider_diagnostics() {
+        let item = serde_json::from_value::<ThreadItem>(serde_json::json!({
+            "type": "error",
+            "id": "error_0",
+            "message": "provider failed"
+        }))
+        .expect("legacy error item");
+
+        assert!(matches!(
+            item,
+            ThreadItem::Error {
+                provider_category: None,
+                status: None,
+                retry_after_ms: None,
+                request_id: None,
+                auth_request_id: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn metadata_notification_preserves_every_field_and_defaults_absent_additions() {
         let metadata = agent_core::provider::ResponseMetadata {
             response_id: Some("resp_1".into()),
@@ -895,6 +930,7 @@ mod tests {
             request_id: Some("req_1".into()),
             turn_state: Some("turn-state".into()),
             models_etag: Some("etag-1".into()),
+            end_turn: Some(false),
             safety: agent_core::provider::SafetyMetadata {
                 use_cases: vec!["cyber".into()],
                 reasons: vec!["review".into()],
@@ -924,6 +960,7 @@ mod tests {
         assert_eq!(params["metadata"]["requestId"], "req_1");
         assert_eq!(params["metadata"]["turnState"], "turn-state");
         assert_eq!(params["metadata"]["modelsEtag"], "etag-1");
+        assert_eq!(params["metadata"]["endTurn"], false);
         assert_eq!(params["metadata"]["safety"]["retryModel"], "gpt-safe");
         assert_eq!(
             params["metadata"]["verifications"][0],

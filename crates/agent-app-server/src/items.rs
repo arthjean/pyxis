@@ -14,11 +14,12 @@
 //! a durable number. The divergence from Codex, whose identifiers are minted
 //! per turn, is recorded in `docs/app-server/README.md`.
 
+use agent_core::error::AgentError;
 use agent_core::event::AgentEvent;
 use agent_core::message::{ContentBlock, Message, Role};
 use agent_core::tools::ToolResultStatus;
 
-use crate::protocol::{ItemStatus, ThreadItem};
+use crate::protocol::{ItemStatus, ProviderErrorCategoryView, ThreadItem};
 
 /// Tools whose call is a command execution rather than a generic tool call.
 const COMMAND_TOOLS: &[&str] = &["bash", "exec_command", "write_stdin"];
@@ -217,9 +218,27 @@ impl Projector {
                 let mut out = self.commit_message();
                 let id = format!("error_{}", self.next_error);
                 self.next_error = self.next_error.saturating_add(1);
+                let (provider_category, status, retry_after_ms, request_id, auth_request_id) =
+                    match error {
+                        AgentError::Provider(failure) => (
+                            failure
+                                .provider_category
+                                .map(ProviderErrorCategoryView::from),
+                            failure.status,
+                            failure.retry_after_ms,
+                            failure.request_id.clone(),
+                            failure.auth_request_id.clone(),
+                        ),
+                        _ => (None, None, None, None, None),
+                    };
                 out.push(Projected::Completed(ThreadItem::Error {
                     id,
                     message: error.to_string(),
+                    provider_category,
+                    status,
+                    retry_after_ms,
+                    request_id,
+                    auth_request_id,
                 }));
                 out
             }
@@ -521,8 +540,10 @@ fn fail_item(open: OpenItem, cause: &str) -> ThreadItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::error::{ProviderFailure, ProviderFailureKind};
     use agent_core::event::{ToolCallView, ToolOutputDeltaView, ToolResultView};
     use agent_core::message::ToolCallId;
+    use agent_core::provider::ProviderErrorCategory;
 
     fn call(id: &str, name: &str, input: serde_json::Value) -> AgentEvent {
         AgentEvent::ToolCall(ToolCallView {
@@ -623,6 +644,7 @@ mod tests {
             request_id: Some("req_1".into()),
             turn_state: Some("sticky".into()),
             models_etag: Some("etag-1".into()),
+            end_turn: Some(false),
             safety: agent_core::provider::SafetyMetadata {
                 use_cases: vec!["cyber".into()],
                 reasons: vec!["review".into()],
@@ -661,6 +683,32 @@ mod tests {
                 if extension.event_type() == "response.item.future"
                     && extension.was_redacted()
                     && extension.payload()["authorization"] == "[REDACTED]"
+        ));
+    }
+
+    #[test]
+    fn provider_error_diagnostics_survive_the_app_server_projection() {
+        let error = AgentEvent::Error(AgentError::Provider(ProviderFailure {
+            kind: ProviderFailureKind::Http,
+            status: Some(429),
+            message: "provider API request failed: RateLimited".into(),
+            retry_after_ms: Some(11_054),
+            class: None,
+            provider_category: Some(ProviderErrorCategory::RateLimited),
+            request_id: Some("req_1".into()),
+            auth_request_id: Some("auth_req_1".into()),
+        }));
+
+        assert!(matches!(
+            Projector::default().engine(&error).as_slice(),
+            [Projected::Completed(ThreadItem::Error {
+                provider_category: Some(ProviderErrorCategoryView::RateLimited),
+                status: Some(429),
+                retry_after_ms: Some(11_054),
+                request_id: Some(request_id),
+                auth_request_id: Some(auth_request_id),
+                ..
+            })] if request_id == "req_1" && auth_request_id == "auth_req_1"
         ));
     }
 

@@ -4,6 +4,47 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Provider-neutral API error category exposed without leaking the provider body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderErrorCategoryView {
+    ContextOverflow,
+    Quota,
+    UsageNotIncluded,
+    CyberPolicy,
+    InvalidPrompt,
+    InvalidImage,
+    RateLimited,
+    Overloaded,
+    Authentication,
+    PermissionDenied,
+    Incomplete,
+    InvalidRequest,
+    Failed,
+}
+
+impl From<agent_core::provider::ProviderErrorCategory> for ProviderErrorCategoryView {
+    fn from(category: agent_core::provider::ProviderErrorCategory) -> Self {
+        use agent_core::provider::ProviderErrorCategory;
+
+        match category {
+            ProviderErrorCategory::ContextOverflow => Self::ContextOverflow,
+            ProviderErrorCategory::Quota => Self::Quota,
+            ProviderErrorCategory::UsageNotIncluded => Self::UsageNotIncluded,
+            ProviderErrorCategory::CyberPolicy => Self::CyberPolicy,
+            ProviderErrorCategory::InvalidPrompt => Self::InvalidPrompt,
+            ProviderErrorCategory::InvalidImage => Self::InvalidImage,
+            ProviderErrorCategory::RateLimited => Self::RateLimited,
+            ProviderErrorCategory::Overloaded => Self::Overloaded,
+            ProviderErrorCategory::Authentication => Self::Authentication,
+            ProviderErrorCategory::PermissionDenied => Self::PermissionDenied,
+            ProviderErrorCategory::Incomplete => Self::Incomplete,
+            ProviderErrorCategory::InvalidRequest => Self::InvalidRequest,
+            ProviderErrorCategory::Failed => Self::Failed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnMetadataNotification {
@@ -93,6 +134,8 @@ pub struct ResponseMetadataView {
     pub turn_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_turn: Option<bool>,
     #[serde(default, skip_serializing_if = "SafetyMetadataView::is_empty")]
     pub safety: SafetyMetadataView,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -112,6 +155,7 @@ impl From<&agent_core::provider::ResponseMetadata> for ResponseMetadataView {
             request_id: metadata.request_id.clone(),
             turn_state: metadata.turn_state.clone(),
             models_etag: metadata.models_etag.clone(),
+            end_turn: metadata.end_turn,
             safety: SafetyMetadataView {
                 use_cases: metadata.safety.use_cases.clone(),
                 reasons: metadata.safety.reasons.clone(),

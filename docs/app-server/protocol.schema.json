@@ -388,6 +388,25 @@
       ],
       "type": "string"
     },
+    "ProviderErrorCategoryView": {
+      "description": "Provider-neutral API error category exposed without leaking the provider body.",
+      "enum": [
+        "context_overflow",
+        "quota",
+        "usage_not_included",
+        "cyber_policy",
+        "invalid_prompt",
+        "invalid_image",
+        "rate_limited",
+        "overloaded",
+        "authentication",
+        "permission_denied",
+        "incomplete",
+        "invalid_request",
+        "failed"
+      ],
+      "type": "string"
+    },
     "ProviderEventNotification": {
       "properties": {
         "extension": {
@@ -461,6 +480,12 @@
     },
     "ResponseMetadataView": {
       "properties": {
+        "endTurn": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "model": {
           "type": [
             "string",
@@ -838,11 +863,50 @@
         },
         {
           "properties": {
+            "authRequestId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "id": {
               "type": "string"
             },
             "message": {
               "type": "string"
+            },
+            "providerCategory": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ProviderErrorCategoryView"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "requestId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "retryAfterMs": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "status": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "type": {
               "const": "error",

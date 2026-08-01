@@ -423,6 +423,7 @@ async fn provider_metadata_and_extensions_reach_the_external_protocol() {
             request_id: Some("req_1".into()),
             turn_state: Some("sticky".into()),
             models_etag: Some("etag-1".into()),
+            end_turn: Some(false),
             safety: agent_core::provider::SafetyMetadata {
                 use_cases: vec!["cyber".into()],
                 reasons: vec!["review".into()],
@@ -451,6 +452,7 @@ async fn provider_metadata_and_extensions_reach_the_external_protocol() {
     assert_eq!(metadata["params"]["threadId"], THREAD_ID);
     assert_eq!(metadata["params"]["turnId"], TURN_ID);
     assert_eq!(metadata["params"]["metadata"]["responseId"], "resp_1");
+    assert_eq!(metadata["params"]["metadata"]["endTurn"], false);
     assert_eq!(
         metadata["params"]["metadata"]["safety"]["retryModel"],
         "gpt-safe"

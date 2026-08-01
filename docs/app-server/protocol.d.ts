@@ -143,6 +143,11 @@ export type ItemNotification = {
 
 export type ItemStatus = "inProgress" | "completed" | "failed";
 
+/**
+ * Provider-neutral API error category exposed without leaking the provider body.
+ */
+export type ProviderErrorCategoryView = "context_overflow" | "quota" | "usage_not_included" | "cyber_policy" | "invalid_prompt" | "invalid_image" | "rate_limited" | "overloaded" | "authentication" | "permission_denied" | "incomplete" | "invalid_request" | "failed";
+
 export type ProviderEventNotification = {
   extension: ProviderExtensionView;
   threadId: string;
@@ -164,6 +169,7 @@ export type ReasoningMetadataView = {
 };
 
 export type ResponseMetadataView = {
+  endTurn?: boolean | null;
   model?: string | null;
   modelsEtag?: string | null;
   moderation?: ProviderExtensionView | null;
@@ -287,8 +293,13 @@ export type ThreadItem = {
    */
   untrusted: boolean;
 } | {
+  authRequestId?: string | null;
   id: string;
   message: string;
+  providerCategory?: ProviderErrorCategoryView | null;
+  requestId?: string | null;
+  retryAfterMs?: number | null;
+  status?: number | null;
   type: "error";
 };
 
