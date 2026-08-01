@@ -1,0 +1,45 @@
+{
+  "name": "completed response exposes metadata and 64-bit usage before success",
+  "note": "EP-002/US-006: response identity and end-turn state precede usage and exactly one success terminal; counters never narrow to u32.",
+  "stream": {
+    "events": [
+      {
+        "type": "response.completed",
+        "request_id": "req_fixture",
+        "response": {
+          "id": "resp_fixture",
+          "status": "completed",
+          "end_turn": false,
+          "usage": {
+            "input_tokens": 4294967297,
+            "output_tokens": 4294967298,
+            "total_tokens": 8589934595
+          }
+        }
+      }
+    ],
+    "expected": [
+      {
+        "type": "response_metadata",
+        "data": {
+          "metadata": {
+            "response_id": "resp_fixture",
+            "request_id": "req_fixture",
+            "end_turn": false
+          }
+        }
+      },
+      {
+        "type": "usage",
+        "data": {
+          "usage": {
+            "input": 4294967297,
+            "output": 4294967298,
+            "total": 8589934595
+          }
+        }
+      },
+      { "type": "done", "data": { "stop": "continue" } }
+    ]
+  }
+}

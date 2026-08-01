@@ -1,0 +1,85 @@
+{
+  "name": "Responses request preserves every supported baseline control",
+  "note": "EP-002/US-003: service tier, strict output format, stream controls, metadata, verbosity, cache identity and encrypted reasoning are independent wire fields; absent instructions stay absent.",
+  "request": {
+    "canonical": {
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "high",
+      "reasoning_replay": true,
+      "service_tier": "priority",
+      "output_schema": {
+        "name": "result",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": { "answer": { "type": "string" } },
+          "required": ["answer"],
+          "additionalProperties": false
+        }
+      },
+      "stream_options": {
+        "reasoning_summary_delivery": "sequential_cutoff",
+        "include_usage": true
+      },
+      "client_metadata": {
+        "thread_id": "thread-fixture",
+        "session_id": "session-fixture",
+        "turn_state": "state-fixture"
+      },
+      "cache_key": "cache-fixture",
+      "messages": [
+        { "role": "user", "content": [{ "type": "text", "text": "return a result" }] }
+      ],
+      "tools": [],
+      "max_output_tokens": 4096
+    },
+    "options": {
+      "reasoning_effort": "high",
+      "include_encrypted_reasoning": true,
+      "parallel_tool_calls": true,
+      "text_verbosity": "high",
+      "dialect": "standard"
+    },
+    "body": {
+      "model": "gpt-5.6-sol",
+      "store": false,
+      "stream": true,
+      "tool_choice": "auto",
+      "parallel_tool_calls": true,
+      "text": {
+        "verbosity": "high",
+        "format": {
+          "type": "json_schema",
+          "name": "result",
+          "strict": true,
+          "schema": {
+            "type": "object",
+            "properties": { "answer": { "type": "string" } },
+            "required": ["answer"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "reasoning": { "effort": "high", "summary": "auto" },
+      "service_tier": "priority",
+      "stream_options": {
+        "reasoning_summary_delivery": "sequential_cutoff",
+        "include_usage": true
+      },
+      "client_metadata": {
+        "thread_id": "thread-fixture",
+        "session_id": "session-fixture",
+        "turn_state": "state-fixture"
+      },
+      "prompt_cache_key": "cache-fixture",
+      "include": ["reasoning.encrypted_content"],
+      "input": [
+        {
+          "type": "message",
+          "role": "user",
+          "content": [{ "type": "input_text", "text": "return a result" }]
+        }
+      ]
+    }
+  }
+}

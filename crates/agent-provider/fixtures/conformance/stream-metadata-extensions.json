@@ -85,6 +85,35 @@
         "type": "provider_extension",
         "data": {
           "extension": {
+            "event_type": "response.metadata",
+            "payload": {
+              "type": "response.metadata",
+              "response_id": "resp_1",
+              "service_tier": "priority",
+              "headers": {
+                "OpenAI-Model": ["gpt-effective"],
+                "X-Request-Id": "req_1",
+                "X-Codex-Turn-State": "turn-state",
+                "X-Models-Etag": "etag-1",
+                "X-Reasoning-Included": "true"
+              },
+              "metadata": {
+                "openai_verification_recommendation": ["trusted_access_for_cyber"],
+                "openai_chatgpt_moderation_metadata": {"flagged": false}
+              },
+              "safety_buffering": {
+                "use_cases": ["cyber"],
+                "reasons": ["review"],
+                "retry_model": "gpt-safe"
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "provider_extension",
+        "data": {
+          "extension": {
             "event_type": "response.future",
             "payload": {
               "type": "response.future"

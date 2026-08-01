@@ -7,12 +7,33 @@
       { "type": "response.custom_tool_call_input.delta", "item_id": "ctc_1", "call_id": "call_c", "delta": "// @exec: cell\n" },
       { "type": "response.custom_tool_call_input.delta", "item_id": "ctc_1", "call_id": "call_c", "delta": "const n = 1;" },
       { "type": "response.output_item.done", "item": { "type": "custom_tool_call", "call_id": "call_c", "id": "ctc_1", "name": "exec", "input": "// @exec: cell\nconst n = 1;" } },
-      { "type": "response.completed", "response": { "status": "completed" } }
+      { "type": "response.completed", "response": { "id": "resp_custom", "status": "completed" } }
     ],
     "expected": [
+      {
+        "type": "provider_extension",
+        "data": {
+          "extension": {
+            "event_type": "response.output_item.added",
+            "payload": { "type": "response.output_item.added", "output_index": 0, "item": { "type": "custom_tool_call", "call_id": "call_c", "id": "ctc_1", "name": "exec", "input": "" } }
+          }
+        }
+      },
       { "type": "tool_call_start", "data": { "id": "call_c", "name": "exec", "format": "text" } },
-      { "type": "tool_call_delta", "data": { "id": "call_c", "input_delta": "// @exec: cell\nconst n = 1;" } },
+      { "type": "tool_call_delta", "data": { "id": "call_c", "input_delta": "// @exec: cell\n" } },
+      { "type": "tool_call_delta", "data": { "id": "call_c", "input_delta": "const n = 1;" } },
+      {
+        "type": "provider_extension",
+        "data": {
+          "extension": {
+            "event_type": "response.output_item.done",
+            "payload": { "type": "response.output_item.done", "item": { "type": "custom_tool_call", "call_id": "call_c", "id": "ctc_1", "name": "exec", "input": "// @exec: cell\nconst n = 1;" } }
+          }
+        }
+      },
+      { "type": "tool_call_input_done", "data": { "id": "call_c", "input": "// @exec: cell\nconst n = 1;" } },
       { "type": "tool_call_end", "data": { "id": "call_c" } },
+      { "type": "response_metadata", "data": { "metadata": { "response_id": "resp_custom" } } },
       { "type": "done", "data": { "stop": "tool_use" } }
     ]
   }

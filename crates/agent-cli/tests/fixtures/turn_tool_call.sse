@@ -20,5 +20,4 @@ event: response.output_item.done
 data: {"type":"response.output_item.done","output_index":0,"item":{"id":"item_1","type":"function_call","call_id":"call_read_1","name":"read","arguments":"{\"path\":\"note.txt\"}"}}
 
 event: response.completed
-data: {"type":"response.completed","response":{"id":"resp_e2e_1","status":"completed","usage":{"input_tokens":120,"output_tokens":18}}}
-
+data: {"type":"response.completed","response":{"id":"resp_e2e_1","status":"completed","usage":{"input_tokens":120,"output_tokens":18,"total_tokens":138}}}

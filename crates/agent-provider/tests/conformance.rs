@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use agent_core::model::ResponsesDialect;
-use agent_core::provider::{CanonicalRequest, StreamEvent};
+use agent_core::provider::{CanonicalRequest, ProviderError, ProviderErrorCategory, StreamEvent};
 use agent_provider::chatgpt_events::{CodexEventMapper, MAPPED_OUTPUT_ITEM_TYPES};
 use agent_provider::chatgpt_request::{ResponsesBodyOptions, build_responses_body};
 use serde::Deserialize;
@@ -25,6 +25,8 @@ struct Fixture {
     request: Option<RequestCase>,
     #[serde(default)]
     stream: Option<StreamCase>,
+    #[serde(default)]
+    error: Option<ErrorCase>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,6 +49,21 @@ struct FixtureOptions {
 struct StreamCase {
     events: Vec<Value>,
     expected: Vec<StreamEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ErrorCase {
+    event: Value,
+    expected: ErrorExpectation,
+}
+
+#[derive(Debug, Deserialize)]
+struct ErrorExpectation {
+    category: ProviderErrorCategory,
+    status: Option<u16>,
+    retry_after_ms: Option<u64>,
+    request_id: Option<String>,
+    auth_request_id: Option<String>,
 }
 
 fn fixtures_dir() -> PathBuf {
@@ -77,9 +94,65 @@ fn load_fixtures() -> Vec<(PathBuf, String, Fixture)> {
 fn every_fixture_covers_exactly_one_contract() {
     for (path, _, fixture) in load_fixtures() {
         assert!(
-            fixture.request.is_some() ^ fixture.stream.is_some(),
-            "{} must declare either a request or a stream case",
+            [
+                fixture.request.is_some(),
+                fixture.stream.is_some(),
+                fixture.error.is_some()
+            ]
+            .into_iter()
+            .filter(|present| *present)
+            .count()
+                == 1,
+            "{} must declare exactly one request, stream or error case",
             path.display()
+        );
+    }
+}
+
+#[test]
+fn errors_match_their_baseline_category_and_diagnostics() {
+    for (path, _, fixture) in load_fixtures() {
+        let Some(case) = fixture.error else {
+            continue;
+        };
+        let error = CodexEventMapper::new()
+            .ingest(&case.event.to_string())
+            .expect_err("error fixture must fail");
+        let ProviderError::Api {
+            category,
+            status,
+            retry_after_ms,
+            request_id,
+            auth_request_id,
+            ..
+        } = error
+        else {
+            panic!(
+                "{} ({}) did not produce a typed API error",
+                fixture.name,
+                path.display()
+            );
+        };
+        assert_eq!(
+            category, case.expected.category,
+            "{} category",
+            fixture.name
+        );
+        assert_eq!(status, case.expected.status, "{} status", fixture.name);
+        assert_eq!(
+            retry_after_ms, case.expected.retry_after_ms,
+            "{} retry delay",
+            fixture.name
+        );
+        assert_eq!(
+            request_id, case.expected.request_id,
+            "{} request id",
+            fixture.name
+        );
+        assert_eq!(
+            auth_request_id, case.expected.auth_request_id,
+            "{} auth request id",
+            fixture.name
         );
     }
 }

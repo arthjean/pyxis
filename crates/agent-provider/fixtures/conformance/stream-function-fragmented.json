@@ -8,13 +8,43 @@
       { "type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "a.txt\"}" },
       { "type": "response.function_call_arguments.done", "item_id": "fc_1", "arguments": "{\"path\":\"a.txt\"}" },
       { "type": "response.output_item.done", "item": { "type": "function_call", "call_id": "call_f", "id": "fc_1", "name": "read", "arguments": "{\"path\":\"a.txt\"}" } },
-      { "type": "response.completed", "response": { "status": "completed", "usage": { "input_tokens": 120, "output_tokens": 8 } } }
+      { "type": "response.completed", "response": { "id": "resp_function", "status": "completed", "usage": { "input_tokens": 120, "output_tokens": 8, "total_tokens": 128 } } }
     ],
     "expected": [
+      {
+        "type": "provider_extension",
+        "data": {
+          "extension": {
+            "event_type": "response.output_item.added",
+            "payload": { "type": "response.output_item.added", "output_index": 0, "item": { "type": "function_call", "call_id": "call_f", "id": "fc_1", "name": "read", "arguments": "" } }
+          }
+        }
+      },
       { "type": "tool_call_start", "data": { "id": "call_f", "name": "read", "format": "json" } },
-      { "type": "tool_call_delta", "data": { "id": "call_f", "input_delta": "{\"path\":\"a.txt\"}" } },
+      { "type": "tool_call_delta", "data": { "id": "call_f", "input_delta": "{\"path\":\"" } },
+      { "type": "tool_call_delta", "data": { "id": "call_f", "input_delta": "a.txt\"}" } },
+      {
+        "type": "provider_extension",
+        "data": {
+          "extension": {
+            "event_type": "response.function_call_arguments.done",
+            "payload": { "type": "response.function_call_arguments.done", "item_id": "fc_1", "arguments": "{\"path\":\"a.txt\"}" }
+          }
+        }
+      },
+      {
+        "type": "provider_extension",
+        "data": {
+          "extension": {
+            "event_type": "response.output_item.done",
+            "payload": { "type": "response.output_item.done", "item": { "type": "function_call", "call_id": "call_f", "id": "fc_1", "name": "read", "arguments": "{\"path\":\"a.txt\"}" } }
+          }
+        }
+      },
+      { "type": "tool_call_input_done", "data": { "id": "call_f", "input": "{\"path\":\"a.txt\"}" } },
       { "type": "tool_call_end", "data": { "id": "call_f" } },
-      { "type": "usage", "data": { "usage": { "input": 120, "output": 8 } } },
+      { "type": "response_metadata", "data": { "metadata": { "response_id": "resp_function" } } },
+      { "type": "usage", "data": { "usage": { "input": 120, "output": 8, "total": 128 } } },
       { "type": "done", "data": { "stop": "tool_use" } }
     ]
   }

@@ -8,5 +8,4 @@ event: response.output_item.done
 data: {"type":"response.output_item.done","output_index":0,"item":{"id":"item_2","type":"function_call","call_id":"call_block_1","name":"blocking","arguments":"{\"label\":\"cargo build\"}"}}
 
 event: response.completed
-data: {"type":"response.completed","response":{"id":"resp_e2e_3","status":"completed","usage":{"input_tokens":90,"output_tokens":12}}}
-
+data: {"type":"response.completed","response":{"id":"resp_e2e_3","status":"completed","usage":{"input_tokens":90,"output_tokens":12,"total_tokens":102}}}

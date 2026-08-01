@@ -1,0 +1,24 @@
+{
+  "name": "reasoning summary and content lifecycle remains distinct",
+  "note": "EP-002/US-005: indices, item identity, part boundaries, text completion and deltas remain observable without fabricated separators.",
+  "stream": {
+    "events": [
+      { "type": "response.reasoning_summary_part.added", "item_id": "rs_1", "summary_index": 0, "part": { "type": "summary_text", "text": "" } },
+      { "type": "response.reasoning_summary_text.delta", "item_id": "rs_1", "summary_index": 0, "delta": "thinking" },
+      { "type": "response.reasoning_summary_text.done", "item_id": "rs_1", "summary_index": 0, "text": "thinking" },
+      { "type": "response.reasoning_summary_part.done", "item_id": "rs_1", "summary_index": 0, "part": { "type": "summary_text", "text": "thinking" } },
+      { "type": "response.reasoning_text.delta", "item_id": "rs_1", "content_index": 1, "delta": "details" },
+      { "type": "response.reasoning_text.done", "item_id": "rs_1", "content_index": 1, "text": "details" }
+    ],
+    "expected": [
+      { "type": "provider_extension", "data": { "extension": { "event_type": "response.reasoning_summary_part.added", "payload": { "type": "response.reasoning_summary_part.added", "item_id": "rs_1", "summary_index": 0, "part": { "type": "summary_text", "text": "" } } } } },
+      { "type": "provider_extension", "data": { "extension": { "event_type": "response.reasoning_summary_text.delta", "payload": { "type": "response.reasoning_summary_text.delta", "item_id": "rs_1", "summary_index": 0, "delta": "thinking" } } } },
+      { "type": "reasoning_delta", "data": { "text": "thinking" } },
+      { "type": "provider_extension", "data": { "extension": { "event_type": "response.reasoning_summary_text.done", "payload": { "type": "response.reasoning_summary_text.done", "item_id": "rs_1", "summary_index": 0, "text": "thinking" } } } },
+      { "type": "provider_extension", "data": { "extension": { "event_type": "response.reasoning_summary_part.done", "payload": { "type": "response.reasoning_summary_part.done", "item_id": "rs_1", "summary_index": 0, "part": { "type": "summary_text", "text": "thinking" } } } } },
+      { "type": "provider_extension", "data": { "extension": { "event_type": "response.reasoning_text.delta", "payload": { "type": "response.reasoning_text.delta", "item_id": "rs_1", "content_index": 1, "delta": "details" } } } },
+      { "type": "reasoning_delta", "data": { "text": "details" } },
+      { "type": "provider_extension", "data": { "extension": { "event_type": "response.reasoning_text.done", "payload": { "type": "response.reasoning_text.done", "item_id": "rs_1", "content_index": 1, "text": "details" } } } }
+    ]
+  }
+}

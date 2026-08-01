@@ -1,599 +1,499 @@
 use super::*;
 
 fn ingest_all(events: &[&str]) -> Vec<StreamEvent> {
-    let mut m = CodexEventMapper::new();
-    let mut out = Vec::new();
-    for e in events {
-        out.extend(m.ingest(e).unwrap());
-    }
-    out
+    let mut mapper = CodexEventMapper::new();
+    events
+        .iter()
+        .flat_map(|event| mapper.ingest(event).expect("event maps"))
+        .collect()
+}
+
+fn extensions(events: &[StreamEvent]) -> Vec<&ProviderExtension> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::ProviderExtension { extension } => Some(extension),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
-fn text_delta_maps() {
-    let ev = ingest_all(&[r#"{"type":"response.output_text.delta","delta":"Hello"}"#]);
+fn text_delta_maps_without_extra_events() {
     assert_eq!(
-        ev,
-        vec![StreamEvent::TextDelta {
+        ingest_all(&[r#"{"type":"response.output_text.delta","delta":"Hello"}"#]),
+        [StreamEvent::TextDelta {
             text: "Hello".into()
         }]
     );
 }
 
 #[test]
-fn reasoning_deltas_map() {
-    let ev = ingest_all(&[
-        r#"{"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
-        r#"{"type":"response.reasoning_text.delta","delta":" encore"}"#,
+fn reasoning_lifecycle_stays_distinct_without_artificial_newline() {
+    let events = ingest_all(&[
+        r#"{"type":"response.reasoning_summary_part.added","item_id":"rs_1","summary_index":0,"part":{"type":"summary_text","text":""}}"#,
+        r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","summary_index":0,"delta":"thinking"}"#,
+        r#"{"type":"response.reasoning_summary_text.done","item_id":"rs_1","summary_index":0,"text":"thinking"}"#,
+        r#"{"type":"response.reasoning_summary_part.done","item_id":"rs_1","summary_index":0,"part":{"type":"summary_text","text":"thinking"}}"#,
+        r#"{"type":"response.reasoning_text.delta","item_id":"rs_1","content_index":1,"delta":"details"}"#,
+        r#"{"type":"response.reasoning_text.done","item_id":"rs_1","content_index":1,"text":"details"}"#,
     ]);
-    assert_eq!(
-        ev,
-        vec![
-            StreamEvent::ReasoningDelta {
-                text: "thinking".into()
-            },
-            StreamEvent::ReasoningDelta {
-                text: " encore".into()
-            },
-        ]
-    );
-}
-
-#[test]
-fn completed_without_tools_is_endturn_with_usage() {
-    let ev = ingest_all(&[
-        r#"{"type":"response.output_text.delta","delta":"ok"}"#,
-        r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":120,"output_tokens":8}}}"#,
-    ]);
-    assert!(ev.contains(&StreamEvent::Usage {
-        usage: TokenUsage::new(120, 8)
-    }));
-    assert_eq!(
-        ev.last(),
-        Some(&StreamEvent::Done {
-            stop: StopReason::EndTurn
-        })
-    );
-}
-
-#[test]
-fn completed_end_turn_false_requests_continuation() {
-    let ev = ingest_all(&[
-        r#"{"type":"response.completed","response":{"status":"completed","end_turn":false}}"#,
-    ]);
-    assert_eq!(
-        ev,
-        [StreamEvent::Done {
-            stop: StopReason::Continue
-        }]
-    );
-}
-
-#[test]
-fn missing_end_turn_keeps_legacy_end_turn_behavior() {
-    let ev = ingest_all(&[r#"{"type":"response.completed","response":{"status":"completed"}}"#]);
-    assert_eq!(
-        ev,
-        [StreamEvent::Done {
-            stop: StopReason::EndTurn
-        }]
-    );
-}
-
-#[test]
-fn incomplete_reasons_are_distinct() {
-    for (reason, expected) in [
-        ("max_output_tokens", StopReason::MaxTokens),
-        ("content_filter", StopReason::ContentFilter),
-        ("future_reason", StopReason::IncompleteUnknown),
-    ] {
-        let event = format!(
-            r#"{{"type":"response.incomplete","response":{{"status":"incomplete","incomplete_details":{{"reason":"{reason}"}}}}}}"#
-        );
-        let ev = ingest_all(&[&event]);
-        assert_eq!(ev.last(), Some(&StreamEvent::Done { stop: expected }));
-    }
-}
-
-#[test]
-fn invalid_end_turn_and_contradictory_terminals_fail_closed() {
-    for event in [
-        r#"{"type":"response.completed","response":{"status":"completed","end_turn":"false"}}"#,
-        r#"{"type":"response.completed","response":{"status":"incomplete"}}"#,
-        r#"{"type":"response.incomplete","response":{"status":"incomplete","end_turn":false}}"#,
-    ] {
-        let mut mapper = CodexEventMapper::new();
-        assert!(matches!(
-            mapper.ingest(event),
-            Err(ProviderError::Decode(_))
-        ));
-    }
-}
-
-#[test]
-fn function_call_full_lifecycle_reassembles_valid_json() {
-    let ev = ingest_all(&[
-        r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_7","id":"fc_1","name":"bash","arguments":""}}"#,
-        r#"{"type":"response.function_call_arguments.delta","delta":"{\"cmd\":\""}"#,
-        r#"{"type":"response.function_call_arguments.delta","delta":"ls\"}"}"#,
-        r#"{"type":"response.function_call_arguments.done","arguments":"{\"cmd\":\"ls\"}"}"#,
-        r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_7","id":"fc_1","name":"bash","arguments":"{\"cmd\":\"ls\"}"}}"#,
-        r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":50,"output_tokens":12}}}"#,
-    ]);
-
-    assert!(ev.contains(&StreamEvent::tool_call_start("call_7", "bash")));
-    assert!(ev.contains(&StreamEvent::ToolCallEnd {
-        id: "call_7".into()
-    }));
-    // stop = ToolUse because a tool call was emitted.
-    assert_eq!(
-        ev.last(),
-        Some(&StreamEvent::Done {
-            stop: StopReason::ToolUse
-        })
-    );
-
-    // invariant: concatenated input_delta = valid JSON.
-    let args: String = ev
+    let reasoning: Vec<&str> = events
         .iter()
-        .filter_map(|e| match e {
-            StreamEvent::ToolCallDelta { id, input_delta } if id == "call_7" => {
-                Some(input_delta.clone())
-            }
+        .filter_map(|event| match event {
+            StreamEvent::ReasoningDelta { text } => Some(text.as_str()),
             _ => None,
         })
         .collect();
-    let parsed: serde_json::Value = serde_json::from_str(&args).expect("JSON valide");
-    assert_eq!(parsed["cmd"], "ls");
-}
-
-#[test]
-fn interleaved_function_calls_are_tracked_by_item_id() {
-    let ev = ingest_all(&[
-        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_a","id":"fc_a","name":"read","arguments":""}}"#,
-        r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_b","id":"fc_b","name":"write","arguments":""}}"#,
-        r#"{"type":"response.function_call_arguments.delta","item_id":"fc_a","delta":"{\"path\":\""}"#,
-        r#"{"type":"response.function_call_arguments.delta","item_id":"fc_b","delta":"{\"path\":\""}"#,
-        r#"{"type":"response.function_call_arguments.delta","item_id":"fc_a","delta":"a.txt\"}"}"#,
-        r#"{"type":"response.function_call_arguments.delta","item_id":"fc_b","delta":"b.txt\"}"}"#,
-        r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_a","id":"fc_a","name":"read","arguments":"{\"path\":\"a.txt\"}"}}"#,
-        r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_b","id":"fc_b","name":"write","arguments":"{\"path\":\"b.txt\"}"}}"#,
-        r#"{"type":"response.completed","response":{"status":"completed"}}"#,
-    ]);
-
-    let args_for = |call_id: &str| -> String {
-        ev.iter()
-            .filter_map(|e| match e {
-                StreamEvent::ToolCallDelta { id, input_delta } if id == call_id => {
-                    Some(input_delta.clone())
-                }
-                _ => None,
-            })
-            .collect()
-    };
-    assert_eq!(args_for("call_a"), "{\"path\":\"a.txt\"}");
-    assert_eq!(args_for("call_b"), "{\"path\":\"b.txt\"}");
-    assert_eq!(
-        ev.last(),
-        Some(&StreamEvent::Done {
-            stop: StopReason::ToolUse
-        })
-    );
-}
-
-#[test]
-fn ambiguous_parallel_tool_delta_fails_closed() {
-    let mut m = CodexEventMapper::new();
-    assert!(
-            m.ingest(
-                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_a","id":"fc_a","name":"read","arguments":""}}"#
-            )
-            .unwrap()
-            .iter()
-            .any(|e| matches!(e, StreamEvent::ToolCallStart { id, .. } if id == "call_a"))
-        );
-    assert!(
-            m.ingest(
-                r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_b","id":"fc_b","name":"write","arguments":""}}"#
-            )
-            .unwrap()
-            .iter()
-            .any(|e| matches!(e, StreamEvent::ToolCallStart { id, .. } if id == "call_b"))
-        );
-    let err = m
-        .ingest(r#"{"type":"response.function_call_arguments.delta","delta":"{}"}"#)
-        .unwrap_err();
-    assert!(matches!(err, ProviderError::Decode(_)));
-}
-
-#[test]
-fn parallel_tool_delta_can_fallback_to_unique_call_id() {
-    let mut m = CodexEventMapper::new();
-    m.ingest(
-            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_a","id":"fc_a","name":"read","arguments":""}}"#,
-        )
-        .unwrap();
-    m.ingest(
-            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_b","id":"fc_b","name":"write","arguments":""}}"#,
-        )
-        .unwrap();
-    assert!(
-            m.ingest(
-                r#"{"type":"response.function_call_arguments.done","call_id":"call_b","arguments":"{\"path\":\"b.txt\"}"}"#
-            )
-            .unwrap()
-            .is_empty()
-        );
-    let ev = m
-            .ingest(
-                r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_b","name":"write"}}"#,
-            )
-            .unwrap();
-    assert!(ev.iter().any(|e| {
-        matches!(
-            e,
-            StreamEvent::ToolCallDelta { id, input_delta }
-            if id == "call_b" && input_delta == "{\"path\":\"b.txt\"}"
-        )
-    }));
-}
-
-#[test]
-fn args_only_in_item_done_still_emitted() {
-    // backend that sends no deltas: args only in output_item.done.
-    let ev = ingest_all(&[
-        r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"c1","id":"fc","name":"x","arguments":""}}"#,
-        r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","id":"fc","name":"x","arguments":"{\"a\":1}"}}"#,
-    ]);
-    let args: String = ev
-        .iter()
-        .filter_map(|e| match e {
-            StreamEvent::ToolCallDelta { input_delta, .. } => Some(input_delta.clone()),
-            _ => None,
-        })
+    assert_eq!(reasoning, ["thinking", "details"]);
+    assert!(!reasoning.iter().any(|text| text.contains('\n')));
+    let types: Vec<&str> = extensions(&events)
+        .into_iter()
+        .map(ProviderExtension::event_type)
         .collect();
-    assert_eq!(args, "{\"a\":1}");
-}
-
-#[test]
-fn function_call_done_without_added_reconstructs_call() {
-    let ev = ingest_all(&[
-        r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","name":"read","arguments":"{\"path\":\"Cargo.toml\"}"}}"#,
-        r#"{"type":"response.completed","response":{"status":"completed"}}"#,
-    ]);
-    assert!(ev.iter().any(|e| {
-        matches!(
-            e,
-            StreamEvent::ToolCallStart { id, name, .. } if id == "c1" && name == "read"
-        )
-    }));
-    assert!(ev.iter().any(|e| {
-        matches!(
-            e,
-            StreamEvent::ToolCallDelta { id, input_delta }
-            if id == "c1" && input_delta == "{\"path\":\"Cargo.toml\"}"
-        )
-    }));
     assert_eq!(
-        ev.last(),
-        Some(&StreamEvent::Done {
-            stop: StopReason::ToolUse
-        })
-    );
-}
-
-#[test]
-fn function_call_done_without_added_or_name_fails_closed() {
-    let mut m = CodexEventMapper::new();
-    let err = m
-            .ingest(
-                r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","arguments":"{}"}}"#,
-            )
-            .unwrap_err();
-    assert!(matches!(err, ProviderError::Decode(_)));
-}
-
-#[test]
-fn incomplete_status_without_a_reason_fails_closed_as_unknown() {
-    let ev = ingest_all(&[r#"{"type":"response.incomplete","response":{"status":"incomplete"}}"#]);
-    assert_eq!(
-        ev,
-        vec![StreamEvent::Done {
-            stop: StopReason::IncompleteUnknown
-        }]
-    );
-}
-
-#[test]
-fn error_event_yields_typed_error_not_panic() {
-    let mut m = CodexEventMapper::new();
-    let err = m
-        .ingest(r#"{"type":"error","code":"server_error","message":"boom"}"#)
-        .unwrap_err();
-    assert!(matches!(err, ProviderError::Stream(_)));
-}
-
-#[test]
-fn context_length_error_is_classified_for_withholding() {
-    let mut m = CodexEventMapper::new();
-    let err = m
-            .ingest(
-                r#"{"type":"response.failed","response":{"error":{"code":"context_length_exceeded","message":"maximum context length"}}}"#,
-            )
-            .unwrap_err();
-    assert!(matches!(err, ProviderError::ContextLengthExceeded));
-    assert!(err.is_context_error());
-}
-
-#[test]
-fn response_failed_invalid_request_is_not_stream_retryable() {
-    let mut m = CodexEventMapper::new();
-    let err = m
-            .ingest(
-                r#"{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"bad schema"}}}"#,
-            )
-            .unwrap_err();
-    assert!(matches!(
-        err,
-        ProviderError::Http {
-            status: 400,
-            retry_after_ms: None,
-            ..
-        }
-    ));
-}
-
-#[test]
-fn response_failed_rate_limit_keeps_rate_limited_status() {
-    let mut m = CodexEventMapper::new();
-    let err = m
-            .ingest(
-                r#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"too many requests"}}}"#,
-            )
-            .unwrap_err();
-    assert!(matches!(
-        err,
-        ProviderError::Http {
-            status: 429,
-            retry_after_ms: None,
-            ..
-        }
-    ));
-}
-
-// Encrypted content stays replay-gated, while the non-sensitive reasoning
-// state remains observable in both modes.
-#[test]
-fn reasoning_item_captured_only_when_replay_on() {
-    let done = r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"ENC"}}"#;
-    let off = CodexEventMapper::new().ingest(done).unwrap();
-    assert!(matches!(
-        off.as_slice(),
-        [StreamEvent::ResponseMetadata { metadata }]
-            if metadata.reasoning.item_id.as_deref() == Some("rs_1")
-    ));
-    // ON -> metadata followed by the opaque replay item.
-    let ev = CodexEventMapper::with_replay(true).ingest(done).unwrap();
-    assert!(matches!(
-        ev.as_slice(),
+        types,
         [
-            StreamEvent::ResponseMetadata { metadata },
-            StreamEvent::EncryptedReasoning { id, encrypted_content }
-        ] if metadata.reasoning.item_id.as_deref() == Some("rs_1")
-            && id == "rs_1" && encrypted_content == "ENC"
-    ));
-    // Missing encrypted content keeps the metadata but emits no replay item.
-    let empty = r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_2"}}"#;
-    assert!(matches!(
-        CodexEventMapper::with_replay(true)
-            .ingest(empty)
-            .unwrap()
-            .as_slice(),
-        [StreamEvent::ResponseMetadata { metadata }]
-            if metadata.reasoning.item_id.as_deref() == Some("rs_2")
-    ));
-}
-
-#[test]
-fn malformed_chunk_is_typed_error() {
-    let mut m = CodexEventMapper::new();
-    assert!(matches!(
-        m.ingest("{not json").unwrap_err(),
-        ProviderError::Decode(_)
-    ));
-    assert!(matches!(
-        m.ingest("").unwrap_err(),
-        ProviderError::Decode(_)
-    ));
-}
-
-#[test]
-fn an_item_id_is_never_reported_as_the_response_id() {
-    let mut mapper = CodexEventMapper::new();
-    let events = mapper
-        .ingest(r#"{"type":"response.output_text.delta","id":"item_1","delta":"hello"}"#)
-        .unwrap();
-    assert_eq!(
-        events,
-        vec![StreamEvent::TextDelta {
-            text: "hello".into()
-        }]
-    );
-}
-
-#[test]
-fn known_lifecycle_events_stay_quiet_while_unknown_events_remain_observable() {
-    let mut mapper = CodexEventMapper::new();
-    for event_type in KNOWN_UNPROJECTED_EVENTS {
-        let event = serde_json::json!({"type": event_type});
-        assert!(mapper.ingest(&event.to_string()).unwrap().is_empty());
-    }
-
-    let unknown = mapper.ingest(r#"{"type":"response.future"}"#).unwrap();
-    assert!(matches!(
-        unknown.as_slice(),
-        [StreamEvent::ProviderExtension { extension }]
-            if extension.event_type() == "response.future"
-    ));
-}
-
-#[test]
-fn fragmented_custom_tool_call_yields_one_terminal_call_with_text_input() {
-    let ev = ingest_all(&[
-        r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","call_id":"call_1","id":"ctc_1","name":"exec","input":""}}"#,
-        r#"{"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","call_id":"call_1","delta":"// @exec: cell\n"}"#,
-        r#"{"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","call_id":"call_1","delta":"const x = 1;"}"#,
-        r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_1","id":"ctc_1","name":"exec","input":"// @exec: cell\nconst x = 1;"}}"#,
-        r#"{"type":"response.completed","response":{"status":"completed"}}"#,
-    ]);
-    assert_eq!(
-        ev,
-        vec![
-            StreamEvent::custom_tool_call_start("call_1", "exec"),
-            StreamEvent::ToolCallDelta {
-                id: "call_1".into(),
-                input_delta: "// @exec: cell\nconst x = 1;".into(),
-            },
-            StreamEvent::ToolCallEnd {
-                id: "call_1".into()
-            },
-            StreamEvent::Done {
-                stop: StopReason::ToolUse
-            },
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+            "response.reasoning_summary_part.done",
+            "response.reasoning_text.delta",
+            "response.reasoning_text.done",
         ]
     );
 }
 
-/// Duplicated deltas then an authoritative terminal item: the terminal
-/// input wins and nothing is emitted twice.
 #[test]
-fn duplicate_deltas_lose_against_the_terminal_item() {
-    let ev = ingest_all(&[
-        r#"{"type":"response.output_item.added","item":{"type":"custom_tool_call","call_id":"call_1","id":"ctc_1","name":"exec","input":""}}"#,
-        r#"{"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","delta":"print(1)"}"#,
-        r#"{"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","delta":"print(1)"}"#,
-        r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_1","id":"ctc_1","name":"exec","input":"print(1)"}}"#,
+fn fragmented_function_deltas_are_immediate_and_terminal_input_is_authoritative() {
+    let mut mapper = CodexEventMapper::new();
+    let added = mapper
+        .ingest(r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_7","id":"fc_1","name":"shell","arguments":""}}"#)
+        .unwrap();
+    assert!(matches!(added.last(), Some(StreamEvent::ToolCallStart { id, .. }) if id == "call_7"));
+
+    for (delta, expected) in [(r#"{"cmd":""#, r#"{"cmd":""#), (r#"ls"}"#, r#"ls"}"#)] {
+        let event = format!(
+            r#"{{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":{}}}"#,
+            serde_json::to_string(delta).unwrap()
+        );
+        assert_eq!(
+            mapper.ingest(&event).unwrap(),
+            [StreamEvent::ToolCallDelta {
+                id: "call_7".into(),
+                input_delta: expected.into(),
+            }]
+        );
+    }
+    let done = mapper
+        .ingest(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_7","id":"fc_1","name":"shell","arguments":"{\"cmd\":\"pwd\"}"}}"#)
+        .unwrap();
+    assert!(done.iter().any(|event| matches!(
+        event,
+        StreamEvent::ToolCallInputDone { id, input }
+            if id == "call_7" && input == "{\"cmd\":\"pwd\"}"
+    )));
+    assert!(
+        !done
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolCallDelta { .. }))
+    );
+    assert!(matches!(done.last(), Some(StreamEvent::ToolCallEnd { id }) if id == "call_7"));
+}
+
+#[test]
+fn fragmented_custom_tool_input_is_emitted_at_arrival() {
+    let events = ingest_all(&[
+        r#"{"type":"response.output_item.added","item":{"type":"custom_tool_call","call_id":"custom_1","id":"ct_1","name":"patch","input":""}}"#,
+        r#"{"type":"response.custom_tool_call_input.delta","item_id":"ct_1","delta":"one"}"#,
+        r#"{"type":"response.custom_tool_call_input.delta","item_id":"ct_1","delta":" two"}"#,
+        r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"custom_1","id":"ct_1","name":"patch","input":"authoritative"}}"#,
     ]);
-    let deltas: Vec<&str> = ev
+    let deltas: Vec<&str> = events
         .iter()
         .filter_map(|event| match event {
             StreamEvent::ToolCallDelta { input_delta, .. } => Some(input_delta.as_str()),
             _ => None,
         })
         .collect();
-    assert_eq!(deltas, ["print(1)"], "terminal item is authoritative");
-    assert_eq!(
-        ev.iter()
-            .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
-            .count(),
-        1,
-        "one dispatch, not two"
-    );
+    assert_eq!(deltas, ["one", " two"]);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::ToolCallInputDone { input, .. } if input == "authoritative"
+    )));
 }
 
 #[test]
-fn custom_tool_call_done_without_added_is_reconstructed() {
-    let ev = ingest_all(&[
-        r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"*** Begin Patch"}}"#,
-        r#"{"type":"response.completed","response":{"status":"completed"}}"#,
-    ]);
-    assert_eq!(
-        ev.first(),
-        Some(&StreamEvent::custom_tool_call_start("c1", "apply_patch"))
-    );
-    assert!(ev.contains(&StreamEvent::ToolCallDelta {
-        id: "c1".into(),
-        input_delta: "*** Begin Patch".into(),
-    }));
-}
-
-#[test]
-fn impossible_custom_streams_fail_closed_without_dispatch() {
-    // Terminal item without a name: nothing is dispatchable.
-    let mut m = CodexEventMapper::new();
-    assert!(matches!(
-            m.ingest(
-                r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"c1","input":"x"}}"#,
-            )
-            .unwrap_err(),
-            ProviderError::Decode(_)
-        ));
-
-    // A custom delta addressed to a function call would silently corrupt
-    // its JSON arguments, and the reverse would corrupt freeform text.
-    let mut m = CodexEventMapper::new();
-    m.ingest(
-            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_a","id":"fc_a","name":"read","arguments":""}}"#,
-        )
-        .unwrap();
-    assert!(matches!(
-        m.ingest(
-            r#"{"type":"response.custom_tool_call_input.delta","item_id":"fc_a","delta":"raw"}"#,
-        )
-        .unwrap_err(),
-        ProviderError::Decode(_)
-    ));
-
-    let mut m = CodexEventMapper::new();
-    m.ingest(
-            r#"{"type":"response.output_item.added","item":{"type":"custom_tool_call","call_id":"call_c","id":"ctc_a","name":"exec","input":""}}"#,
-        )
-        .unwrap();
-    assert!(matches!(
-        m.ingest(
-            r#"{"type":"response.function_call_arguments.delta","item_id":"ctc_a","delta":"{}"}"#,
-        )
-        .unwrap_err(),
-        ProviderError::Decode(_)
-    ));
-
-    // Format flip between the opening and the terminal item.
-    let mut m = CodexEventMapper::new();
-    m.ingest(
-            r#"{"type":"response.output_item.added","item":{"type":"custom_tool_call","call_id":"c2","id":"ctc_2","name":"exec","input":""}}"#,
-        )
-        .unwrap();
-    assert!(matches!(
-            m.ingest(
-                r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c2","id":"ctc_2","name":"exec","arguments":"{}"}}"#,
-            )
-            .unwrap_err(),
-            ProviderError::Decode(_)
-        ));
-
-    // Invalid UTF-8 escape inside the payload: rejected at decode, so no
-    // call is ever built from it.
-    let mut m = CodexEventMapper::new();
-    assert!(matches!(
-            m.ingest(
-                "{\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"c3\",\"name\":\"exec\",\"input\":\"\\ud800\"}}",
-            )
-            .unwrap_err(),
-            ProviderError::Decode(_)
-        ));
-}
-
-#[test]
-fn function_and_custom_calls_interleave_without_crosstalk() {
-    let ev = ingest_all(&[
+fn parallel_calls_are_correlated_without_crosstalk_and_ambiguity_fails_closed() {
+    let mut mapper = CodexEventMapper::new();
+    for event in [
         r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_f","id":"fc_1","name":"read","arguments":""}}"#,
-        r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"custom_tool_call","call_id":"call_c","id":"ctc_1","name":"exec","input":""}}"#,
-        r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"path\":\"a.txt\"}"}"#,
-        r#"{"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","delta":"await tools.read()"}"#,
-        r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_f","id":"fc_1","name":"read","arguments":"{\"path\":\"a.txt\"}"}}"#,
-        r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_c","id":"ctc_1","name":"exec","input":"await tools.read()"}}"#,
-        r#"{"type":"response.completed","response":{"status":"completed"}}"#,
-    ]);
-    let payload = |call: &str| -> Option<String> {
-        ev.iter().find_map(|event| match event {
-            StreamEvent::ToolCallDelta { id, input_delta } if id == call => {
-                Some(input_delta.clone())
+        r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"custom_tool_call","call_id":"call_c","id":"ct_1","name":"exec","input":""}}"#,
+    ] {
+        mapper.ingest(event).unwrap();
+    }
+    assert!(matches!(
+        mapper.ingest(r#"{"type":"response.function_call_arguments.delta","delta":"{}"}"#),
+        Err(ProviderError::Decode(_))
+    ));
+
+    let function = mapper
+        .ingest(
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"path\":\"a.txt\"}"}"#,
+        )
+        .unwrap();
+    let custom = mapper
+        .ingest(
+            r#"{"type":"response.custom_tool_call_input.delta","item_id":"ct_1","delta":"run"}"#,
+        )
+        .unwrap();
+    assert!(matches!(
+        function.as_slice(),
+        [StreamEvent::ToolCallDelta { id, input_delta }]
+            if id == "call_f" && input_delta == "{\"path\":\"a.txt\"}"
+    ));
+    assert!(matches!(
+        custom.as_slice(),
+        [StreamEvent::ToolCallDelta { id, input_delta }]
+            if id == "call_c" && input_delta == "run"
+    ));
+}
+
+#[test]
+fn terminal_items_reconstruct_complete_calls_but_reject_missing_identity() {
+    for (item_type, input_field, input, expected_format) in [
+        (
+            "function_call",
+            "arguments",
+            r#"{"path":"Cargo.toml"}"#,
+            ToolCallFormat::Json,
+        ),
+        (
+            "custom_tool_call",
+            "input",
+            "*** Begin Patch",
+            ToolCallFormat::Text,
+        ),
+    ] {
+        let event = serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": item_type,
+                "call_id": "call_1",
+                "name": "tool",
+                (input_field): input,
             }
-            _ => None,
-        })
+        });
+        let events = CodexEventMapper::new().ingest(&event.to_string()).unwrap();
+        assert!(matches!(
+            events.first(),
+            Some(StreamEvent::ToolCallStart { id, format, .. })
+                if id == "call_1" && *format == expected_format
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(StreamEvent::ToolCallInputDone { id, input: value })
+                if id == "call_1" && value == input
+        ));
+        assert!(matches!(events.last(), Some(StreamEvent::ToolCallEnd { id }) if id == "call_1"));
+    }
+
+    let error = CodexEventMapper::new()
+        .ingest(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","arguments":"{}"}}"#,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ProviderError::Decode(_)));
+}
+
+#[test]
+fn contradictory_tool_and_response_terminals_fail_closed() {
+    let mut mapper = CodexEventMapper::new();
+    mapper
+        .ingest(
+            r#"{"type":"response.output_item.added","item":{"type":"custom_tool_call","call_id":"call_1","id":"ct_1","name":"exec","input":""}}"#,
+        )
+        .unwrap();
+    assert!(matches!(
+        mapper.ingest(
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","id":"ct_1","name":"exec","arguments":"{}"}}"#,
+        ),
+        Err(ProviderError::Decode(_))
+    ));
+
+    for event in [
+        r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_1","status":"failed"}}"#,
+        r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","end_turn":"yes"}}"#,
+    ] {
+        assert!(matches!(
+            CodexEventMapper::new().ingest(event),
+            Err(ProviderError::Decode(_))
+        ));
+    }
+}
+
+#[test]
+fn completed_publishes_metadata_usage_then_one_success_terminal() {
+    let events = ingest_all(&[
+        r#"{"type":"response.completed","request_id":"req_1","response":{"id":"resp_1","status":"completed","end_turn":false,"usage":{"input_tokens":4294967297,"output_tokens":4294967298,"total_tokens":8589934595}}}"#,
+    ]);
+    assert!(matches!(
+        &events[0],
+        StreamEvent::ResponseMetadata { metadata }
+            if metadata.response_id.as_deref() == Some("resp_1")
+                && metadata.request_id.as_deref() == Some("req_1")
+                && metadata.end_turn == Some(false)
+    ));
+    assert_eq!(
+        events[1],
+        StreamEvent::Usage {
+            usage: TokenUsage {
+                input: 4_294_967_297,
+                output: 4_294_967_298,
+                total: 8_589_934_595,
+                ..TokenUsage::default()
+            }
+        }
+    );
+    assert_eq!(
+        events[2],
+        StreamEvent::Done {
+            stop: StopReason::Continue
+        }
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::Done { .. }))
+            .count(),
+        1
+    );
+
+    let mut mapper = CodexEventMapper::new();
+    mapper
+        .ingest(
+            r#"{"type":"response.completed","response":{"id":"resp_once","status":"completed"}}"#,
+        )
+        .unwrap();
+    assert!(matches!(
+        mapper.ingest(
+            r#"{"type":"response.completed","response":{"id":"resp_twice","status":"completed"}}"#,
+        ),
+        Err(ProviderError::Decode(_))
+    ));
+}
+
+#[test]
+fn usage_rejects_negative_and_out_of_i64_counters_at_the_provider_boundary() {
+    for input_tokens in [serde_json::json!(-1), serde_json::json!(u64::MAX)] {
+        let event = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "status": "completed",
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": 1,
+                    "total_tokens": 1
+                }
+            }
+        });
+        assert!(matches!(
+            CodexEventMapper::new().ingest(&event.to_string()),
+            Err(ProviderError::Decode(_))
+        ));
+    }
+}
+
+#[test]
+fn usage_without_backend_total_falls_back_to_input_plus_output() {
+    let events = ingest_all(&[
+        r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","usage":{"input_tokens":7,"output_tokens":5}}}"#,
+    ]);
+    let usage = TokenUsage {
+        input: 7,
+        output: 5,
+        ..TokenUsage::default()
     };
-    assert_eq!(payload("call_f").as_deref(), Some(r#"{"path":"a.txt"}"#));
-    assert_eq!(payload("call_c").as_deref(), Some("await tools.read()"));
-    assert!(ev.contains(&StreamEvent::tool_call_start("call_f", "read")));
-    assert!(ev.contains(&StreamEvent::custom_tool_call_start("call_c", "exec")));
+    assert_eq!(events.get(1), Some(&StreamEvent::Usage { usage }));
+    assert_eq!(usage.total(), 12);
+}
+
+#[test]
+fn incomplete_failed_and_done_never_synthesize_success() {
+    let cases = [
+        (
+            r#"{"type":"response.incomplete","response":{"id":"resp_i","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}"#,
+            ProviderErrorCategory::Incomplete,
+        ),
+        (
+            r#"{"type":"response.failed","response":{"id":"resp_f","status":"failed","error":{"code":"invalid_request_error","message":"bad schema"}}}"#,
+            ProviderErrorCategory::InvalidRequest,
+        ),
+        (
+            r#"{"type":"response.done","response":{"id":"resp_d","status":"completed"}}"#,
+            ProviderErrorCategory::Failed,
+        ),
+    ];
+    for (event, expected) in cases {
+        let error = CodexEventMapper::new().ingest(event).unwrap_err();
+        assert!(matches!(error, ProviderError::Api { category, .. } if category == expected));
+    }
+}
+
+#[test]
+fn provider_error_categories_retry_delay_and_diagnostic_ids_survive() {
+    let cases = [
+        (
+            "context_length_exceeded",
+            ProviderErrorCategory::ContextOverflow,
+        ),
+        ("insufficient_quota", ProviderErrorCategory::Quota),
+        (
+            "usage_not_included",
+            ProviderErrorCategory::UsageNotIncluded,
+        ),
+        ("cyber_policy_violation", ProviderErrorCategory::CyberPolicy),
+        ("invalid_prompt", ProviderErrorCategory::InvalidPrompt),
+        ("invalid_image", ProviderErrorCategory::InvalidImage),
+        ("server_is_overloaded", ProviderErrorCategory::Overloaded),
+        (
+            "authentication_error",
+            ProviderErrorCategory::Authentication,
+        ),
+        ("permission_denied", ProviderErrorCategory::PermissionDenied),
+    ];
+    for (code, expected) in cases {
+        let event = serde_json::json!({
+            "type": "response.failed",
+            "request_id": "req_diag",
+            "auth_request_id": "auth_diag",
+            "response": {"error": {"code": code, "message": "provider failure"}}
+        });
+        let error = CodexEventMapper::new()
+            .ingest(&event.to_string())
+            .unwrap_err();
+        assert!(
+            matches!(error, ProviderError::Api { category, request_id: Some(ref request), auth_request_id: Some(ref auth), .. }
+            if category == expected && request == "req_diag" && auth == "auth_diag")
+        );
+    }
+
+    let error = CodexEventMapper::new()
+        .ingest(r#"{"type":"error","code":"rate_limit_exceeded","message":"Try again in 11.054s","request_id":"req_rate"}"#)
+        .unwrap_err();
+    assert!(matches!(error, ProviderError::Api {
+        category: ProviderErrorCategory::RateLimited,
+        retry_after_ms: Some(11_054),
+        request_id: Some(ref request),
+        ..
+    } if request == "req_rate"));
+}
+
+#[test]
+fn diagnostic_ids_only_come_from_known_bounded_envelope_fields() {
+    let nested = serde_json::json!({
+        "type": "response.failed",
+        "payload": {"auth_request_id": "nested-user-value"},
+        "response": {"error": {"code": "server_error", "message": "boom"}}
+    });
+    assert!(matches!(
+        CodexEventMapper::new().ingest(&nested.to_string()),
+        Err(ProviderError::Api {
+            auth_request_id: None,
+            ..
+        })
+    ));
+
+    let oversized = serde_json::json!({
+        "type": "response.failed",
+        "request_id": "x".repeat(257),
+        "response": {"error": {"code": "server_error", "message": "boom"}}
+    });
+    assert!(matches!(
+        CodexEventMapper::new().ingest(&oversized.to_string()),
+        Err(ProviderError::Api {
+            request_id: None,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn malformed_json_is_diagnosed_and_later_events_continue() {
+    let mut mapper = CodexEventMapper::new();
+    let malformed = mapper.ingest("{broken").unwrap();
+    assert!(matches!(
+        &malformed[0],
+        StreamEvent::ProviderExtension { extension }
+            if extension.event_type() == "malformed_sse_event_ignored"
+                && extension.payload()["reason"] == "invalid_json"
+                && extension.payload().get("raw").is_none()
+    ));
+    assert_eq!(
+        mapper
+            .ingest(r#"{"type":"response.output_text.delta","delta":"still alive"}"#)
+            .unwrap(),
+        [StreamEvent::TextDelta {
+            text: "still alive".into()
+        }]
+    );
+    assert!(mapper
+        .ingest(r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","end_turn":true}}"#)
+        .unwrap()
+        .iter()
+        .any(|event| matches!(event, StreamEvent::Done { stop: StopReason::EndTurn })));
+}
+
+#[test]
+fn known_and_unknown_output_items_preserve_complete_bounded_payloads() {
+    let events = ingest_all(&[
+        r#"{"type":"response.output_item.added","output_index":2,"item":{"type":"message","id":"msg_1","status":"in_progress","content":[]}}"#,
+        r#"{"type":"response.output_item.done","output_index":3,"item":{"type":"web_search_call","id":"ws_1","status":"completed"}}"#,
+    ]);
+    assert!(extensions(&events).iter().any(|extension| {
+        extension.event_type() == "response.output_item.added"
+            && extension.payload()["item"]["id"] == "msg_1"
+            && extension.payload()["output_index"] == 2
+    }));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::UnmappedItem { item_type, extension: Some(extension) }
+            if item_type == "web_search_call"
+                && extension.payload()["id"] == "ws_1"
+    )));
+}
+
+#[test]
+fn known_output_item_frames_without_an_item_remain_observable() {
+    let events = ingest_all(&[
+        r#"{"type":"response.output_item.added","output_index":2}"#,
+        r#"{"type":"response.output_item.done","output_index":2}"#,
+    ]);
+    let types: Vec<&str> = extensions(&events)
+        .into_iter()
+        .map(ProviderExtension::event_type)
+        .collect();
+    assert_eq!(
+        types,
+        ["response.output_item.added", "response.output_item.done"]
+    );
+}
+
+#[test]
+fn encrypted_reasoning_is_gated_but_reasoning_metadata_is_not() {
+    let event = r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","status":"completed","encrypted_content":"opaque"}}"#;
+    let without_replay = CodexEventMapper::new().ingest(event).unwrap();
+    assert!(
+        !without_replay
+            .iter()
+            .any(|event| matches!(event, StreamEvent::EncryptedReasoning { .. }))
+    );
+    let with_replay = CodexEventMapper::with_replay(true).ingest(event).unwrap();
+    assert!(with_replay.iter().any(|event| matches!(
+        event,
+        StreamEvent::EncryptedReasoning { id, encrypted_content }
+            if id == "rs_1" && encrypted_content == "opaque"
+    )));
 }
