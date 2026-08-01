@@ -111,10 +111,11 @@ impl ContextBudget {
     /// real usage after a compaction becomes the `prefill` baseline (incompressible
     /// overhead), so that we then measure growth and not the absolute value.
     pub fn observe_usage(&mut self, usage: TokenUsage) {
-        self.current_input = usage.input;
+        let input = u32::try_from(usage.input).unwrap_or(u32::MAX);
+        self.current_input = input;
         self.usage_seen = true;
         if self.awaiting_baseline {
-            self.prefill_input = usage.input;
+            self.prefill_input = input;
             self.awaiting_baseline = false;
         }
     }

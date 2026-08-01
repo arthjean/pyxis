@@ -325,7 +325,7 @@ pub struct ModelTurnView {
     /// usage: the measure is absent, which is not the same as zero, and a client
     /// must then display nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_tokens: Option<u32>,
+    pub context_tokens: Option<u64>,
     /// Context window of the active model, when the backend declares one
     /// (US-001). `None` = unknown. The core deliberately computes NO percentage:
     /// relating one to the other is a presentation decision.

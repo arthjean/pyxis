@@ -123,7 +123,7 @@ impl UsageBudget {
     }
 
     pub fn record_usage(&mut self, usage: TokenUsage) {
-        self.record(usage.input as u64, usage.output as u64);
+        self.record(usage.input, usage.output);
     }
 
     pub fn spent_tokens(&self) -> u64 {

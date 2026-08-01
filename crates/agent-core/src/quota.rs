@@ -16,7 +16,7 @@ pub struct QuotaWindow {
     pub used_percent: f64,
     /// Duration of the rolling window, in minutes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub window_minutes: Option<u32>,
+    pub window_minutes: Option<i64>,
     /// Instant the window resets, in seconds since the Unix epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at_unix: Option<i64>,
@@ -109,6 +109,12 @@ impl QuotaReachedKind {
 /// Quota state of the connected account at a given instant.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct QuotaSnapshot {
+    /// Stable metered pool identifier (`codex`, `codex_secondary`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_id: Option<String>,
+    /// Human-readable model or pool label when the backend serves one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_name: Option<String>,
     /// Short window (the one that usually blocks first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub primary: Option<QuotaWindow>,
@@ -126,6 +132,8 @@ pub struct QuotaSnapshot {
     /// blocked without a stated reason", never "fine".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reached: Option<QuotaReachedKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promo: Option<String>,
 }
 
 impl QuotaSnapshot {
@@ -137,6 +145,7 @@ impl QuotaSnapshot {
             && self.credits.is_none()
             && self.plan.is_none()
             && self.reached.is_none()
+            && self.promo.is_none()
     }
 
     /// The window closest to exhaustion, which is the one worth naming in a

@@ -48,7 +48,7 @@ pub fn usage_probe_line(view: &agent_core::ModelTurnView) -> Option<String> {
         "[usage] turn={} backend input={measured} | local estimate≈{estimated} \
          (ratio real/estimated={:.3})",
         view.index,
-        f64::from(measured) / f64::from(estimated.max(1)),
+        measured as f64 / f64::from(estimated.max(1)),
     ))
 }
 

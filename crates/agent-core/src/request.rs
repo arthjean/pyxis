@@ -112,6 +112,26 @@ impl CanonicalRequest {
                     detail: "runtime reasoning effort does not match request".into(),
                 });
             }
+            if let Some(tier) = self.service_tier.as_deref()
+                && tier != "default"
+                && !runtime
+                    .service_tiers
+                    .iter()
+                    .any(|supported| supported.eq_ignore_ascii_case(tier))
+            {
+                return Err(CanonicalRequestValidationError::UnsupportedServiceTier {
+                    model: runtime.slug.clone(),
+                    tier: tier.to_string(),
+                });
+            }
+            if self.stream_options.reasoning_summary_delivery.is_some()
+                && runtime.reasoning_effort.is_none()
+            {
+                return Err(CanonicalRequestValidationError::IncompatibleControl {
+                    model: runtime.slug.clone(),
+                    control: "reasoning_summary_delivery".to_string(),
+                });
+            }
             if self.reasoning_replay
                 && runtime.reasoning_replay != crate::model::ReasoningReplaySupport::Enabled
             {
@@ -176,6 +196,10 @@ pub enum CanonicalRequestValidationError {
     UnsupportedImageModality { model: String },
     #[error("model {model} does not support encrypted stateless reasoning replay")]
     UnsupportedReasoningReplay { model: String },
+    #[error("model {model} does not support service tier {tier}")]
+    UnsupportedServiceTier { model: String, tier: String },
+    #[error("model {model} does not support request control {control}")]
+    IncompatibleControl { model: String, control: String },
     #[error("message {index} is invalid: {detail}")]
     InvalidMessage { index: usize, detail: String },
     #[error("tool spec is invalid: {0}")]
@@ -240,6 +264,7 @@ mod tests {
             supports_verbosity: false,
             verbosity: None,
             supports_parallel_tool_calls: false,
+            service_tiers: Vec::new(),
             reasoning_replay: crate::model::ReasoningReplaySupport::Disabled,
             responses_dialect: ResponsesDialect::Standard,
             tool_mode: ModelToolMode::Direct,
@@ -372,6 +397,55 @@ mod tests {
         assert!(matches!(
             request.validate(),
             Err(CanonicalRequestValidationError::DuplicateToolName { tool }) if tool == "read"
+        ));
+    }
+
+    #[test]
+    fn incompatible_enriched_controls_fail_at_the_canonical_boundary() {
+        let mut runtime = text_only_runtime();
+        runtime.service_tiers = vec!["priority".into()];
+        let base = CanonicalRequest {
+            model: runtime.slug.clone(),
+            model_runtime: Some(runtime),
+            messages: vec![Message::user("ok")],
+            max_output_tokens: 100,
+            ..CanonicalRequest::default()
+        };
+
+        let unsupported_tier = CanonicalRequest {
+            service_tier: Some("flex".into()),
+            ..base.clone()
+        };
+        assert!(matches!(
+            unsupported_tier.validate(),
+            Err(CanonicalRequestValidationError::UnsupportedServiceTier { tier, .. })
+                if tier == "flex"
+        ));
+
+        let unsupported_summary = CanonicalRequest {
+            stream_options: RequestStreamOptions {
+                reasoning_summary_delivery: Some(ReasoningSummaryDelivery::SequentialCutoff),
+                include_usage: false,
+            },
+            ..base.clone()
+        };
+        assert!(matches!(
+            unsupported_summary.validate(),
+            Err(CanonicalRequestValidationError::IncompatibleControl { control, .. })
+                if control == "reasoning_summary_delivery"
+        ));
+
+        let invalid_schema = CanonicalRequest {
+            output_schema: Some(OutputSchema {
+                name: "result".into(),
+                schema: serde_json::json!(["not", "an", "object"]),
+                strict: true,
+            }),
+            ..base
+        };
+        assert!(matches!(
+            invalid_schema.validate(),
+            Err(CanonicalRequestValidationError::InvalidOutputSchema { .. })
         ));
     }
 

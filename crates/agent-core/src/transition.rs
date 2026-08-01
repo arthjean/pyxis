@@ -218,6 +218,14 @@ impl Accumulator {
                 id,
                 encrypted_content,
             } => self.reasonings.push((id, encrypted_content)),
+            StreamEvent::ToolCallInputDone { id, input } => {
+                let Some(partial) = self.open.get_mut(&id) else {
+                    return Err(contract_error(format!(
+                        "tool call terminal input without start: {id}"
+                    )));
+                };
+                partial.args = input;
+            }
             StreamEvent::ToolCallEnd { id } => {
                 let Some(partial) = self.open.remove(&id) else {
                     return Err(contract_error(format!("tool call end without start: {id}")));
@@ -590,6 +598,33 @@ mod tests {
             .push(StreamEvent::ToolCallEnd { id: "c1".into() })
             .unwrap_err();
         assert!(matches!(err, AgentError::Provider(_)));
+    }
+
+    #[test]
+    fn authoritative_terminal_input_replaces_already_observed_deltas() {
+        let mut accumulator = Accumulator::new();
+        accumulator
+            .push(StreamEvent::tool_call_start("c1", "shell"))
+            .unwrap();
+        accumulator
+            .push(StreamEvent::ToolCallDelta {
+                id: "c1".into(),
+                input_delta: "{\"cmd\":\"stale\"}".into(),
+            })
+            .unwrap();
+        accumulator
+            .push(StreamEvent::ToolCallInputDone {
+                id: "c1".into(),
+                input: "{\"cmd\":\"fresh\"}".into(),
+            })
+            .unwrap();
+        accumulator
+            .push(StreamEvent::ToolCallEnd { id: "c1".into() })
+            .unwrap();
+        assert_eq!(
+            accumulator.tool_calls()[0].input,
+            serde_json::json!({"cmd": "fresh"})
+        );
     }
 
     /// A freeform call carries text the model wrote: it must survive

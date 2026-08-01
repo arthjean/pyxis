@@ -36,9 +36,9 @@ pub enum ProviderKind {
 }
 
 /// The only streaming vocabulary the core knows (PROVIDERS section 2). Every
-/// adapter must produce THIS sequence. At `ToolCallEnd`, concatenating the
-/// `ToolCallDelta.input_delta` of a same id MUST yield valid JSON for a `Json`
-/// call, and is taken as-is for a `Text` one.
+/// adapter must produce THIS sequence. Deltas are observable fragments; when a
+/// provider later sends an authoritative complete input, `ToolCallInputDone`
+/// replaces the accumulated fragments before `ToolCallEnd`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum StreamEvent {
@@ -59,6 +59,13 @@ pub enum StreamEvent {
     ToolCallDelta {
         id: ToolCallId,
         input_delta: String,
+    },
+    /// Complete input from the authoritative terminal item. Deltas stay
+    /// observable at arrival time; the accumulator replaces them here rather
+    /// than receiving a duplicate terminal delta.
+    ToolCallInputDone {
+        id: ToolCallId,
+        input: String,
     },
     ToolCallEnd {
         id: ToolCallId,
@@ -142,27 +149,27 @@ impl StreamEvent {
 /// that reports nothing but the two totals stays valid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
-    pub input: u32,
+    pub input: u64,
     /// Share of `input` served from the backend prefix cache.
     #[serde(default)]
-    pub cached_input: u32,
+    pub cached_input: u64,
     /// Share of `input` written to the cache by this round-trip (billed apart
     /// on the backends that meter it).
     #[serde(default)]
-    pub cache_write_input: u32,
-    pub output: u32,
+    pub cache_write_input: u64,
+    pub output: u64,
     /// Share of `output` spent on reasoning rather than on visible text.
     #[serde(default)]
-    pub reasoning_output: u32,
+    pub reasoning_output: u64,
     /// Total as the backend reports it. Zero means "not reported", which is why
     /// [`TokenUsage::total`] falls back on the sum rather than trusting it blind.
     #[serde(default)]
-    pub total: u32,
+    pub total: u64,
 }
 
 impl TokenUsage {
     /// Counts of a provider that reports nothing but the two totals.
-    pub fn new(input: u32, output: u32) -> Self {
+    pub fn new(input: u64, output: u64) -> Self {
         Self {
             input,
             output,
@@ -172,7 +179,7 @@ impl TokenUsage {
 
     /// Backend total when it serves one, the local sum otherwise. The two can
     /// differ: a backend may count tokens we never see.
-    pub fn total(&self) -> u32 {
+    pub fn total(&self) -> u64 {
         match self.total {
             0 => self.input.saturating_add(self.output),
             reported => reported,
@@ -184,14 +191,14 @@ impl TokenUsage {
     }
 
     /// Input actually paid for at full price.
-    pub fn non_cached_input(&self) -> u32 {
+    pub fn non_cached_input(&self) -> u64 {
         self.input.saturating_sub(self.cached_input)
     }
 
     /// Single absolute value worth displaying: what this round-trip cost beyond
     /// the cache. Ported from Codex `TokenUsage::blended_total`
     /// (`codex-rs/protocol/src/protocol.rs:2231`).
-    pub fn blended_total(&self) -> u32 {
+    pub fn blended_total(&self) -> u64 {
         self.non_cached_input().saturating_add(self.output)
     }
 
@@ -554,6 +561,18 @@ pub enum ProviderError {
         message: String,
         retry_after_ms: Option<u64>,
     },
+    /// Typed provider/API failure with the diagnostic identifiers that are safe
+    /// and useful outside the adapter. Credential and account values never enter
+    /// this payload.
+    #[error("provider {category:?}: {message}")]
+    Api {
+        category: ProviderErrorCategory,
+        status: Option<u16>,
+        message: String,
+        retry_after_ms: Option<u64>,
+        request_id: Option<String>,
+        auth_request_id: Option<String>,
+    },
     #[error("decode: {0}")]
     Decode(String),
     #[error("stream interrupted: {0}")]
@@ -579,9 +598,33 @@ impl ProviderError {
     pub fn is_context_error(&self) -> bool {
         matches!(
             self,
-            ProviderError::ContextLengthExceeded | ProviderError::Http { status: 413, .. }
+            ProviderError::ContextLengthExceeded
+                | ProviderError::Http { status: 413, .. }
+                | ProviderError::Api {
+                    category: ProviderErrorCategory::ContextOverflow,
+                    ..
+                }
         )
     }
+}
+
+/// Stable provider-neutral categories used by HTTP and streamed failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderErrorCategory {
+    ContextOverflow,
+    Quota,
+    UsageNotIncluded,
+    CyberPolicy,
+    InvalidPrompt,
+    InvalidImage,
+    RateLimited,
+    Overloaded,
+    Authentication,
+    PermissionDenied,
+    Incomplete,
+    InvalidRequest,
+    Failed,
 }
 
 /// Canonical error taxonomy (ADR-9). Named `ErrorClass` everywhere.

@@ -50,6 +50,8 @@ pub struct ResponseMetadata {
     pub turn_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models_etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_turn: Option<bool>,
     #[serde(default, skip_serializing_if = "SafetyMetadata::is_empty")]
     pub safety: SafetyMetadata,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

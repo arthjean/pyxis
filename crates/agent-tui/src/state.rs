@@ -680,7 +680,7 @@ pub struct AppState {
     pub context_pct: Option<u8>,
     /// Context occupied at the last round-trip, as measured by the backend
     /// (US-004). `None` = not reported.
-    pub context_tokens: Option<u32>,
+    pub context_tokens: Option<u64>,
     /// Context window of the active model when the backend declares one
     /// (US-001). `None` = unknown.
     pub context_window: Option<u32>,
@@ -1389,7 +1389,7 @@ impl AppState {
         if let (Some(tokens), Some(window)) = (self.context_tokens, self.context_window)
             && window > 0
         {
-            let pct = (u64::from(tokens) * 100).div_ceil(u64::from(window));
+            let pct = tokens.saturating_mul(100).div_ceil(u64::from(window));
             self.context_pct = Some(pct.min(100) as u8);
         }
     }
@@ -3759,7 +3759,7 @@ mod tests {
         );
     }
 
-    fn model_turn(index: u32, context_tokens: Option<u32>, window: Option<u32>) -> AgentEvent {
+    fn model_turn(index: u32, context_tokens: Option<u64>, window: Option<u32>) -> AgentEvent {
         AgentEvent::ModelTurn(agent_core::ModelTurnView {
             index,
             input_tokens: u64::from(index) * 1_000,

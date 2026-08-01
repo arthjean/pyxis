@@ -1,6 +1,6 @@
 //! High-level core error, propagated to clients through `AgentEvent::Error`.
 
-use crate::provider::{AuthError, ErrorClass, ProviderError};
+use crate::provider::{AuthError, ErrorClass, ProviderError, ProviderErrorCategory};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +23,12 @@ pub struct ProviderFailure {
     pub retry_after_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<ErrorClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_category: Option<ProviderErrorCategory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_request_id: Option<String>,
 }
 
 impl ProviderFailure {
@@ -33,6 +39,9 @@ impl ProviderFailure {
             message: message.into(),
             retry_after_ms: None,
             class: None,
+            provider_category: None,
+            request_id: None,
+            auth_request_id: None,
         }
     }
 
@@ -98,6 +107,9 @@ impl From<&ProviderError> for ProviderFailure {
                 message: "provider transport failed".to_string(),
                 retry_after_ms: None,
                 class: None,
+                provider_category: None,
+                request_id: None,
+                auth_request_id: None,
             },
             ProviderError::Http {
                 status,
@@ -109,6 +121,30 @@ impl From<&ProviderError> for ProviderFailure {
                 message: "provider HTTP request failed".to_string(),
                 retry_after_ms: *retry_after_ms,
                 class: None,
+                provider_category: None,
+                request_id: None,
+                auth_request_id: None,
+            },
+            ProviderError::Api {
+                category,
+                status,
+                retry_after_ms,
+                request_id,
+                auth_request_id,
+                ..
+            } => Self {
+                kind: if *category == ProviderErrorCategory::ContextOverflow {
+                    ProviderFailureKind::ContextLengthExceeded
+                } else {
+                    ProviderFailureKind::Http
+                },
+                status: *status,
+                message: format!("provider API request failed: {category:?}"),
+                retry_after_ms: *retry_after_ms,
+                class: None,
+                provider_category: Some(*category),
+                request_id: request_id.clone(),
+                auth_request_id: auth_request_id.clone(),
             },
             ProviderError::Decode(_) => Self {
                 kind: ProviderFailureKind::Decode,
@@ -116,6 +152,9 @@ impl From<&ProviderError> for ProviderFailure {
                 message: "provider response decode failed".to_string(),
                 retry_after_ms: None,
                 class: None,
+                provider_category: None,
+                request_id: None,
+                auth_request_id: None,
             },
             ProviderError::Stream(_) => Self {
                 kind: ProviderFailureKind::Stream,
@@ -123,6 +162,9 @@ impl From<&ProviderError> for ProviderFailure {
                 message: "provider stream failed".to_string(),
                 retry_after_ms: None,
                 class: None,
+                provider_category: None,
+                request_id: None,
+                auth_request_id: None,
             },
             ProviderError::Credential(_) => Self {
                 kind: ProviderFailureKind::Credential,
@@ -130,6 +172,9 @@ impl From<&ProviderError> for ProviderFailure {
                 message: "credential recovery required".to_string(),
                 retry_after_ms: None,
                 class: None,
+                provider_category: None,
+                request_id: None,
+                auth_request_id: None,
             },
             // Local incompatibility decided before any request: it is a
             // contract failure, never a transient one, and it names the tool so
@@ -140,6 +185,9 @@ impl From<&ProviderError> for ProviderFailure {
                 message: format!("tool {tool} is unsupported: {reason}"),
                 retry_after_ms: None,
                 class: Some(ErrorClass::InvalidRequest),
+                provider_category: None,
+                request_id: None,
+                auth_request_id: None,
             },
             ProviderError::ContextLengthExceeded => Self {
                 kind: ProviderFailureKind::ContextLengthExceeded,
@@ -147,6 +195,9 @@ impl From<&ProviderError> for ProviderFailure {
                 message: "context too long (PTL/413)".to_string(),
                 retry_after_ms: None,
                 class: None,
+                provider_category: Some(ProviderErrorCategory::ContextOverflow),
+                request_id: None,
+                auth_request_id: None,
             },
         }
     }

@@ -5,6 +5,7 @@
 //! independent answers from a model slug.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 pub const MAX_MODEL_INSTRUCTIONS_BYTES: usize = 64 * 1024;
 
@@ -168,6 +169,8 @@ pub struct ModelDescriptor {
     pub default_verbosity: Option<String>,
     pub supports_parallel_tool_calls: bool,
     #[serde(default)]
+    pub service_tiers: Vec<String>,
+    #[serde(default)]
     pub reasoning_replay: ReasoningReplaySupport,
     pub responses_dialect: ResponsesDialect,
     pub tool_mode: ModelToolMode,
@@ -287,6 +290,23 @@ impl ModelDescriptor {
                 detail: "must contain at most 64 bytes".into(),
             });
         }
+        let unique_service_tiers = self
+            .service_tiers
+            .iter()
+            .map(|tier| tier.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        if self.service_tiers.len() > 32
+            || self.service_tiers.iter().any(|tier| {
+                tier.trim().is_empty() || tier.len() > 64 || tier.chars().any(char::is_control)
+            })
+            || unique_service_tiers.len() != self.service_tiers.len()
+        {
+            return Err(ModelRuntimeError::InvalidField {
+                field: "service_tiers",
+                detail: "must contain at most 32 unique non-empty values of at most 64 bytes"
+                    .into(),
+            });
+        }
         let minimum_feedback = match self.truncation.mode {
             TruncationMode::Bytes => crate::tools::MIN_MODEL_TOOL_RESULT_BYTES,
             TruncationMode::Tokens => crate::tools::MIN_MODEL_TOOL_RESULT_TOKENS,
@@ -324,6 +344,8 @@ pub struct ResolvedModelRuntime {
     pub verbosity: Option<String>,
     pub supports_parallel_tool_calls: bool,
     #[serde(default)]
+    pub service_tiers: Vec<String>,
+    #[serde(default)]
     pub reasoning_replay: ReasoningReplaySupport,
     pub responses_dialect: ResponsesDialect,
     pub tool_mode: ModelToolMode,
@@ -350,6 +372,7 @@ impl ResolvedModelRuntime {
             supports_verbosity: self.supports_verbosity,
             default_verbosity: self.verbosity.clone(),
             supports_parallel_tool_calls: self.supports_parallel_tool_calls,
+            service_tiers: self.service_tiers.clone(),
             reasoning_replay: self.reasoning_replay,
             responses_dialect: self.responses_dialect,
             tool_mode: self.tool_mode,
@@ -448,6 +471,7 @@ mod tests {
             supports_verbosity: false,
             default_verbosity: None,
             supports_parallel_tool_calls: false,
+            service_tiers: Vec::new(),
             reasoning_replay: ReasoningReplaySupport::Disabled,
             responses_dialect: ResponsesDialect::Standard,
             tool_mode: ModelToolMode::Direct,
@@ -479,6 +503,7 @@ mod tests {
             supports_verbosity: false,
             default_verbosity: None,
             supports_parallel_tool_calls: false,
+            service_tiers: Vec::new(),
             reasoning_replay: ReasoningReplaySupport::Disabled,
             responses_dialect: ResponsesDialect::Standard,
             tool_mode: ModelToolMode::Direct,
@@ -519,6 +544,7 @@ mod tests {
             supports_verbosity: false,
             default_verbosity: None,
             supports_parallel_tool_calls: false,
+            service_tiers: Vec::new(),
             reasoning_replay: ReasoningReplaySupport::Disabled,
             responses_dialect: ResponsesDialect::Standard,
             tool_mode: ModelToolMode::Direct,

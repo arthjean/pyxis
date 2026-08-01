@@ -267,6 +267,10 @@ fn retry_delay(base: Duration, err: &ProviderError) -> Duration {
         ProviderError::Http {
             retry_after_ms: Some(ms),
             ..
+        }
+        | ProviderError::Api {
+            retry_after_ms: Some(ms),
+            ..
         } => base.max(Duration::from_millis((*ms).min(MAX_RETRY_AFTER_MS))),
         _ => base,
     }
@@ -293,6 +297,7 @@ fn retry_jitter_ms(
     };
     let status_code = match err {
         ProviderError::Http { status, .. } => *status as u64,
+        ProviderError::Api { status, .. } => status.map(u64::from).unwrap_or(16),
         ProviderError::Transport(_) => 10,
         ProviderError::Decode(_) => 11,
         ProviderError::Stream(_) => 12,
@@ -325,6 +330,9 @@ fn transient_retry_delay(
     if matches!(
         err,
         ProviderError::Http {
+            retry_after_ms: Some(ms),
+            ..
+        } | ProviderError::Api {
             retry_after_ms: Some(ms),
             ..
         } if *ms >= MAX_RETRY_AFTER_MS

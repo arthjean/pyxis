@@ -635,6 +635,7 @@ mod loop_tests {
             supports_verbosity: true,
             verbosity: Some("low".into()),
             supports_parallel_tool_calls: false,
+            service_tiers: Vec::new(),
             reasoning_replay: replay,
             responses_dialect: crate::model::ResponsesDialect::Standard,
             tool_mode: crate::model::ModelToolMode::Direct,
@@ -2014,7 +2015,7 @@ mod loop_tests {
     fn tool_turn_usage(id: &str, input: u32, output: u32) -> MockTurn {
         MockTurn::Stream(vec![
             StreamEvent::Usage {
-                usage: TokenUsage::new(input, output),
+                usage: TokenUsage::new(u64::from(input), u64::from(output)),
             },
             StreamEvent::tool_call_start(id, "bash"),
             StreamEvent::ToolCallDelta {
