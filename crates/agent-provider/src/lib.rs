@@ -12,7 +12,9 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod chatgpt;
+mod chatgpt_error;
 pub mod chatgpt_events;
+pub mod chatgpt_http;
 mod chatgpt_metadata;
 pub mod chatgpt_request;
 pub mod credential;
@@ -24,7 +26,8 @@ pub use chatgpt::{
     OpenAiChatGptProvider,
 };
 pub use chatgpt_events::CodexEventMapper;
+pub use chatgpt_http::{OpenAiChatGptConfig, ResponsesCompression};
 pub use chatgpt_request::build_responses_body;
 pub use credential::CredentialManager;
 pub use models::CatalogModel;
-pub use quota::{parse_quota_headers, quota_refusal_message};
+pub use quota::{parse_all_quota_headers, parse_quota_headers, quota_refusal_message};

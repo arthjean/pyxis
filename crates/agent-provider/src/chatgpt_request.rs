@@ -32,8 +32,6 @@ use agent_core::model::ResponsesDialect;
 use agent_core::provider::{CanonicalRequest, GrammarSyntax, ToolKind, ToolSpec};
 use serde_json::{Value, json};
 
-const DEFAULT_INSTRUCTIONS: &str = "You are a helpful assistant.";
-
 #[derive(Debug, Clone, Copy)]
 pub struct ResponsesBodyOptions<'a> {
     pub reasoning_effort: Option<&'a str>,
@@ -57,7 +55,7 @@ impl Default for ResponsesBodyOptions<'_> {
 
 /// Builds the complete JSON body of the Responses request (SSE).
 pub fn build_responses_body(req: &CanonicalRequest, options: ResponsesBodyOptions<'_>) -> Value {
-    let instructions = req.system.as_deref().unwrap_or(DEFAULT_INSTRUCTIONS);
+    let instructions = req.system.as_deref();
     let lite = options.dialect == ResponsesDialect::Lite;
     let mut input = build_input(&req.messages, lite);
     if lite {
@@ -69,7 +67,7 @@ pub fn build_responses_body(req: &CanonicalRequest, options: ResponsesBodyOption
                 "tools": build_tools(&req.tools),
             }),
         );
-        if !instructions.is_empty() {
+        if let Some(instructions) = instructions.filter(|value| !value.is_empty()) {
             input.insert(
                 1,
                 json!({
@@ -90,10 +88,25 @@ pub fn build_responses_body(req: &CanonicalRequest, options: ResponsesBodyOption
         "tool_choice": "auto",
         "parallel_tool_calls": options.parallel_tool_calls && !lite,
     });
+    let mut text = serde_json::Map::new();
     if let Some(verbosity) = options.text_verbosity {
-        body["text"] = json!({ "verbosity": verbosity });
+        text.insert("verbosity".into(), json!(verbosity));
     }
-    if !lite {
+    if let Some(output) = &req.output_schema {
+        text.insert(
+            "format".into(),
+            json!({
+                "type": "json_schema",
+                "name": output.name,
+                "strict": output.strict,
+                "schema": output.schema,
+            }),
+        );
+    }
+    if !text.is_empty() {
+        body["text"] = Value::Object(text);
+    }
+    if !lite && let Some(instructions) = instructions.filter(|value| !value.is_empty()) {
         body["instructions"] = json!(instructions);
     }
 
@@ -109,6 +122,36 @@ pub fn build_responses_body(req: &CanonicalRequest, options: ResponsesBodyOption
             reasoning["context"] = json!("all_turns");
         }
         body["reasoning"] = reasoning;
+    }
+    if let Some(tier) = req
+        .service_tier
+        .as_deref()
+        .filter(|tier| *tier != "default")
+    {
+        body["service_tier"] = json!(tier);
+    }
+    let mut stream_options = serde_json::Map::new();
+    if let Some(delivery) = req.stream_options.reasoning_summary_delivery {
+        stream_options.insert(
+            "reasoning_summary_delivery".into(),
+            json!(match delivery {
+                agent_core::provider::ReasoningSummaryDelivery::SequentialCutoff => {
+                    "sequential_cutoff"
+                }
+            }),
+        );
+    }
+    if req.stream_options.include_usage {
+        stream_options.insert("include_usage".into(), json!(true));
+    }
+    if !stream_options.is_empty() {
+        body["stream_options"] = Value::Object(stream_options);
+    }
+    if !req.client_metadata.is_empty() {
+        body["client_metadata"] = json!(req.client_metadata);
+    }
+    if let Some(cache_key) = req.cache_key.as_deref() {
+        inject_cache_key(&mut body, cache_key);
     }
     body
 }
@@ -500,9 +543,12 @@ mod tests {
     }
 
     #[test]
-    fn default_instructions_when_no_system() {
+    fn absent_or_empty_instructions_are_not_fabricated() {
         let body = request_body(&req(vec![Message::user("hi")], vec![], None));
-        assert_eq!(body["instructions"], DEFAULT_INSTRUCTIONS);
+        assert!(body.get("instructions").is_none());
+
+        let body = request_body(&req(vec![Message::user("hi")], vec![], Some("")));
+        assert!(body.get("instructions").is_none());
     }
 
     #[test]
@@ -800,6 +846,56 @@ mod tests {
             },
         );
         assert_eq!(with["include"], json!(["reasoning.encrypted_content"]));
+    }
+
+    #[test]
+    fn canonical_request_controls_keep_their_responses_shapes() {
+        let mut request = req(vec![Message::user("structured")], vec![], Some("developer"));
+        request.service_tier = Some("priority".into());
+        request.output_schema = Some(agent_core::provider::OutputSchema {
+            name: "answer".into(),
+            strict: true,
+            schema: json!({
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+                "additionalProperties": false
+            }),
+        });
+        request.stream_options = agent_core::provider::RequestStreamOptions {
+            reasoning_summary_delivery: Some(
+                agent_core::provider::ReasoningSummaryDelivery::SequentialCutoff,
+            ),
+            include_usage: true,
+        };
+        request
+            .client_metadata
+            .insert("thread_id".into(), "thread-1".into());
+        request.cache_key = Some("cache-1".into());
+
+        let body = request_body_with_options(
+            &request,
+            ResponsesBodyOptions {
+                include_encrypted_reasoning: true,
+                reasoning_effort: Some("high"),
+                text_verbosity: Some("low"),
+                ..ResponsesBodyOptions::default()
+            },
+        );
+
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["text"]["verbosity"], "low");
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
+        assert_eq!(body["text"]["format"]["name"], "answer");
+        assert_eq!(body["text"]["format"]["strict"], true);
+        assert_eq!(
+            body["stream_options"]["reasoning_summary_delivery"],
+            "sequential_cutoff"
+        );
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        assert_eq!(body["client_metadata"]["thread_id"], "thread-1");
+        assert_eq!(body["prompt_cache_key"], "cache-1");
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     }
 
     // US-031: reasoning re-emitted BEFORE its function_call; orphan (without tool_use) skipped.

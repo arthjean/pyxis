@@ -1,19 +1,20 @@
 //! Mapping of the SSE events of the Responses API (ChatGPT/Codex backend) into the
 //! canonical `StreamEvent` vocabulary (PROVIDERS 2). Stateful: tracks the
-//! active function call and accumulates its arguments to guarantee the invariant
-//! "`input_delta` complete & valid at `ToolCallEnd`".
+//! active function calls, emits fragments at arrival time, then publishes the
+//! authoritative terminal input before `ToolCallEnd`.
 //!
 //! Known semantic events receive dedicated canonical variants. Other event and
 //! item types remain observable as bounded, sanitized provider extensions.
 
 use agent_core::message::ToolCallFormat;
 use agent_core::provider::{
-    ProviderError, ProviderExtension, ReasoningMetadata, ResponseMetadata, StopReason, StreamEvent,
-    TokenUsage,
+    ProviderError, ProviderErrorCategory, ProviderExtension, ReasoningMetadata, ResponseMetadata,
+    StopReason, StreamEvent, TokenUsage,
 };
 use serde_json::Value;
 use std::collections::HashMap;
 
+use crate::chatgpt_error::{failed_error, incomplete_error, stream_error, terminal_error};
 use crate::chatgpt_metadata::response_metadata_from_event;
 
 struct ActiveCall {
@@ -29,9 +30,8 @@ struct ActiveCall {
 pub const MAPPED_OUTPUT_ITEM_TYPES: &[&str] =
     &["message", "reasoning", "function_call", "custom_tool_call"];
 
-/// Baseline lifecycle events whose information is already carried by a mapped
-/// delta or terminal item. They are intentionally quiet, unlike a genuinely
-/// additive event unknown to this build.
+/// Baseline lifecycle events preserved as extensions because the canonical
+/// vocabulary has no dedicated projection for them.
 const KNOWN_UNPROJECTED_EVENTS: &[&str] = &[
     "response.in_progress",
     "response.content_part.added",
@@ -53,6 +53,7 @@ pub struct CodexEventMapper {
     /// US-031: capture the encrypted reasoning items for replay? The raw mapper
     /// keeps an OFF default; the ChatGPT provider enables it explicitly.
     replay: bool,
+    terminal: bool,
 }
 
 impl CodexEventMapper {
@@ -69,48 +70,63 @@ impl CodexEventMapper {
     }
 
     /// Translates an SSE `data:` payload (one JSON Responses event) into 0..n
-    /// `StreamEvent`. A terminal event (`response.completed`/`.done`/
-    /// `.incomplete`) emits `Usage?` then `Done`. An error (`error`/
-    /// `response.failed`) surfaces a typed `ProviderError`, never a panic.
+    /// `StreamEvent`. Only `response.completed` emits `Usage?` then `Done`.
+    /// Incomplete, failed, legacy done and explicit error events surface a typed
+    /// `ProviderError`, never a panic.
     pub fn ingest(&mut self, data: &str) -> Result<Vec<StreamEvent>, ProviderError> {
-        let data = data.trim();
-        if data.is_empty() {
+        if self.terminal {
             return Err(ProviderError::Decode(
-                "empty Responses event payload".to_string(),
+                "Responses event received after terminal success".into(),
             ));
         }
-        let v: Value =
-            serde_json::from_str(data).map_err(|e| ProviderError::Decode(e.to_string()))?;
+        let data = data.trim();
+        if data.is_empty() {
+            return Ok(vec![malformed_event(0, "empty_payload")]);
+        }
+        let v: Value = match serde_json::from_str(data) {
+            Ok(value) => value,
+            Err(_) => return Ok(vec![malformed_event(data.len(), "invalid_json")]),
+        };
         let typ = v.get("type").and_then(Value::as_str).unwrap_or("");
 
         let events = match typ {
-            // Observable through the metadata prefix assembled below.
-            "response.created" | "response.metadata" => Ok(Vec::new()),
+            "response.created" | "response.metadata" => Ok(vec![extension_event(typ, &v)]),
             "response.output_text.delta" => {
                 Ok(delta_event(&v, |text| StreamEvent::TextDelta { text }))
             }
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                Ok(delta_event(&v, |text| StreamEvent::ReasoningDelta { text }))
+                let mut events = vec![extension_event(typ, &v)];
+                events.extend(delta_event(&v, |text| StreamEvent::ReasoningDelta { text }));
+                Ok(events)
             }
-            "response.reasoning_summary_part.done" => Ok(vec![StreamEvent::ReasoningDelta {
-                text: "\n\n".to_string(),
-            }]),
+            "response.reasoning_summary_part.added"
+            | "response.reasoning_summary_part.done"
+            | "response.reasoning_summary_text.done"
+            | "response.reasoning_text.done" => Ok(vec![extension_event(typ, &v)]),
             "response.output_item.added" => Ok(self.on_item_added(&v)),
             "response.function_call_arguments.delta" => {
                 if let (Some(key), Some(delta)) = (
                     self.event_item_key(&v, "function_call_arguments.delta")?,
                     v.get("delta").and_then(Value::as_str),
-                ) && let Some(active) = self.active.get_mut(&key)
-                {
-                    if active.format != ToolCallFormat::Json {
-                        return Err(ProviderError::Decode(format!(
-                            "function arguments delta on custom tool call {}",
-                            active.call_id
-                        )));
+                ) {
+                    if let Some(active) = self.active.get_mut(&key) {
+                        if active.format != ToolCallFormat::Json {
+                            return Err(ProviderError::Decode(format!(
+                                "function arguments delta on custom tool call {}",
+                                active.call_id
+                            )));
+                        }
+                        active.args.push_str(delta);
+                        Ok(vec![StreamEvent::ToolCallDelta {
+                            id: active.call_id.clone(),
+                            input_delta: delta.to_string(),
+                        }])
+                    } else {
+                        Ok(vec![extension_event(typ, &v)])
                     }
-                    active.args.push_str(delta);
+                } else {
+                    Ok(vec![extension_event(typ, &v)])
                 }
-                Ok(Vec::new())
             }
             "response.function_call_arguments.done" => {
                 // Authoritative source of the complete arguments (replaces the accumulated ones).
@@ -121,24 +137,32 @@ impl CodexEventMapper {
                 {
                     active.args = args.to_string();
                 }
-                Ok(Vec::new())
+                Ok(vec![extension_event(typ, &v)])
             }
             // Freeform input arrives as text fragments on its own event name.
             "response.custom_tool_call_input.delta" => {
                 if let (Some(key), Some(delta)) = (
                     self.event_item_key(&v, "custom_tool_call_input.delta")?,
                     v.get("delta").and_then(Value::as_str),
-                ) && let Some(active) = self.active.get_mut(&key)
-                {
-                    if active.format != ToolCallFormat::Text {
-                        return Err(ProviderError::Decode(format!(
-                            "custom tool input delta on function call {}",
-                            active.call_id
-                        )));
+                ) {
+                    if let Some(active) = self.active.get_mut(&key) {
+                        if active.format != ToolCallFormat::Text {
+                            return Err(ProviderError::Decode(format!(
+                                "custom tool input delta on function call {}",
+                                active.call_id
+                            )));
+                        }
+                        active.args.push_str(delta);
+                        Ok(vec![StreamEvent::ToolCallDelta {
+                            id: active.call_id.clone(),
+                            input_delta: delta.to_string(),
+                        }])
+                    } else {
+                        Ok(vec![extension_event(typ, &v)])
                     }
-                    active.args.push_str(delta);
+                } else {
+                    Ok(vec![extension_event(typ, &v)])
                 }
-                Ok(Vec::new())
             }
             "response.custom_tool_call_input.done" => {
                 if let (Some(key), Some(input)) = (
@@ -148,12 +172,21 @@ impl CodexEventMapper {
                 {
                     active.args = input.to_string();
                 }
-                Ok(Vec::new())
+                Ok(vec![extension_event(typ, &v)])
             }
             "response.output_item.done" => self.on_item_done(&v),
-            "response.completed" | "response.done" | "response.incomplete" => {
-                self.on_terminal(&v, typ)
+            "response.completed" => {
+                let events = self.on_completed(&v)?;
+                self.terminal = true;
+                Ok(events)
             }
+            "response.done" => Err(terminal_error(
+                ProviderErrorCategory::Failed,
+                Some(503),
+                "response.done is not a successful Responses terminal",
+                &v,
+            )),
+            "response.incomplete" => Err(incomplete_error(&v)),
             // Quota state pushed mid-stream. Richer than the response headers,
             // which never name the plan, so it is read here as well.
             "codex.rate_limits" => Ok(crate::quota::parse_quota_event(&v)
@@ -161,7 +194,9 @@ impl CodexEventMapper {
                 .unwrap_or_default()),
             "error" => Err(stream_error(&v)),
             "response.failed" => Err(failed_error(&v)),
-            known if KNOWN_UNPROJECTED_EVENTS.contains(&known) => Ok(Vec::new()),
+            known if KNOWN_UNPROJECTED_EVENTS.contains(&known) => {
+                Ok(vec![extension_event(known, &v)])
+            }
             // A baseline event not yet represented by a dedicated canonical
             // variant remains visible as bounded, redacted data. This wildcard
             // must never become a silent drop again.
@@ -192,9 +227,16 @@ impl CodexEventMapper {
     fn on_item_added(&mut self, v: &Value) -> Vec<StreamEvent> {
         let item = match v.get("item") {
             Some(i) => i,
-            None => return Vec::new(),
+            None => return vec![extension_event("response.output_item.added", v)],
         };
         let Some(format) = call_format(item) else {
+            if item
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|item_type| MAPPED_OUTPUT_ITEM_TYPES.contains(&item_type))
+            {
+                return vec![extension_event("response.output_item.added", v)];
+            }
             return unmapped_item_event(item, "added");
         };
         let call_id = item
@@ -223,11 +265,14 @@ impl CodexEventMapper {
                 format,
             },
         );
-        vec![StreamEvent::ToolCallStart {
-            id: call_id,
-            name,
-            format,
-        }]
+        vec![
+            extension_event("response.output_item.added", v),
+            StreamEvent::ToolCallStart {
+                id: call_id,
+                name,
+                format,
+            },
+        ]
     }
 
     fn on_item_done(&mut self, v: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
@@ -242,19 +287,22 @@ impl CodexEventMapper {
                 Some(i) => i,
                 None => return Ok(Vec::new()),
             };
-            let mut events = vec![StreamEvent::ResponseMetadata {
-                metadata: Box::new(ResponseMetadata {
-                    reasoning: ReasoningMetadata {
-                        item_id: item_id(item).map(str::to_string),
-                        status: item
-                            .get("status")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                        ..ReasoningMetadata::default()
-                    },
-                    ..ResponseMetadata::default()
-                }),
-            }];
+            let mut events = vec![
+                extension_event("response.output_item.done", v),
+                StreamEvent::ResponseMetadata {
+                    metadata: Box::new(ResponseMetadata {
+                        reasoning: ReasoningMetadata {
+                            item_id: item_id(item).map(str::to_string),
+                            status: item
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .map(str::to_string),
+                            ..ReasoningMetadata::default()
+                        },
+                        ..ResponseMetadata::default()
+                    }),
+                },
+            ];
             if !self.replay {
                 return Ok(events);
             }
@@ -274,9 +322,16 @@ impl CodexEventMapper {
             return Ok(events);
         }
         let Some(item) = v.get("item") else {
-            return Ok(Vec::new());
+            return Ok(vec![extension_event("response.output_item.done", v)]);
         };
         let Some(format) = call_format(item) else {
+            if item
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|item_type| MAPPED_OUTPUT_ITEM_TYPES.contains(&item_type))
+            {
+                return Ok(vec![extension_event("response.output_item.done", v)]);
+            }
             // Everything outside the mapped set is content we cannot read. It is
             // REPORTED rather than dropped: a web search or an image generation
             // served by the backend would otherwise leave no trace at all.
@@ -303,13 +358,13 @@ impl CodexEventMapper {
             Some(a) if !a.is_empty() => a.to_string(),
             _ => active.args,
         };
-        let mut out = Vec::new();
-        // A single ToolCallDelta carrying everything: valid JSON for a
-        // function, the exact text for a freeform call, and no duplicate.
+        let mut out = vec![extension_event("response.output_item.done", v)];
+        // Deltas were emitted at arrival time. The terminal item is carried as
+        // an authoritative replacement, never as a duplicate delta.
         if !args.is_empty() {
-            out.push(StreamEvent::ToolCallDelta {
+            out.push(StreamEvent::ToolCallInputDone {
                 id: active.call_id.clone(),
-                input_delta: args,
+                input: args,
             });
         }
         out.push(StreamEvent::ToolCallEnd { id: active.call_id });
@@ -341,9 +396,9 @@ impl CodexEventMapper {
             format,
         }];
         if !args.is_empty() {
-            out.push(StreamEvent::ToolCallDelta {
+            out.push(StreamEvent::ToolCallInputDone {
                 id: call_id.to_string(),
-                input_delta: args.to_string(),
+                input: args.to_string(),
             });
         }
         out.push(StreamEvent::ToolCallEnd {
@@ -394,29 +449,24 @@ impl CodexEventMapper {
         )))
     }
 
-    fn on_terminal(
-        &mut self,
-        v: &Value,
-        event_type: &str,
-    ) -> Result<Vec<StreamEvent>, ProviderError> {
+    fn on_completed(&mut self, v: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
         let response = v.get("response");
+        if response
+            .and_then(|response| response.get("id"))
+            .and_then(Value::as_str)
+            .is_none_or(|id| id.trim().is_empty())
+        {
+            return Err(ProviderError::Decode(
+                "response.completed is missing response.id".into(),
+            ));
+        }
         let declared_status = response
             .and_then(|r| r.get("status"))
             .and_then(Value::as_str);
-        let status = declared_status.unwrap_or(match event_type {
-            "response.incomplete" => "incomplete",
-            _ => "completed",
-        });
-        let expected = match event_type {
-            "response.completed" => Some("completed"),
-            "response.incomplete" => Some("incomplete"),
-            _ => None,
-        };
-        if let Some(expected) = expected
-            && status != expected
-        {
+        let status = declared_status.unwrap_or("completed");
+        if status != "completed" {
             return Err(ProviderError::Decode(format!(
-                "contradictory terminal: {event_type} carries status {status}"
+                "contradictory terminal: response.completed carries status {status}"
             )));
         }
         let end_turn = match response.and_then(|r| r.get("end_turn")) {
@@ -428,53 +478,46 @@ impl CodexEventMapper {
                 ));
             }
         };
-        if status == "incomplete" && end_turn.is_some() {
-            return Err(ProviderError::Decode(
-                "incomplete response must not carry end_turn".into(),
-            ));
-        }
-
         let mut out = Vec::new();
-        if let Some(usage) = response.and_then(|r| r.get("usage")).and_then(parse_usage) {
+        if let Some(usage) = response
+            .and_then(|r| r.get("usage"))
+            .map(parse_usage)
+            .transpose()?
+        {
             out.push(StreamEvent::Usage { usage });
         }
         out.push(StreamEvent::Done {
-            stop: self.stop_for(status, end_turn, response)?,
+            stop: self.stop_for_completed(end_turn),
         });
         Ok(out)
     }
 
-    fn stop_for(
-        &self,
-        status: &str,
-        end_turn: Option<bool>,
-        response: Option<&Value>,
-    ) -> Result<StopReason, ProviderError> {
-        if self.saw_tool_call && status == "completed" {
-            return Ok(StopReason::ToolUse);
+    fn stop_for_completed(&self, end_turn: Option<bool>) -> StopReason {
+        if self.saw_tool_call {
+            StopReason::ToolUse
+        } else if end_turn.unwrap_or(true) {
+            StopReason::EndTurn
+        } else {
+            StopReason::Continue
         }
-        match status {
-            "completed" => Ok(if end_turn.unwrap_or(true) {
-                StopReason::EndTurn
-            } else {
-                StopReason::Continue
+    }
+}
+
+fn extension_event(event_type: &str, value: &Value) -> StreamEvent {
+    StreamEvent::ProviderExtension {
+        extension: ProviderExtension::from_value(event_type, value.clone()),
+    }
+}
+
+fn malformed_event(original_bytes: usize, reason: &str) -> StreamEvent {
+    StreamEvent::ProviderExtension {
+        extension: ProviderExtension::from_value(
+            "malformed_sse_event_ignored",
+            serde_json::json!({
+                "original_bytes": original_bytes,
+                "reason": reason,
             }),
-            "incomplete" => {
-                let reason = response
-                    .and_then(|value| value.get("incomplete_details"))
-                    .and_then(|details| details.get("reason"))
-                    .and_then(Value::as_str);
-                Ok(match reason {
-                    Some("max_output_tokens") | Some("max_tokens") => StopReason::MaxTokens,
-                    Some("content_filter") => StopReason::ContentFilter,
-                    _ => StopReason::IncompleteUnknown,
-                })
-            }
-            "failed" | "cancelled" => Ok(StopReason::Refusal),
-            other => Err(ProviderError::Decode(format!(
-                "unknown terminal status {other}"
-            ))),
-        }
+        ),
     }
 }
 
@@ -508,9 +551,6 @@ fn unmapped_item_event(item: &Value, phase: &str) -> Vec<StreamEvent> {
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("<untyped>");
-    if MAPPED_OUTPUT_ITEM_TYPES.contains(&raw_item_type) {
-        return Vec::new();
-    }
     let item_type: String = raw_item_type.chars().take(128).collect();
     let item_type = if item_type.is_empty()
         || !item_type.chars().all(|character| {
@@ -551,118 +591,46 @@ fn terminal_call_input(item: &Value, format: ToolCallFormat) -> Option<&str> {
 /// Responses API puts it (baseline: `codex-rs/codex-api/src/sse/responses.rs:131`).
 /// Each one is optional: a backend that reports only the two totals still yields
 /// a valid usage, with a zeroed breakdown.
-fn parse_usage(usage: &Value) -> Option<TokenUsage> {
-    let input = usage.get("input_tokens").and_then(Value::as_u64)? as u32;
-    let output = usage.get("output_tokens").and_then(Value::as_u64)? as u32;
-    Some(TokenUsage {
+fn parse_usage(usage: &Value) -> Result<TokenUsage, ProviderError> {
+    let input = counter(usage, "input_tokens")?;
+    let output = counter(usage, "output_tokens")?;
+    let total = match usage.get("total_tokens") {
+        Some(value) => non_negative_counter(value, "total_tokens")?,
+        None => 0,
+    };
+    Ok(TokenUsage {
         input,
-        cached_input: detail(usage, "input_tokens_details", "cached_tokens"),
-        cache_write_input: detail(usage, "input_tokens_details", "cache_write_tokens"),
+        cached_input: detail(usage, "input_tokens_details", "cached_tokens")?,
+        cache_write_input: detail(usage, "input_tokens_details", "cache_write_tokens")?,
         output,
-        reasoning_output: detail(usage, "output_tokens_details", "reasoning_tokens"),
-        total: usage
-            .get("total_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or_default() as u32,
+        reasoning_output: detail(usage, "output_tokens_details", "reasoning_tokens")?,
+        total,
     })
 }
 
 /// One counter of a `*_tokens_details` sub-object. Absent or malformed reads as
 /// zero: a missing breakdown must never invalidate the totals that carry the
 /// budget.
-fn detail(usage: &Value, group: &str, field: &str) -> u32 {
-    usage
-        .get(group)
-        .and_then(|group| group.get(field))
-        .and_then(Value::as_u64)
-        .unwrap_or_default() as u32
+fn detail(usage: &Value, group: &str, field: &str) -> Result<u64, ProviderError> {
+    let Some(value) = usage.get(group).and_then(|group| group.get(field)) else {
+        return Ok(0);
+    };
+    non_negative_counter(value, &format!("{group}.{field}"))
 }
 
-fn stream_error(v: &Value) -> ProviderError {
-    let code = v.get("code").and_then(Value::as_str).unwrap_or("");
-    let message = v.get("message").and_then(Value::as_str).unwrap_or("");
-    classify_message(code, message)
+fn counter(usage: &Value, field: &str) -> Result<u64, ProviderError> {
+    let value = usage
+        .get(field)
+        .ok_or_else(|| ProviderError::Decode(format!("response usage {field} is missing")))?;
+    non_negative_counter(value, field)
 }
 
-fn failed_error(v: &Value) -> ProviderError {
-    let err = v.get("response").and_then(|r| r.get("error"));
-    let code = err
-        .and_then(|e| e.get("code"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let message = err
-        .and_then(|e| e.get("message"))
-        .and_then(Value::as_str)
-        .unwrap_or("response.failed");
-    classify_failed_message(code, message)
-}
-
-/// Distinguishes a context overflow (-> withholding/reactive compaction) from a
-/// generic stream error.
-fn classify_message(code: &str, message: &str) -> ProviderError {
-    let hay = format!("{code} {message}").to_lowercase();
-    if hay.contains("context") && (hay.contains("length") || hay.contains("long")) {
-        ProviderError::ContextLengthExceeded
-    } else {
-        ProviderError::Stream(format!("{code}: {message}"))
-    }
-}
-
-fn classify_failed_message(code: &str, message: &str) -> ProviderError {
-    let hay = format!("{code} {message}").to_lowercase();
-    let detail = format!("{code}: {message}");
-    if hay.contains("context") && (hay.contains("length") || hay.contains("long")) {
-        ProviderError::ContextLengthExceeded
-    } else if hay.contains("rate_limit")
-        || hay.contains("rate limit")
-        || hay.contains("too many requests")
-        || hay.contains("quota")
-    {
-        ProviderError::Http {
-            status: 429,
-            message: detail,
-            retry_after_ms: None,
-        }
-    } else if hay.contains("auth")
-        || hay.contains("unauthorized")
-        || hay.contains("invalid token")
-        || hay.contains("expired")
-    {
-        ProviderError::Http {
-            status: 401,
-            message: detail,
-            retry_after_ms: None,
-        }
-    } else if hay.contains("permission") || hay.contains("forbidden") {
-        ProviderError::Http {
-            status: 403,
-            message: detail,
-            retry_after_ms: None,
-        }
-    } else if hay.contains("overload") {
-        ProviderError::Http {
-            status: 529,
-            message: detail,
-            retry_after_ms: None,
-        }
-    } else if hay.contains("server")
-        || hay.contains("internal")
-        || hay.contains("temporarily")
-        || hay.contains("unavailable")
-        || hay.contains("timeout")
-    {
-        ProviderError::Http {
-            status: 503,
-            message: detail,
-            retry_after_ms: None,
-        }
-    } else {
-        ProviderError::Http {
-            status: 400,
-            message: detail,
-            retry_after_ms: None,
-        }
-    }
+fn non_negative_counter(value: &Value, field: &str) -> Result<u64, ProviderError> {
+    let value = value.as_i64().ok_or_else(|| {
+        ProviderError::Decode(format!("response usage {field} is outside the i64 range"))
+    })?;
+    u64::try_from(value)
+        .map_err(|_| ProviderError::Decode(format!("response usage {field} must be non-negative")))
 }
 
 #[cfg(test)]

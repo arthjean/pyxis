@@ -255,6 +255,7 @@ impl ModelCatalog {
             supports_verbosity: descriptor.supports_verbosity,
             verbosity: descriptor.default_verbosity.clone(),
             supports_parallel_tool_calls: descriptor.supports_parallel_tool_calls,
+            service_tiers: descriptor.service_tiers.clone(),
             reasoning_replay: descriptor.reasoning_replay,
             responses_dialect: descriptor.responses_dialect,
             tool_mode: descriptor.tool_mode,
@@ -422,6 +423,8 @@ struct WireModel {
     #[serde(default)]
     supports_parallel_tool_calls: Option<bool>,
     #[serde(default)]
+    service_tiers: Vec<WireServiceTier>,
+    #[serde(default)]
     supports_encrypted_reasoning: Option<bool>,
     #[serde(default)]
     supports_reasoning_replay: Option<bool>,
@@ -444,6 +447,11 @@ struct WireModel {
 #[derive(Deserialize)]
 struct WireReasoningLevel {
     effort: String,
+}
+
+#[derive(Deserialize)]
+struct WireServiceTier {
+    id: String,
 }
 
 #[derive(Deserialize)]
@@ -574,6 +582,11 @@ fn descriptor_from_wire(
     let parallel = model
         .supports_parallel_tool_calls
         .ok_or_else(|| "missing supports_parallel_tool_calls".to_string())?;
+    let service_tiers = model
+        .service_tiers
+        .into_iter()
+        .map(|tier| tier.id)
+        .collect();
     let lite = model
         .use_responses_lite
         .ok_or_else(|| "missing use_responses_lite".to_string())?;
@@ -607,6 +620,7 @@ fn descriptor_from_wire(
         supports_verbosity,
         default_verbosity: model.default_verbosity,
         supports_parallel_tool_calls: parallel,
+        service_tiers,
         reasoning_replay: if model.supports_encrypted_reasoning == Some(true)
             && model.supports_reasoning_replay == Some(true)
         {
@@ -702,6 +716,7 @@ fn descriptor(
     default_reasoning_effort: &str,
     supported_reasoning_efforts: &[&str],
     verbosity: &str,
+    service_tiers: &[&str],
     dialect: ResponsesDialect,
     tool_mode: ModelToolMode,
     multi_agent_version: MultiAgentVersion,
@@ -723,6 +738,10 @@ fn descriptor(
         supports_verbosity: true,
         default_verbosity: Some(verbosity.into()),
         supports_parallel_tool_calls: true,
+        service_tiers: service_tiers
+            .iter()
+            .map(|tier| (*tier).to_string())
+            .collect(),
         reasoning_replay: ReasoningReplaySupport::Enabled,
         responses_dialect: dialect,
         tool_mode,
@@ -738,6 +757,8 @@ fn descriptor(
 fn embedded_descriptors() -> Vec<ModelDescriptor> {
     const STANDARD_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
     const FRONTIER_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+    const PRIORITY: &[&str] = &["priority"];
+    const NO_SERVICE_TIERS: &[&str] = &[];
     vec![
         descriptor(
             "gpt-5.6-sol",
@@ -746,6 +767,7 @@ fn embedded_descriptors() -> Vec<ModelDescriptor> {
             "low",
             FRONTIER_EFFORTS,
             "low",
+            PRIORITY,
             ResponsesDialect::Lite,
             ModelToolMode::CodeModeOnly,
             MultiAgentVersion::V2,
@@ -758,6 +780,7 @@ fn embedded_descriptors() -> Vec<ModelDescriptor> {
             "medium",
             FRONTIER_EFFORTS,
             "low",
+            PRIORITY,
             ResponsesDialect::Lite,
             ModelToolMode::CodeModeOnly,
             MultiAgentVersion::V2,
@@ -770,6 +793,7 @@ fn embedded_descriptors() -> Vec<ModelDescriptor> {
             "medium",
             &["low", "medium", "high", "xhigh", "max"],
             "low",
+            PRIORITY,
             ResponsesDialect::Lite,
             ModelToolMode::CodeModeOnly,
             MultiAgentVersion::V1,
@@ -782,6 +806,7 @@ fn embedded_descriptors() -> Vec<ModelDescriptor> {
             "medium",
             STANDARD_EFFORTS,
             "low",
+            PRIORITY,
             ResponsesDialect::Standard,
             ModelToolMode::Direct,
             MultiAgentVersion::Disabled,
@@ -794,6 +819,7 @@ fn embedded_descriptors() -> Vec<ModelDescriptor> {
             "medium",
             STANDARD_EFFORTS,
             "low",
+            PRIORITY,
             ResponsesDialect::Standard,
             ModelToolMode::Direct,
             MultiAgentVersion::Disabled,
@@ -806,6 +832,7 @@ fn embedded_descriptors() -> Vec<ModelDescriptor> {
             "medium",
             STANDARD_EFFORTS,
             "medium",
+            NO_SERVICE_TIERS,
             ResponsesDialect::Standard,
             ModelToolMode::Direct,
             MultiAgentVersion::Disabled,
@@ -818,6 +845,7 @@ fn embedded_descriptors() -> Vec<ModelDescriptor> {
             "high",
             STANDARD_EFFORTS,
             "low",
+            NO_SERVICE_TIERS,
             ResponsesDialect::Standard,
             ModelToolMode::Direct,
             MultiAgentVersion::Disabled,

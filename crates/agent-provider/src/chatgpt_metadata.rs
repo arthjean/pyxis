@@ -5,6 +5,8 @@ use agent_core::provider::{
 };
 use serde_json::Value;
 
+const MAX_DIAGNOSTIC_ID_BYTES: usize = 256;
+
 pub(crate) fn response_metadata_from_event(event: &Value) -> ResponseMetadata {
     let response = event.get("response");
     let response_headers = response.and_then(|value| value.get("headers"));
@@ -63,11 +65,7 @@ pub(crate) fn response_metadata_from_event(event: &Value) -> ResponseMetadata {
             .or_else(|| event.get("service_tier").and_then(Value::as_str))
             .map(str::to_string)
             .or_else(|| header(&["openai-service-tier"])),
-        request_id: event
-            .get("request_id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| header(&["x-request-id", "request-id"])),
+        request_id: request_id_from_event(event),
         turn_state: event
             .get("turn_state")
             .and_then(Value::as_str)
@@ -78,6 +76,9 @@ pub(crate) fn response_metadata_from_event(event: &Value) -> ResponseMetadata {
             .and_then(Value::as_str)
             .map(str::to_string)
             .or_else(|| header(&["x-models-etag"])),
+        end_turn: response
+            .and_then(|value| value.get("end_turn"))
+            .and_then(Value::as_bool),
         safety: SafetyMetadata {
             use_cases: strings("use_cases"),
             reasons: strings("reasons"),
@@ -96,6 +97,52 @@ pub(crate) fn response_metadata_from_event(event: &Value) -> ResponseMetadata {
             ..ReasoningMetadata::default()
         },
     }
+}
+
+pub(crate) fn request_id_from_event(event: &Value) -> Option<String> {
+    diagnostic_id_from_event(event, &["request_id"], &["x-request-id", "request-id"])
+}
+
+pub(crate) fn auth_request_id_from_event(event: &Value) -> Option<String> {
+    diagnostic_id_from_event(
+        event,
+        &["auth_request_id"],
+        &["x-auth-request-id", "auth-request-id"],
+    )
+}
+
+pub(crate) fn bounded_diagnostic_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= MAX_DIAGNOSTIC_ID_BYTES
+        && !value.chars().any(char::is_control))
+    .then(|| value.to_string())
+}
+
+fn diagnostic_id_from_event(event: &Value, fields: &[&str], headers: &[&str]) -> Option<String> {
+    direct_string(event, fields)
+        .or_else(|| {
+            event
+                .get("response")
+                .and_then(|value| direct_string(value, fields))
+        })
+        .or_else(|| {
+            let response_headers = event.get("response").and_then(|value| value.get("headers"));
+            header_value(response_headers, headers)
+        })
+        .or_else(|| header_value(event.get("headers"), headers))
+        .as_deref()
+        .and_then(bounded_diagnostic_id)
+}
+
+fn direct_string(value: &Value, names: &[&str]) -> Option<String> {
+    value.as_object()?.iter().find_map(|(name, value)| {
+        names
+            .iter()
+            .any(|candidate| name.eq_ignore_ascii_case(candidate))
+            .then(|| value.as_str().map(str::to_string))
+            .flatten()
+    })
 }
 
 fn header_value(headers: Option<&Value>, names: &[&str]) -> Option<String> {

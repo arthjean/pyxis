@@ -14,9 +14,7 @@ use std::time::Duration;
 
 use agent_auth::OAuthCredential;
 use agent_core::message::ContentBlock;
-use agent_core::model::{
-    ModelRetryPolicy, ModelRuntimeError, ResolvedModelRuntime, ResponsesDialect,
-};
+use agent_core::model::{ModelRetryPolicy, ModelRuntimeError, ResolvedModelRuntime};
 use agent_core::provider::{
     AuthError, CacheCapabilities, CanonicalRequest, CanonicalResponse, Capabilities,
     CapabilityLimits, ErrorClass, Provider, ProviderError, ProviderKind, ReasoningCapabilities,
@@ -29,7 +27,13 @@ use futures_util::Stream;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 
+use crate::chatgpt_error::{
+    bounded_error_body, from_http_response, invalid_request, is_terminal_rate_limit,
+    should_retry_without_reasoning_replay,
+};
 use crate::chatgpt_events::CodexEventMapper;
+use crate::chatgpt_http::OpenAiChatGptConfig;
+use crate::chatgpt_metadata::bounded_diagnostic_id;
 use crate::chatgpt_request::{ResponsesBodyOptions, build_responses_body, inject_cache_key};
 use crate::credential::CredentialManager;
 use crate::models::ModelCatalog;
@@ -44,6 +48,11 @@ pub const DEFAULT_MAX_CONTEXT: u32 = 256_000;
 
 /// Default reasoning effort (Codex CLI is roughly "medium").
 pub const DEFAULT_REASONING_EFFORT: &str = "medium";
+
+const DEFAULT_CHATGPT_RETRY: ModelRetryPolicy = ModelRetryPolicy {
+    max_attempts: 4,
+    backoff_base_ms: 50,
+};
 
 /// Default model slug. The Codex backend (ChatGPT subscription) enforces an
 /// allow-list of VERSIONED slugs that it keeps changing (frequent removals): the
@@ -60,19 +69,11 @@ fn reasoning_effort_for_request(effort: &str) -> &str {
     }
 }
 
-/// Bound of the captured HTTP error body (avoids a giant message in the logs).
-const MAX_ERR_BODY: usize = 2000;
-
 /// Total budget of the catalog discovery (`/models`). Off the critical path:
 /// a slow backend must never delay the session, the bundled catalog takes
 /// over.
 const MODELS_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_MODELS_BODY: usize = 4 * 1024 * 1024;
-
-/// Connection ESTABLISHMENT timeout (US-022). A backend that never establishes
-/// the connection (corporate proxy, blackholed DNS) fails here rather than freezing;
-/// the `reqwest` error is mapped to `Transport` -> classified `Retryable`. Pi: 20 s.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Default per-event idle timeout (US-022). An OPEN SSE stream that emits
 /// no more events (silent backend, queue) is cancelled after this delay ->
@@ -85,8 +86,7 @@ pub struct OpenAiChatGptProvider {
     http: reqwest::Client,
     capabilities: Capabilities,
     reasoning_effort: Option<String>,
-    /// Max delay without an SSE event before cancelling (US-022). See `DEFAULT_IDLE_TIMEOUT`.
-    idle_timeout: Duration,
+    config: OpenAiChatGptConfig,
     /// STABLE session identifier (UUID v4), sent as `prompt_cache_key` on
     /// every request (US-029) -> the backend reuses its prefix cache.
     session_id: RwLock<String>,
@@ -129,11 +129,42 @@ impl OpenAiChatGptProvider {
     /// from the keyring). `max_context` drives the compaction; `reasoning_effort`
     /// = `None` omits the `reasoning` field.
     pub fn new(cred: OAuthCredential, max_context: u32, reasoning_effort: Option<String>) -> Self {
+        Self::from_validated_config(
+            cred,
+            max_context,
+            reasoning_effort,
+            OpenAiChatGptConfig::chatgpt_default(),
+        )
+    }
+
+    /// Builds an adapter with an explicit provider policy. The endpoint origin
+    /// is rejected before a credential manager can expose OAuth headers.
+    pub fn new_with_config(
+        cred: OAuthCredential,
+        max_context: u32,
+        reasoning_effort: Option<String>,
+        config: OpenAiChatGptConfig,
+    ) -> Result<Self, ProviderError> {
+        config.validate_for_chatgpt()?;
+        Ok(Self::from_validated_config(
+            cred,
+            max_context,
+            reasoning_effort,
+            config,
+        ))
+    }
+
+    fn from_validated_config(
+        cred: OAuthCredential,
+        max_context: u32,
+        reasoning_effort: Option<String>,
+        config: OpenAiChatGptConfig,
+    ) -> Self {
         // US-022: `connect_timeout` bounds the TCP/TLS establishment. A `build()`
         // failure (TLS backend unavailable) falls back on the default client:
         // never a panic (`panic = deny` lint).
         let http = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
+            .connect_timeout(config.connect_timeout())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         let creds = CredentialManager::new(cred, http.clone(), KEYRING_ACCOUNT);
@@ -168,7 +199,7 @@ impl OpenAiChatGptProvider {
                 },
             },
             reasoning_effort,
-            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            config,
             session_id: RwLock::new(new_session_id()),
             catalog: RwLock::new(ModelCatalog::embedded()),
         }
@@ -195,9 +226,7 @@ impl OpenAiChatGptProvider {
     /// Overrides the SSE idle timeout (US-022). `Duration::ZERO` is ignored (keeps
     /// the default) so that an absurd env value does not disable the watchdog.
     pub fn with_idle_timeout(mut self, idle: Duration) -> Self {
-        if !idle.is_zero() {
-            self.idle_timeout = idle;
-        }
+        self.config.set_idle_timeout(idle);
         self
     }
 
@@ -213,6 +242,23 @@ impl OpenAiChatGptProvider {
             .read()
             .map(|key| key.clone())
             .unwrap_or_else(|_| new_session_id())
+    }
+
+    fn runtime_for_request(
+        &self,
+        request: &CanonicalRequest,
+    ) -> Result<ResolvedModelRuntime, ProviderError> {
+        if let Some(runtime) = &request.model_runtime {
+            return Ok(runtime.clone());
+        }
+        self.resolve_model_runtime(
+            &request.model,
+            request.reasoning_effort.as_deref(),
+            request.max_output_tokens,
+            DEFAULT_CHATGPT_RETRY.max_attempts.saturating_sub(1),
+            DEFAULT_CHATGPT_RETRY.backoff_base_ms,
+        )
+        .map_err(invalid_request)
     }
 
     /// Catalog of the models offered to the connected account (`GET /models`), sorted by
@@ -245,7 +291,7 @@ impl OpenAiChatGptProvider {
         let body = String::from_utf8(body_bytes)
             .map_err(|error| ProviderError::Decode(format!("models: invalid UTF-8: {error}")))?;
         if !status.is_success() {
-            let message = truncate_chars(&body, MAX_ERR_BODY);
+            let message = bounded_error_body(&body);
             return Err(ProviderError::Http {
                 status: status.as_u16(),
                 message,
@@ -320,194 +366,14 @@ where
 /// (`Elapsed`) becomes `Stream("header timeout")` -> classified `Retryable`, parity
 /// with the idle timeout. A network error from `send()` stays `Transport` (Retryable).
 async fn send_with_header_timeout(
-    rb: reqwest::RequestBuilder,
+    client: &reqwest::Client,
+    request: reqwest::Request,
     timeout: Duration,
 ) -> Result<reqwest::Response, ProviderError> {
-    tokio::time::timeout(timeout, rb.send())
+    tokio::time::timeout(timeout, client.execute(request))
         .await
         .map_err(|_elapsed| ProviderError::Stream("header timeout".to_string()))?
         .map_err(|e| ProviderError::Transport(e.to_string()))
-}
-
-async fn http_error_from_response(resp: reqwest::Response) -> ProviderError {
-    let code = resp.status().as_u16();
-    if code == 413 {
-        return ProviderError::ContextLengthExceeded;
-    }
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let retry_after_ms = parse_retry_after_ms(resp.headers(), now_ms);
-    let quota = crate::quota::parse_quota_headers(resp.headers());
-    let mut text = sanitize_error_body(&resp.text().await.unwrap_or_default());
-    // Truncated BEFORE prefixing: the terminal-quota markers sit at the start of
-    // the body, and `is_terminal_rate_limit` must keep seeing them.
-    text = truncate_chars(&text, MAX_ERR_BODY);
-    // US-003 AC3: an exhausted quota is announced by naming the limit and its
-    // reset instead of handing back the raw body. The body stays appended: it
-    // carries the markers used for the terminal/transient classification.
-    if code == 429 && is_terminal_rate_limit(&text) {
-        text = format!(
-            "{} {text}",
-            crate::quota::quota_refusal_message(quota.as_ref())
-        );
-    }
-    // US-019 AC3: a provider failure used to leave NOTHING on the trace. The
-    // turn-level line names `http <code>` and stops there, because the failure
-    // that crosses into `agent-core` deliberately drops the body (it is backend
-    // text and may echo the request). So the status and the retry hint go at
-    // `debug`, inside the turn/tool span that already carries thread and turn,
-    // and the sanitized body at `trace` where content is allowed — which is the
-    // only place that says WHY a 400 is a 400.
-    tracing::warn!(
-        target: "pyxis::provider",
-        status = code,
-        retry_after_ms,
-        "provider request failed"
-    );
-    tracing::trace!(
-        target: "pyxis::provider",
-        status = code,
-        body = %text,
-        "provider error body"
-    );
-    ProviderError::Http {
-        status: code,
-        message: text,
-        retry_after_ms,
-    }
-}
-
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    value.chars().take(max_chars).collect()
-}
-
-fn should_retry_without_reasoning_replay(status: u16, message: &str) -> bool {
-    if status != 400 {
-        return false;
-    }
-    let message = message.to_ascii_lowercase();
-    message.contains("encrypted_reasoning")
-        || message.contains("encrypted reasoning")
-        || message.contains("reasoning replay")
-}
-
-/// Markers of a TERMINAL 429 (subscription quota exhausted), derived from Pi
-/// (`isTerminalRateLimitError`). A 429 carrying one of them must NEVER be
-/// retried: the session neither burns its attempts nor harasses a blocked account
-/// (US-023, edge case #2). ASCII lowercase comparison (the body is backend error
-/// JSON).
-///
-/// We only keep the UNAMBIGUOUS signals: Pi's bare substrings `"billing"`
-/// and `"available balance"` are ruled out (a transient 429 saying "rate limited;
-/// see billing dashboard" would be wrongly dropped). Deliberate bias toward false negatives:
-/// a missed terminal falls back to `RateLimited` -> BOUNDED retry (`max_attempts` + 60 s cap),
-/// a safe degradation; a false positive would kill the session with no recourse.
-const TERMINAL_RATE_LIMIT_MARKERS: &[&str] = &[
-    "gousagelimiterror",
-    "freeusagelimiterror",
-    "monthly usage limit reached",
-    "insufficient_quota",
-    "out of budget",
-    "quota exceeded",
-];
-
-/// True when the body of a 429 denotes an exhausted quota (terminal), not a transient
-/// overload. See `TERMINAL_RATE_LIMIT_MARKERS`.
-pub fn is_terminal_rate_limit(body: &str) -> bool {
-    let lower = body.to_ascii_lowercase();
-    TERMINAL_RATE_LIMIT_MARKERS
-        .iter()
-        .any(|m| lower.contains(m))
-}
-
-fn sanitize_error_body(body: &str) -> String {
-    let text = if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
-        let (value, _) = agent_core::redaction::redact_json_value(value);
-        serde_json::to_string(&value).unwrap_or_else(|_| body.to_string())
-    } else {
-        body.to_string()
-    };
-    agent_core::redaction::redact_text(&text)
-}
-
-/// Parses the server delay of a `Retry-After` into milliseconds (US-023), in
-/// Pi's priority order: `retry-after-ms` (exact ms) > `Retry-After`
-/// (whole seconds) > `Retry-After` (IMF-fixdate HTTP date, delta vs `now_ms`).
-/// `now_ms` is injected for testability. `None` when no header is usable.
-///
-/// NB: the RETURNED value is NOT capped here (it reflects the raw server value);
-/// the `MAX_RETRY_AFTER_MS` cap is applied by the consumer (`retry_delay`,
-/// agent-core). Any future consumer of `retry_after_ms` must re-bound it.
-fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap, now_ms: u64) -> Option<u64> {
-    // 1) `retry-after-ms`: exact milliseconds, takes priority.
-    if let Some(ms) = headers
-        .get("retry-after-ms")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .filter(|ms| ms.is_finite())
-    {
-        return Some(ms.max(0.0) as u64);
-    }
-    // 2) `Retry-After`: whole seconds, otherwise an HTTP date.
-    let raw = headers
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim();
-    if let Some(secs) = raw.parse::<f64>().ok().filter(|s| s.is_finite()) {
-        return Some((secs.max(0.0) * 1000.0) as u64);
-    }
-    // 3) absolute HTTP date -> positive delta until the deadline.
-    let target_ms = parse_imf_fixdate_ms(raw)?;
-    Some(target_ms.saturating_sub(now_ms))
-}
-
-/// Parses an IMF-fixdate HTTP date (`"Tue, 15 Nov 1994 08:12:31 GMT"`, RFC 7231)
-/// into epoch ms. The only format emitted by the OpenAI backends; the legacy variants
-/// (RFC 850 / asctime) are not handled (returns `None`). Avoids an external date
-/// dependency (offline-safe).
-fn parse_imf_fixdate_ms(s: &str) -> Option<u64> {
-    let rest = s.trim().split_once(", ")?.1; // "15 Nov 1994 08:12:31 GMT"
-    let mut it = rest.split(' ');
-    let day: i64 = it.next()?.parse().ok()?;
-    let month: i64 = match it.next()? {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    };
-    let year: i64 = it.next()?.parse().ok()?;
-    let mut hms = it.next()?.split(':');
-    let h: i64 = hms.next()?.parse().ok()?;
-    let mi: i64 = hms.next()?.parse().ok()?;
-    let se: i64 = hms.next()?.parse().ok()?;
-    let secs = days_from_civil(year, month, day) * 86_400 + h * 3_600 + mi * 60 + se;
-    if secs < 0 {
-        return None;
-    }
-    Some((secs as u64) * 1000)
-}
-
-/// Days since 1970-01-01 (Howard Hinnant's algorithm, public domain). Exact
-/// over the whole proleptic Gregorian range.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = (if y >= 0 { y } else { y - 399 }) / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 #[async_trait]
@@ -544,14 +410,15 @@ impl Provider for OpenAiChatGptProvider {
                 field: "catalog",
                 detail: "lock poisoned".into(),
             })?;
+        let retry = self.config.effective_retry(ModelRetryPolicy {
+            max_attempts: max_retries.saturating_add(1),
+            backoff_base_ms,
+        });
         catalog.resolve(
             model,
             reasoning_effort.or(self.reasoning_effort.as_deref()),
             max_output_tokens,
-            ModelRetryPolicy {
-                max_attempts: max_retries.saturating_add(1),
-                backoff_base_ms,
-            },
+            retry,
         )
     }
 
@@ -575,34 +442,18 @@ impl Provider for OpenAiChatGptProvider {
         &self,
         req: CanonicalRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
-        req.validate()
-            .map_err(|error| ProviderError::Decode(error.to_string()))?;
+        req.validate().map_err(invalid_request)?;
         // A tool this adapter cannot serialize is refused here, before the
         // credential is read and before any socket is opened.
         self.capabilities.ensure_tools_supported(&req.tools)?;
-        let runtime = match req.model_runtime.clone() {
-            Some(runtime) => runtime,
-            None => self
-                .resolve_model_runtime(
-                    &req.model,
-                    req.reasoning_effort.as_deref(),
-                    req.max_output_tokens,
-                    3,
-                    50,
-                )
-                .map_err(|error| ProviderError::Decode(error.to_string()))?,
-        };
+        let runtime = self.runtime_for_request(&req)?;
         let mut req = req;
         if req.model_runtime.is_none() {
             req.reasoning_effort = runtime.reasoning_effort.clone();
             req.model_runtime = Some(runtime.clone());
         }
-        req.validate()
-            .map_err(|error| ProviderError::Decode(error.to_string()))?;
+        req.validate().map_err(invalid_request)?;
 
-        // Credential access and every network operation happen only after the
-        // complete effective request has passed canonical validation.
-        let spec = self.creds.request_spec().await?;
         let reasoning_effort = runtime
             .reasoning_effort
             .as_deref()
@@ -624,34 +475,32 @@ impl Provider for OpenAiChatGptProvider {
         );
         // US-029: stable per-session cache key -> reuse of the backend cache.
         let prompt_cache_key = self.prompt_cache_key();
-        inject_cache_key(&mut body, &prompt_cache_key);
+        if body.get("prompt_cache_key").is_none() {
+            inject_cache_key(&mut body, &prompt_cache_key);
+        }
 
-        // 3. POST. `.json()` sets the content-type; we add the proprietary headers
-        //    (Authorization, chatgpt-account-id, originator, OpenAI-Beta, accept).
-        let build_request = |body: &serde_json::Value| {
-            let mut rb = self.http.post(&spec.url).json(body);
-            for (k, v) in &spec.headers {
-                if k.eq_ignore_ascii_case("content-type") {
-                    continue;
-                }
-                rb = rb.header(k, v);
-            }
-            if runtime.responses_dialect == ResponsesDialect::Lite {
-                rb = rb.header("x-openai-internal-codex-responses-lite", "true");
-            }
-            rb
-        };
+        // 3. Serialize and prepare every non-secret request component before
+        // credentials are read. Compression and metadata-header validation are
+        // therefore local failures at this boundary.
+        let body_bytes = serde_json::to_vec(&body)
+            .map_err(|_| ProviderError::Decode("responses request serialization failed".into()))?;
+        let prepared = self
+            .config
+            .prepare_request(&req, runtime.responses_dialect, &body_bytes)?;
+        let spec = self.creds.request_spec().await?;
+        let request = prepared.authorize(&self.http, &spec)?;
         // US-022 (hardening): bounds the HEADERS phase. `connect_timeout` covers
         // the TCP/TLS establishment and `idle_guarded` the OPEN stream, but between the
         // two `send()` waits for the response headers without a bound: a backend that
         // handshakes then withholds its headers (blocked proxy, queue) would freeze the loop
         // without a signal. `send()` resolves when the headers are received -> this timeout
         // does NOT cut the long SSE stream that follows.
-        let resp = send_with_header_timeout(build_request(&body), CONNECT_TIMEOUT).await?;
+        let resp =
+            send_with_header_timeout(&self.http, request, self.config.header_timeout()).await?;
 
         // 4. status. 413 -> context error (withholding/reactive compaction).
         if !resp.status().is_success() {
-            return Err(http_error_from_response(resp).await);
+            return Err(from_http_response(resp).await);
         }
 
         // 5. SSE stream -> canonical StreamEvent (never ANSI, never a panic).
@@ -661,7 +510,7 @@ impl Provider for OpenAiChatGptProvider {
         //    cutting while draining already buffered events (US-022).
         //    US-003: the quota state travels in the response headers, so it is read
         //    here, before the body is consumed, and emitted first.
-        let quota = crate::quota::parse_quota_headers(resp.headers());
+        let quotas = crate::quota::parse_all_quota_headers(resp.headers());
         let header = |name: &str| {
             resp.headers()
                 .get(name)
@@ -671,7 +520,10 @@ impl Provider for OpenAiChatGptProvider {
         let response_metadata = ResponseMetadata {
             model: header("openai-model"),
             service_tier: header("openai-service-tier"),
-            request_id: header("x-request-id").or_else(|| header("request-id")),
+            request_id: header("x-request-id")
+                .or_else(|| header("request-id"))
+                .as_deref()
+                .and_then(bounded_diagnostic_id),
             turn_state: header("x-codex-turn-state"),
             models_etag: header("x-models-etag").or_else(|| header("etag")),
             reasoning: ReasoningMetadata {
@@ -682,7 +534,7 @@ impl Provider for OpenAiChatGptProvider {
         };
         let mut es = resp.bytes_stream().eventsource();
         let mapped = async_stream::stream! {
-            if let Some(snapshot) = quota {
+            for snapshot in quotas {
                 yield Ok(StreamEvent::Quota { snapshot });
             }
             if !response_metadata.is_empty() {
@@ -691,16 +543,16 @@ impl Provider for OpenAiChatGptProvider {
                 });
             }
             let mut mapper = CodexEventMapper::with_replay(req.reasoning_replay);
-            let mut saw_terminal = false;
             while let Some(ev) = es.next().await {
                 match ev {
                     Ok(event) => match mapper.ingest(&event.data) {
                         Ok(events) => {
                             for e in events {
-                                if matches!(e, StreamEvent::Done { .. }) {
-                                    saw_terminal = true;
-                                }
+                                let terminal = matches!(e, StreamEvent::Done { .. });
                                 yield Ok(e);
+                                if terminal {
+                                    return;
+                                }
                             }
                         }
                         Err(e) => {
@@ -714,11 +566,9 @@ impl Provider for OpenAiChatGptProvider {
                     }
                 }
             }
-            if !saw_terminal {
-                yield Err(ProviderError::Stream("missing terminal event".to_string()));
-            }
+            yield Err(ProviderError::Stream("missing terminal event".to_string()));
         };
-        Ok(idle_guarded(mapped.boxed(), self.idle_timeout).boxed())
+        Ok(idle_guarded(mapped.boxed(), self.config.idle_timeout()).boxed())
     }
 
     async fn complete(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError> {
@@ -780,6 +630,36 @@ impl Provider for OpenAiChatGptProvider {
                 s if s >= 500 => ErrorClass::Retryable,
                 _ => ErrorClass::InvalidRequest,
             },
+            ProviderError::Api {
+                category,
+                status,
+                message,
+                ..
+            } => match category {
+                agent_core::provider::ProviderErrorCategory::Authentication => {
+                    ErrorClass::Auth(AuthError::Expired)
+                }
+                agent_core::provider::ProviderErrorCategory::PermissionDenied => {
+                    ErrorClass::Auth(AuthError::Invalid)
+                }
+                agent_core::provider::ProviderErrorCategory::RateLimited => ErrorClass::RateLimited,
+                agent_core::provider::ProviderErrorCategory::Overloaded => {
+                    ErrorClass::Overloaded(status.unwrap_or(529))
+                }
+                agent_core::provider::ProviderErrorCategory::Failed
+                    if status.is_some_and(|status| status >= 500) =>
+                {
+                    ErrorClass::Retryable
+                }
+                agent_core::provider::ProviderErrorCategory::Incomplete => ErrorClass::Retryable,
+                agent_core::provider::ProviderErrorCategory::InvalidRequest
+                    if status == &Some(400)
+                        && should_retry_without_reasoning_replay(400, message) =>
+                {
+                    ErrorClass::ReasoningReplayRejected
+                }
+                _ => ErrorClass::InvalidRequest,
+            },
             // Transient: transport, cut stream, garbled chunk -> cross-cutting retry.
             ProviderError::Transport(_) | ProviderError::Stream(_) | ProviderError::Decode(_) => {
                 ErrorClass::Retryable
@@ -795,19 +675,25 @@ impl Provider for OpenAiChatGptProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::provider::ProviderErrorCategory;
+
+    use crate::chatgpt_error::{
+        api_category_for_http, days_from_civil, parse_imf_fixdate_ms, parse_retry_after_ms,
+        sanitize_error_body,
+    };
+
+    fn credential(expires_at: u64) -> OAuthCredential {
+        OAuthCredential {
+            provider: agent_auth::ProviderId::OpenAiChatGpt,
+            access: agent_auth::Secret::new("AT"),
+            refresh: agent_auth::Secret::new("RT"),
+            expires_at,
+            account_id: Some("acct".into()),
+        }
+    }
 
     fn provider() -> OpenAiChatGptProvider {
-        OpenAiChatGptProvider::new(
-            OAuthCredential {
-                provider: agent_auth::ProviderId::OpenAiChatGpt,
-                access: agent_auth::Secret::new("AT"),
-                refresh: agent_auth::Secret::new("RT"),
-                expires_at: u64::MAX,
-                account_id: Some("acct".into()),
-            },
-            DEFAULT_MAX_CONTEXT,
-            None,
-        )
+        OpenAiChatGptProvider::new(credential(u64::MAX), DEFAULT_MAX_CONTEXT, None)
     }
 
     #[test]
@@ -837,10 +723,37 @@ mod tests {
         assert!(
             matches!(
                 p.stream(request).await,
-                Err(ProviderError::Decode(ref detail)) if detail.contains("model is empty")
+                Err(ProviderError::Api {
+                    category: ProviderErrorCategory::InvalidRequest,
+                    status: None,
+                    ref message,
+                    ..
+                }) if message.contains("model is empty")
             ),
             "invalid request must fail before opening a stream"
         );
+    }
+
+    #[tokio::test]
+    async fn transport_headers_are_validated_before_expired_credentials() {
+        let provider = OpenAiChatGptProvider::new(credential(0), DEFAULT_MAX_CONTEXT, None);
+        let request = CanonicalRequest {
+            model: "gpt-5.5".into(),
+            client_metadata: std::collections::BTreeMap::from([(
+                "thread_id".into(),
+                "invalid\nheader".into(),
+            )]),
+            max_output_tokens: 4096,
+            ..CanonicalRequest::default()
+        };
+        assert!(matches!(
+            provider.stream(request).await,
+            Err(ProviderError::Api {
+                category: ProviderErrorCategory::InvalidRequest,
+                ref message,
+                ..
+            }) if message.contains("client metadata")
+        ));
     }
 
     #[test]
@@ -861,6 +774,33 @@ mod tests {
         assert!(
             p.resolve_model_runtime("unknown-model", None, 4096, 3, 50)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_provider_retry_is_applied_during_runtime_resolution() {
+        let config = OpenAiChatGptConfig::chatgpt_default()
+            .with_retry(ModelRetryPolicy {
+                max_attempts: 5,
+                backoff_base_ms: 75,
+            })
+            .unwrap();
+        let provider = OpenAiChatGptProvider::new_with_config(
+            credential(u64::MAX),
+            DEFAULT_MAX_CONTEXT,
+            None,
+            config,
+        )
+        .unwrap();
+        let runtime = provider
+            .resolve_model_runtime("gpt-5.5", None, 4096, 1, 10)
+            .unwrap();
+        assert_eq!(
+            runtime.retry,
+            ModelRetryPolicy {
+                max_attempts: 5,
+                backoff_base_ms: 75,
+            }
         );
     }
 
@@ -974,6 +914,46 @@ mod tests {
             p.classify_error(&ProviderError::Transport("x".into())),
             ErrorClass::Retryable
         ));
+        let api = |category, status| ProviderError::Api {
+            category,
+            status,
+            message: String::new(),
+            retry_after_ms: None,
+            request_id: None,
+            auth_request_id: None,
+        };
+        assert_eq!(
+            p.classify_error(&api(ProviderErrorCategory::Incomplete, Some(400))),
+            ErrorClass::Retryable
+        );
+        assert_eq!(
+            p.classify_error(&api(ProviderErrorCategory::Failed, Some(503))),
+            ErrorClass::Retryable
+        );
+        assert_eq!(
+            p.classify_error(&api(ProviderErrorCategory::Quota, Some(429))),
+            ErrorClass::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn http_status_and_body_codes_map_to_typed_categories() {
+        assert_eq!(
+            api_category_for_http(400, r#"{"error":{"code":"invalid_image"}}"#),
+            ProviderErrorCategory::InvalidImage
+        );
+        assert_eq!(
+            api_category_for_http(429, r#"{"error":{"code":"insufficient_quota"}}"#),
+            ProviderErrorCategory::Quota
+        );
+        assert_eq!(
+            api_category_for_http(401, "unauthorized"),
+            ProviderErrorCategory::Authentication
+        );
+        assert_eq!(
+            api_category_for_http(403, "forbidden"),
+            ProviderErrorCategory::PermissionDenied
+        );
     }
 
     // US-023: a 429 with an "exhausted quota" (GoUsageLimitError/billing body) is
@@ -1175,8 +1155,12 @@ mod tests {
                 drop(sock);
             }
         });
-        let rb = reqwest::Client::new().post(format!("http://{addr}/"));
-        let res = send_with_header_timeout(rb, Duration::from_millis(150)).await;
+        let client = reqwest::Client::new();
+        let request = client
+            .post(format!("http://{addr}/"))
+            .build()
+            .expect("local request");
+        let res = send_with_header_timeout(&client, request, Duration::from_millis(150)).await;
         assert!(
             matches!(&res, Err(ProviderError::Stream(m)) if m == "header timeout"),
             "header timeout expected, got: {res:?}"
