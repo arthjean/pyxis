@@ -25,10 +25,10 @@
     {
       "id": "EP-003",
       "title": "Session Responses WebSocket",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 4,
-      "stories_done": 0
+      "stories_done": 4
     },
     {
       "id": "EP-004",
@@ -138,49 +138,53 @@
       "id": "US-007",
       "title": "Valider le contrat WebSocket ChatGPT en live",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": ["US-001"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01T21:58:32+02:00",
+      "completed_at": "2026-08-01T22:39:24+02:00",
+      "reviewed_at": "2026-08-01T23:28:22+02:00",
+      "note": "Authorized live probe passed on the ChatGPT subscription endpoint: sanitized wss URL, HTTP 101 upgrade, non-sensitive header names, initial metadata, generate=false terminal, accepted previous_response_id continuation and actual terminal were observed. The backend exposed neither turn_state nor a peer close code, recorded explicitly as null; no credential, account ID, response ID or payload was persisted."
     },
     {
       "id": "US-008",
       "title": "Implémenter le cycle de vie WebSocket borné",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": ["US-002", "US-007"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01T21:58:32+02:00",
+      "completed_at": "2026-08-01T22:39:24+02:00",
+      "reviewed_at": "2026-08-01T23:28:22+02:00",
+      "note": "A single lazy session actor owns the persistent socket and one response in flight. HTTP auth scope is reused; command, event, write and incremental buffers are bounded; input is capped at 64 MiB; early close, binary frames and idle expiry are typed failures. Cancellation, actor shutdown and 55-minute renewal perform a close handshake within the five-second bound."
     },
     {
       "id": "US-009",
       "title": "Réutiliser état de tour et réponses incrémentales",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": ["US-005", "US-008"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01T21:58:32+02:00",
+      "completed_at": "2026-08-01T22:39:24+02:00",
+      "reviewed_at": "2026-08-01T23:28:22+02:00",
+      "note": "Continuation uses the runtime's explicit turn ID, requires a typed strict same-property extension, subtracts normalized prior server output, and bounds response IDs, turn state and captured items. Divergence or a missing ID sends a full body; previous_response_not_found retries exactly once and only before any response event was published."
     },
     {
       "id": "US-010",
       "title": "Garantir fallback et équivalence SSE/WebSocket",
       "epic": "EP-003",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": ["US-006", "US-009"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01T21:58:32+02:00",
+      "completed_at": "2026-08-01T22:39:24+02:00",
+      "reviewed_at": "2026-08-01T23:28:22+02:00",
+      "note": "WebSocket and SSE use the same replay-aware mapper, metadata projection and HTTP error decoder. HTTP 426 during preconnect or direct upgrade enables sticky HTTP fallback, transport failures reserve the final provider attempt for HTTP, semantic failures do not consume that budget, and an ambiguous post-dispatch outcome is terminal rather than replayed. Auth refresh and a new prompt-cache session clear connection, fallback, turn state and response state."
     },
     {
       "id": "US-011",
