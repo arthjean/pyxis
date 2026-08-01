@@ -1,0 +1,302 @@
+{
+  "prd": {
+    "file": "tasks/prd-parite-client-modele-codex-api.md",
+    "title": "Parité du client modèle et des API provider Codex",
+    "created_at": "2026-08-01",
+    "status": "IN_PROGRESS"
+  },
+  "epics": [
+    {
+      "id": "EP-001",
+      "title": "Contrat résiduel et preuve de parité",
+      "status": "DONE",
+      "priority": "P0",
+      "stories_total": 2,
+      "stories_done": 2
+    },
+    {
+      "id": "EP-002",
+      "title": "Requêtes HTTP et streaming SSE fidèles",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 4,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-003",
+      "title": "Session Responses WebSocket",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 4,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-004",
+      "title": "Outils, items et catalogue de modèles",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 3,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-005",
+      "title": "Providers configurables et authentification",
+      "status": "TODO",
+      "priority": "P1",
+      "stories_total": 3,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-006",
+      "title": "API auxiliaires de codex-api",
+      "status": "TODO",
+      "priority": "P1",
+      "stories_total": 4,
+      "stories_done": 0
+    }
+  ],
+  "stories": [
+    {
+      "id": "US-001",
+      "title": "Figer la matrice résiduelle au commit courant",
+      "epic": "EP-001",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [],
+      "started_at": "2026-08-01T15:31:23+02:00",
+      "completed_at": "2026-08-01T15:56:04+02:00",
+      "reviewed_at": "2026-08-01T17:01:33+02:00",
+      "note": "Declarative 16-family audit matrix validated against ee0247f95a6fe2b094ba2253d82cae2a2b4c2dff; historical DONE proofs, tracked-dirty rejection, untracked .codex exclusion and deterministic fingerprint are tested."
+    },
+    {
+      "id": "US-002",
+      "title": "Étendre le canonique et sa projection externe",
+      "epic": "EP-001",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "L",
+      "blocked_by": ["US-001"],
+      "started_at": "2026-08-01T15:40:36+02:00",
+      "completed_at": "2026-08-01T15:56:04+02:00",
+      "reviewed_at": "2026-08-01T17:01:33+02:00",
+      "note": "Canonical request controls, baseline response metadata, private invariant-bearing provider extensions, centralized redaction, backward defaults, known-event silence, unknown-event observability and core-to-app-server traversal are proven."
+    },
+    {
+      "id": "US-003",
+      "title": "Compléter le corps de requête Responses",
+      "epic": "EP-002",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": ["US-002"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-004",
+      "title": "Aligner configuration HTTP, headers et compression",
+      "epic": "EP-002",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "L",
+      "blocked_by": ["US-002"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-005",
+      "title": "Préserver items, deltas et métadonnées SSE",
+      "epic": "EP-002",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "L",
+      "blocked_by": ["US-002", "US-003"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-006",
+      "title": "Aligner terminaux, erreurs, quotas et usage",
+      "epic": "EP-002",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "L",
+      "blocked_by": ["US-004", "US-005"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-007",
+      "title": "Valider le contrat WebSocket ChatGPT en live",
+      "epic": "EP-003",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": ["US-001"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-008",
+      "title": "Implémenter le cycle de vie WebSocket borné",
+      "epic": "EP-003",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "L",
+      "blocked_by": ["US-002", "US-007"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-009",
+      "title": "Réutiliser état de tour et réponses incrémentales",
+      "epic": "EP-003",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "L",
+      "blocked_by": ["US-005", "US-008"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-010",
+      "title": "Garantir fallback et équivalence SSE/WebSocket",
+      "epic": "EP-003",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": ["US-006", "US-009"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-011",
+      "title": "Compléter l'algèbre des outils Responses",
+      "epic": "EP-004",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "L",
+      "blocked_by": ["US-002"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-012",
+      "title": "Préserver le vocabulaire complet des response items",
+      "epic": "EP-004",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "L",
+      "blocked_by": ["US-002", "US-011"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-013",
+      "title": "Rendre le catalogue fidèle, scoped et disponible en headless",
+      "epic": "EP-004",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "L",
+      "blocked_by": ["US-004"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-014",
+      "title": "Ajouter un provider OpenAI-compatible configuré",
+      "epic": "EP-005",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "L",
+      "blocked_by": ["US-004", "US-013"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-015",
+      "title": "Aligner modes d'auth et récupération 401",
+      "epic": "EP-005",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "L",
+      "blocked_by": ["US-014"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-016",
+      "title": "Ajouter le provider Amazon Bedrock",
+      "epic": "EP-005",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "L",
+      "blocked_by": ["US-002", "US-015"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-017",
+      "title": "Porter remote compact et memories",
+      "epic": "EP-006",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "L",
+      "blocked_by": ["US-006", "US-014"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-018",
+      "title": "Porter génération et édition d'images",
+      "epic": "EP-006",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "L",
+      "blocked_by": ["US-014"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-019",
+      "title": "Porter search et le cycle de fichiers",
+      "epic": "EP-006",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "L",
+      "blocked_by": ["US-014"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-020",
+      "title": "Porter Realtime call et Realtime WebSocket",
+      "epic": "EP-006",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "L",
+      "blocked_by": ["US-008", "US-014"],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    }
+  ]
+}
