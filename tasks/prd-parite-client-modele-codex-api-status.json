@@ -17,10 +17,10 @@
     {
       "id": "EP-002",
       "title": "Requêtes HTTP et streaming SSE fidèles",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 4,
-      "stories_done": 0
+      "stories_done": 4
     },
     {
       "id": "EP-003",
@@ -86,49 +86,53 @@
       "id": "US-003",
       "title": "Compléter le corps de requête Responses",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": ["US-002"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01T17:15:16+02:00",
+      "completed_at": "2026-08-01T17:54:55+02:00",
+      "reviewed_at": "2026-08-01T17:54:55+02:00",
+      "note": "Responses bodies now preserve service tier, strict structured output, stream options, client metadata, verbosity, cache keys and encrypted reasoning; Lite composition and local pre-network validation are covered by conformance fixtures."
     },
     {
       "id": "US-004",
       "title": "Aligner configuration HTTP, headers et compression",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": ["US-002"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01T17:39:31+02:00",
+      "completed_at": "2026-08-01T17:54:55+02:00",
+      "reviewed_at": "2026-08-01T17:54:55+02:00",
+      "note": "Composable endpoint, query, header, retry and timeout configuration is wired into ChatGPT Responses; zstd bodies round-trip byte-exactly and invalid transport configuration fails locally without credential disclosure."
     },
     {
       "id": "US-005",
       "title": "Préserver items, deltas et métadonnées SSE",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": ["US-002", "US-003"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01T17:39:31+02:00",
+      "completed_at": "2026-08-01T17:54:55+02:00",
+      "reviewed_at": "2026-08-01T17:54:55+02:00",
+      "note": "Function, custom and reasoning deltas are emitted immediately and in order; terminal tool input is authoritative, known payloads remain complete, and bounded malformed or unknown additions no longer terminate a valid stream."
     },
     {
       "id": "US-006",
       "title": "Aligner terminaux, erreurs, quotas et usage",
       "epic": "EP-002",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": ["US-004", "US-005"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01T17:39:31+02:00",
+      "completed_at": "2026-08-01T17:54:55+02:00",
+      "reviewed_at": "2026-08-01T17:54:55+02:00",
+      "note": "Success requires one completed terminal with response metadata and exact i64 usage; incomplete and failed paths remain typed, provider diagnostics reach the app-server, and multiple named quota pools remain distinct and lossless."
     },
     {
       "id": "US-007",
