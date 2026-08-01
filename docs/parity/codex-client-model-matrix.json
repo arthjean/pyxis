@@ -1,0 +1,516 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "ee0247f95a6fe2b094ba2253d82cae2a2b4c2dff",
+  "sources": [
+    "codex-rs/codex-api/src/common.rs",
+    "codex-rs/codex-api/src/endpoint/compact.rs",
+    "codex-rs/codex-api/src/endpoint/images.rs",
+    "codex-rs/codex-api/src/endpoint/memories.rs",
+    "codex-rs/codex-api/src/endpoint/models.rs",
+    "codex-rs/codex-api/src/endpoint/realtime_call.rs",
+    "codex-rs/codex-api/src/endpoint/realtime_websocket/mod.rs",
+    "codex-rs/codex-api/src/endpoint/responses_websocket.rs",
+    "codex-rs/codex-api/src/endpoint/search.rs",
+    "codex-rs/codex-api/src/error.rs",
+    "codex-rs/codex-api/src/files.rs",
+    "codex-rs/codex-api/src/provider.rs",
+    "codex-rs/codex-api/src/rate_limits.rs",
+    "codex-rs/codex-api/src/sse/responses.rs",
+    "codex-rs/core/src/client.rs",
+    "codex-rs/model-provider/src/amazon_bedrock/mod.rs",
+    "codex-rs/model-provider/src/auth.rs",
+    "codex-rs/model-provider/src/models_endpoint.rs",
+    "codex-rs/model-provider/src/provider.rs",
+    "codex-rs/protocol/src/models.rs"
+  ],
+  "gap_families": [
+    {
+      "id": "responses-request-controls",
+      "title": "Responses request controls",
+      "sources": [
+        {
+          "file": "codex-rs/codex-api/src/common.rs",
+          "anchors": [
+            "ResponsesApiRequest",
+            "TextFormat",
+            "StreamOptions"
+          ]
+        }
+      ],
+      "input": "instructions, service tier, strict output schema, stream options, client metadata and cache key",
+      "output": "serialized Responses request body",
+      "state": "requested controls remain distinct through canonical projection",
+      "error": "invalid or model-incompatible controls fail before credential and network access",
+      "edge_case": "absent and explicitly empty instructions remain distinguishable",
+      "expected_proof": "US-002 serde compatibility plus US-003 request golden fixtures",
+      "residual_stories": [
+        "US-002",
+        "US-003"
+      ],
+      "existing_proofs": [
+        {
+          "tracker": "tasks/prd-parite-totale-codex-cli-status.json",
+          "story": "US-004",
+          "artifact": "crates/agent-provider/tests/conformance.rs"
+        }
+      ]
+    },
+    {
+      "id": "responses-metadata",
+      "title": "Responses metadata",
+      "sources": [
+        {
+          "file": "codex-rs/codex-api/src/common.rs",
+          "anchors": [
+            "ResponseEvent",
+            "ServerModel",
+            "ModelsEtag",
+            "ServerReasoningIncluded"
+          ]
+        }
+      ],
+      "input": "response headers and metadata events",
+      "output": "response ID, effective model and tier, request ID, turn state, ETag, safety, verification, moderation and reasoning state",
+      "state": "metadata is merged in causal order without becoming transcript text",
+      "error": "malformed metadata is diagnosed without inventing a terminal",
+      "edge_case": "unknown metadata remains bounded and redacted",
+      "expected_proof": "US-002 vertical core-to-app-server fixture and US-005 transport fixtures",
+      "residual_stories": [
+        "US-002",
+        "US-005"
+      ],
+      "existing_proofs": [
+        {
+          "tracker": "tasks/prd-parite-totale-codex-cli-status.json",
+          "story": "US-019",
+          "artifact": "crates/agent-app-server/tests/protocol.rs"
+        }
+      ]
+    },
+    {
+      "id": "http-transport",
+      "title": "HTTP configuration, headers and compression",
+      "sources": [
+        {
+          "file": "codex-rs/codex-api/src/provider.rs",
+          "anchors": [
+            "Provider",
+            "websocket_url_for_path"
+          ]
+        }
+      ],
+      "input": "base URL, path, query, headers, retry policy, timeouts and compression policy",
+      "output": "one fully composed request with non-sensitive diagnostics",
+      "state": "transport configuration is immutable for an in-flight request",
+      "error": "invalid URL, header, compression or policy fails before opening a socket",
+      "edge_case": "zstd body decompresses byte-identically to the source JSON",
+      "expected_proof": "US-004 request-builder and capture-server fixtures",
+      "residual_stories": [
+        "US-004"
+      ],
+      "existing_proofs": [
+        {
+          "tracker": "tasks/prd-codex-orchestration-status.json",
+          "story": "US-022",
+          "artifact": "crates/agent-provider/src/chatgpt.rs"
+        }
+      ]
+    },
+    {
+      "id": "sse-event-stream",
+      "title": "Responses SSE items and deltas",
+      "sources": [
+        {
+          "file": "codex-rs/codex-api/src/sse/responses.rs",
+          "anchors": [
+            "process_sse",
+            "OutputItemAdded",
+            "OutputItemDone"
+          ]
+        }
+      ],
+      "input": "ordered SSE frames",
+      "output": "item added/done, text, reasoning and tool deltas",
+      "state": "deltas publish immediately and terminal payloads remain authoritative",
+      "error": "an isolated malformed frame is diagnostic, not a stream restart",
+      "edge_case": "additive event types are observable and bounded",
+      "expected_proof": "US-005 ordered golden stream fixtures",
+      "residual_stories": [
+        "US-005"
+      ],
+      "existing_proofs": [
+        {
+          "tracker": "tasks/prd-parite-totale-codex-cli-status.json",
+          "story": "US-003",
+          "artifact": "crates/agent-provider/fixtures/conformance"
+        }
+      ]
+    },
+    {
+      "id": "terminals-errors-quotas-usage",
+      "title": "Terminals, errors, quotas and usage",
+      "sources": [
+        {
+          "file": "codex-rs/codex-api/src/rate_limits.rs",
+          "anchors": [
+            "parse_all_rate_limits",
+            "parse_rate_limit_event"
+          ]
+        },
+        {
+          "file": "codex-rs/codex-api/src/error.rs",
+          "anchors": [
+            "ApiError",
+            "RateLimit"
+          ]
+        }
+      ],
+      "input": "HTTP status, terminal events, usage and all limit pools",
+      "output": "one success terminal or one typed failure with i64 counters and diagnostic IDs",
+      "state": "usage and response identity precede the terminal",
+      "error": "incomplete, failed and premature close never synthesize success",
+      "edge_case": "multiple limit pools and counters above u32::MAX remain distinct and exact",
+      "expected_proof": "US-006 terminal/error/quota fixtures",
+      "residual_stories": [
+        "US-006"
+      ],
+      "existing_proofs": [
+        {
+          "tracker": "tasks/prd-codex-orchestration-status.json",
+          "story": "US-023",
+          "artifact": "crates/agent-provider/src/chatgpt.rs"
+        },
+        {
+          "tracker": "tasks/prd-harness-capabilities-status.json",
+          "story": "US-003",
+          "artifact": "crates/agent-provider/src/quota.rs"
+        }
+      ]
+    },
+    {
+      "id": "responses-websocket",
+      "title": "Responses WebSocket handshake and lifecycle",
+      "sources": [
+        {
+          "file": "codex-rs/core/src/client.rs",
+          "anchors": [
+            "build_websocket_headers",
+            "WebsocketSession"
+          ]
+        },
+        {
+          "file": "codex-rs/codex-api/src/endpoint/responses_websocket.rs",
+          "anchors": [
+            "ResponsesWebsocketClient",
+            "ResponsesWebsocketConnection"
+          ]
+        }
+      ],
+      "input": "subscription URL, non-sensitive headers and response.create messages",
+      "output": "the same canonical events as SSE",
+      "state": "one response in flight, bounded prewarm/reuse/renew/close lifecycle",
+      "error": "auth, incompatibility and absent capability remain distinct",
+      "edge_case": "premature close invalidates the connection without leaking a task",
+      "expected_proof": "US-007 opt-in probe plus US-008 deterministic WebSocket fixtures",
+      "residual_stories": [
+        "US-007",
+        "US-008"
+      ]
+    },
+    {
+      "id": "incremental-continuation-fallback",
+      "title": "Incremental continuation and session fallback",
+      "sources": [
+        {
+          "file": "codex-rs/core/src/client.rs",
+          "anchors": [
+            "previous_response_id",
+            "turn_state",
+            "disable_websockets"
+          ]
+        }
+      ],
+      "input": "compatible full or incremental request",
+      "output": "one normalized event sequence regardless of transport",
+      "state": "previous response, turn state and session-scoped fallback are explicit",
+      "error": "previous_response_not_found permits one full retry only",
+      "edge_case": "fallback before acknowledgement cannot double execution or publication",
+      "expected_proof": "US-009 state machine and US-010 SSE/WebSocket equivalence fixtures",
+      "residual_stories": [
+        "US-009",
+        "US-010"
+      ]
+    },
+    {
+      "id": "responses-tools",
+      "title": "Responses tool algebra",
+      "sources": [
+        {
+          "file": "codex-rs/codex-api/src/common.rs",
+          "anchors": [
+            "ResponsesApiTools",
+            "ResponsesApiRequest"
+          ]
+        }
+      ],
+      "input": "function, custom, namespace, tool search and web search definitions",
+      "output": "complete call/output round trips without schema fabrication",
+      "state": "call identity and namespace survive added/done",
+      "error": "local incompatibility is typed before network access",
+      "edge_case": "strict is preserved when present and never forced when absent",
+      "expected_proof": "US-011 request and round-trip fixtures",
+      "residual_stories": [
+        "US-011"
+      ],
+      "existing_proofs": [
+        {
+          "tracker": "tasks/prd-parite-totale-codex-cli-status.json",
+          "story": "US-002",
+          "artifact": "crates/agent-core/src/provider.rs"
+        }
+      ]
+    },
+    {
+      "id": "response-items",
+      "title": "Complete response item vocabulary",
+      "sources": [
+        {
+          "file": "codex-rs/protocol/src/models.rs",
+          "anchors": [
+            "ResponseItem",
+            "ResponseItem::Other"
+          ]
+        }
+      ],
+      "input": "known and additive response item payloads",
+      "output": "complete provider-neutral item with identity and added/done phase",
+      "state": "items remain ordered independently from their deltas",
+      "error": "unrepresentable content is a bounded Other or a typed contract error",
+      "edge_case": "sensitive fields and signed URLs are redacted before projection or persistence",
+      "expected_proof": "US-002 unknown-item fixture plus US-012 full item matrix",
+      "residual_stories": [
+        "US-002",
+        "US-012"
+      ],
+      "existing_proofs": [
+        {
+          "tracker": "tasks/prd-parite-totale-codex-cli-status.json",
+          "story": "US-003",
+          "artifact": "crates/agent-provider/src/chatgpt_events.rs"
+        }
+      ]
+    },
+    {
+      "id": "model-catalog",
+      "title": "Scoped remote model catalog",
+      "sources": [
+        {
+          "file": "codex-rs/model-provider/src/models_endpoint.rs",
+          "anchors": [
+            "ModelsClient",
+            "fetch"
+          ]
+        },
+        {
+          "file": "codex-rs/codex-api/src/endpoint/models.rs",
+          "anchors": [
+            "ModelsClient",
+            "ETAG"
+          ]
+        }
+      ],
+      "input": "provider, endpoint and non-secret identity scope plus optional ETag",
+      "output": "complete model descriptors and visibility",
+      "state": "fresh, stale and bypass-cache snapshots are distinguishable",
+      "error": "empty, oversized and transient failures preserve a scoped last-good snapshot",
+      "edge_case": "headless and interactive resolve through the same path",
+      "expected_proof": "US-013 scoped-cache and headless integration fixtures",
+      "residual_stories": [
+        "US-013"
+      ],
+      "existing_proofs": [
+        {
+          "tracker": "tasks/prd-parite-totale-codex-cli-status.json",
+          "story": "US-010",
+          "artifact": "crates/agent-provider/src/models.rs"
+        }
+      ]
+    },
+    {
+      "id": "provider-authentication",
+      "title": "Configurable providers and authentication",
+      "sources": [
+        {
+          "file": "codex-rs/model-provider/src/provider.rs",
+          "anchors": [
+            "ModelProvider",
+            "supports_websockets"
+          ]
+        },
+        {
+          "file": "codex-rs/model-provider/src/auth.rs",
+          "anchors": [
+            "AuthProvider",
+            "AuthError"
+          ]
+        }
+      ],
+      "input": "ChatGPT OAuth or configured OpenAI-compatible provider credentials",
+      "output": "provider-neutral response and safe request diagnostics",
+      "state": "auth scope and at most one 401 recovery belong to a sampling",
+      "error": "transient refresh and permanent reconnect are distinct",
+      "edge_case": "credentials never cross provider origin or appear in errors",
+      "expected_proof": "US-014 provider fixtures and US-015 auth recovery fixtures",
+      "residual_stories": [
+        "US-014",
+        "US-015"
+      ],
+      "existing_proofs": [
+        {
+          "tracker": "tasks/prd-frontier-harness-runtime-status.json",
+          "story": "US-017",
+          "artifact": "crates/agent-core/src/agent.rs"
+        }
+      ]
+    },
+    {
+      "id": "amazon-bedrock",
+      "title": "Amazon Bedrock provider",
+      "sources": [
+        {
+          "file": "codex-rs/model-provider/src/amazon_bedrock/mod.rs",
+          "anchors": [
+            "AmazonBedrockModelProvider",
+            "ModelProvider"
+          ]
+        }
+      ],
+      "input": "AWS identity, region and Bedrock model request",
+      "output": "canonical deltas, usage and stop reasons",
+      "state": "capabilities are probed and captured per provider",
+      "error": "service and stream exceptions retain typed retry classes",
+      "edge_case": "AWS credentials and signed material never enter fixtures or logs",
+      "expected_proof": "US-016 provider conformance and supply-chain gates",
+      "residual_stories": [
+        "US-016"
+      ]
+    },
+    {
+      "id": "remote-compact-memories",
+      "title": "Remote compact and memories",
+      "sources": [
+        {
+          "file": "codex-rs/codex-api/src/endpoint/compact.rs",
+          "anchors": [
+            "CompactClient",
+            "compact"
+          ]
+        },
+        {
+          "file": "codex-rs/codex-api/src/endpoint/memories.rs",
+          "anchors": [
+            "MemoriesClient",
+            "summarize"
+          ]
+        }
+      ],
+      "input": "typed compact or memory input",
+      "output": "replacement items or memory summary",
+      "state": "operation capability and timeout are explicit",
+      "error": "unsupported, timeout and malformed response have operation-specific errors",
+      "edge_case": "remote output never rewrites history until accepted by the caller",
+      "expected_proof": "US-017 success/error/timeout fixtures",
+      "residual_stories": [
+        "US-017"
+      ],
+      "existing_proofs": [
+        {
+          "tracker": "tasks/prd-codex-orchestration-status.json",
+          "story": "US-030",
+          "artifact": "crates/agent-core/src/compaction.rs"
+        }
+      ]
+    },
+    {
+      "id": "images",
+      "title": "Image generation and editing",
+      "sources": [
+        {
+          "file": "codex-rs/codex-api/src/endpoint/images.rs",
+          "anchors": [
+            "ImagesClient",
+            "generate"
+          ]
+        }
+      ],
+      "input": "typed generation or edit request",
+      "output": "typed image artifact metadata",
+      "state": "operation capability and timeout are explicit",
+      "error": "invalid image, policy and transport errors remain distinguishable",
+      "edge_case": "binary payload and signed URL content never enter logs or fixtures",
+      "expected_proof": "US-018 success/error/timeout and redaction fixtures",
+      "residual_stories": [
+        "US-018"
+      ]
+    },
+    {
+      "id": "search-files",
+      "title": "Search and file lifecycle",
+      "sources": [
+        {
+          "file": "codex-rs/codex-api/src/endpoint/search.rs",
+          "anchors": [
+            "SearchClient",
+            "search"
+          ]
+        },
+        {
+          "file": "codex-rs/codex-api/src/files.rs",
+          "anchors": [
+            "upload_openai_file",
+            "OPENAI_FILE_UPLOAD_LIMIT_BYTES"
+          ]
+        }
+      ],
+      "input": "typed search query or bounded file create/upload/finalize request",
+      "output": "search items or typed uploaded file descriptor",
+      "state": "file creation, upload and finalization states are explicit",
+      "error": "files over 512 MiB fail locally and upload-host failures stay typed",
+      "edge_case": "provider credentials are not forwarded to the signed upload host",
+      "expected_proof": "US-019 capture-server, size-bound and timeout fixtures",
+      "residual_stories": [
+        "US-019"
+      ]
+    },
+    {
+      "id": "realtime",
+      "title": "Realtime call and WebSocket",
+      "sources": [
+        {
+          "file": "codex-rs/codex-api/src/endpoint/realtime_call.rs",
+          "anchors": [
+            "RealtimeCallClient",
+            "pub async fn create"
+          ]
+        },
+        {
+          "file": "codex-rs/codex-api/src/endpoint/realtime_websocket/mod.rs",
+          "anchors": [
+            "RealtimeWebsocketClient",
+            "RealtimeWebsocketConnection"
+          ]
+        }
+      ],
+      "input": "typed SDP call or realtime session events",
+      "output": "typed realtime events and close result",
+      "state": "session mode, sideband join and writer lifecycle are bounded",
+      "error": "handshake, protocol and close failures remain distinct",
+      "edge_case": "cancellation reaches a terminal task state within the shutdown bound",
+      "expected_proof": "US-020 call/WebSocket success/error/timeout fixtures",
+      "residual_stories": [
+        "US-020"
+      ]
+    }
+  ],
+  "fingerprint": "dc101983b5dc44104c29df2e865a453f056978148b708a808151bd0892909cc7"
+}

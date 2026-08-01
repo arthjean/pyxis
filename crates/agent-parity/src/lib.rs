@@ -24,6 +24,8 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub mod client_model;
+
 /// Normative Codex commit for this parity campaign (PRD hard constraint).
 pub const BASELINE_COMMIT: &str = "fa1d4c40d0e63eef2e0ba8a9e004ccd0a80b77f5";
 
@@ -72,6 +74,14 @@ pub enum BaselineError {
         path: PathBuf,
         expected_commit: String,
         actual_commit: String,
+    },
+    #[error(
+        "codex baseline at {path} has tracked changes (expected clean commit {expected_commit}): {files}"
+    )]
+    DirtyTracked {
+        path: PathBuf,
+        expected_commit: String,
+        files: String,
     },
     #[error("baseline source {file} is unreadable under {path} (commit {commit}): {detail}")]
     UnreadableSource {
@@ -147,6 +157,7 @@ impl CodexBaseline {
                 actual_commit,
             });
         }
+        ensure_tracked_clean(&root, expected_commit)?;
         Ok(Self {
             root,
             commit: actual_commit,
@@ -206,10 +217,11 @@ impl CodexBaseline {
     }
 }
 
-/// HEAD of a clone, read-only. The clone is never written: `rev-parse` is a
-/// query, and it is the only git invocation this crate makes.
+/// HEAD of a clone, read-only. The clone is never written: every git invocation
+/// in this crate is a query.
 fn head_of(root: &Path, expected_commit: &str) -> Result<String, BaselineError> {
     let output = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(root)
         .args(["rev-parse", "HEAD"])
@@ -227,6 +239,40 @@ fn head_of(root: &Path, expected_commit: &str) -> Result<String, BaselineError> 
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Rejects staged or unstaged changes to tracked files. Untracked files are
+/// deliberately excluded: in particular, `.codex` is app-managed state and is
+/// neither a normative source nor something this verifier may inspect.
+fn ensure_tracked_clean(root: &Path, expected_commit: &str) -> Result<(), BaselineError> {
+    let output = Command::new("git")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain=v1", "--untracked-files=no"])
+        .output()
+        .map_err(|error| BaselineError::NotAGitRepository {
+            path: root.to_path_buf(),
+            expected_commit: expected_commit.to_string(),
+            detail: error.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(BaselineError::NotAGitRepository {
+            path: root.to_path_buf(),
+            expected_commit: expected_commit.to_string(),
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    let files = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if files.is_empty() {
+        Ok(())
+    } else {
+        Err(BaselineError::DirtyTracked {
+            path: root.to_path_buf(),
+            expected_commit: expected_commit.to_string(),
+            files,
+        })
+    }
 }
 
 /// One model row of the contract matrix.
@@ -762,6 +808,56 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains(BASELINE_COMMIT), "{rendered}");
         assert!(matches!(error, BaselineError::CommitMismatch { .. }));
+    }
+
+    #[test]
+    fn pinned_verification_rejects_tracked_dirt_but_ignores_untracked_codex_state() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("agent-parity-dirty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "parity@example.invalid"]);
+        git(&["config", "user.name", "Parity Test"]);
+        std::fs::write(root.join("tracked.rs"), "clean\n").unwrap();
+        git(&["add", "tracked.rs"]);
+        git(&["commit", "-q", "-m", "fixture"]);
+        let commit = String::from_utf8_lossy(&git(&["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+
+        std::fs::create_dir_all(root.join(".codex")).unwrap();
+        std::fs::write(root.join(".codex/hooks.json"), "do not inspect").unwrap();
+        CodexBaseline::open_at_commit(&root, &commit)
+            .expect("untracked app state is outside the baseline");
+
+        std::fs::write(root.join("tracked.rs"), "dirty\n").unwrap();
+        let error = CodexBaseline::open_at_commit(&root, &commit).unwrap_err();
+        let rendered = error.to_string();
+        assert!(matches!(error, BaselineError::DirtyTracked { .. }));
+        assert!(rendered.contains(&root.display().to_string()), "{rendered}");
+        assert!(rendered.contains(&commit), "{rendered}");
+        assert!(rendered.contains("tracked.rs"), "{rendered}");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".codex/hooks.json")).unwrap(),
+            "do not inspect"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// US-020 AC4: the drift report reads a clone at ANY commit, so an upstream

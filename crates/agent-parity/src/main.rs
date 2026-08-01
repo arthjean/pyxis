@@ -4,6 +4,8 @@
 //! agent-parity generate [--codex <path>] [--out <path>]
 //! agent-parity check    [--codex <path>] [--out <path>]
 //! agent-parity drift    [--codex <path>] [--out <path>]
+//! agent-parity client-model-generate [--codex <path>] [--out <path>]
+//! agent-parity client-model-check    [--codex <path>] [--out <path>]
 //! ```
 //!
 //! `generate` rewrites the committed matrix; `check` fails with a readable diff
@@ -16,18 +18,26 @@
 //! moving a baseline is a decision and not the outcome of a command: a `drift`
 //! that regenerated the matrix would make the campaign follow HEAD silently,
 //! which is exactly what the pinned baseline exists to prevent.
+//!
+//! The client/model matrix is a declarative audit record. Its commands validate
+//! every source anchor and existing Pyxis proof; `client-model-generate` only
+//! refreshes its deterministic fingerprint and normalized JSON representation.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use agent_parity::client_model::{
+    BASELINE_COMMIT as CLIENT_MODEL_BASELINE_COMMIT,
+    COMMITTED_MATRIX_PATH as CLIENT_MODEL_MATRIX_PATH, load as load_client_model_matrix,
+};
 use agent_parity::{
     BASELINE_COMMIT, BASELINE_PATH_ENV, COMMITTED_MATRIX_PATH, CodexBaseline,
     DEFAULT_BASELINE_PATH, ParityMatrix,
 };
 
-const USAGE: &str = "usage: agent-parity <generate|check|drift> [--codex <path>] [--out <path>]";
+const USAGE: &str = "usage: agent-parity <generate|check|drift|client-model-generate|client-model-check> [--codex <path>] [--out <path>]";
 
 fn main() -> ExitCode {
     match run() {
@@ -43,6 +53,8 @@ enum Mode {
     Generate,
     Check,
     Drift,
+    ClientModelGenerate,
+    ClientModelCheck,
 }
 
 fn run() -> Result<(), String> {
@@ -51,6 +63,8 @@ fn run() -> Result<(), String> {
         Some("generate") => Mode::Generate,
         Some("check") => Mode::Check,
         Some("drift") => Mode::Drift,
+        Some("client-model-generate") => Mode::ClientModelGenerate,
+        Some("client-model-check") => Mode::ClientModelCheck,
         Some("--help" | "-h") => {
             println!("{USAGE}");
             println!("baseline commit: {BASELINE_COMMIT}");
@@ -62,7 +76,13 @@ fn run() -> Result<(), String> {
     };
 
     let mut codex: Option<PathBuf> = None;
-    let mut out = PathBuf::from(COMMITTED_MATRIX_PATH);
+    let mut out = PathBuf::from(
+        if matches!(mode, Mode::ClientModelGenerate | Mode::ClientModelCheck) {
+            CLIENT_MODEL_MATRIX_PATH
+        } else {
+            COMMITTED_MATRIX_PATH
+        },
+    );
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--codex" => {
@@ -75,6 +95,10 @@ fn run() -> Result<(), String> {
             }
             other => return Err(format!("unknown flag {other}\n{USAGE}")),
         }
+    }
+
+    if matches!(mode, Mode::ClientModelGenerate | Mode::ClientModelCheck) {
+        return run_client_model(mode, codex, out);
     }
 
     // `drift` is the only mode that accepts an unpinned clone: it REPORTS what
@@ -162,5 +186,56 @@ fn run() -> Result<(), String> {
             // report went to stdout, the reason goes to stderr through `main`.
             Err("upstream contract drift detected".to_string())
         }
+        Mode::ClientModelGenerate | Mode::ClientModelCheck => unreachable!(),
+    }
+}
+
+fn run_client_model(mode: Mode, codex: Option<PathBuf>, out: PathBuf) -> Result<(), String> {
+    let path = codex.unwrap_or_else(|| {
+        std::env::var_os(BASELINE_PATH_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_BASELINE_PATH))
+    });
+    let baseline = CodexBaseline::open_at_commit(path, CLIENT_MODEL_BASELINE_COMMIT)
+        .map_err(|error| error.to_string())?;
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = if matches!(mode, Mode::ClientModelGenerate) && !out.exists() {
+        repository_root.join(CLIENT_MODEL_MATRIX_PATH)
+    } else {
+        out.clone()
+    };
+    let mut matrix = load_client_model_matrix(&source)?;
+
+    match mode {
+        Mode::ClientModelGenerate => {
+            matrix.refresh_fingerprint();
+            matrix.validate(&repository_root)?;
+            matrix.verify_baseline(&baseline)?;
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+            }
+            std::fs::write(&out, matrix.to_pretty_json())
+                .map_err(|error| format!("cannot write {}: {error}", out.display()))?;
+            println!(
+                "client/model matrix validated and written to {} (commit {}, fingerprint {})",
+                out.display(),
+                matrix.baseline_commit,
+                matrix.fingerprint
+            );
+            Ok(())
+        }
+        Mode::ClientModelCheck => {
+            matrix.validate(&repository_root)?;
+            matrix.verify_baseline(&baseline)?;
+            println!(
+                "client/model matrix is valid at {} (commit {}, fingerprint {})",
+                out.display(),
+                matrix.baseline_commit,
+                matrix.fingerprint
+            );
+            Ok(())
+        }
+        Mode::Generate | Mode::Check | Mode::Drift => unreachable!(),
     }
 }
