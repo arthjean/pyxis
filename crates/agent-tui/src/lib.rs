@@ -58,13 +58,13 @@ pub use bottom_pane::{
 };
 #[cfg(feature = "codex_tui_parity")]
 pub use chatwidget::ChatWidget;
+pub use custom_terminal::Frame;
 pub use footer::{FooterMode, FooterProps, StatusAccent, StatusSegment};
 #[cfg(feature = "codex_tui_parity")]
 pub use history_cell::{
-    ActiveHistoryCell, AgentMarkdownCell, ApprovalCell, ChatSurface, CompositeCell, ErrorCell,
-    ActivityHeader, ExecCell, FileChangeCell, FinalMessageSeparatorCell, HistoryCell,
-    HistoryCellKind, HookCell,
-    HookOutputEntry, HookOutputKind, HookStatus, McpInvocation, McpToolCell, NoticeCell,
+    ActiveHistoryCell, ActivityHeader, AgentMarkdownCell, ApprovalCell, ChatSurface, CompositeCell,
+    ErrorCell, ExecCell, FileChangeCell, FinalMessageSeparatorCell, HistoryCell, HistoryCellKind,
+    HookCell, HookOutputEntry, HookOutputKind, HookStatus, McpInvocation, McpToolCell, NoticeCell,
     PatchApplyFailureCell, PatchChangeKind, PatchFileChange, PatchSummaryCell, PlanStep,
     PlanStepStatus, PlanUpdateCell, ReasoningCell, RequestUserInputCell, SessionHeaderCell,
     SpecialNoticeCell, SpecialNoticeKind, SpecialNoticeLink, ToolCell, UserCell, UserInputAnswer,
@@ -75,10 +75,9 @@ pub use insert_history::{
     HistoryInsertError, HistoryInserter, InsertHistoryMode, PendingHistoryInsert,
     SanitizedHistoryLine,
 };
-pub use custom_terminal::Frame;
-pub use render::render;
 #[cfg(feature = "codex_tui_parity")]
 pub use render::parity_content_height;
+pub use render::render;
 pub use state::{
     AppState, Block, COMMANDS, DEFAULT_PERMISSION_MODE_ID, InputAction, McpServerMeta, McpStatus,
     MenuItem, ModelCatalogEntry, ModelMeta, PERMISSION_MODES, PermissionModeMeta, PermissionPrompt,
@@ -91,7 +90,9 @@ pub use state::{
     set_models, supported_reasoning_efforts_for_model, turn_diff_summary,
 };
 #[cfg(feature = "codex_tui_parity")]
-pub use streaming::{COMMIT_TICK_INTERVAL, ChunkingMode, ChunkingPolicy, StreamController, StreamView};
+pub use streaming::{
+    COMMIT_TICK_INTERVAL, ChunkingMode, ChunkingPolicy, StreamController, StreamView,
+};
 pub use term::{
     REFLOW_DEBOUNCE, Tui, clear, clear_for_reflow, draw, enter, is_active, leave, restore,
     supports_truecolor,

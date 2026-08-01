@@ -558,7 +558,9 @@ fn interrupted_turn() {
     // US-002: the in-flight call gets its synthetic result BEFORE the
     // interruption event emitted by the core.
     s.apply(&tool_result("call_1", "interrupted by user", true));
-    s.apply(&AgentEvent::Interrupted(agent_core::InterruptedView::cancelled()));
+    s.apply(&AgentEvent::Interrupted(
+        agent_core::InterruptedView::cancelled(),
+    ));
     insta::assert_snapshot!(
         "interrupted_turn",
         harness::frame("interrupted_turn", &s, W, H)
@@ -809,6 +811,12 @@ fn parity_surface_exploring_then_streaming() {
 
     insta::assert_snapshot!(
         "parity_surface_exploring_then_streaming",
-        harness::chat_frame("parity_surface_exploring_then_streaming", &s, &mut chat, W, H)
+        harness::chat_frame(
+            "parity_surface_exploring_then_streaming",
+            &s,
+            &mut chat,
+            W,
+            H
+        )
     );
 }

@@ -43,11 +43,13 @@ impl ParsedCommand {
 /// Commands that only reshape the output of the previous pipeline stage. Their
 /// presence must not turn a classified pipeline into an opaque one.
 const PIPELINE_FILTERS: &[&str] = &[
-    "head", "tail", "wc", "sort", "uniq", "cut", "tr", "awk", "sed", "column", "nl", "xargs",
-    "jq", "grep", "rg",
+    "head", "tail", "wc", "sort", "uniq", "cut", "tr", "awk", "sed", "column", "nl", "xargs", "jq",
+    "grep", "rg",
 ];
 
-const READ_COMMANDS: &[&str] = &["cat", "bat", "batcat", "less", "more", "head", "tail", "view"];
+const READ_COMMANDS: &[&str] = &[
+    "cat", "bat", "batcat", "less", "more", "head", "tail", "view",
+];
 const LIST_COMMANDS: &[&str] = &["ls", "eza", "exa", "tree", "du"];
 const SEARCH_COMMANDS: &[&str] = &["rg", "grep", "ag", "ack", "fd", "fdfind"];
 
@@ -291,7 +293,9 @@ fn classify(tokens: &[String], stage: &str) -> Option<ParsedCommand> {
     }
 
     if name == "find" {
-        let has_pattern = args.iter().any(|arg| matches!(arg.as_str(), "-name" | "-iname" | "-path"));
+        let has_pattern = args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-name" | "-iname" | "-path"));
         let path = first_operand(args).map(str::to_string);
         return Some(if has_pattern {
             ParsedCommand::Search {
@@ -341,7 +345,8 @@ fn operands(args: &[String]) -> Vec<&str> {
         }
         if arg.starts_with('-') {
             // `-n 5`, `-C 3`: a short flag whose value is the next argument.
-            skip_next = arg.len() == 2 && arg.as_bytes()[1].is_ascii_alphabetic() && !is_boolean_flag(arg);
+            skip_next =
+                arg.len() == 2 && arg.as_bytes()[1].is_ascii_alphabetic() && !is_boolean_flag(arg);
             continue;
         }
         out.push(arg.as_str());
@@ -355,7 +360,10 @@ fn first_operand(args: &[String]) -> Option<&str> {
 
 /// Short flags that never take a value, so the token after them is an operand.
 fn is_boolean_flag(arg: &str) -> bool {
-    matches!(arg, "-l" | "-a" | "-r" | "-R" | "-i" | "-v" | "-h" | "-p" | "-f" | "-s")
+    matches!(
+        arg,
+        "-l" | "-a" | "-r" | "-R" | "-i" | "-v" | "-h" | "-p" | "-f" | "-s"
+    )
 }
 
 fn looks_like_path(operand: &str) -> bool {

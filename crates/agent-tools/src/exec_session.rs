@@ -1095,10 +1095,7 @@ fn emit(ctx: &ToolCtx, chunk: &OutputBuffer, accumulated: &mut OutputBuffer) {
         // A session multiplexes both streams onto one PTY or one pipe pair and
         // no longer knows which produced what, so everything is reported as
         // stdout rather than guessed.
-        ctx.emit_output(
-            agent_core::event::OutputStream::Stdout,
-            chunk.bytes.clone(),
-        );
+        ctx.emit_output(agent_core::event::OutputStream::Stdout, chunk.bytes.clone());
     }
     accumulated.absorb(chunk);
 }

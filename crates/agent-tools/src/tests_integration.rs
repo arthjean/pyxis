@@ -2223,7 +2223,10 @@ async fn the_dispatcher_qualifies_exec_and_patch_calls() {
 
     // A plain tool claims nothing, and an unknown name invents nothing.
     assert_eq!(
-        ToolDispatch::call_kind(&reg, &call("c", "read", serde_json::json!({"path": "a.rs"}))),
+        ToolDispatch::call_kind(
+            &reg,
+            &call("c", "read", serde_json::json!({"path": "a.rs"}))
+        ),
         ToolCallKind::Other
     );
     assert_eq!(

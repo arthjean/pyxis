@@ -18,8 +18,8 @@ use agent_core::ToolErrorKind;
 use crate::cache::fingerprint;
 use crate::composer;
 use crate::footer::{self, FooterProps, StatusSegment};
-use crate::measure;
 use crate::history_cell::ActivityHeader;
+use crate::measure;
 use crate::state::{
     AppState, Block, COMMANDS, DEFAULT_PERMISSION_MODE_ID, MenuItem, PermissionPrompt, Status,
 };
@@ -244,11 +244,7 @@ pub(crate) fn render_parity(
 /// long tool output, a table). Showing its tail rather than its head keeps the
 /// newest content visible, which is what the reader is following.
 #[cfg(feature = "codex_tui_parity")]
-fn render_active_cell(
-    frame: &mut Frame,
-    area: Rect,
-    surface: &crate::history_cell::ChatSurface,
-) {
+fn render_active_cell(frame: &mut Frame, area: Rect, surface: &crate::history_cell::ChatSurface) {
     let content = Rect {
         y: area.y.saturating_add(ACTIVE_CELL_TOP_MARGIN),
         height: area.height.saturating_sub(ACTIVE_CELL_TOP_MARGIN),
@@ -1999,9 +1995,9 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::custom_terminal::Terminal;
     use agent_core::AgentEvent;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use crate::custom_terminal::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
 

@@ -934,7 +934,12 @@ async fn event_loop(
                 let viewport = tui.viewport_area;
                 let line = format!(
                     "frame: screen={}x{} viewport=(x{} y{} w{} h{})",
-                    size.width, size.height, viewport.x, viewport.y, viewport.width, viewport.height
+                    size.width,
+                    size.height,
+                    viewport.x,
+                    viewport.y,
+                    viewport.width,
+                    viewport.height
                 );
                 if last_logged_geometry.as_deref() != Some(line.as_str()) {
                     agent_tui::debug_log::log(&line);

@@ -3,8 +3,8 @@
 //! `TestBackend`, without a real terminal, to eyeball before going live.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use agent_tui::{AppState, render};
 use agent_tui::custom_terminal::Terminal;
+use agent_tui::{AppState, render};
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 

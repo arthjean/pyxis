@@ -10,9 +10,9 @@
 use std::time::{Duration, Instant};
 
 use agent_core::AgentEvent;
+use agent_tui::custom_terminal::Terminal;
 use agent_tui::render;
 use agent_tui::state::AppState;
-use agent_tui::custom_terminal::Terminal;
 use ratatui::backend::TestBackend;
 
 /// Renders a frame and returns the cursor position reported by the backend.

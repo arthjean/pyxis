@@ -555,7 +555,11 @@ mod tests {
             .expect("insertion inline");
 
         assert_eq!(terminal.viewport_area.y, 2, "le viewport cède par le haut");
-        assert_eq!(terminal.viewport_area.bottom(), 5, "le bord bas ne bouge pas");
+        assert_eq!(
+            terminal.viewport_area.bottom(),
+            5,
+            "le bord bas ne bouge pas"
+        );
         let screen = dump(terminal.backend().buffer());
         assert!(screen.contains("line 1"), "{screen}");
         assert!(screen.contains("line 2"), "{screen}");
@@ -573,7 +577,10 @@ mod tests {
             .insert(&mut terminal, &insert)
             .expect("insertion inline");
 
-        assert_eq!(terminal.viewport_area.y, 3, "le viewport reste ancré en bas");
+        assert_eq!(
+            terminal.viewport_area.y, 3,
+            "le viewport reste ancré en bas"
+        );
         let screen = dump(terminal.backend().buffer());
         assert!(screen.contains('a'), "{screen}");
         assert!(screen.contains('b'), "{screen}");
@@ -596,7 +603,10 @@ mod tests {
         let freed = terminal.clear_owned_history().expect("libération");
 
         assert_eq!(freed, 2);
-        assert_eq!(terminal.viewport_area.y, 0, "le viewport revient à leur place");
+        assert_eq!(
+            terminal.viewport_area.y, 0,
+            "le viewport revient à leur place"
+        );
         assert_eq!(terminal.visible_history_rows(), 0);
     }
 
@@ -662,7 +672,10 @@ mod tests {
             .expect("insertion inline");
 
         let screen = dump(terminal.backend().buffer());
-        assert!(!screen.contains("\u{1b}]0;"), "injection émise : {screen:?}");
+        assert!(
+            !screen.contains("\u{1b}]0;"),
+            "injection émise : {screen:?}"
+        );
         assert!(screen.contains("lien"), "le texte reste rendu : {screen:?}");
     }
 

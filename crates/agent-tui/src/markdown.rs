@@ -97,7 +97,10 @@ fn local_link_target(dest_url: &str) -> Option<String> {
         None => dest_url,
     };
     // `mailto:`, `tel:` and friends: a scheme, not a path.
-    if path.contains(':') && path.split_once(':').is_some_and(|(head, _)| !head.contains('/'))
+    if path.contains(':')
+        && path
+            .split_once(':')
+            .is_some_and(|(head, _)| !head.contains('/'))
         && !path.starts_with('/')
         && !path.starts_with('.')
     {

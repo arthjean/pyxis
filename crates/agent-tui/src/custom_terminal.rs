@@ -100,7 +100,9 @@ pub struct Terminal<B: Backend> {
 
 impl<B: Backend> Drop for Terminal<B> {
     fn drop(&mut self) {
-        if self.hidden_cursor && let Err(err) = self.show_cursor() {
+        if self.hidden_cursor
+            && let Err(err) = self.show_cursor()
+        {
             eprintln!("Failed to show the cursor: {err}");
         }
     }
@@ -317,7 +319,8 @@ impl<B: Backend> Terminal<B> {
     /// Used when the viewport moves or shrinks: the rows it no longer owns still
     /// show its previous frame, and nothing else will ever repaint them.
     pub fn clear_after_row(&mut self, row: u16) -> io::Result<()> {
-        self.backend.set_cursor_position(Position { x: 0, y: row })?;
+        self.backend
+            .set_cursor_position(Position { x: 0, y: row })?;
         self.backend.clear_region(ClearType::AfterCursor)?;
         self.invalidate_viewport();
         Ok(())
@@ -346,7 +349,8 @@ impl<B: Backend> Terminal<B> {
     pub fn clear_owned_history(&mut self) -> io::Result<u16> {
         let rows = self.visible_history_rows;
         let top = self.viewport_area.top().saturating_sub(rows);
-        self.backend.set_cursor_position(Position { x: 0, y: top })?;
+        self.backend
+            .set_cursor_position(Position { x: 0, y: top })?;
         self.backend.clear_region(ClearType::AfterCursor)?;
         let width = self.viewport_area.width;
         self.set_viewport_area(Rect::new(0, top, width, 0));

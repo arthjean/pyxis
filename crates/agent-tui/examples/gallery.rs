@@ -5,9 +5,9 @@
 
 use agent_core::AgentEvent;
 use agent_core::event::{ToolCallView, ToolResultView};
+use agent_tui::custom_terminal::Terminal;
 use agent_tui::state::PermissionPrompt;
 use agent_tui::{AppState, diff, render};
-use agent_tui::custom_terminal::Terminal;
 use ratatui::backend::TestBackend;
 
 fn dump(state: &AppState, w: u16, h: u16, label: &str) {

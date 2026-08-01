@@ -109,8 +109,7 @@ impl ChunkingPolicy {
         {
             return false;
         }
-        queued >= ENTER_QUEUE_DEPTH_LINES
-            || oldest_age.is_some_and(|age| age >= ENTER_OLDEST_AGE)
+        queued >= ENTER_QUEUE_DEPTH_LINES || oldest_age.is_some_and(|age| age >= ENTER_OLDEST_AGE)
     }
 
     fn should_exit_catch_up(
@@ -119,8 +118,8 @@ impl ChunkingPolicy {
         oldest_age: Option<Duration>,
         now: Instant,
     ) -> bool {
-        let calm = queued <= EXIT_QUEUE_DEPTH_LINES
-            && oldest_age.is_none_or(|age| age <= EXIT_OLDEST_AGE);
+        let calm =
+            queued <= EXIT_QUEUE_DEPTH_LINES && oldest_age.is_none_or(|age| age <= EXIT_OLDEST_AGE);
         if !calm {
             self.below_exit_since = None;
             return false;

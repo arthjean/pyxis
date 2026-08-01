@@ -5,8 +5,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use agent_core::AgentEvent;
-use agent_tui::{AppState, Block, render};
 use agent_tui::custom_terminal::Terminal;
+use agent_tui::{AppState, Block, render};
 use ratatui::backend::TestBackend;
 
 fn dump(state: &AppState, w: u16, h: u16, label: &str) {

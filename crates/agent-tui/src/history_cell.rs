@@ -651,7 +651,8 @@ impl AgentMarkdownCell {
         let theme = Theme::current();
         let content_width = safe_width_usize(width).saturating_sub(2).max(1);
         let clean = bounded_sanitize(tail, MAX_MARKDOWN_SOURCE_CHARS);
-        let lines = crate::markdown::render_markdown_with_highlight(&clean, &theme, content_width, false);
+        let lines =
+            crate::markdown::render_markdown_with_highlight(&clean, &theme, content_width, false);
         let first = if leads {
             bullet_prefix()
         } else {
@@ -1076,7 +1077,10 @@ impl ExecCell {
             let mut spans = vec![Span::styled("Read ", accent_style())];
             for (idx, name) in names.drain(..).enumerate() {
                 if idx > 0 {
-                    spans.push(Span::styled(", ", Style::default().add_modifier(Modifier::DIM)));
+                    spans.push(Span::styled(
+                        ", ",
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
                 }
                 spans.push(Span::raw(name));
             }
@@ -6317,7 +6321,10 @@ mod tests {
             !after.contains("une"),
             "la ligne libérée ne doit plus être redessinée :\n{after}"
         );
-        assert!(after.contains("deux"), "le reste attend son tour :\n{after}");
+        assert!(
+            after.contains("deux"),
+            "le reste attend son tour :\n{after}"
+        );
         assert!(after.contains("en cours"), "le tail mutable reste visible");
     }
 
@@ -6382,8 +6389,14 @@ mod tests {
             .map(|line| line.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("message 9"), "le plus récent survit :\n{text}");
-        assert!(!text.contains("message 0"), "le plus ancien tombe :\n{text}");
+        assert!(
+            text.contains("message 9"),
+            "le plus récent survit :\n{text}"
+        );
+        assert!(
+            !text.contains("message 0"),
+            "le plus ancien tombe :\n{text}"
+        );
     }
 
     /// The status row names what the turn is doing, and it reads that from the
@@ -6446,7 +6459,6 @@ mod tests {
         assert!(scrollback.contains("deux") && scrollback.contains("trois"));
     }
 
-
     #[test]
     fn streaming_cell_exposes_stable_prefix_and_mutable_tail() {
         let mut surface = ChatSurface::new();
@@ -6479,7 +6491,10 @@ mod tests {
         // typed, and it stays out of the scrollback until it is confirmed.
         let rendered = flatten(&cell.display_lines(80)).join("\n");
         assert!(rendered.contains("stable line"), "{rendered}");
-        assert!(rendered.contains('A') && rendered.contains('B'), "{rendered}");
+        assert!(
+            rendered.contains('A') && rendered.contains('B'),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -7130,8 +7145,8 @@ mod tests {
 
         assert!(lines.len() > 1);
         let widths: Vec<usize> = lines.iter().map(|line| measure::width(line)).collect();
-        let spread = widths.iter().max().copied().unwrap_or(0)
-            - widths.iter().min().copied().unwrap_or(0);
+        let spread =
+            widths.iter().max().copied().unwrap_or(0) - widths.iter().min().copied().unwrap_or(0);
         assert!(
             spread <= 5,
             "les lignes doivent rester de longueur voisine : {widths:?} pour {lines:?}"
