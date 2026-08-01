@@ -49,6 +49,7 @@ struct FakeProvider {
     caps: Capabilities,
     turns: Mutex<VecDeque<Scripted>>,
     calls: Arc<Mutex<usize>>,
+    requests: Mutex<Vec<CanonicalRequest>>,
 }
 
 #[async_trait::async_trait]
@@ -61,9 +62,10 @@ impl Provider for FakeProvider {
     }
     async fn stream(
         &self,
-        _req: CanonicalRequest,
+        req: CanonicalRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
         *self.calls.lock().unwrap() += 1;
+        self.requests.lock().unwrap().push(req);
         match self.turns.lock().unwrap().pop_front() {
             Some(Scripted::Stream(events)) => Ok(Box::pin(futures_util::stream::iter(
                 events.into_iter().map(Ok),
@@ -190,6 +192,7 @@ fn provider(turns: Vec<Scripted>, calls: Arc<Mutex<usize>>) -> Arc<FakeProvider>
         },
         turns: Mutex::new(turns.into()),
         calls,
+        requests: Mutex::new(Vec::new()),
     })
 }
 
@@ -297,7 +300,7 @@ async fn engine_events_cross_the_seam_without_reimplementing_retry_or_dispatch()
         Arc::clone(&calls),
     );
 
-    let runner = RunAgentRunner::new(deps(provider, Arc::clone(&store)), context);
+    let runner = RunAgentRunner::new(deps(Arc::clone(&provider), Arc::clone(&store)), context);
     let (tx, rx) = mpsc::channel(64);
     let observer = tokio::spawn(collect(rx));
     let request = request("salut");
@@ -307,6 +310,13 @@ async fn engine_events_cross_the_seam_without_reimplementing_retry_or_dispatch()
 
     assert_eq!(outcome, TurnOutcome::Completed);
     assert_eq!(*calls.lock().unwrap(), 3, "the engine retried on its own");
+    assert!(
+        provider.requests.lock().unwrap().iter().all(|request| {
+            request.client_metadata.get("turn_id").map(String::as_str)
+                == Some(expected_turn_id.as_str())
+        }),
+        "every provider attempt must carry the stable turn scope"
+    );
     assert!(
         events.iter().any(|e| matches!(e, AgentEvent::StreamReset)),
         "the retry of the engine crossed the seam: {events:?}"

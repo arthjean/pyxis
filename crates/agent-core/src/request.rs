@@ -9,6 +9,10 @@ use crate::model::ResolvedModelRuntime;
 use crate::provider::{ToolSpec, ToolSpecValidationError};
 use crate::redaction::{is_sensitive_key, looks_like_signed_url};
 
+/// Canonical correlation key used by adapters whose transport state must not
+/// cross a runtime turn boundary.
+pub const TURN_ID_METADATA_KEY: &str = "turn_id";
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OutputSchema {
     pub name: String,

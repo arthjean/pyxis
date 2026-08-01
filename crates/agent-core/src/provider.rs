@@ -17,7 +17,7 @@ use crate::model::{ModelRuntimeError, ResolvedModelRuntime};
 pub use crate::provider_extension::{MAX_PROVIDER_EXTENSION_BYTES, ProviderExtension};
 pub use crate::request::{
     CanonicalRequest, CanonicalRequestValidationError, OutputSchema, ReasoningSummaryDelivery,
-    RequestStreamOptions,
+    RequestStreamOptions, TURN_ID_METADATA_KEY,
 };
 pub use crate::response_metadata::{ReasoningMetadata, ResponseMetadata, SafetyMetadata};
 

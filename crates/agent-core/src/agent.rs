@@ -28,7 +28,9 @@ use crate::message::{
 };
 use crate::model::{ResolvedModelRuntime, TruncationMode};
 use crate::prompt::{ContextTransitionCause, PromptSnapshot, replay_enabled, transition_between};
-use crate::provider::{AuthError, ErrorClass, ProviderError, StreamEvent, TokenUsage, ToolSpec};
+use crate::provider::{
+    AuthError, ErrorClass, ProviderError, StreamEvent, TURN_ID_METADATA_KEY, TokenUsage, ToolSpec,
+};
 use crate::step::StepContextSource;
 use crate::tools::{
     MAX_MODEL_TOOL_RESULT_BYTES, ModelToolResult, StepToolPlan, ToolDispatchEvent,
@@ -877,7 +879,11 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         reasoning_replay = snapshot.reasoning_replay(),
                         "prompt snapshot opened"
                     );
-                    let req = snapshot.request();
+                    let mut req = snapshot.request();
+                    if let Some(turn_id) = turn_id.as_deref() {
+                        req.client_metadata
+                            .insert(TURN_ID_METADATA_KEY.to_string(), turn_id.to_string());
+                    }
                     if let Err(e) = req.validate() {
                         yield AgentEvent::Error(AgentError::InvalidRequest(e.to_string()));
                         return;
