@@ -22,6 +22,7 @@ pub mod items;
 pub mod jsonrpc;
 pub mod outbound;
 pub mod protocol;
+mod protocol_metadata;
 pub mod schema;
 pub mod server;
 pub mod transport;

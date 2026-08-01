@@ -457,6 +457,7 @@ mod tests {
             messages,
             tools,
             max_output_tokens: 4096,
+            ..CanonicalRequest::default()
         }
     }
 
@@ -657,8 +658,13 @@ mod tests {
     #[test]
     fn tool_result_images_ride_in_the_output_content_items() {
         let assistant = Message::assistant(vec![tool_use("call_1")]);
-        let mut result =
-            agent_core::tools::ModelToolResult::new("call_1".into(), "seen".into(), false, false, None);
+        let mut result = agent_core::tools::ModelToolResult::new(
+            "call_1".into(),
+            "seen".into(),
+            false,
+            false,
+            None,
+        );
         result.images = vec![agent_core::tools::ToolImage {
             media_type: "image/png".into(),
             data: "QUJD".into(),
@@ -671,7 +677,9 @@ mod tests {
             .iter()
             .find(|i| i["type"] == "function_call_output")
             .unwrap();
-        let items = out["output"].as_array().expect("an array carries the image");
+        let items = out["output"]
+            .as_array()
+            .expect("an array carries the image");
         assert_eq!(items[0]["type"], "input_text");
         assert_eq!(items[0]["text"], "seen");
         assert_eq!(items[1]["type"], "input_image");

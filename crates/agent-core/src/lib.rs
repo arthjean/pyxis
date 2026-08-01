@@ -20,7 +20,11 @@ pub mod model;
 pub mod permission;
 pub mod prompt;
 pub mod provider;
+mod provider_extension;
 pub mod quota;
+pub mod redaction;
+mod request;
+mod response_metadata;
 pub mod sandbox;
 pub mod session;
 pub mod step;
@@ -43,10 +47,10 @@ pub use event::{
 };
 pub use guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget};
 pub use input::InputQueue;
-pub use permission::PermissionMode;
 pub use message::{
     ContentBlock, INTERRUPTED_TOOL_RESULT, Message, Role, ToolErrorKind, unanswered_tool_calls,
 };
+pub use permission::PermissionMode;
 pub use prompt::{
     ContextBaseline, ContextTransition, ContextTransitionCause, PromptSnapshot, PromptSnapshotError,
 };
@@ -1840,6 +1844,55 @@ mod loop_tests {
         MockTurn::Stream(all)
     }
 
+    #[tokio::test]
+    async fn response_metadata_and_extensions_cross_the_core_event_boundary() {
+        let metadata = crate::provider::ResponseMetadata {
+            response_id: Some("resp_1".into()),
+            request_id: Some("req_1".into()),
+            ..crate::provider::ResponseMetadata::default()
+        };
+        let extension = crate::provider::ProviderExtension::from_value(
+            "response.future",
+            serde_json::json!({"authorization": "Bearer secret", "detail": "kept"}),
+        );
+        let unmapped = crate::provider::ProviderExtension::from_value(
+            "response.output_item.done:future_item",
+            serde_json::json!({"type": "future_item", "value": 1}),
+        );
+        let h = harness(
+            vec![text_turn_with(vec![
+                StreamEvent::ResponseMetadata {
+                    metadata: Box::new(metadata.clone()),
+                },
+                StreamEvent::ProviderExtension {
+                    extension: extension.clone(),
+                },
+                StreamEvent::UnmappedItem {
+                    item_type: "future_item".into(),
+                    extension: Some(unmapped.clone()),
+                },
+            ])],
+            false,
+            10_000,
+        );
+
+        let events = drive(AgentContext::new("mock").push(Message::user("go")), h.deps).await;
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::ResponseMetadata(actual) if actual.as_ref() == &metadata)
+        ));
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::ProviderExtension(actual) if actual == &extension)
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::UnmappedResponseItem { item_type, extension: Some(actual) }
+                if item_type == "future_item" && actual == &unmapped
+        )));
+        let encoded = serde_json::to_string(&events).unwrap();
+        assert!(!encoded.contains("Bearer secret"));
+        assert!(encoded.contains("[REDACTED]"));
+    }
+
     /// US-002 AC1: the end-of-round-trip event carries the real occupancy of the
     /// window and the window of the active model, next to the counters already
     /// present.
@@ -2432,7 +2485,9 @@ mod loop_tests {
         assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
         cancel.cancel();
         assert!(
-            !events.iter().any(|e| matches!(e, AgentEvent::Interrupted(..))),
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Interrupted(..))),
             "{events:?}"
         );
     }

@@ -143,6 +143,45 @@ export type ItemNotification = {
 
 export type ItemStatus = "inProgress" | "completed" | "failed";
 
+export type ProviderEventNotification = {
+  extension: ProviderExtensionView;
+  threadId: string;
+  turnId?: string | null;
+};
+
+export type ProviderExtensionView = {
+  eventType: string;
+  originalBytes: number;
+  payload: unknown;
+  redacted: boolean;
+  truncated: boolean;
+};
+
+export type ReasoningMetadataView = {
+  itemId?: string | null;
+  serverIncluded?: boolean | null;
+  status?: string | null;
+};
+
+export type ResponseMetadataView = {
+  model?: string | null;
+  modelsEtag?: string | null;
+  moderation?: ProviderExtensionView | null;
+  reasoning?: ReasoningMetadataView;
+  requestId?: string | null;
+  responseId?: string | null;
+  safety?: SafetyMetadataView;
+  serviceTier?: string | null;
+  turnState?: string | null;
+  verifications?: string[];
+};
+
+export type SafetyMetadataView = {
+  reasons?: string[];
+  retryModel?: string | null;
+  useCases?: string[];
+};
+
 /**
  * What this build can actually do. Published BEFORE any mutation so a client
  * never discovers a missing capability by having a call fail.
@@ -356,6 +395,12 @@ export type TurnInterruptParams = {
   turnId?: string | null;
 };
 
+export type TurnMetadataNotification = {
+  metadata: ResponseMetadataView;
+  threadId: string;
+  turnId?: string | null;
+};
+
 export type TurnStartParams = {
   /**
    * Idempotency key. Two `turn/start` carrying the same key open one turn.
@@ -410,6 +455,8 @@ export interface ServerNotifications {
   "item/agentMessage/delta": { params: ItemDeltaNotification };
   "item/commandExecution/outputDelta": { params: ItemDeltaNotification };
   "turn/reasoning/delta": { params: TurnDeltaNotification };
+  "turn/metadata": { params: TurnMetadataNotification };
+  "turn/providerEvent": { params: ProviderEventNotification };
   "serverRequest/resolved": { params: ServerRequestResolvedNotification };
 }
 
@@ -422,6 +469,6 @@ export interface ServerRequests {
 
 export type ClientMethod = "initialize" | "thread/start" | "thread/resume" | "thread/unsubscribe" | "thread/items/list" | "turn/start" | "turn/steer" | "turn/interrupt";
 
-export type ServerNotificationMethod = "error" | "thread/started" | "thread/closed" | "turn/started" | "turn/completed" | "item/started" | "item/completed" | "item/agentMessage/delta" | "item/commandExecution/outputDelta" | "turn/reasoning/delta" | "serverRequest/resolved";
+export type ServerNotificationMethod = "error" | "thread/started" | "thread/closed" | "turn/started" | "turn/completed" | "item/started" | "item/completed" | "item/agentMessage/delta" | "item/commandExecution/outputDelta" | "turn/reasoning/delta" | "turn/metadata" | "turn/providerEvent" | "serverRequest/resolved";
 
 export type ServerRequestMethod = "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" | "item/tool/requestApproval" | "item/tool/call";

@@ -43,6 +43,8 @@ pub enum Projected {
     ReasoningDelta {
         delta: String,
     },
+    ResponseMetadata(Box<agent_core::provider::ResponseMetadata>),
+    ProviderExtension(agent_core::provider::ProviderExtension),
 }
 
 /// An item still waiting for its terminal projection.
@@ -136,6 +138,23 @@ impl Projector {
             AgentEvent::Reasoning(chunk) => vec![Projected::ReasoningDelta {
                 delta: chunk.clone(),
             }],
+            AgentEvent::ResponseMetadata(metadata) => {
+                vec![Projected::ResponseMetadata(metadata.clone())]
+            }
+            AgentEvent::ProviderExtension(extension) => {
+                vec![Projected::ProviderExtension(extension.clone())]
+            }
+            AgentEvent::UnmappedResponseItem {
+                item_type,
+                extension,
+            } => vec![Projected::ProviderExtension(
+                extension.clone().unwrap_or_else(|| {
+                    agent_core::provider::ProviderExtension::from_value(
+                        format!("response.item.{item_type}"),
+                        serde_json::json!({"item_type": item_type}),
+                    )
+                }),
+            )],
             // The sampling was abandoned before commit: what was streamed is not
             // what the transcript will hold. The item is re-announced empty
             // rather than completed, which keeps its identifier from naming text
@@ -592,6 +611,57 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["item_0".to_string()]
         );
+    }
+
+    #[test]
+    fn response_metadata_and_unknown_items_are_never_lost_by_the_projector() {
+        let mut projector = Projector::default();
+        let metadata = agent_core::provider::ResponseMetadata {
+            response_id: Some("resp_1".into()),
+            model: Some("gpt-effective".into()),
+            service_tier: Some("priority".into()),
+            request_id: Some("req_1".into()),
+            turn_state: Some("sticky".into()),
+            models_etag: Some("etag-1".into()),
+            safety: agent_core::provider::SafetyMetadata {
+                use_cases: vec!["cyber".into()],
+                reasons: vec!["review".into()],
+                retry_model: Some("gpt-safe".into()),
+            },
+            verifications: vec!["trusted_access_for_cyber".into()],
+            moderation: Some(agent_core::provider::ProviderExtension::from_value(
+                "turn_moderation_metadata",
+                serde_json::json!({"flagged": false}),
+            )),
+            reasoning: agent_core::provider::ReasoningMetadata {
+                server_included: Some(true),
+                item_id: Some("rs_1".into()),
+                status: Some("completed".into()),
+            },
+        };
+        assert!(matches!(
+            projector
+                .engine(&AgentEvent::ResponseMetadata(Box::new(metadata)))
+                .as_slice(),
+            [Projected::ResponseMetadata(metadata)] if metadata.response_id.as_deref() == Some("resp_1")
+        ));
+
+        let extension = agent_core::provider::ProviderExtension::from_value(
+            "response.item.future",
+            serde_json::json!({"type": "future", "authorization": "secret"}),
+        );
+        assert!(matches!(
+            projector
+                .engine(&AgentEvent::UnmappedResponseItem {
+                    item_type: "future".into(),
+                    extension: Some(extension),
+                })
+                .as_slice(),
+            [Projected::ProviderExtension(extension)]
+                if extension.event_type() == "response.item.future"
+                    && extension.was_redacted()
+                    && extension.payload()["authorization"] == "[REDACTED]"
+        ));
     }
 
     #[test]

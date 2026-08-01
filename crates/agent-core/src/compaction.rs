@@ -170,6 +170,7 @@ pub async fn full_compact(
             provider.max_context_for_model(model),
             max_output_tokens,
         ),
+        ..CanonicalRequest::default()
     };
     // `?` here leaves `messages` intact on failure (From<ProviderError>).
     let resp = provider.complete(req).await?;

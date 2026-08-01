@@ -1239,7 +1239,14 @@ impl AppState {
                     "reasoning replay disabled: {reason}"
                 )));
             }
-            AgentEvent::UnmappedResponseItem { item_type } => {
+            AgentEvent::ResponseMetadata(_) => {}
+            AgentEvent::ProviderExtension(extension) => {
+                self.blocks.push(Block::Notice(format!(
+                    "the backend sent an additive `{}` event",
+                    extension.event_type()
+                )));
+            }
+            AgentEvent::UnmappedResponseItem { item_type, .. } => {
                 self.blocks.push(Block::Notice(format!(
                     "the backend sent a `{item_type}` item this build does not render"
                 )));
@@ -2736,7 +2743,9 @@ mod tests {
             truncation: None,
             execution: None,
         }));
-        s.apply(&AgentEvent::Interrupted(agent_core::InterruptedView::cancelled()));
+        s.apply(&AgentEvent::Interrupted(
+            agent_core::InterruptedView::cancelled(),
+        ));
         assert_eq!(s.live_output_lines(), vec!["warning: unused".to_string()]);
     }
 
@@ -3564,7 +3573,9 @@ mod tests {
             crate::diff::Diff::default(),
         ));
 
-        s.apply(&AgentEvent::Interrupted(agent_core::InterruptedView::cancelled()));
+        s.apply(&AgentEvent::Interrupted(
+            agent_core::InterruptedView::cancelled(),
+        ));
 
         assert!(s.pending.is_none());
         assert_eq!(s.status, Status::Idle);
@@ -3624,7 +3635,9 @@ mod tests {
         assert!(s.quit_shortcut_hint_visible());
         assert!(!s.should_quit);
 
-        s.apply(&AgentEvent::Interrupted(agent_core::InterruptedView::cancelled()));
+        s.apply(&AgentEvent::Interrupted(
+            agent_core::InterruptedView::cancelled(),
+        ));
         let action = s.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(action, InputAction::Quit);
         assert!(s.should_quit);

@@ -11,8 +11,15 @@ use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-use crate::message::{Message, ToolCallFormat, ToolCallId};
+use crate::message::{ToolCallFormat, ToolCallId};
 use crate::model::{ModelRuntimeError, ResolvedModelRuntime};
+
+pub use crate::provider_extension::{MAX_PROVIDER_EXTENSION_BYTES, ProviderExtension};
+pub use crate::request::{
+    CanonicalRequest, CanonicalRequestValidationError, OutputSchema, ReasoningSummaryDelivery,
+    RequestStreamOptions,
+};
+pub use crate::response_metadata::{ReasoningMetadata, ResponseMetadata, SafetyMetadata};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,16 +87,29 @@ pub enum StreamEvent {
     Quota {
         snapshot: crate::quota::QuotaSnapshot,
     },
+    /// Additive response and transport metadata. Every field is optional so an
+    /// adapter can publish values as soon as they become available without
+    /// fabricating a complete response envelope.
+    ResponseMetadata {
+        metadata: Box<ResponseMetadata>,
+    },
+    /// An additive provider event that has no canonical variant yet. Its
+    /// payload is sanitized and bounded before it crosses the provider seam.
+    ProviderExtension {
+        extension: ProviderExtension,
+    },
     /// The backend produced a response item this adapter does not map. The
     /// content is genuinely lost, so the LOSS is reported instead of being
     /// swallowed: Codex keeps such an item as `ResponseItem::Other`
     /// (`codex-rs/protocol/src/models.rs:1041`), which is how a newly served
     /// item type stays visible rather than vanishing from the stream.
     ///
-    /// `item_type` is the wire tag and nothing else: the payload is not carried,
-    /// because an unmapped item is by definition one we cannot interpret.
+    /// `item_type` keeps the wire tag while `extension`, when present, carries a
+    /// bounded and sanitized copy of the item for forward-compatible clients.
     UnmappedItem {
         item_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extension: Option<ProviderExtension>,
     },
 }
 
@@ -179,7 +199,9 @@ impl TokenUsage {
     pub fn add_assign(&mut self, other: &Self) {
         self.input = self.input.saturating_add(other.input);
         self.cached_input = self.cached_input.saturating_add(other.cached_input);
-        self.cache_write_input = self.cache_write_input.saturating_add(other.cache_write_input);
+        self.cache_write_input = self
+            .cache_write_input
+            .saturating_add(other.cache_write_input);
         self.output = self.output.saturating_add(other.output);
         self.reasoning_output = self.reasoning_output.saturating_add(other.reasoning_output);
         // `total()` and not `total`: a backend that reports no total must not
@@ -511,121 +533,6 @@ pub enum ToolSpecValidationError {
     EmptyGrammarDefinition { tool: String },
 }
 
-/// Canonical request (what `ctx.request()` produces). Client-side transcript.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CanonicalRequest {
-    pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_runtime: Option<ResolvedModelRuntime>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub reasoning_replay: bool,
-    pub system: Option<String>,
-    pub messages: Vec<Message>,
-    pub tools: Vec<ToolSpec>,
-    pub max_output_tokens: u32,
-}
-
-impl CanonicalRequest {
-    pub fn validate(&self) -> Result<(), CanonicalRequestValidationError> {
-        if self.model.trim().is_empty() {
-            return Err(CanonicalRequestValidationError::EmptyModel);
-        }
-        if self.max_output_tokens == 0 {
-            return Err(CanonicalRequestValidationError::ZeroMaxOutputTokens);
-        }
-        if let Some(runtime) = &self.model_runtime {
-            runtime.validate().map_err(|error| {
-                CanonicalRequestValidationError::InvalidModelRuntime {
-                    detail: error.to_string(),
-                }
-            })?;
-            if runtime.slug != self.model {
-                return Err(CanonicalRequestValidationError::InvalidModelRuntime {
-                    detail: "runtime slug does not match request model".into(),
-                });
-            }
-            if runtime.max_output_tokens != self.max_output_tokens {
-                return Err(CanonicalRequestValidationError::InvalidModelRuntime {
-                    detail: "runtime output limit does not match request".into(),
-                });
-            }
-            if runtime.reasoning_effort != self.reasoning_effort {
-                return Err(CanonicalRequestValidationError::InvalidModelRuntime {
-                    detail: "runtime reasoning effort does not match request".into(),
-                });
-            }
-            if self.reasoning_replay
-                && runtime.reasoning_replay != crate::model::ReasoningReplaySupport::Enabled
-            {
-                return Err(
-                    CanonicalRequestValidationError::UnsupportedReasoningReplay {
-                        model: runtime.slug.clone(),
-                    },
-                );
-            }
-            if !runtime.accepts_images()
-                && self.messages.iter().any(|message| {
-                    message
-                        .content
-                        .iter()
-                        .any(|block| matches!(block, crate::message::ContentBlock::Image { .. }))
-                })
-            {
-                return Err(CanonicalRequestValidationError::UnsupportedImageModality {
-                    model: runtime.slug.clone(),
-                });
-            }
-        }
-        for (index, message) in self.messages.iter().enumerate() {
-            message.validate().map_err(|source| {
-                CanonicalRequestValidationError::InvalidMessage {
-                    index,
-                    detail: source.to_string(),
-                }
-            })?;
-        }
-        for tool in &self.tools {
-            tool.validate()
-                .map_err(CanonicalRequestValidationError::InvalidTool)?;
-        }
-        let mut seen_tools = HashSet::new();
-        for tool in &self.tools {
-            if !seen_tools.insert(tool.name.as_str()) {
-                return Err(CanonicalRequestValidationError::DuplicateToolName {
-                    tool: tool.name.clone(),
-                });
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum CanonicalRequestValidationError {
-    #[error("model is empty")]
-    EmptyModel,
-    #[error("max_output_tokens must be greater than zero")]
-    ZeroMaxOutputTokens,
-    #[error("invalid model runtime: {detail}")]
-    InvalidModelRuntime { detail: String },
-    #[error("model {model} does not accept image input")]
-    UnsupportedImageModality { model: String },
-    #[error("model {model} does not support encrypted stateless reasoning replay")]
-    UnsupportedReasoningReplay { model: String },
-    #[error("message {index} is invalid: {detail}")]
-    InvalidMessage { index: usize, detail: String },
-    #[error("tool spec is invalid: {0}")]
-    InvalidTool(#[from] ToolSpecValidationError),
-    #[error("duplicate tool name: {tool}")]
-    DuplicateToolName { tool: String },
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 /// Non-stream response (utility: titles, compaction summaries).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalResponse {
@@ -798,44 +705,6 @@ pub trait Provider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{ContentBlock, Message, Role};
-    use crate::model::{
-        InputModality, ModelRetryPolicy, ModelRuntimeSource, ModelToolMode, ResponsesDialect,
-        TruncationMode, TruncationPolicy,
-    };
-
-    fn text_only_runtime() -> ResolvedModelRuntime {
-        ResolvedModelRuntime {
-            slug: "text-model".into(),
-            source: ModelRuntimeSource::Embedded {
-                version: "test".into(),
-            },
-            instructions: "test".into(),
-            fingerprint: "a".repeat(64),
-            context_window: 10_000,
-            auto_compact_token_limit: 8_000,
-            input_modalities: vec![InputModality::Text],
-            reasoning_effort: None,
-            supports_verbosity: false,
-            verbosity: None,
-            supports_parallel_tool_calls: false,
-            reasoning_replay: crate::model::ReasoningReplaySupport::Disabled,
-            responses_dialect: ResponsesDialect::Standard,
-            tool_mode: ModelToolMode::Direct,
-            multi_agent_version: crate::model::MultiAgentVersion::Disabled,
-            truncation: TruncationPolicy {
-                mode: TruncationMode::Tokens,
-                limit: 1_000,
-            },
-            retry: ModelRetryPolicy {
-                max_attempts: 2,
-                backoff_base_ms: 50,
-            },
-            max_output_tokens: 100,
-            comp_hash: None,
-        }
-    }
-
     #[test]
     fn context_error_detection() {
         assert!(ProviderError::ContextLengthExceeded.is_context_error());
@@ -856,142 +725,6 @@ mod tests {
             .is_context_error()
         );
         assert!(!ProviderError::Transport("reset".into()).is_context_error());
-    }
-
-    #[test]
-    fn canonical_request_validation_rejects_invalid_message_and_tool_schema() {
-        let invalid_message = Message {
-            role: Role::Assistant,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: "c1".into(),
-                content: "out".into(),
-                status: None,
-                structured_content: None,
-                untrusted: true,
-                is_error: false,
-                error_kind: None,
-                duration_ms: None,
-                truncation: None,
-                execution: None,
-                images: Vec::new(),
-            }],
-        };
-        let req = CanonicalRequest {
-            model: "gpt".into(),
-            model_runtime: None,
-            reasoning_effort: None,
-            reasoning_replay: false,
-            system: None,
-            messages: vec![invalid_message],
-            tools: vec![],
-            max_output_tokens: 100,
-        };
-        assert!(matches!(
-            req.validate(),
-            Err(CanonicalRequestValidationError::InvalidMessage { .. })
-        ));
-
-        let req = CanonicalRequest {
-            model: "gpt".into(),
-            model_runtime: None,
-            reasoning_effort: None,
-            reasoning_replay: false,
-            system: None,
-            messages: vec![Message::user("ok")],
-            tools: vec![ToolSpec::function(
-                "bad",
-                String::new(),
-                serde_json::json!({
-                    "type": "string",
-                    "additionalProperties": false,
-                    "required": []
-                }),
-            )],
-            max_output_tokens: 100,
-        };
-        assert!(matches!(
-            req.validate(),
-            Err(CanonicalRequestValidationError::InvalidTool(
-                ToolSpecValidationError::SchemaMustBeObject { .. }
-            ))
-        ));
-    }
-
-    #[test]
-    fn canonical_request_rejects_images_before_serialization_for_text_only_runtime() {
-        let req = CanonicalRequest {
-            model: "text-model".into(),
-            model_runtime: Some(text_only_runtime()),
-            reasoning_effort: None,
-            reasoning_replay: false,
-            system: Some("test".into()),
-            messages: vec![Message {
-                role: Role::User,
-                content: vec![ContentBlock::Image {
-                    media_type: "image/png".into(),
-                    data: "AA==".into(),
-                }],
-            }],
-            tools: Vec::new(),
-            max_output_tokens: 100,
-        };
-        assert!(matches!(
-            req.validate(),
-            Err(CanonicalRequestValidationError::UnsupportedImageModality { .. })
-        ));
-    }
-
-    #[test]
-    fn canonical_request_rejects_non_strict_tool_schemas_and_duplicate_names() {
-        let req = CanonicalRequest {
-            model: "gpt".into(),
-            model_runtime: None,
-            reasoning_effort: None,
-            reasoning_replay: false,
-            system: None,
-            messages: vec![Message::user("ok")],
-            tools: vec![ToolSpec::function(
-                "read",
-                "lit",
-                serde_json::json!({
-                    "type": "object",
-                    "properties": { "path": { "type": "string" } },
-                    "required": ["path"]
-                }),
-            )],
-            max_output_tokens: 100,
-        };
-        assert!(matches!(
-            req.validate(),
-            Err(CanonicalRequestValidationError::InvalidTool(
-                ToolSpecValidationError::SchemaMustDenyAdditionalProperties { .. }
-            ))
-        ));
-
-        let strict_tool = ToolSpec::function(
-            "read",
-            "lit",
-            serde_json::json!({
-                "type": "object",
-                "properties": { "path": { "type": "string" } },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
-        );
-        let req = CanonicalRequest {
-            model: "gpt".into(),
-            model_runtime: None,
-            reasoning_effort: None,
-            reasoning_replay: false,
-            system: None,
-            messages: vec![Message::user("ok")],
-            tools: vec![strict_tool.clone(), strict_tool],
-            max_output_tokens: 100,
-        };
-        assert!(matches!(
-            req.validate(),
-            Err(CanonicalRequestValidationError::DuplicateToolName { tool }) if tool == "read"
-        ));
     }
 
     #[test]

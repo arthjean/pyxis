@@ -388,6 +388,163 @@
       ],
       "type": "string"
     },
+    "ProviderEventNotification": {
+      "properties": {
+        "extension": {
+          "$ref": "#/$defs/ProviderExtensionView"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "threadId",
+        "extension"
+      ],
+      "type": "object"
+    },
+    "ProviderExtensionView": {
+      "properties": {
+        "eventType": {
+          "type": "string"
+        },
+        "originalBytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "payload": true,
+        "redacted": {
+          "type": "boolean"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "eventType",
+        "payload",
+        "originalBytes",
+        "truncated",
+        "redacted"
+      ],
+      "type": "object"
+    },
+    "ReasoningMetadataView": {
+      "properties": {
+        "itemId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "serverIncluded": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "ResponseMetadataView": {
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "modelsEtag": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "moderation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderExtensionView"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reasoning": {
+          "$ref": "#/$defs/ReasoningMetadataView"
+        },
+        "requestId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "responseId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "safety": {
+          "$ref": "#/$defs/SafetyMetadataView"
+        },
+        "serviceTier": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turnState": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verifications": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "SafetyMetadataView": {
+      "properties": {
+        "reasons": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "retryModel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "useCases": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "ServerCapabilities": {
       "description": "What this build can actually do. Published BEFORE any mutation so a client\nnever discovers a missing capability by having a call fail.",
       "properties": {
@@ -963,6 +1120,27 @@
       ],
       "type": "object"
     },
+    "TurnMetadataNotification": {
+      "properties": {
+        "metadata": {
+          "$ref": "#/$defs/ResponseMetadataView"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "threadId",
+        "metadata"
+      ],
+      "type": "object"
+    },
     "TurnStartParams": {
       "additionalProperties": false,
       "properties": {
@@ -1194,6 +1372,18 @@
       "method": "turn/reasoning/delta",
       "params": {
         "$ref": "#/$defs/TurnDeltaNotification"
+      }
+    },
+    {
+      "method": "turn/metadata",
+      "params": {
+        "$ref": "#/$defs/TurnMetadataNotification"
+      }
+    },
+    {
+      "method": "turn/providerEvent",
+      "params": {
+        "$ref": "#/$defs/ProviderEventNotification"
       }
     },
     {

@@ -245,6 +245,7 @@ impl PromptSnapshot {
             messages,
             tools: self.tool_plan.specs().to_vec(),
             max_output_tokens: self.max_output_tokens,
+            ..CanonicalRequest::default()
         }
     }
 

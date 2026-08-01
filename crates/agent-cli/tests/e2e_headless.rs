@@ -453,6 +453,7 @@ async fn interrupted_turn_leaves_a_resumable_session() {
         messages,
         tools: Vec::new(),
         max_output_tokens: 4096,
+        ..CanonicalRequest::default()
     };
     request
         .validate()

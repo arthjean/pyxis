@@ -1163,11 +1163,25 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 reasoning_replay = false;
                                 yield AgentEvent::ReasoningReplayDisabled { reason };
                             }
-                            Ok(StreamEvent::UnmappedItem { item_type }) => {
+                            Ok(StreamEvent::ResponseMetadata { metadata }) => {
+                                if !metadata.is_empty() {
+                                    yield AgentEvent::ResponseMetadata(metadata);
+                                }
+                            }
+                            Ok(StreamEvent::ProviderExtension { extension }) => {
+                                yield AgentEvent::ProviderExtension(extension);
+                            }
+                            Ok(StreamEvent::UnmappedItem {
+                                item_type,
+                                extension,
+                            }) => {
                                 // The turn continues: an item we cannot read is a
                                 // gap in what the client can show, never a reason
                                 // to fail a turn the model completed.
-                                yield AgentEvent::UnmappedResponseItem { item_type };
+                                yield AgentEvent::UnmappedResponseItem {
+                                    item_type,
+                                    extension,
+                                };
                             }
                             Ok(other) => {
                                 if let Err(e) = acc.push(other) {

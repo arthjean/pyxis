@@ -13,6 +13,7 @@
 
 pub mod chatgpt;
 pub mod chatgpt_events;
+mod chatgpt_metadata;
 pub mod chatgpt_request;
 pub mod credential;
 pub mod models;

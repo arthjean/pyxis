@@ -243,6 +243,8 @@ impl Accumulator {
             // because its content could not be read.
             StreamEvent::Usage { .. }
             | StreamEvent::Quota { .. }
+            | StreamEvent::ResponseMetadata { .. }
+            | StreamEvent::ProviderExtension { .. }
             | StreamEvent::UnmappedItem { .. }
             | StreamEvent::ReasoningReplayDisabled { .. } => {}
             StreamEvent::Done { stop } => self.stop = Some(stop),

@@ -16,6 +16,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::jsonrpc::{ErrorObject, error_code};
+pub use crate::protocol_metadata::{
+    ProviderEventNotification, ProviderExtensionView, ReasoningMetadataView, ResponseMetadataView,
+    SafetyMetadataView, TurnMetadataNotification,
+};
 
 /// Protocol version this build speaks. Bumped when an already published shape
 /// changes; adding a method or an optional field does not change how an
@@ -225,6 +229,11 @@ server_notifications! {
     /// persists reasoning, so binding it to an item would make the item numbering
     /// of a resumed thread disagree with its log. It is turn-scoped instead.
     TurnReasoningDelta => "turn/reasoning/delta" (TurnDeltaNotification),
+    /// Provider response/header metadata, additive and turn-scoped.
+    TurnMetadata => "turn/metadata" (TurnMetadataNotification),
+    /// Additive provider data that has no dedicated client type yet. The core
+    /// bounded and redacted the payload before this projection.
+    TurnProviderEvent => "turn/providerEvent" (ProviderEventNotification),
     /// A pending server request stopped waiting for the client.
     ServerRequestResolved => "serverRequest/resolved" (ServerRequestResolvedNotification),
 }
@@ -875,5 +884,55 @@ mod tests {
             serde_json::from_value::<ThreadItem>(json).expect("round-trip"),
             item
         );
+    }
+
+    #[test]
+    fn metadata_notification_preserves_every_field_and_defaults_absent_additions() {
+        let metadata = agent_core::provider::ResponseMetadata {
+            response_id: Some("resp_1".into()),
+            model: Some("gpt-effective".into()),
+            service_tier: Some("priority".into()),
+            request_id: Some("req_1".into()),
+            turn_state: Some("turn-state".into()),
+            models_etag: Some("etag-1".into()),
+            safety: agent_core::provider::SafetyMetadata {
+                use_cases: vec!["cyber".into()],
+                reasons: vec!["review".into()],
+                retry_model: Some("gpt-safe".into()),
+            },
+            verifications: vec!["trusted_access_for_cyber".into()],
+            moderation: Some(agent_core::provider::ProviderExtension::from_value(
+                "turn_moderation_metadata",
+                serde_json::json!({"flagged": false}),
+            )),
+            reasoning: agent_core::provider::ReasoningMetadata {
+                server_included: Some(true),
+                item_id: Some("rs_1".into()),
+                status: Some("completed".into()),
+            },
+        };
+        let notification = ServerNotification::TurnMetadata(TurnMetadataNotification {
+            thread_id: "thread_1".into(),
+            turn_id: Some("turn_1".into()),
+            metadata: Box::new(ResponseMetadataView::from(&metadata)),
+        });
+        let params = notification.params();
+        assert_eq!(notification.method_name(), "turn/metadata");
+        assert_eq!(params["metadata"]["responseId"], "resp_1");
+        assert_eq!(params["metadata"]["model"], "gpt-effective");
+        assert_eq!(params["metadata"]["serviceTier"], "priority");
+        assert_eq!(params["metadata"]["requestId"], "req_1");
+        assert_eq!(params["metadata"]["turnState"], "turn-state");
+        assert_eq!(params["metadata"]["modelsEtag"], "etag-1");
+        assert_eq!(params["metadata"]["safety"]["retryModel"], "gpt-safe");
+        assert_eq!(
+            params["metadata"]["verifications"][0],
+            "trusted_access_for_cyber"
+        );
+        assert_eq!(params["metadata"]["reasoning"]["status"], "completed");
+
+        let old: ResponseMetadataView = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(old, ResponseMetadataView::default());
+        assert_eq!(serde_json::to_value(old).unwrap(), serde_json::json!({}));
     }
 }

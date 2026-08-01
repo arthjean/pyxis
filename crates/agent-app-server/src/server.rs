@@ -711,6 +711,20 @@ impl Pump {
                         delta,
                     })
                 }
+                Projected::ResponseMetadata(metadata) => {
+                    ServerNotification::TurnMetadata(TurnMetadataNotification {
+                        thread_id: self.thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        metadata: Box::new(ResponseMetadataView::from(metadata.as_ref())),
+                    })
+                }
+                Projected::ProviderExtension(extension) => {
+                    ServerNotification::TurnProviderEvent(ProviderEventNotification {
+                        thread_id: self.thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        extension: ProviderExtensionView::from(&extension),
+                    })
+                }
             };
             self.emit(notification);
         }

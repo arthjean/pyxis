@@ -582,7 +582,9 @@ impl TranscriptMapper {
                         agent_core::event::HookRunStatus::Completed => {
                             TranscriptItemStatus::Complete
                         }
-                        agent_core::event::HookRunStatus::Blocked => TranscriptItemStatus::Cancelled,
+                        agent_core::event::HookRunStatus::Blocked => {
+                            TranscriptItemStatus::Cancelled
+                        }
                         agent_core::event::HookRunStatus::Failed => TranscriptItemStatus::Failed,
                     },
                     TranscriptPayload::HookRun {
@@ -598,7 +600,9 @@ impl TranscriptMapper {
                             agent_core::event::HookRunStatus::Blocked => {
                                 TranscriptHookStatus::Blocked
                             }
-                            agent_core::event::HookRunStatus::Failed => TranscriptHookStatus::Failed,
+                            agent_core::event::HookRunStatus::Failed => {
+                                TranscriptHookStatus::Failed
+                            }
                         },
                         entries: Vec::new(),
                     },
@@ -607,7 +611,23 @@ impl TranscriptMapper {
             // An item the adapter could not read: shown as a notice precisely
             // because there is nothing else to show. Staying silent would let
             // the user believe the model produced only what is on screen.
-            AgentEvent::UnmappedResponseItem { item_type } => vec![TranscriptUpdate::new(
+            AgentEvent::ResponseMetadata(_) => Vec::new(),
+            AgentEvent::ProviderExtension(extension) => vec![TranscriptUpdate::new(
+                TranscriptLifecycle::Completed,
+                TranscriptItem::new(
+                    Some(self.next_local("notice")),
+                    TranscriptRole::System,
+                    TranscriptItemKind::Notice,
+                    TranscriptItemStatus::Complete,
+                    TranscriptPayload::Notice {
+                        message: format!(
+                            "the backend sent an additive `{}` event",
+                            extension.event_type()
+                        ),
+                    },
+                ),
+            )],
+            AgentEvent::UnmappedResponseItem { item_type, .. } => vec![TranscriptUpdate::new(
                 TranscriptLifecycle::Completed,
                 TranscriptItem::new(
                     Some(self.next_local("notice")),

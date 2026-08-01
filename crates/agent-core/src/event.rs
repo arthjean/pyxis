@@ -25,12 +25,19 @@ pub enum AgentEvent {
     ReasoningReplayDisabled {
         reason: String,
     },
+    /// Response/header metadata that must remain observable without becoming
+    /// transcript text.
+    ResponseMetadata(Box<crate::provider::ResponseMetadata>),
+    /// Additive provider event with a bounded and redacted payload.
+    ProviderExtension(crate::provider::ProviderExtension),
     /// The backend served a response item the provider adapter does not map, so
     /// its content never reached the transcript. Reported rather than dropped:
     /// silence here reads as "the model produced nothing", which is false.
-    /// Carries the wire tag only, since an unmapped item is one we cannot read.
+    /// Carries the wire tag plus an optional bounded, sanitized provider copy.
     UnmappedResponseItem {
         item_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extension: Option<crate::provider::ProviderExtension>,
     },
     /// A provider reopening planned from the single sampling-scoped attempt
     /// budget. It carries identifiers and allow-listed classifications only.

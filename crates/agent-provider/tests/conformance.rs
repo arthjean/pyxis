@@ -139,15 +139,15 @@ fn streams_match_their_baseline_events() {
     }
 }
 
-/// An output item type the mapper does not project would disappear from the
-/// stream. The suite refuses to host one silently, and names it with its
-/// position.
+/// A known output item must have a dedicated mapping. An additive one is legal
+/// only when the mapper preserves its type, phase and bounded payload.
 #[test]
-fn unmapped_output_items_fail_with_their_type_and_position() {
+fn every_output_item_is_mapped_or_preserved_with_its_type_and_position() {
     for (path, _, fixture) in load_fixtures() {
         let Some(case) = fixture.stream else {
             continue;
         };
+        let mut mapper = CodexEventMapper::new();
         for (index, event) in case.events.iter().enumerate() {
             let kind = event
                 .get("type")
@@ -167,10 +167,27 @@ fn unmapped_output_items_fail_with_their_type_and_position() {
                         path.display()
                     )
                 });
+            let produced = mapper.ingest(&event.to_string()).unwrap_or_else(|error| {
+                panic!(
+                    "{} ({}): event {index}: {error}",
+                    fixture.name,
+                    path.display()
+                )
+            });
+            if MAPPED_OUTPUT_ITEM_TYPES.contains(&item_type) {
+                continue;
+            }
             assert!(
-                MAPPED_OUTPUT_ITEM_TYPES.contains(&item_type),
-                "{} ({}): unmapped Responses item `{item_type}` at position {index}; map it in \
-                 chatgpt_events.rs or the stream loses it",
+                produced.iter().any(|event| matches!(
+                    event,
+                    StreamEvent::UnmappedItem {
+                        item_type: found,
+                        extension: Some(extension),
+                    } if found == item_type
+                        && extension.event_type().contains(item_type)
+                        && !extension.is_truncated()
+                )),
+                "{} ({}): additive item `{item_type}` at position {index} was not preserved",
                 fixture.name,
                 path.display()
             );

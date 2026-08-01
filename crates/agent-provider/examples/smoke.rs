@@ -52,6 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         messages: vec![Message::user(prompt)],
         tools: vec![],
         max_output_tokens: 1024,
+        ..CanonicalRequest::default()
     };
 
     let mut stream = provider.stream(req).await?;

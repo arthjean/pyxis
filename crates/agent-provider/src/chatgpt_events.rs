@@ -3,14 +3,18 @@
 //! active function call and accumulates its arguments to guarantee the invariant
 //! "`input_delta` complete & valid at `ToolCallEnd`".
 //!
-//! Event types transcribed verbatim from Pi (`openai-responses-shared.ts` +
-//! `openai-codex-responses.ts`). The irrelevant events (created, part.added,
-//! content_part.added, ...) are silently ignored, like Pi.
+//! Known semantic events receive dedicated canonical variants. Other event and
+//! item types remain observable as bounded, sanitized provider extensions.
 
 use agent_core::message::ToolCallFormat;
-use agent_core::provider::{ProviderError, StopReason, StreamEvent, TokenUsage};
+use agent_core::provider::{
+    ProviderError, ProviderExtension, ReasoningMetadata, ResponseMetadata, StopReason, StreamEvent,
+    TokenUsage,
+};
 use serde_json::Value;
 use std::collections::HashMap;
+
+use crate::chatgpt_metadata::response_metadata_from_event;
 
 struct ActiveCall {
     call_id: String,
@@ -21,10 +25,22 @@ struct ActiveCall {
 /// Responses output item types this mapper knowingly handles: projected here
 /// (`function_call`, `custom_tool_call`, `reasoning`) or carried by their own
 /// delta events (`message`). The conformance suite reads it so an item the
-/// wire starts sending, and that we silently ignore, fails a test instead of
-/// disappearing from the stream.
+/// wire starts sending fails a test instead of disappearing from the stream.
 pub const MAPPED_OUTPUT_ITEM_TYPES: &[&str] =
     &["message", "reasoning", "function_call", "custom_tool_call"];
+
+/// Baseline lifecycle events whose information is already carried by a mapped
+/// delta or terminal item. They are intentionally quiet, unlike a genuinely
+/// additive event unknown to this build.
+const KNOWN_UNPROJECTED_EVENTS: &[&str] = &[
+    "response.in_progress",
+    "response.content_part.added",
+    "response.content_part.done",
+    "response.output_text.done",
+    "response.reasoning_text.done",
+    "response.reasoning_summary_part.added",
+    "response.reasoning_summary_text.done",
+];
 
 /// Stateful mapper for one response stream. Reinstantiated on every turn.
 #[derive(Default)]
@@ -59,13 +75,17 @@ impl CodexEventMapper {
     pub fn ingest(&mut self, data: &str) -> Result<Vec<StreamEvent>, ProviderError> {
         let data = data.trim();
         if data.is_empty() {
-            return Ok(Vec::new());
+            return Err(ProviderError::Decode(
+                "empty Responses event payload".to_string(),
+            ));
         }
         let v: Value =
             serde_json::from_str(data).map_err(|e| ProviderError::Decode(e.to_string()))?;
         let typ = v.get("type").and_then(Value::as_str).unwrap_or("");
 
-        match typ {
+        let events = match typ {
+            // Observable through the metadata prefix assembled below.
+            "response.created" | "response.metadata" => Ok(Vec::new()),
             "response.output_text.delta" => {
                 Ok(delta_event(&v, |text| StreamEvent::TextDelta { text }))
             }
@@ -141,9 +161,32 @@ impl CodexEventMapper {
                 .unwrap_or_default()),
             "error" => Err(stream_error(&v)),
             "response.failed" => Err(failed_error(&v)),
-            // created, content_part.added, reasoning_summary_part.added, ... -> ignored.
-            _ => Ok(Vec::new()),
+            known if KNOWN_UNPROJECTED_EVENTS.contains(&known) => Ok(Vec::new()),
+            // A baseline event not yet represented by a dedicated canonical
+            // variant remains visible as bounded, redacted data. This wildcard
+            // must never become a silent drop again.
+            _ => Ok(vec![StreamEvent::ProviderExtension {
+                extension: ProviderExtension::from_value(
+                    if typ.is_empty() {
+                        "<untyped-event>"
+                    } else {
+                        typ
+                    },
+                    v.clone(),
+                ),
+            }]),
+        };
+        let mut events = events?;
+        let metadata = response_metadata_from_event(&v);
+        if !metadata.is_empty() {
+            events.insert(
+                0,
+                StreamEvent::ResponseMetadata {
+                    metadata: Box::new(metadata),
+                },
+            );
         }
+        Ok(events)
     }
 
     fn on_item_added(&mut self, v: &Value) -> Vec<StreamEvent> {
@@ -152,7 +195,7 @@ impl CodexEventMapper {
             None => return Vec::new(),
         };
         let Some(format) = call_format(item) else {
-            return Vec::new();
+            return unmapped_item_event(item, "added");
         };
         let call_id = item
             .get("call_id")
@@ -195,13 +238,26 @@ impl CodexEventMapper {
         // US-031: encrypted reasoning item, captured only when replay is active.
         // `encrypted_content`/`id` opaque.
         if item_type == Some("reasoning") {
-            if !self.replay {
-                return Ok(Vec::new());
-            }
             let item = match v.get("item") {
                 Some(i) => i,
                 None => return Ok(Vec::new()),
             };
+            let mut events = vec![StreamEvent::ResponseMetadata {
+                metadata: Box::new(ResponseMetadata {
+                    reasoning: ReasoningMetadata {
+                        item_id: item_id(item).map(str::to_string),
+                        status: item
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        ..ReasoningMetadata::default()
+                    },
+                    ..ResponseMetadata::default()
+                }),
+            }];
+            if !self.replay {
+                return Ok(events);
+            }
             let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
             let enc = item
                 .get("encrypted_content")
@@ -209,12 +265,13 @@ impl CodexEventMapper {
                 .unwrap_or_default();
             // a reasoning without encrypted content is not reinjectable -> ignored.
             if id.is_empty() || enc.is_empty() {
-                return Ok(Vec::new());
+                return Ok(events);
             }
-            return Ok(vec![StreamEvent::EncryptedReasoning {
+            events.push(StreamEvent::EncryptedReasoning {
                 id: id.to_string(),
                 encrypted_content: enc.to_string(),
-            }]);
+            });
+            return Ok(events);
         }
         let Some(item) = v.get("item") else {
             return Ok(Vec::new());
@@ -223,7 +280,7 @@ impl CodexEventMapper {
             // Everything outside the mapped set is content we cannot read. It is
             // REPORTED rather than dropped: a web search or an image generation
             // served by the backend would otherwise leave no trace at all.
-            return Ok(unmapped_item_event(item));
+            return Ok(unmapped_item_event(item, "done"));
         };
         // The terminal item is authoritative over every delta that preceded it.
         let item_args = terminal_call_input(item, format);
@@ -446,16 +503,29 @@ fn call_format(item: &Value) -> Option<ToolCallFormat> {
 /// `reasoning` is captured before this point). An item with no readable `type`
 /// is reported under a placeholder rather than ignored: a malformed item is
 /// still an item we dropped.
-fn unmapped_item_event(item: &Value) -> Vec<StreamEvent> {
-    let item_type = item
+fn unmapped_item_event(item: &Value, phase: &str) -> Vec<StreamEvent> {
+    let raw_item_type = item
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("<untyped>");
-    if MAPPED_OUTPUT_ITEM_TYPES.contains(&item_type) {
+    if MAPPED_OUTPUT_ITEM_TYPES.contains(&raw_item_type) {
         return Vec::new();
     }
+    let item_type: String = raw_item_type.chars().take(128).collect();
+    let item_type = if item_type.is_empty()
+        || !item_type.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        }) {
+        "<invalid-type>".to_string()
+    } else {
+        item_type
+    };
     vec![StreamEvent::UnmappedItem {
-        item_type: item_type.to_string(),
+        item_type: item_type.clone(),
+        extension: Some(ProviderExtension::from_value(
+            format!("response.item.{item_type}.{phase}"),
+            item.clone(),
+        )),
     }]
 }
 
@@ -596,567 +666,4 @@ fn classify_failed_message(code: &str, message: &str) -> ProviderError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ingest_all(events: &[&str]) -> Vec<StreamEvent> {
-        let mut m = CodexEventMapper::new();
-        let mut out = Vec::new();
-        for e in events {
-            out.extend(m.ingest(e).unwrap());
-        }
-        out
-    }
-
-    #[test]
-    fn text_delta_maps() {
-        let ev = ingest_all(&[r#"{"type":"response.output_text.delta","delta":"Hello"}"#]);
-        assert_eq!(
-            ev,
-            vec![StreamEvent::TextDelta {
-                text: "Hello".into()
-            }]
-        );
-    }
-
-    #[test]
-    fn reasoning_deltas_map() {
-        let ev = ingest_all(&[
-            r#"{"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
-            r#"{"type":"response.reasoning_text.delta","delta":" encore"}"#,
-        ]);
-        assert_eq!(
-            ev,
-            vec![
-                StreamEvent::ReasoningDelta {
-                    text: "thinking".into()
-                },
-                StreamEvent::ReasoningDelta {
-                    text: " encore".into()
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn completed_without_tools_is_endturn_with_usage() {
-        let ev = ingest_all(&[
-            r#"{"type":"response.output_text.delta","delta":"ok"}"#,
-            r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":120,"output_tokens":8}}}"#,
-        ]);
-        assert!(ev.contains(&StreamEvent::Usage {
-            usage: TokenUsage::new(120, 8)
-        }));
-        assert_eq!(
-            ev.last(),
-            Some(&StreamEvent::Done {
-                stop: StopReason::EndTurn
-            })
-        );
-    }
-
-    #[test]
-    fn completed_end_turn_false_requests_continuation() {
-        let ev = ingest_all(&[
-            r#"{"type":"response.completed","response":{"status":"completed","end_turn":false}}"#,
-        ]);
-        assert_eq!(
-            ev,
-            [StreamEvent::Done {
-                stop: StopReason::Continue
-            }]
-        );
-    }
-
-    #[test]
-    fn missing_end_turn_keeps_legacy_end_turn_behavior() {
-        let ev =
-            ingest_all(&[r#"{"type":"response.completed","response":{"status":"completed"}}"#]);
-        assert_eq!(
-            ev,
-            [StreamEvent::Done {
-                stop: StopReason::EndTurn
-            }]
-        );
-    }
-
-    #[test]
-    fn incomplete_reasons_are_distinct() {
-        for (reason, expected) in [
-            ("max_output_tokens", StopReason::MaxTokens),
-            ("content_filter", StopReason::ContentFilter),
-            ("future_reason", StopReason::IncompleteUnknown),
-        ] {
-            let event = format!(
-                r#"{{"type":"response.incomplete","response":{{"status":"incomplete","incomplete_details":{{"reason":"{reason}"}}}}}}"#
-            );
-            let ev = ingest_all(&[&event]);
-            assert_eq!(ev.last(), Some(&StreamEvent::Done { stop: expected }));
-        }
-    }
-
-    #[test]
-    fn invalid_end_turn_and_contradictory_terminals_fail_closed() {
-        for event in [
-            r#"{"type":"response.completed","response":{"status":"completed","end_turn":"false"}}"#,
-            r#"{"type":"response.completed","response":{"status":"incomplete"}}"#,
-            r#"{"type":"response.incomplete","response":{"status":"incomplete","end_turn":false}}"#,
-        ] {
-            let mut mapper = CodexEventMapper::new();
-            assert!(matches!(
-                mapper.ingest(event),
-                Err(ProviderError::Decode(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn function_call_full_lifecycle_reassembles_valid_json() {
-        let ev = ingest_all(&[
-            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_7","id":"fc_1","name":"bash","arguments":""}}"#,
-            r#"{"type":"response.function_call_arguments.delta","delta":"{\"cmd\":\""}"#,
-            r#"{"type":"response.function_call_arguments.delta","delta":"ls\"}"}"#,
-            r#"{"type":"response.function_call_arguments.done","arguments":"{\"cmd\":\"ls\"}"}"#,
-            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_7","id":"fc_1","name":"bash","arguments":"{\"cmd\":\"ls\"}"}}"#,
-            r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":50,"output_tokens":12}}}"#,
-        ]);
-
-        assert!(ev.contains(&StreamEvent::tool_call_start("call_7", "bash")));
-        assert!(ev.contains(&StreamEvent::ToolCallEnd {
-            id: "call_7".into()
-        }));
-        // stop = ToolUse because a tool call was emitted.
-        assert_eq!(
-            ev.last(),
-            Some(&StreamEvent::Done {
-                stop: StopReason::ToolUse
-            })
-        );
-
-        // invariant: concatenated input_delta = valid JSON.
-        let args: String = ev
-            .iter()
-            .filter_map(|e| match e {
-                StreamEvent::ToolCallDelta { id, input_delta } if id == "call_7" => {
-                    Some(input_delta.clone())
-                }
-                _ => None,
-            })
-            .collect();
-        let parsed: serde_json::Value = serde_json::from_str(&args).expect("JSON valide");
-        assert_eq!(parsed["cmd"], "ls");
-    }
-
-    #[test]
-    fn interleaved_function_calls_are_tracked_by_item_id() {
-        let ev = ingest_all(&[
-            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_a","id":"fc_a","name":"read","arguments":""}}"#,
-            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_b","id":"fc_b","name":"write","arguments":""}}"#,
-            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_a","delta":"{\"path\":\""}"#,
-            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_b","delta":"{\"path\":\""}"#,
-            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_a","delta":"a.txt\"}"}"#,
-            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_b","delta":"b.txt\"}"}"#,
-            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_a","id":"fc_a","name":"read","arguments":"{\"path\":\"a.txt\"}"}}"#,
-            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_b","id":"fc_b","name":"write","arguments":"{\"path\":\"b.txt\"}"}}"#,
-            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
-        ]);
-
-        let args_for = |call_id: &str| -> String {
-            ev.iter()
-                .filter_map(|e| match e {
-                    StreamEvent::ToolCallDelta { id, input_delta } if id == call_id => {
-                        Some(input_delta.clone())
-                    }
-                    _ => None,
-                })
-                .collect()
-        };
-        assert_eq!(args_for("call_a"), "{\"path\":\"a.txt\"}");
-        assert_eq!(args_for("call_b"), "{\"path\":\"b.txt\"}");
-        assert_eq!(
-            ev.last(),
-            Some(&StreamEvent::Done {
-                stop: StopReason::ToolUse
-            })
-        );
-    }
-
-    #[test]
-    fn ambiguous_parallel_tool_delta_fails_closed() {
-        let mut m = CodexEventMapper::new();
-        assert!(
-            m.ingest(
-                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_a","id":"fc_a","name":"read","arguments":""}}"#
-            )
-            .unwrap()
-            .iter()
-            .any(|e| matches!(e, StreamEvent::ToolCallStart { id, .. } if id == "call_a"))
-        );
-        assert!(
-            m.ingest(
-                r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_b","id":"fc_b","name":"write","arguments":""}}"#
-            )
-            .unwrap()
-            .iter()
-            .any(|e| matches!(e, StreamEvent::ToolCallStart { id, .. } if id == "call_b"))
-        );
-        let err = m
-            .ingest(r#"{"type":"response.function_call_arguments.delta","delta":"{}"}"#)
-            .unwrap_err();
-        assert!(matches!(err, ProviderError::Decode(_)));
-    }
-
-    #[test]
-    fn parallel_tool_delta_can_fallback_to_unique_call_id() {
-        let mut m = CodexEventMapper::new();
-        m.ingest(
-            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_a","id":"fc_a","name":"read","arguments":""}}"#,
-        )
-        .unwrap();
-        m.ingest(
-            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_b","id":"fc_b","name":"write","arguments":""}}"#,
-        )
-        .unwrap();
-        assert!(
-            m.ingest(
-                r#"{"type":"response.function_call_arguments.done","call_id":"call_b","arguments":"{\"path\":\"b.txt\"}"}"#
-            )
-            .unwrap()
-            .is_empty()
-        );
-        let ev = m
-            .ingest(
-                r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_b","name":"write"}}"#,
-            )
-            .unwrap();
-        assert!(ev.iter().any(|e| {
-            matches!(
-                e,
-                StreamEvent::ToolCallDelta { id, input_delta }
-                if id == "call_b" && input_delta == "{\"path\":\"b.txt\"}"
-            )
-        }));
-    }
-
-    #[test]
-    fn args_only_in_item_done_still_emitted() {
-        // backend that sends no deltas: args only in output_item.done.
-        let ev = ingest_all(&[
-            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"c1","id":"fc","name":"x","arguments":""}}"#,
-            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","id":"fc","name":"x","arguments":"{\"a\":1}"}}"#,
-        ]);
-        let args: String = ev
-            .iter()
-            .filter_map(|e| match e {
-                StreamEvent::ToolCallDelta { input_delta, .. } => Some(input_delta.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(args, "{\"a\":1}");
-    }
-
-    #[test]
-    fn function_call_done_without_added_reconstructs_call() {
-        let ev = ingest_all(&[
-            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","name":"read","arguments":"{\"path\":\"Cargo.toml\"}"}}"#,
-            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
-        ]);
-        assert!(ev.iter().any(|e| {
-            matches!(
-                e,
-                StreamEvent::ToolCallStart { id, name, .. } if id == "c1" && name == "read"
-            )
-        }));
-        assert!(ev.iter().any(|e| {
-            matches!(
-                e,
-                StreamEvent::ToolCallDelta { id, input_delta }
-                if id == "c1" && input_delta == "{\"path\":\"Cargo.toml\"}"
-            )
-        }));
-        assert_eq!(
-            ev.last(),
-            Some(&StreamEvent::Done {
-                stop: StopReason::ToolUse
-            })
-        );
-    }
-
-    #[test]
-    fn function_call_done_without_added_or_name_fails_closed() {
-        let mut m = CodexEventMapper::new();
-        let err = m
-            .ingest(
-                r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","arguments":"{}"}}"#,
-            )
-            .unwrap_err();
-        assert!(matches!(err, ProviderError::Decode(_)));
-    }
-
-    #[test]
-    fn incomplete_status_without_a_reason_fails_closed_as_unknown() {
-        let ev =
-            ingest_all(&[r#"{"type":"response.incomplete","response":{"status":"incomplete"}}"#]);
-        assert_eq!(
-            ev,
-            vec![StreamEvent::Done {
-                stop: StopReason::IncompleteUnknown
-            }]
-        );
-    }
-
-    #[test]
-    fn error_event_yields_typed_error_not_panic() {
-        let mut m = CodexEventMapper::new();
-        let err = m
-            .ingest(r#"{"type":"error","code":"server_error","message":"boom"}"#)
-            .unwrap_err();
-        assert!(matches!(err, ProviderError::Stream(_)));
-    }
-
-    #[test]
-    fn context_length_error_is_classified_for_withholding() {
-        let mut m = CodexEventMapper::new();
-        let err = m
-            .ingest(
-                r#"{"type":"response.failed","response":{"error":{"code":"context_length_exceeded","message":"maximum context length"}}}"#,
-            )
-            .unwrap_err();
-        assert!(matches!(err, ProviderError::ContextLengthExceeded));
-        assert!(err.is_context_error());
-    }
-
-    #[test]
-    fn response_failed_invalid_request_is_not_stream_retryable() {
-        let mut m = CodexEventMapper::new();
-        let err = m
-            .ingest(
-                r#"{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"bad schema"}}}"#,
-            )
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            ProviderError::Http {
-                status: 400,
-                retry_after_ms: None,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn response_failed_rate_limit_keeps_rate_limited_status() {
-        let mut m = CodexEventMapper::new();
-        let err = m
-            .ingest(
-                r#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"too many requests"}}}"#,
-            )
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            ProviderError::Http {
-                status: 429,
-                retry_after_ms: None,
-                ..
-            }
-        ));
-    }
-
-    // US-031: encrypted reasoning item captured only when replay is active.
-    #[test]
-    fn reasoning_item_captured_only_when_replay_on() {
-        let done = r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"ENC"}}"#;
-        // OFF (default) -> ignored (flat path).
-        assert!(CodexEventMapper::new().ingest(done).unwrap().is_empty());
-        // ON -> EncryptedReasoning emitted.
-        let ev = CodexEventMapper::with_replay(true).ingest(done).unwrap();
-        assert_eq!(
-            ev,
-            vec![StreamEvent::EncryptedReasoning {
-                id: "rs_1".into(),
-                encrypted_content: "ENC".into()
-            }]
-        );
-        // reasoning without encrypted content -> ignored even when ON (not reinjectable).
-        let empty =
-            r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_2"}}"#;
-        assert!(
-            CodexEventMapper::with_replay(true)
-                .ingest(empty)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn malformed_chunk_is_typed_error() {
-        let mut m = CodexEventMapper::new();
-        assert!(matches!(
-            m.ingest("{not json").unwrap_err(),
-            ProviderError::Decode(_)
-        ));
-        // empty line -> no-op.
-        assert!(m.ingest("").unwrap().is_empty());
-    }
-
-    #[test]
-    fn fragmented_custom_tool_call_yields_one_terminal_call_with_text_input() {
-        let ev = ingest_all(&[
-            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"custom_tool_call","call_id":"call_1","id":"ctc_1","name":"exec","input":""}}"#,
-            r#"{"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","call_id":"call_1","delta":"// @exec: cell\n"}"#,
-            r#"{"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","call_id":"call_1","delta":"const x = 1;"}"#,
-            r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_1","id":"ctc_1","name":"exec","input":"// @exec: cell\nconst x = 1;"}}"#,
-            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
-        ]);
-        assert_eq!(
-            ev,
-            vec![
-                StreamEvent::custom_tool_call_start("call_1", "exec"),
-                StreamEvent::ToolCallDelta {
-                    id: "call_1".into(),
-                    input_delta: "// @exec: cell\nconst x = 1;".into(),
-                },
-                StreamEvent::ToolCallEnd {
-                    id: "call_1".into()
-                },
-                StreamEvent::Done {
-                    stop: StopReason::ToolUse
-                },
-            ]
-        );
-    }
-
-    /// Duplicated deltas then an authoritative terminal item: the terminal
-    /// input wins and nothing is emitted twice.
-    #[test]
-    fn duplicate_deltas_lose_against_the_terminal_item() {
-        let ev = ingest_all(&[
-            r#"{"type":"response.output_item.added","item":{"type":"custom_tool_call","call_id":"call_1","id":"ctc_1","name":"exec","input":""}}"#,
-            r#"{"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","delta":"print(1)"}"#,
-            r#"{"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","delta":"print(1)"}"#,
-            r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_1","id":"ctc_1","name":"exec","input":"print(1)"}}"#,
-        ]);
-        let deltas: Vec<&str> = ev
-            .iter()
-            .filter_map(|event| match event {
-                StreamEvent::ToolCallDelta { input_delta, .. } => Some(input_delta.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(deltas, ["print(1)"], "terminal item is authoritative");
-        assert_eq!(
-            ev.iter()
-                .filter(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
-                .count(),
-            1,
-            "one dispatch, not two"
-        );
-    }
-
-    #[test]
-    fn custom_tool_call_done_without_added_is_reconstructed() {
-        let ev = ingest_all(&[
-            r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"c1","name":"apply_patch","input":"*** Begin Patch"}}"#,
-            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
-        ]);
-        assert_eq!(
-            ev.first(),
-            Some(&StreamEvent::custom_tool_call_start("c1", "apply_patch"))
-        );
-        assert!(ev.contains(&StreamEvent::ToolCallDelta {
-            id: "c1".into(),
-            input_delta: "*** Begin Patch".into(),
-        }));
-    }
-
-    #[test]
-    fn impossible_custom_streams_fail_closed_without_dispatch() {
-        // Terminal item without a name: nothing is dispatchable.
-        let mut m = CodexEventMapper::new();
-        assert!(matches!(
-            m.ingest(
-                r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"c1","input":"x"}}"#,
-            )
-            .unwrap_err(),
-            ProviderError::Decode(_)
-        ));
-
-        // A custom delta addressed to a function call would silently corrupt
-        // its JSON arguments, and the reverse would corrupt freeform text.
-        let mut m = CodexEventMapper::new();
-        m.ingest(
-            r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_a","id":"fc_a","name":"read","arguments":""}}"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            m.ingest(
-                r#"{"type":"response.custom_tool_call_input.delta","item_id":"fc_a","delta":"raw"}"#,
-            )
-            .unwrap_err(),
-            ProviderError::Decode(_)
-        ));
-
-        let mut m = CodexEventMapper::new();
-        m.ingest(
-            r#"{"type":"response.output_item.added","item":{"type":"custom_tool_call","call_id":"call_c","id":"ctc_a","name":"exec","input":""}}"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            m.ingest(
-                r#"{"type":"response.function_call_arguments.delta","item_id":"ctc_a","delta":"{}"}"#,
-            )
-            .unwrap_err(),
-            ProviderError::Decode(_)
-        ));
-
-        // Format flip between the opening and the terminal item.
-        let mut m = CodexEventMapper::new();
-        m.ingest(
-            r#"{"type":"response.output_item.added","item":{"type":"custom_tool_call","call_id":"c2","id":"ctc_2","name":"exec","input":""}}"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            m.ingest(
-                r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c2","id":"ctc_2","name":"exec","arguments":"{}"}}"#,
-            )
-            .unwrap_err(),
-            ProviderError::Decode(_)
-        ));
-
-        // Invalid UTF-8 escape inside the payload: rejected at decode, so no
-        // call is ever built from it.
-        let mut m = CodexEventMapper::new();
-        assert!(matches!(
-            m.ingest(
-                "{\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"c3\",\"name\":\"exec\",\"input\":\"\\ud800\"}}",
-            )
-            .unwrap_err(),
-            ProviderError::Decode(_)
-        ));
-    }
-
-    #[test]
-    fn function_and_custom_calls_interleave_without_crosstalk() {
-        let ev = ingest_all(&[
-            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_f","id":"fc_1","name":"read","arguments":""}}"#,
-            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"custom_tool_call","call_id":"call_c","id":"ctc_1","name":"exec","input":""}}"#,
-            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"path\":\"a.txt\"}"}"#,
-            r#"{"type":"response.custom_tool_call_input.delta","item_id":"ctc_1","delta":"await tools.read()"}"#,
-            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_f","id":"fc_1","name":"read","arguments":"{\"path\":\"a.txt\"}"}}"#,
-            r#"{"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_c","id":"ctc_1","name":"exec","input":"await tools.read()"}}"#,
-            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
-        ]);
-        let payload = |call: &str| -> Option<String> {
-            ev.iter().find_map(|event| match event {
-                StreamEvent::ToolCallDelta { id, input_delta } if id == call => {
-                    Some(input_delta.clone())
-                }
-                _ => None,
-            })
-        };
-        assert_eq!(payload("call_f").as_deref(), Some(r#"{"path":"a.txt"}"#));
-        assert_eq!(payload("call_c").as_deref(), Some("await tools.read()"));
-        assert!(ev.contains(&StreamEvent::tool_call_start("call_f", "read")));
-        assert!(ev.contains(&StreamEvent::custom_tool_call_start("call_c", "exec")));
-    }
-}
+mod tests;

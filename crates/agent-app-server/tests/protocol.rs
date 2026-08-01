@@ -411,6 +411,69 @@ async fn a_turn_streams_ordered_items_under_stable_identifiers() {
     assert_eq!(completed["params"]["status"], "completed");
 }
 
+#[tokio::test]
+async fn provider_metadata_and_extensions_reach_the_external_protocol() {
+    let harness = Harness::new();
+    harness.open_thread().await;
+    harness.engine(AgentEvent::ResponseMetadata(Box::new(
+        agent_core::provider::ResponseMetadata {
+            response_id: Some("resp_1".into()),
+            model: Some("gpt-effective".into()),
+            service_tier: Some("priority".into()),
+            request_id: Some("req_1".into()),
+            turn_state: Some("sticky".into()),
+            models_etag: Some("etag-1".into()),
+            safety: agent_core::provider::SafetyMetadata {
+                use_cases: vec!["cyber".into()],
+                reasons: vec!["review".into()],
+                retry_model: Some("gpt-safe".into()),
+            },
+            verifications: vec!["trusted_access_for_cyber".into()],
+            moderation: Some(agent_core::provider::ProviderExtension::from_value(
+                "turn_moderation_metadata",
+                json!({"flagged": false}),
+            )),
+            reasoning: agent_core::provider::ReasoningMetadata {
+                server_included: Some(true),
+                item_id: Some("rs_1".into()),
+                status: Some("completed".into()),
+            },
+        },
+    )));
+    harness.engine(AgentEvent::ProviderExtension(
+        agent_core::provider::ProviderExtension::from_value(
+            "response.future",
+            json!({"authorization": "Bearer secret", "detail": "kept"}),
+        ),
+    ));
+
+    let metadata = harness.next_notification("turn/metadata").await;
+    assert_eq!(metadata["params"]["threadId"], THREAD_ID);
+    assert_eq!(metadata["params"]["turnId"], TURN_ID);
+    assert_eq!(metadata["params"]["metadata"]["responseId"], "resp_1");
+    assert_eq!(
+        metadata["params"]["metadata"]["safety"]["retryModel"],
+        "gpt-safe"
+    );
+    assert_eq!(
+        metadata["params"]["metadata"]["reasoning"]["status"],
+        "completed"
+    );
+
+    let extension = harness.next_notification("turn/providerEvent").await;
+    assert_eq!(extension["params"]["threadId"], THREAD_ID);
+    assert_eq!(extension["params"]["turnId"], TURN_ID);
+    assert_eq!(
+        extension["params"]["extension"]["eventType"],
+        "response.future"
+    );
+    assert_eq!(
+        extension["params"]["extension"]["payload"]["authorization"],
+        "[REDACTED]"
+    );
+    assert_eq!(extension["params"]["extension"]["redacted"], true);
+}
+
 /// AC2 again, on the failure side: a terminal cause reaches the client instead
 /// of the turn simply stopping (FR-19).
 #[tokio::test]

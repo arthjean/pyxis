@@ -20,7 +20,8 @@ use agent_core::model::{
 use agent_core::provider::{
     AuthError, CacheCapabilities, CanonicalRequest, CanonicalResponse, Capabilities,
     CapabilityLimits, ErrorClass, Provider, ProviderError, ProviderKind, ReasoningCapabilities,
-    StopReason, StreamEvent, TokenUsage, ToolCallingCapabilities,
+    ReasoningMetadata, ResponseMetadata, StopReason, StreamEvent, TokenUsage,
+    ToolCallingCapabilities,
 };
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
@@ -421,97 +422,14 @@ pub fn is_terminal_rate_limit(body: &str) -> bool {
         .any(|m| lower.contains(m))
 }
 
-fn redact_bearer_tokens(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(pos) = rest.to_ascii_lowercase().find("bearer ") {
-        let (before, after_before) = rest.split_at(pos);
-        out.push_str(before);
-        out.push_str("Bearer [redacted]");
-        let value = &after_before["bearer ".len()..];
-        let end = value
-            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | '}' | ']'))
-            .unwrap_or(value.len());
-        rest = &value[end..];
-    }
-    out.push_str(rest);
-    out
-}
-
-fn redact_form_value(input: &str, key: &str) -> String {
-    let marker = format!("{key}=");
-    let lower_marker = marker.to_ascii_lowercase();
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(pos) = rest.to_ascii_lowercase().find(&lower_marker) {
-        let (before, after_before) = rest.split_at(pos);
-        out.push_str(before);
-        out.push_str(&after_before[..marker.len()]);
-        out.push_str("[redacted]");
-        let value = &after_before[marker.len()..];
-        let end = value
-            .find(|c: char| c.is_whitespace() || matches!(c, '&' | '"' | '\'' | ',' | ';'))
-            .unwrap_or(value.len());
-        rest = &value[end..];
-    }
-    out.push_str(rest);
-    out
-}
-
-fn sensitive_json_key(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
-    lower.contains("token")
-        || lower.contains("authorization")
-        || lower.contains("credential")
-        || lower.contains("secret")
-        || lower.contains("password")
-        || lower == "api_key"
-        || lower == "apikey"
-        || lower == "chatgpt-account-id"
-        || lower == "chatgpt_account_id"
-        || lower == "account_id"
-}
-
-fn redact_json_secrets(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, value) in map {
-                if sensitive_json_key(key) {
-                    *value = serde_json::Value::String("[redacted]".to_string());
-                } else {
-                    redact_json_secrets(value);
-                }
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                redact_json_secrets(item);
-            }
-        }
-        _ => {}
-    }
-}
-
 fn sanitize_error_body(body: &str) -> String {
-    let mut text = if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) {
-        redact_json_secrets(&mut value);
+    let text = if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        let (value, _) = agent_core::redaction::redact_json_value(value);
         serde_json::to_string(&value).unwrap_or_else(|_| body.to_string())
     } else {
         body.to_string()
     };
-    text = redact_bearer_tokens(&text);
-    for key in [
-        "access_token",
-        "refresh_token",
-        "id_token",
-        "authorization",
-        "chatgpt-account-id",
-        "chatgpt_account_id",
-        "api_key",
-    ] {
-        text = redact_form_value(&text, key);
-    }
-    text
+    agent_core::redaction::redact_text(&text)
 }
 
 /// Parses the server delay of a `Retry-After` into milliseconds (US-023), in
@@ -744,10 +662,33 @@ impl Provider for OpenAiChatGptProvider {
         //    US-003: the quota state travels in the response headers, so it is read
         //    here, before the body is consumed, and emitted first.
         let quota = crate::quota::parse_quota_headers(resp.headers());
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+        let response_metadata = ResponseMetadata {
+            model: header("openai-model"),
+            service_tier: header("openai-service-tier"),
+            request_id: header("x-request-id").or_else(|| header("request-id")),
+            turn_state: header("x-codex-turn-state"),
+            models_etag: header("x-models-etag").or_else(|| header("etag")),
+            reasoning: ReasoningMetadata {
+                server_included: header("x-reasoning-included").map(|_| true),
+                ..ReasoningMetadata::default()
+            },
+            ..ResponseMetadata::default()
+        };
         let mut es = resp.bytes_stream().eventsource();
         let mapped = async_stream::stream! {
             if let Some(snapshot) = quota {
                 yield Ok(StreamEvent::Quota { snapshot });
+            }
+            if !response_metadata.is_empty() {
+                yield Ok(StreamEvent::ResponseMetadata {
+                    metadata: Box::new(response_metadata),
+                });
             }
             let mut mapper = CodexEventMapper::with_replay(req.reasoning_replay);
             let mut saw_terminal = false;
@@ -891,6 +832,7 @@ mod tests {
             messages: Vec::new(),
             tools: Vec::new(),
             max_output_tokens: 4096,
+            ..CanonicalRequest::default()
         };
         assert!(
             matches!(
@@ -1113,7 +1055,7 @@ mod tests {
         assert!(!redacted.contains("AT"));
         assert!(!redacted.contains("RT"));
         assert!(!redacted.contains("acct_1"));
-        assert!(redacted.contains("[redacted]"));
+        assert!(redacted.contains("[REDACTED]"));
 
         let raw =
             "Authorization: Bearer AT_SECRET\nrefresh_token=RT_SECRET&chatgpt-account-id=acct_2";
