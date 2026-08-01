@@ -20,15 +20,28 @@ const TERMINAL_RATE_LIMIT_MARKERS: &[&str] = &[
 
 pub(crate) async fn from_http_response(response: reqwest::Response) -> ProviderError {
     let status = response.status().as_u16();
-    let request_id = diagnostic_header(&response, &["x-request-id", "request-id"]);
-    let auth_request_id = diagnostic_header(&response, &["x-auth-request-id", "auth-request-id"]);
+    let headers = response.headers().clone();
+    let body = response.text().await.unwrap_or_default();
+    from_http_parts(status, &headers, &body)
+}
+
+/// Decodes an HTTP failure independently of the transport that performed the
+/// handshake. HTTP/SSE and WebSocket upgrade failures must expose the same
+/// category, retry delay, and bounded diagnostic identifiers.
+pub(crate) fn from_http_parts(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+) -> ProviderError {
+    let request_id = diagnostic_header(headers, &["x-request-id", "request-id"]);
+    let auth_request_id = diagnostic_header(headers, &["x-auth-request-id", "auth-request-id"]);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0);
-    let retry_after_ms = parse_retry_after_ms(response.headers(), now_ms);
-    let quota = crate::quota::parse_quota_headers(response.headers());
-    let mut message = bounded_error_body(&response.text().await.unwrap_or_default());
+    let retry_after_ms = parse_retry_after_ms(headers, now_ms);
+    let quota = crate::quota::parse_quota_headers(headers);
+    let mut message = bounded_error_body(body);
     let category = api_category_for_http(status, &message);
     if category == ProviderErrorCategory::Quota {
         message = format!(
@@ -213,10 +226,9 @@ fn api_error(
     }
 }
 
-fn diagnostic_header(response: &reqwest::Response, names: &[&str]) -> Option<String> {
+fn diagnostic_header(headers: &reqwest::header::HeaderMap, names: &[&str]) -> Option<String> {
     names.iter().find_map(|name| {
-        response
-            .headers()
+        headers
             .get(*name)
             .and_then(|value| value.to_str().ok())
             .and_then(bounded_diagnostic_id)

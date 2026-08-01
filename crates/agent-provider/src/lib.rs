@@ -1,11 +1,12 @@
 //! `agent-provider`: adapters implementing the core `Provider` trait
 //! (`agent-core`). MVP target: `OpenAiChatGpt`, the ChatGPT subscription through the
-//! Responses API on the ChatGPT/Codex backend (ADR-10), stateless SSE.
+//! Responses API on the ChatGPT/Codex backend (ADR-10), with WebSocket and
+//! deterministic HTTP/SSE fallback.
 //!
 //! The canonical model (Anthropic-like, client-side transcript) and the
 //! `StreamEvent` vocabulary live in `agent-core` (invariant 1: the core does not depend
-//! on the adapters; it consumes `dyn Provider`). In-house networking: `reqwest` +
-//! `eventsource-stream`, without an SDK (PROVIDERS 1.1).
+//! on the adapters; it consumes `dyn Provider`). In-house networking: `reqwest`,
+//! `eventsource-stream`, and `tokio-tungstenite`, without an SDK (PROVIDERS 1.1).
 //!
 //! The other providers (Anthropic, OpenAI Chat BYOK, Gemini, ...) will be added
 //! later, each as a module here. Ollama is out of scope (dropped).
@@ -17,6 +18,7 @@ pub mod chatgpt_events;
 pub mod chatgpt_http;
 mod chatgpt_metadata;
 pub mod chatgpt_request;
+mod chatgpt_websocket;
 pub mod credential;
 pub mod models;
 pub mod quota;
@@ -28,6 +30,9 @@ pub use chatgpt::{
 pub use chatgpt_events::CodexEventMapper;
 pub use chatgpt_http::{OpenAiChatGptConfig, ResponsesCompression};
 pub use chatgpt_request::build_responses_body;
+pub use chatgpt_websocket::{
+    WebSocketProbeAuthorization, WebSocketProbeReport, WebSocketProbeVerdict,
+};
 pub use credential::CredentialManager;
 pub use models::CatalogModel;
 pub use quota::{parse_all_quota_headers, parse_quota_headers, quota_refusal_message};

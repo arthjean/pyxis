@@ -1,9 +1,9 @@
 //! `OpenAiChatGpt` adapter: ChatGPT subscription through the Responses API on the
 //! ChatGPT/Codex backend (ADR-10). Implements `agent_core::Provider`.
 //!
-//! **Stateless SSE**: `server_side_state = false` -> no `previous_response_id`,
-//! full context rebuilt on the client side every turn -> maps cleanly onto the
-//! canonical model (PROVIDERS 4.1, the WebSocket+state trap is explicitly avoided).
+//! The canonical transcript remains client-side. WebSocket may reuse
+//! `previous_response_id` only for a strict extension inside one turn; every new
+//! turn and every HTTP fallback starts from the complete canonical transcript.
 //!
 //! The backend can receive `include: ["reasoning.encrypted_content"]` when
 //! reasoning replay is explicitly enabled. By default, that path stays OFF
@@ -18,8 +18,7 @@ use agent_core::model::{ModelRetryPolicy, ModelRuntimeError, ResolvedModelRuntim
 use agent_core::provider::{
     AuthError, CacheCapabilities, CanonicalRequest, CanonicalResponse, Capabilities,
     CapabilityLimits, ErrorClass, Provider, ProviderError, ProviderKind, ReasoningCapabilities,
-    ReasoningMetadata, ResponseMetadata, StopReason, StreamEvent, TokenUsage,
-    ToolCallingCapabilities,
+    StopReason, StreamEvent, TokenUsage, ToolCallingCapabilities,
 };
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
@@ -33,8 +32,11 @@ use crate::chatgpt_error::{
 };
 use crate::chatgpt_events::CodexEventMapper;
 use crate::chatgpt_http::OpenAiChatGptConfig;
-use crate::chatgpt_metadata::bounded_diagnostic_id;
+use crate::chatgpt_metadata::response_metadata_from_headers;
 use crate::chatgpt_request::{ResponsesBodyOptions, build_responses_body, inject_cache_key};
+use crate::chatgpt_websocket::{
+    ChatGptWebSocket, WebSocketOutcome, WebSocketProbeAuthorization, WebSocketProbeReport,
+};
 use crate::credential::CredentialManager;
 use crate::models::ModelCatalog;
 
@@ -93,6 +95,7 @@ pub struct OpenAiChatGptProvider {
     /// Last valid remote catalog layered over the versioned embedded fallback.
     /// Shared by interactive discovery and headless turn resolution.
     catalog: RwLock<ModelCatalog>,
+    websocket: ChatGptWebSocket,
 }
 
 /// Generates a UUID v4 (RFC 4122) from 16 random bytes. Avoids the `uuid` crate
@@ -177,7 +180,8 @@ impl OpenAiChatGptProvider {
                 // implicit caching on the backend side, not explicitly controlled.
                 prompt_caching: false,
                 reasoning: true,
-                // KEY: stateless SSE -> the client-side canonical model maps (PROVIDERS 4.1).
+                // WebSocket continuation is transport-local and does not move
+                // ownership of the canonical transcript to the server.
                 server_side_state: false,
                 max_context,
                 limits: CapabilityLimits {
@@ -202,6 +206,7 @@ impl OpenAiChatGptProvider {
             config,
             session_id: RwLock::new(new_session_id()),
             catalog: RwLock::new(ModelCatalog::embedded()),
+            websocket: ChatGptWebSocket::new(),
         }
     }
 
@@ -259,6 +264,76 @@ impl OpenAiChatGptProvider {
             DEFAULT_CHATGPT_RETRY.backoff_base_ms,
         )
         .map_err(invalid_request)
+    }
+
+    fn prepare_request(
+        &self,
+        mut req: CanonicalRequest,
+    ) -> Result<(CanonicalRequest, ResolvedModelRuntime, serde_json::Value), ProviderError> {
+        req.validate().map_err(invalid_request)?;
+        self.capabilities.ensure_tools_supported(&req.tools)?;
+        let runtime = self.runtime_for_request(&req)?;
+        if req.model_runtime.is_none() {
+            req.reasoning_effort = runtime.reasoning_effort.clone();
+            req.model_runtime = Some(runtime.clone());
+        }
+        req.validate().map_err(invalid_request)?;
+        let reasoning_effort = runtime
+            .reasoning_effort
+            .as_deref()
+            .map(reasoning_effort_for_request);
+        let mut body = build_responses_body(
+            &req,
+            ResponsesBodyOptions {
+                reasoning_effort,
+                include_encrypted_reasoning: req.reasoning_replay
+                    && runtime.reasoning_effort.is_some(),
+                parallel_tool_calls: runtime.supports_parallel_tool_calls,
+                text_verbosity: if runtime.supports_verbosity {
+                    runtime.verbosity.as_deref()
+                } else {
+                    None
+                },
+                dialect: runtime.responses_dialect,
+            },
+        );
+        if body.get("prompt_cache_key").is_none() {
+            inject_cache_key(&mut body, &self.prompt_cache_key());
+        }
+        Ok((req, runtime, body))
+    }
+
+    /// Establishes the persistent transport without sending model input. It is
+    /// safe to call repeatedly and is a no-op after session fallback to SSE.
+    pub async fn preconnect_websocket(&self, req: CanonicalRequest) -> Result<(), ProviderError> {
+        let (req, runtime, _body) = self.prepare_request(req)?;
+        if !self.config.websocket_enabled() {
+            return Ok(());
+        }
+        self.websocket
+            .preconnect(&self.creds, &self.config, &req, runtime.responses_dialect)
+            .await
+    }
+
+    /// Runs the opt-in live handshake, `generate=false`, continuation, terminal,
+    /// and close proof without mutating the provider session state.
+    pub async fn probe_websocket(
+        &self,
+        authorization: WebSocketProbeAuthorization,
+        req: CanonicalRequest,
+    ) -> Result<WebSocketProbeReport, ProviderError> {
+        let (req, runtime, body) = self.prepare_request(req)?;
+        Ok(self
+            .websocket
+            .probe(
+                authorization,
+                &self.creds,
+                &self.config,
+                &req,
+                runtime.responses_dialect,
+                body,
+            )
+            .await)
     }
 
     /// Catalog of the models offered to the connected account (`GET /models`), sorted by
@@ -442,41 +517,28 @@ impl Provider for OpenAiChatGptProvider {
         &self,
         req: CanonicalRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
-        req.validate().map_err(invalid_request)?;
-        // A tool this adapter cannot serialize is refused here, before the
-        // credential is read and before any socket is opened.
-        self.capabilities.ensure_tools_supported(&req.tools)?;
-        let runtime = self.runtime_for_request(&req)?;
-        let mut req = req;
-        if req.model_runtime.is_none() {
-            req.reasoning_effort = runtime.reasoning_effort.clone();
-            req.model_runtime = Some(runtime.clone());
-        }
-        req.validate().map_err(invalid_request)?;
-
-        let reasoning_effort = runtime
-            .reasoning_effort
-            .as_deref()
-            .map(reasoning_effort_for_request);
-        let mut body = build_responses_body(
-            &req,
-            ResponsesBodyOptions {
-                reasoning_effort,
-                include_encrypted_reasoning: req.reasoning_replay
-                    && runtime.reasoning_effort.is_some(),
-                parallel_tool_calls: runtime.supports_parallel_tool_calls,
-                text_verbosity: if runtime.supports_verbosity {
-                    runtime.verbosity.as_deref()
-                } else {
-                    None
-                },
-                dialect: runtime.responses_dialect,
-            },
-        );
-        // US-029: stable per-session cache key -> reuse of the backend cache.
-        let prompt_cache_key = self.prompt_cache_key();
-        if body.get("prompt_cache_key").is_none() {
-            inject_cache_key(&mut body, &prompt_cache_key);
+        let (req, runtime, body) = self.prepare_request(req)?;
+        if self.config.websocket_enabled() {
+            match self
+                .websocket
+                .stream(
+                    &self.creds,
+                    &self.config,
+                    &req,
+                    runtime.responses_dialect,
+                    body.clone(),
+                    runtime.retry.max_attempts,
+                )
+                .await?
+            {
+                WebSocketOutcome::Stream(stream) => return Ok(stream),
+                WebSocketOutcome::FallbackHttp => {
+                    tracing::warn!(
+                        target: "pyxis::provider",
+                        "Responses WebSocket unavailable for this session; using HTTP/SSE"
+                    );
+                }
+            }
         }
 
         // 3. Serialize and prepare every non-secret request component before
@@ -511,27 +573,7 @@ impl Provider for OpenAiChatGptProvider {
         //    US-003: the quota state travels in the response headers, so it is read
         //    here, before the body is consumed, and emitted first.
         let quotas = crate::quota::parse_all_quota_headers(resp.headers());
-        let header = |name: &str| {
-            resp.headers()
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-        };
-        let response_metadata = ResponseMetadata {
-            model: header("openai-model"),
-            service_tier: header("openai-service-tier"),
-            request_id: header("x-request-id")
-                .or_else(|| header("request-id"))
-                .as_deref()
-                .and_then(bounded_diagnostic_id),
-            turn_state: header("x-codex-turn-state"),
-            models_etag: header("x-models-etag").or_else(|| header("etag")),
-            reasoning: ReasoningMetadata {
-                server_included: header("x-reasoning-included").map(|_| true),
-                ..ReasoningMetadata::default()
-            },
-            ..ResponseMetadata::default()
-        };
+        let response_metadata = response_metadata_from_headers(resp.headers());
         let mut es = resp.bytes_stream().eventsource();
         let mapped = async_stream::stream! {
             for snapshot in quotas {
@@ -594,17 +636,27 @@ impl Provider for OpenAiChatGptProvider {
     }
 
     async fn refresh_auth(&self) -> Result<(), ProviderError> {
-        self.creds.force_refresh().await
+        self.creds.force_refresh().await?;
+        self.websocket.reset_scope();
+        Ok(())
     }
 
     async fn disconnect_auth(&self) -> Result<(), ProviderError> {
+        self.websocket.disconnect(&self.config).await;
         self.creds.disconnect().await;
         Ok(())
     }
 
     fn set_prompt_cache_key(&self, key: &str) {
-        if let Ok(mut session_id) = self.session_id.write() {
+        let mut changed = false;
+        if let Ok(mut session_id) = self.session_id.write()
+            && session_id.as_str() != key
+        {
             *session_id = key.to_string();
+            changed = true;
+        }
+        if changed {
+            self.websocket.reset_scope();
         }
     }
 
@@ -697,10 +749,10 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_are_sse_stateless() {
+    fn capabilities_preserve_client_side_state_with_websocket_transport() {
         let p = provider();
         let c = p.capabilities();
-        assert!(!c.server_side_state, "SSE stateless → mappe le canonique");
+        assert!(!c.server_side_state);
         assert!(c.tools && c.reasoning);
         assert!(c.reasoning_options.encrypted_replay);
         assert_eq!(p.kind(), ProviderKind::OpenAiChatGpt);
@@ -929,6 +981,11 @@ mod tests {
         assert_eq!(
             p.classify_error(&api(ProviderErrorCategory::Failed, Some(503))),
             ErrorClass::Retryable
+        );
+        assert_eq!(
+            p.classify_error(&api(ProviderErrorCategory::Failed, None)),
+            ErrorClass::InvalidRequest,
+            "an unknown post-dispatch outcome must never be replayed"
         );
         assert_eq!(
             p.classify_error(&api(ProviderErrorCategory::Quota, Some(429))),

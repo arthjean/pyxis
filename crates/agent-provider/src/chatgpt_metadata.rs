@@ -66,11 +66,7 @@ pub(crate) fn response_metadata_from_event(event: &Value) -> ResponseMetadata {
             .map(str::to_string)
             .or_else(|| header(&["openai-service-tier"])),
         request_id: request_id_from_event(event),
-        turn_state: event
-            .get("turn_state")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| header(&["x-codex-turn-state"])),
+        turn_state: turn_state_from_event(event),
         models_etag: event
             .get("models_etag")
             .and_then(Value::as_str)
@@ -96,6 +92,57 @@ pub(crate) fn response_metadata_from_event(event: &Value) -> ResponseMetadata {
                 .or_else(|| header(&["x-reasoning-included"]).map(|_| true)),
             ..ReasoningMetadata::default()
         },
+    }
+}
+
+/// Extracts the sticky turn token from every envelope location accepted by the
+/// Responses mapper. Continuation state must not maintain a narrower, bespoke
+/// interpretation of the same event.
+pub(crate) fn turn_state_from_event(event: &Value) -> Option<String> {
+    event
+        .get("turn_state")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            event
+                .get("response")
+                .and_then(|response| response.get("turn_state"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
+        .or_else(|| {
+            let response_headers = event.get("response").and_then(|value| value.get("headers"));
+            header_value(response_headers, &["x-codex-turn-state"])
+        })
+        .or_else(|| header_value(event.get("headers"), &["x-codex-turn-state"]))
+}
+
+/// Canonical metadata projection for transport response headers. Both HTTP/SSE
+/// and the WebSocket upgrade call this helper so the two transports cannot
+/// silently drift.
+pub(crate) fn response_metadata_from_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> ResponseMetadata {
+    let header = |names: &[&str]| {
+        names.iter().find_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        })
+    };
+    ResponseMetadata {
+        model: header(&["openai-model", "x-openai-model"]),
+        service_tier: header(&["openai-service-tier"]),
+        request_id: header(&["x-request-id", "request-id"])
+            .as_deref()
+            .and_then(bounded_diagnostic_id),
+        turn_state: header(&["x-codex-turn-state"]),
+        models_etag: header(&["x-models-etag", "etag"]),
+        reasoning: ReasoningMetadata {
+            server_included: header(&["x-reasoning-included"]).map(|_| true),
+            ..ReasoningMetadata::default()
+        },
+        ..ResponseMetadata::default()
     }
 }
 

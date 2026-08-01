@@ -20,6 +20,10 @@ const DEFAULT_PATH: &str = "codex/responses";
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_HEADER_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_WEBSOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_WEBSOCKET_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_WEBSOCKET_WRITE_BUFFER: usize = 1024 * 1024;
 const MAX_HEADER_COUNT: usize = 64;
 const MAX_QUERY_COUNT: usize = 32;
 
@@ -53,12 +57,22 @@ pub struct OpenAiChatGptConfig {
     header_timeout: Duration,
     idle_timeout: Duration,
     compression: ResponsesCompression,
+    websocket_enabled: bool,
+    websocket_connect_timeout: Duration,
+    websocket_write_timeout: Duration,
+    websocket_close_timeout: Duration,
+    websocket_write_buffer: usize,
 }
 
 pub(crate) struct PreparedResponsesRequest {
     endpoint: Url,
     headers: HeaderMap,
     body: Vec<u8>,
+}
+
+pub(crate) struct PreparedWebSocketRequest {
+    pub(crate) endpoint: Url,
+    pub(crate) headers: HeaderMap,
 }
 
 impl PreparedResponsesRequest {
@@ -129,6 +143,11 @@ impl OpenAiChatGptConfig {
             header_timeout: DEFAULT_HEADER_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             compression: ResponsesCompression::None,
+            websocket_enabled: true,
+            websocket_connect_timeout: DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
+            websocket_write_timeout: DEFAULT_WEBSOCKET_WRITE_TIMEOUT,
+            websocket_close_timeout: DEFAULT_WEBSOCKET_CLOSE_TIMEOUT,
+            websocket_write_buffer: DEFAULT_WEBSOCKET_WRITE_BUFFER,
         })
     }
 
@@ -143,6 +162,11 @@ impl OpenAiChatGptConfig {
             header_timeout: DEFAULT_HEADER_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             compression: ResponsesCompression::None,
+            websocket_enabled: true,
+            websocket_connect_timeout: DEFAULT_WEBSOCKET_CONNECT_TIMEOUT,
+            websocket_write_timeout: DEFAULT_WEBSOCKET_WRITE_TIMEOUT,
+            websocket_close_timeout: DEFAULT_WEBSOCKET_CLOSE_TIMEOUT,
+            websocket_write_buffer: DEFAULT_WEBSOCKET_WRITE_BUFFER,
         }
     }
 
@@ -197,6 +221,41 @@ impl OpenAiChatGptConfig {
         self
     }
 
+    /// Selects the Responses WebSocket optimization for this provider session.
+    /// HTTP/SSE remains the deterministic fallback when disabled or rejected.
+    pub fn with_websocket(mut self, enabled: bool) -> Self {
+        self.websocket_enabled = enabled;
+        self
+    }
+
+    pub fn with_websocket_timeouts(
+        mut self,
+        connect: Duration,
+        write: Duration,
+        close: Duration,
+    ) -> Result<Self, ProviderError> {
+        if connect.is_zero() || write.is_zero() || close.is_zero() || close > Duration::from_secs(5)
+        {
+            return Err(invalid(
+                "websocket timeouts must be nonzero and close must be at most 5 seconds",
+            ));
+        }
+        self.websocket_connect_timeout = connect;
+        self.websocket_write_timeout = write;
+        self.websocket_close_timeout = close;
+        Ok(self)
+    }
+
+    pub fn with_websocket_write_buffer(mut self, bytes: usize) -> Result<Self, ProviderError> {
+        if !(128 * 1024..=16 * 1024 * 1024).contains(&bytes) {
+            return Err(invalid(
+                "websocket write buffer must contain 128 KiB..=16 MiB",
+            ));
+        }
+        self.websocket_write_buffer = bytes;
+        Ok(self)
+    }
+
     pub fn endpoint(&self) -> Result<Url, ProviderError> {
         let base_url =
             Url::parse(&self.base_url).map_err(|_| invalid("invalid responses base URL"))?;
@@ -234,6 +293,26 @@ impl OpenAiChatGptConfig {
 
     pub fn idle_timeout(&self) -> Duration {
         self.idle_timeout
+    }
+
+    pub(crate) fn websocket_enabled(&self) -> bool {
+        self.websocket_enabled
+    }
+
+    pub(crate) fn websocket_connect_timeout(&self) -> Duration {
+        self.websocket_connect_timeout
+    }
+
+    pub(crate) fn websocket_write_timeout(&self) -> Duration {
+        self.websocket_write_timeout
+    }
+
+    pub(crate) fn websocket_close_timeout(&self) -> Duration {
+        self.websocket_close_timeout
+    }
+
+    pub(crate) fn websocket_write_buffer(&self) -> usize {
+        self.websocket_write_buffer
     }
 
     pub(crate) fn set_idle_timeout(&mut self, idle: Duration) {
@@ -313,6 +392,49 @@ impl OpenAiChatGptConfig {
             headers,
             body: encoded,
         })
+    }
+
+    pub(crate) fn prepare_websocket_request(
+        &self,
+        canonical: &CanonicalRequest,
+        dialect: ResponsesDialect,
+        auth: &RequestSpec,
+    ) -> Result<PreparedWebSocketRequest, ProviderError> {
+        let mut endpoint = self.endpoint()?;
+        validate_authority(&endpoint, &auth.url)?;
+        let websocket_scheme = match endpoint.scheme() {
+            "http" => "ws",
+            "https" => "wss",
+            _ => return Err(invalid("invalid responses websocket URL scheme")),
+        };
+        endpoint
+            .set_scheme(websocket_scheme)
+            .map_err(|_| invalid("invalid responses websocket URL"))?;
+
+        let mut headers = self.prepare_request(canonical, dialect, b"{}")?.headers;
+        headers.remove(reqwest::header::ACCEPT);
+        headers.remove(reqwest::header::CONTENT_TYPE);
+        headers.remove(reqwest::header::CONTENT_ENCODING);
+        for (name, value) in &auth.headers {
+            if name.eq_ignore_ascii_case("accept")
+                || name.eq_ignore_ascii_case("content-type")
+                || name.eq_ignore_ascii_case("content-length")
+                || name.eq_ignore_ascii_case("content-encoding")
+                || name.eq_ignore_ascii_case("openai-beta")
+            {
+                continue;
+            }
+            let name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| invalid("invalid credential header name"))?;
+            let value = HeaderValue::from_str(value)
+                .map_err(|_| invalid("invalid credential header value"))?;
+            headers.insert(name, value);
+        }
+        headers.insert(
+            HeaderName::from_static("openai-beta"),
+            HeaderValue::from_static("responses_websockets=2026-02-06"),
+        );
+        Ok(PreparedWebSocketRequest { endpoint, headers })
     }
 
     fn validate_authority(&self, authorized_url: &str) -> Result<(), ProviderError> {
@@ -485,6 +607,65 @@ mod tests {
                 .as_str(),
             "https://chatgpt.com/backend-api/codex/responses"
         );
+    }
+
+    #[test]
+    fn websocket_uses_the_same_auth_scope_and_the_baseline_beta_contract() {
+        let config = OpenAiChatGptConfig::new("https://example.test/api/", "responses")
+            .unwrap()
+            .with_query("api-version", "2026-08-01")
+            .unwrap();
+        let canonical = CanonicalRequest {
+            client_metadata: BTreeMap::from([
+                ("thread_id".into(), "thread-1".into()),
+                ("session_id".into(), "session-1".into()),
+            ]),
+            ..CanonicalRequest::default()
+        };
+        let request = config
+            .prepare_websocket_request(
+                &canonical,
+                ResponsesDialect::Standard,
+                &spec("https://example.test/responses"),
+            )
+            .unwrap();
+        assert_eq!(
+            request.endpoint.as_str(),
+            "wss://example.test/api/responses?api-version=2026-08-01"
+        );
+        assert_eq!(request.headers["authorization"], "Bearer secret-token");
+        assert_eq!(request.headers["chatgpt-account-id"], "secret-account");
+        assert_eq!(request.headers["originator"], "codex_cli_rs");
+        assert_eq!(request.headers["thread-id"], "thread-1");
+        assert_eq!(request.headers["session-id"], "session-1");
+        assert_eq!(
+            request.headers["openai-beta"],
+            "responses_websockets=2026-02-06"
+        );
+        assert!(!request.headers.contains_key(reqwest::header::ACCEPT));
+        assert!(!request.headers.contains_key(reqwest::header::CONTENT_TYPE));
+    }
+
+    #[test]
+    fn websocket_policy_rejects_unbounded_or_overlong_close_configuration() {
+        let config = OpenAiChatGptConfig::new("https://example.test/", "responses").unwrap();
+        assert!(
+            config
+                .clone()
+                .with_websocket_timeouts(
+                    Duration::from_secs(1),
+                    Duration::from_secs(1),
+                    Duration::from_secs(6),
+                )
+                .is_err()
+        );
+        assert!(
+            config
+                .clone()
+                .with_websocket_write_buffer(usize::MAX)
+                .is_err()
+        );
+        assert!(!config.with_websocket(false).websocket_enabled());
     }
 
     #[test]

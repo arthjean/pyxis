@@ -126,9 +126,9 @@ sse-stream = "0.2"
 # App-server (EP-005). `schemars` derives the JSON Schema of the protocol from
 # the Rust types themselves, so the published schema cannot drift from what
 # serde really reads (US-018 AC3); the TypeScript is emitted from that schema.
-# `tokio-tungstenite` carries the second transport. No TLS feature: the listener
-# is loopback-only and refuses anything else, so a TLS stack would add a
-# dependency for a perimeter that is already closed.
+# `tokio-tungstenite` carries both the loopback app-server listener and the
+# outbound ChatGPT Responses client. The workspace baseline keeps handshake
+# only; `agent-provider` adds the rustls/root features required by `wss://`.
 schemars = "1"
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
 # internal crates
