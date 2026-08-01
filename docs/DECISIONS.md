@@ -15,7 +15,7 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/CURRENT_S
 | ADR-7 | Registre des risques majeurs | Vivant |
 | ADR-8 | Nommage des crates : `pyxis*` publié, `agent-*` interne | Accepté |
 | ADR-9 | Taxonomie d'erreurs canonique : `ErrorClass` | Accepté |
-| ADR-10 | Auth abonnement ChatGPT = `ProviderKind::OpenAiChatGpt` (Responses API backend ChatGPT, SSE stateless, gated) | Accepté (2026-06-15) |
+| ADR-10 | Auth abonnement ChatGPT = `ProviderKind::OpenAiChatGpt` (Responses backend ChatGPT, WebSocket borné avec repli SSE) | Accepté (2026-06-15), transport amendé par EP-003 (2026-08-01) |
 | ADR-11 | Scope MVP recentré : abonnement ChatGPT d'abord, Ollama retiré, autres providers différés | Accepté (2026-06-15) |
 | ADR-12 | Runtime de thread `agent-runtime` au-dessus de `run_agent` | Accepté (2026-07-27) |
 
@@ -123,7 +123,7 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/CURRENT_S
 
 **Divergences par provider (résumé ; détail dans `docs/PROVIDERS.md` §3).**
 - **Anthropic** : adapter quasi-identité. `cache_control` ephemeral TTL 1h, thinking adaptatif. Betas gated sur `kind == Anthropic`.
-- **OpenAI** : **trois surfaces à ne pas confondre**. `OpenAiChatGpt` (backend ChatGPT/Codex, SSE stateless) est le provider MVP courant depuis ADR-11. *Chat Completions* (transcript client) reste un adapter BYOK futur. *Responses API publique* (état server-side via `previous_response_id`) ne mappe pas sur le canonique et reste un mode gated sur `capabilities.server_side_state`, jamais par défaut.
+- **OpenAI** : **trois surfaces à ne pas confondre**. `OpenAiChatGpt` (backend ChatGPT/Codex, WebSocket borné au tour avec repli SSE stateless) est le provider MVP courant depuis ADR-11. *Chat Completions* (transcript client) reste un adapter BYOK futur. *Responses API publique* (état server-side via `previous_response_id`) ne mappe pas sur le canonique et reste un mode gated sur `capabilities.server_side_state`, jamais par défaut.
 - **Gemini** : function calls potentiellement **fragmentées** en stream → **réassembler côté adapter** avant `ToolCallEnd`. `systemInstruction`, context cache.
 - **Ollama** : contexte historique retiré du scope par ADR-11. Le risque d'`usage` absent reste utile comme justification provider-agnostique du fallback `agent-tokenizer`.
 - **OpenRouter** : méta-routeur OpenAI-compat (200+ modèles, perd les features natives).
@@ -294,7 +294,7 @@ Règles de retry associées (détail `docs/PROVIDERS.md` §5.1) : `Retryable` �
 
 ---
 
-## ADR-10 — Auth abonnement ChatGPT : `ProviderKind::OpenAiChatGpt` (Responses API backend ChatGPT, SSE stateless, gated)
+## ADR-10 — Auth abonnement ChatGPT : `ProviderKind::OpenAiChatGpt` (Responses API backend ChatGPT)
 
 **Contexte.** Le dogfooder principal (Arthur) veut alimenter Pyxis avec son **abonnement ChatGPT** (Plus/Pro), pas une clé API au token, et a rejeté Ollama comme défaut quotidien. L'extraction de l'implémentation de référence Pi (TypeScript, détail vérifié dans `docs/openai-subscription-auth.md`, 45/45 constantes confirmées contre le code) établit un fait structurant : **l'auth abonnement ChatGPT n'appelle PAS Chat Completions.** Elle :
 - réutilise le `client_id` OAuth du **Codex CLI officiel OSS** (`app_EMoamEEZ73f0CkXaXp7hrann`), flow PKCE S256 sur `auth.openai.com` (browser callback `localhost:1455` + device-code) ;
@@ -304,14 +304,14 @@ Cela entre en conflit frontal avec **US-017** (« cible Chat Completions ; Respo
 
 **Décision.** Introduire un **`ProviderKind::OpenAiChatGpt`** distinct, et NON réutiliser `OpenAiChat` ni `OpenAiResponses` :
 - **Surface séparée** : base `https://chatgpt.com/backend-api/codex`, endpoint `/responses`, `capabilities().server_side_state = false`.
-- **SSE stateless uniquement** : le backend Codex est stateless en SSE (contexte complet dans `input[]` à chaque tour) → mappe proprement le canonique client-side. Le mode **WebSocket + `previous_response_id` est explicitement refusé** pour le MVP (il casserait compaction/resume).
+- **Transport amendé par EP-003 en 2026** : le backend Codex est stateless en SSE. WebSocket peut réutiliser `previous_response_id` uniquement pour une extension stricte dans le même tour et sur la même connexion. Nouvelle session, nouveau tour, changement de propriétés non-input ou repli SSE repartent du contexte complet dans `input[]`; compaction/resume restent client-side.
 - **Auth** : OAuth PKCE (réutilise le client Codex), credentials en **keyring** (US-018, jamais en clair — contrairement au `~/.pi/agent/auth.json` clair de Pi), refresh tokens rotatifs. Implémentée dans `agent-auth/src/oauth/openai_chatgpt.rs`.
 - **Statut** : credential **optionnelle, gated, étiquetée « fragile »**. **Jamais en P0**, jamais le défaut, jamais en chemin critique. US-017 reste pur (Chat Completions au token, BYOK) et est **clarifié** : il ne couvre pas l'abonnement ChatGPT.
 
 **Justification.**
 - L'endpoint et le wire format diffèrent totalement de Chat Completions : un `if` dans `OpenAiChat` créerait des branches conditionnelles fragiles. Adapter dédié = divergences localisées (`PROVIDERS.md §1.1`).
 - `OpenAiResponses` générique cible `api.openai.com/v1/responses` (API publique au token) ; le backend ChatGPT en diverge (base URL, headers propriétaires, `store:false` forcé) → ne pas confondre les deux.
-- Le mode SSE stateless est le seul qui préserve l'invariant transcript client-side. Renoncer au WS coûte la continuation optimisée mais garde un canonique sain — arbitrage assumé.
+- L'invariant porte sur la propriété du transcript, pas sur le transport. Une continuation WebSocket bornée au tour conserve cet invariant tant que chaque frontière de session et chaque fallback repart du corps complet.
 - Garder l'abonnement hors P0 respecte **FR-11** et le **risque R1** (ADR-7) : le MVP ne dépend d'aucun canal subscription.
 
 **Alternatives écartées.**
@@ -331,7 +331,7 @@ Cela entre en conflit frontal avec **US-017** (« cible Chat Completions ; Respo
 - Dépendance dure au claim custom `https://api.openai.com/auth`.chatgpt_account_id (header `chatgpt-account-id` requis pour router) : un changement de namespace côté OpenAI casse silencieusement.
 - **Conséquence sur les autres documents** : `docs/PROVIDERS.md §2` (ajouter `OpenAiChatGpt` à `ProviderKind`), US-017 clarifié (scope = Chat Completions au token). Détail d'implémentation : `docs/openai-subscription-auth.md`.
 
-> **Mise à jour (ADR-11, 2026-06-15)** : le **statut** d'ADR-10 (« gated, optionnelle, jamais en P0 ») est **superseded par ADR-11**. La décision *technique* (ProviderKind distinct, Responses backend, SSE stateless, OAuth keyring) reste intégralement valide ; seul le positionnement produit change (l'abonnement devient la cible MVP livrée en premier).
+> **Mise à jour (ADR-11, 2026-06-15; EP-003, 2026-08-01)** : le **statut** d'ADR-10 (« gated, optionnelle, jamais en P0 ») est **superseded par ADR-11**. La décision *technique* conserve un ProviderKind distinct, le backend Responses, le transcript client-side et l'OAuth keyring. EP-003 amende le transport: WebSocket borné au tour avec repli SSE stateless.
 
 ---
 
@@ -342,7 +342,7 @@ Cela entre en conflit frontal avec **US-017** (« cible Chat Completions ; Respo
 **Contexte.** Arthur veut dogfooder Pyxis **maintenant**, avec son abonnement ChatGPT (modèles GPT/Codex), exactement comme Pi. Décision explicite : « je ne veux pas faire le multi-provider maintenant, je veux d'abord me concentrer sur Codex et les modèles GPT du plan d'abonnement, que Pyxis fonctionne déjà parfaitement avec, et plus tard j'attaquerai d'autres providers au fur et à mesure. » Et, séparément : **Ollama est retiré du scope** (« trop instable, je ne l'implémenterai certainement jamais »).
 
 **Décision.**
-1. **Seul provider livré au MVP = `OpenAiChatGpt`** (abonnement, Responses API SSE stateless, ADR-10). C'est désormais la cible P0 du dogfood, pas une commodité gated.
+1. **Seul provider livré au MVP = `OpenAiChatGpt`** (abonnement, Responses WebSocket avec repli SSE, ADR-10 amendé par EP-003). C'est désormais la cible P0 du dogfood, pas une commodité gated.
 2. **Ollama supprimé** : variante `ProviderKind::Ollama` / `ProviderId::Ollama` retirée du code, US-016 **annulée**. Le fallback tokenizer (US-007) reste — il est provider-agnostique (estimation pré-tour US-014, providers futurs sans `usage`), sa justification n'est juste plus « Ollama ».
 3. **US-017 (OpenAI Chat Completions BYOK) différée** au rang de provider futur (plus la cible MVP). US-015 (trait + canonique + retry) et US-018 (auth keyring) restent et sont **satisfaites**.
 4. **L'architecture reste multi-provider** : le trait `Provider` est inchangé, les autres adapters (Anthropic, OpenAI Chat, Gemini…) s'ajoutent ensuite, chacun comme un module d'`agent-provider`, sans toucher le cœur.

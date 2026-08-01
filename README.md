@@ -52,7 +52,7 @@ $ pyxis -p "summarize the changes in the last commit"
 **Early, single-provider, Linux-first. No packaged releases yet, you build from source.** This is an honest snapshot, not a roadmap fantasy:
 
 - **It runs today.** The agentic loop, the tool suite, the Linux filesystem sandbox, JSONL sessions with resume, MCP tools called by the model, and the monochrome TUI all work.
-- **One model channel ships so far: your ChatGPT subscription.** GPT / Codex models served through the Codex backend (Responses API, SSE, stateless). The provider layer is written multi-provider from day one, but this is the only adapter wired up. Anthropic, OpenAI BYOK, Gemini, and others are architecture-ready, not yet built. See [Roadmap](#roadmap).
+- **One model channel ships so far: your ChatGPT subscription.** GPT / Codex models served through the Codex backend (Responses WebSocket with deterministic HTTP/SSE fallback). The provider layer is written multi-provider from day one, but this is the only adapter wired up. Anthropic, OpenAI BYOK, Gemini, and others are architecture-ready, not yet built. See [Roadmap](#roadmap).
 - **Linux is the supported platform.** The filesystem sandbox uses Landlock (Linux kernel) and credentials use the Secret Service keyring. macOS Seatbelt and broader support come later; off-Linux, FS confinement degrades explicitly.
 - **The subscription auth is unofficial and revocable.** It reuses the open-source Codex CLI OAuth client, which is ToS-grey and could be cut off at any time (it happened to Anthropic Pro/Max for third-party tools in 2026). Treat it as a convenience, not a foundation. See [Authentication](#authentication).
 
@@ -139,7 +139,7 @@ The founding invariant: **`agent-core` depends on neither the TUI nor the provid
 | Crate | Role |
 |---|---|
 | `agent-core` | Agent loop, transition state machine, canonical message/transcript types (headless) |
-| `agent-provider` | `Provider` trait + adapters (reqwest + SSE), canonical `StreamEvent`, error taxonomy |
+| `agent-provider` | `Provider` trait + adapters (WebSocket + HTTP/SSE), canonical `StreamEvent`, error taxonomy |
 | `agent-tools` | Tool registry, fail-closed trait, concurrent/serial dispatch, permissions, taint |
 | `agent-mcp` | `rmcp`-based MCP client (stdio + Streamable HTTP), config loading, server registry, per-server tool policy and bounds, per-server OAuth, MCP tools as `DynTool` |
 | `agent-tui` | Ratatui + crossterm frontend, decoupled from the core via channels |
@@ -159,7 +159,7 @@ Pyxis authenticates with your **ChatGPT subscription** (Plus / Pro), not a meter
 cargo run -p agent-auth --example login
 ```
 
-This runs OAuth PKCE against `auth.openai.com`, then talks to the ChatGPT backend's Responses API (`chatgpt.com/backend-api/codex/responses`) in stateless SSE mode, so the full transcript is sent each turn and compaction / resume / replay stay intact. Tokens are stored in the OS keyring and refreshed automatically.
+This runs OAuth PKCE against `auth.openai.com`, then talks to the ChatGPT backend's Responses API (`chatgpt.com/backend-api/codex/responses`). WebSocket is preferred within a session and falls back deterministically to HTTP/SSE. The full transcript is sent at the start of every turn; continuation state is scoped to strict same-turn extensions, so compaction / resume / replay stay intact. Tokens are stored in the OS keyring and refreshed automatically.
 
 **Read this before you rely on it.** The login reuses the OAuth client of the open-source Codex CLI, which effectively impersonates Codex. That is ToS-grey and **revocable**: OpenAI could disable this client at any time, exactly as Anthropic blocked third-party tools from using Pro/Max subscriptions in 2026. Pyxis treats the subscription as a disposable convenience layer, not a foundation. The day it breaks, adding a BYOK adapter (Chat Completions, Anthropic, ...) is an isolated module, not a rewrite. The model-agnostic architecture is the insurance policy. See [`docs/DECISIONS.md`](docs/DECISIONS.md) (ADR-10, ADR-11) and [`docs/openai-subscription-auth.md`](docs/openai-subscription-auth.md).
 

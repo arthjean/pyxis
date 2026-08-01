@@ -81,7 +81,7 @@ Autrement dit, « OAuth/refresh complexe » reporté = **multi-serveur** (MCP) e
 
 | Inclus dans le MVP courant | Explicitement HORS scope (reporté) |
 |---|---|
-| `OpenAiChatGpt` (abonnement ChatGPT, SSE stateless via backend Codex) | OpenAI Chat Completions BYOK, OpenAI Responses public API |
+| `OpenAiChatGpt` (abonnement ChatGPT, WebSocket borné avec repli SSE via backend Codex) | OpenAI Chat Completions BYOK, OpenAI Responses public API |
 | Architecture multi-provider (`Provider` trait) | Anthropic, Gemini, OpenRouter, Ollama, Bedrock, Vertex, Azure |
 | Outils Bash, Read, Edit, Write, Glob, Grep | MCP tools exposés au modèle |
 | Permissions 5 modes + taint untrusted | Skills / commands / hooks utilisateur |

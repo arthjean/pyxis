@@ -62,7 +62,7 @@ Le projet est un workspace Cargo. Chaque crate a une responsabilité unique et u
 | Crate | Rôle | Dépendances interdites |
 |---|---|---|
 | `agent-core` | Boucle d'agent, state machine, types canoniques (messages, content blocks, transcript, budget). | Aucune dépendance TUI / HTTP. Ne connaît ni Ratatui ni reqwest. |
-| `agent-provider` | Trait `Provider` + adapters (reqwest + eventsource-stream). Normalisation vers le format canonique, émission de `StreamEvent`. | Ne dépend pas de `agent-tui`. |
+| `agent-provider` | Trait `Provider` + adapters (`reqwest`, `eventsource-stream`, `tokio-tungstenite`). Normalisation vers le format canonique, émission de `StreamEvent`. | Ne dépend pas de `agent-tui`. |
 | `agent-tools` | `Registry`, trait `Tool`, dispatch concurrent/série, permissions, hooks, taint. | — |
 | `agent-mcp` | Wrapper autour de `rmcp` (SDK MCP Rust officiel). Charge la config, suit le lifecycle stdio, liste les outils et les expose au modèle comme `DynTool` (nommage sûr, schéma strict, taint intégral). | — |
 | `agent-tui` | Frontend Ratatui + crossterm. **Découplé du core via canaux.** | **Jamais importé par le core.** |

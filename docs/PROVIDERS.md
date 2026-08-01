@@ -2,7 +2,7 @@
 
 > La couche multi-provider est le cœur architectural de Pyxis. C'est elle qui justifie le projet : « qualité Claude Code, **tous** les modèles frontier ». Là où Claude Code est Anthropic-only, Pyxis est multi-provider first-class. Ce document est la source de vérité du contrat provider. L'état livré courant vit dans [`docs/CURRENT_STATUS.md`](./CURRENT_STATUS.md).
 
-**État courant après ADR-11.** Un seul adapter est livré aujourd'hui : `OpenAiChatGpt`, c'est-à-dire l'abonnement ChatGPT via le backend Codex en SSE stateless. `OpenAiChat`, `OpenAiResponses`, `Anthropic`, `Gemini`, `OpenRouter` et les clouds sont des adapters futurs. `Ollama` a été retiré du scope et n'existe plus dans `ProviderKind`.
+**État courant après ADR-11.** Un seul adapter est livré aujourd'hui : `OpenAiChatGpt`, c'est-à-dire l'abonnement ChatGPT via le backend Codex en WebSocket Responses avec repli HTTP/SSE. `OpenAiChat`, `OpenAiResponses`, `Anthropic`, `Gemini`, `OpenRouter` et les clouds sont des adapters futurs. `Ollama` a été retiré du scope et n'existe plus dans `ProviderKind`.
 
 **Docs liées.** Décisions : [`docs/DECISIONS.md`](./DECISIONS.md) (ADR-4 = couche provider, ADR-7 = roadmap/risque). Architecture transverse : [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md). Plan d'exécution : [`docs/ROADMAP.md`](./ROADMAP.md). Ce document est la version détaillée d'ADR-4 ; toute divergence de signature entre ADR-4 et ce fichier se résout en faveur de ce fichier (taxonomie d'erreurs notamment, cf. §5.1).
 
@@ -23,7 +23,7 @@ Ce document emploie les noms internes `agent-*`. La réservation `pyxis*` couvre
 
 ### 1.1 La décision
 
-Pyxis implémente sa **propre couche provider**, en Rust natif, sur `reqwest` + `eventsource-stream`. Pas d'abstraction tierce au centre. Le format interne canonique est **Anthropic-like** (content blocks : `text`, `tool_use`, `tool_result`, `thinking`, `image` — soit `ContentBlock::Text/ToolUse/ToolResult/Thinking/Image`). Chaque provider possède un **adapter** qui traduit son wire format vers/depuis ce canonique. Toutes les divergences sont **localisées dans l'adapter** — le reste du système (`agent-core`, `agent-tools`, `agent-session`) ne connaît que le canonique.
+Pyxis implémente sa **propre couche provider**, en Rust natif, sur `reqwest` + `eventsource-stream` et `tokio-tungstenite`. Pas d'abstraction tierce au centre. Le format interne canonique est **Anthropic-like** (content blocks : `text`, `tool_use`, `tool_result`, `thinking`, `image` — soit `ContentBlock::Text/ToolUse/ToolResult/Thinking/Image`). Chaque provider possède un **adapter** qui traduit son wire format vers/depuis ce canonique. Toutes les divergences sont **localisées dans l'adapter** — le reste du système (`agent-core`, `agent-tools`, `agent-session`) ne connaît que le canonique.
 
 ```
 agent-core  ──(canonique)──►  agent-provider  ──(adapter)──►  wire format provider
@@ -193,7 +193,7 @@ Chaque cellule décrit ce que l'**adapter** doit faire pour ramener le provider 
 
 | Kind | Statut | Surface | Auth | État conversation |
 |---|---|---|---|---|
-| `OpenAiChatGpt` | MVP courant | `chatgpt.com/backend-api/codex/responses`, SSE stateless | OAuth PKCE abonnement ChatGPT, keyring | Client-side : transcript complet dans `input[]`, pas de `previous_response_id` |
+| `OpenAiChatGpt` | MVP courant | `chatgpt.com/backend-api/codex/responses`, WebSocket puis HTTP/SSE | OAuth PKCE abonnement ChatGPT, keyring | Client-side : transcript complet par tour; continuation WebSocket bornée au tour |
 
 Le tableau ci-dessous couvre les adapters publics/BYOK futurs et conserve Ollama comme contexte historique retiré du scope, pas comme promesse de livraison.
 
@@ -223,10 +223,10 @@ Le tableau ci-dessous couvre les adapters publics/BYOK futurs et conserve Ollama
 
 La Responses API publique peut maintenir l'**état conversationnel côté serveur** (`previous_response_id`). Notre canonique repose sur un **transcript client-side** (on reconstruit l'historique à chaque tour, indispensable pour la compaction, le resume JSONL, le replay des sessions). Les deux modèles sont **incompatibles par design**.
 
-`OpenAiChatGpt` est un cas distinct : il utilise un endpoint `responses` sur le backend ChatGPT/Codex, mais Pyxis l'emploie en SSE stateless avec `store:false` et transcript complet dans `input[]`. Il ne doit pas être confondu avec `OpenAiResponses` public.
+`OpenAiChatGpt` est un cas distinct : il utilise un endpoint `responses` sur le backend ChatGPT/Codex avec `store:false`. Pyxis envoie le transcript complet au début de chaque tour, puis peut employer `previous_response_id` uniquement pour une extension stricte dans le même tour et sur la même connexion. Un changement de tour, de session ou de propriétés non-input repart du corps complet. Un repli HTTP/SSE repart également du transcript complet. La compaction, le resume et le replay restent donc client-side. Il ne doit pas être confondu avec `OpenAiResponses` public.
 
 Décision :
-- **`OpenAiChatGpt` = cible MVP courante.** Transcript client-side → mapping propre vers le canonique.
+- **`OpenAiChatGpt` = cible MVP courante.** Transcript client-side, WebSocket comme optimisation de transport, HTTP/SSE comme repli déterministe.
 - **Chat Completions BYOK = adapter futur.** Transcript client-side → mapping propre vers le canonique.
 - **Responses API publique = mode gated optionnel**, exposé via `capabilities().server_side_state == true`. **Jamais le défaut.** `agent-core` ne l'active que sur opt-in explicite, et la compaction / le resume sont alors dégradés (l'état vit côté OpenAI).
 
