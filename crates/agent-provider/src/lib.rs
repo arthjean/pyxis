@@ -21,6 +21,7 @@ pub mod chatgpt_request;
 mod chatgpt_websocket;
 pub mod credential;
 pub mod models;
+pub mod openai;
 pub mod quota;
 mod responses;
 
@@ -36,4 +37,8 @@ pub use chatgpt_websocket::{
 };
 pub use credential::CredentialManager;
 pub use models::CatalogModel;
+pub use openai::{
+    AuthRecovery, ConfiguredOpenAiConfig, ConfiguredOpenAiProvider, OpenAiAccountState,
+    OpenAiAuthPolicy, OpenAiCatalogPolicy, OpenAiEndpointKind,
+};
 pub use quota::{parse_all_quota_headers, parse_quota_headers, quota_refusal_message};
