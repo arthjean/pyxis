@@ -6,6 +6,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod agent;
+pub mod auxiliary;
 pub mod budget;
 pub mod cancel;
 pub mod clock;
@@ -37,6 +38,7 @@ pub use agent::{
     AgentContext, HeadlessEnd, HeadlessResult, RunConfig, run_agent, run_headless,
     run_headless_observed,
 };
+pub use auxiliary::{AuxiliaryError, AuxiliaryOperation, AuxiliaryPhase, AuxiliaryProvider};
 pub use budget::ContextBudget;
 pub use cancel::{Cancellable, CancellationToken};
 pub use compaction::CompactKind;

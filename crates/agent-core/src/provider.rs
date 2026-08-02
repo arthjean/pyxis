@@ -264,6 +264,11 @@ pub struct Capabilities {
     pub reasoning_options: ReasoningCapabilities,
     #[serde(default)]
     pub cache: CacheCapabilities,
+    /// Provider-scoped unary and realtime APIs that are not model sampling.
+    /// Every flag defaults to false so a generic Responses endpoint never
+    /// receives a speculative auxiliary request.
+    #[serde(default)]
+    pub auxiliary: AuxiliaryCapabilities,
 }
 
 impl Capabilities {
@@ -429,6 +434,16 @@ pub struct CacheCapabilities {
     pub prompt_cache_key: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AuxiliaryCapabilities {
+    pub remote_compact: bool,
+    pub memories: bool,
+    pub images: bool,
+    pub search: bool,
+    pub files: bool,
+    pub realtime: bool,
+}
+
 /// Non-stream response (utility: titles, compaction summaries).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalResponse {
@@ -558,6 +573,13 @@ pub enum AuthError {
 pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
     fn capabilities(&self) -> &Capabilities;
+
+    /// Provider-scoped operations that are not model sampling. Adapters without
+    /// an auxiliary implementation return `None`; each operation remains gated
+    /// by its capability flag.
+    fn auxiliary(&self) -> Option<&dyn crate::auxiliary::AuxiliaryProvider> {
+        None
+    }
 
     /// Tool mode of `slug`, for the surfaces that must compose a tool plan
     /// WITHOUT resolving a full runtime (a step boundary is one of them).
@@ -730,5 +752,31 @@ mod tests {
         ));
         // No tool at all stays valid on a provider without tool support.
         capabilities.ensure_tools_supported(&[]).unwrap();
+    }
+
+    #[test]
+    fn legacy_capabilities_default_every_auxiliary_api_to_disabled() {
+        let capabilities: Capabilities = serde_json::from_value(serde_json::json!({
+            "vision": true,
+            "tools": false,
+            "prompt_caching": false,
+            "reasoning": false,
+            "server_side_state": false,
+            "max_context": 8192
+        }))
+        .unwrap();
+        assert_eq!(capabilities.auxiliary, AuxiliaryCapabilities::default());
+
+        let enabled = Capabilities {
+            auxiliary: AuxiliaryCapabilities {
+                images: true,
+                realtime: true,
+                ..AuxiliaryCapabilities::default()
+            },
+            ..capabilities
+        };
+        let wire = serde_json::to_value(enabled).unwrap();
+        assert_eq!(wire["auxiliary"]["images"], true);
+        assert_eq!(wire["auxiliary"]["realtime"], true);
     }
 }
