@@ -2,7 +2,7 @@
 
 > La couche multi-provider est le cœur architectural de Pyxis. C'est elle qui justifie le projet : « qualité Claude Code, **tous** les modèles frontier ». Là où Claude Code est Anthropic-only, Pyxis est multi-provider first-class. Ce document est la source de vérité du contrat provider. L'état livré courant vit dans [`docs/CURRENT_STATUS.md`](./CURRENT_STATUS.md).
 
-**État courant après ADR-11.** Un seul adapter est livré aujourd'hui : `OpenAiChatGpt`, c'est-à-dire l'abonnement ChatGPT via le backend Codex en WebSocket Responses avec repli HTTP/SSE. `OpenAiChat`, `OpenAiResponses`, `Anthropic`, `Gemini`, `OpenRouter` et les clouds sont des adapters futurs. `Ollama` a été retiré du scope et n'existe plus dans `ProviderKind`.
+**État courant après EP-005.** Trois adapters existent dans `agent-provider` : `OpenAiChatGpt`, `ConfiguredOpenAiProvider` pour un endpoint Responses configurable, et `AmazonBedrockProvider` sur l'API directe `ConverseStream`. Le binaire reste câblé sur le seul canal abonnement ChatGPT. `OpenAiChat`, `Anthropic`, `Gemini`, `OpenRouter`, Vertex et les surfaces auxiliaires restent futurs. `Ollama` a été retiré du scope et n'existe plus dans `ProviderKind`.
 
 **Docs liées.** Décisions : [`docs/DECISIONS.md`](./DECISIONS.md) (ADR-4 = couche provider, ADR-7 = roadmap/risque). Architecture transverse : [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md). Plan d'exécution : [`docs/ROADMAP.md`](./ROADMAP.md). Ce document est la version détaillée d'ADR-4 ; toute divergence de signature entre ADR-4 et ce fichier se résout en faveur de ce fichier (taxonomie d'erreurs notamment, cf. §5.1).
 
@@ -75,11 +75,11 @@ pub enum ProviderKind {
     Anthropic,
     OpenAiChat,        // Chat Completions BYOK, futur
     OpenAiChatGpt,     // Abonnement ChatGPT via backend Codex, MVP courant
-    OpenAiResponses,   // Responses API publique, future/gated
+    OpenAiResponses,   // Endpoint Responses configuré, adapter bibliothèque
+    AmazonBedrock,     // API directe ConverseStream via le SDK AWS officiel
     Gemini,
     OpenRouter,
-    // Bedrock / Vertex / Azure ne sont PAS des kinds : ce sont des
-    // injections d'auth/endpoint au-dessus d'Anthropic/OpenAi/Gemini.
+    // Azure est une convention d'endpoint OpenAiResponses. Vertex reste futur.
 }
 ```
 
@@ -176,6 +176,9 @@ pub enum AuthError {
     ThirdPartyBlocked,         // blocage Anthropic des outils tiers (voir §5.2 / §6)
     Invalid,                   // creds invalides → erreur utilisateur
     ReconnectRequired,         // refresh absent, refusé ou déjà tenté
+    RecoveryPermanent,        // mécanisme présent, rejet définitif
+    RecoveryTransient,        // mécanisme présent, échec transitoire
+    RecoveryUnavailable,      // aucun mécanisme pour ce credential
 }
 ```
 
@@ -189,15 +192,19 @@ Cette taxonomie est additive pour les consommateurs d'événements; les erreurs 
 
 Chaque cellule décrit ce que l'**adapter** doit faire pour ramener le provider au canonique Anthropic-like. Tout ce qui n'est pas « identité » est du code localisé dans l'adapter.
 
-**Adapter livré aujourd'hui.**
+**Adapters livrés dans la bibliothèque.**
 
 | Kind | Statut | Surface | Auth | État conversation |
 |---|---|---|---|---|
-| `OpenAiChatGpt` | MVP courant | `chatgpt.com/backend-api/codex/responses`, WebSocket puis HTTP/SSE | OAuth PKCE abonnement ChatGPT, keyring | Client-side : transcript complet par tour; continuation WebSocket bornée au tour |
+| `OpenAiChatGpt` | Câblé dans le binaire | `chatgpt.com/backend-api/codex/responses`, WebSocket puis HTTP/SSE | OAuth PKCE abonnement ChatGPT, keyring | Client-side : transcript complet par tour; continuation WebSocket bornée au tour |
+| `OpenAiResponses` | Adapter bibliothèque | Base URL, query, headers, retry, timeout, catalogue et WebSocket configurés | API key, bearer, OAuth ChatGPT, PAT, headers préconstruits ou agent identity, tous scopés à l'origin | Client-side par défaut; catalogue statique sans fetch ou distant scopé par provider, endpoint et identité |
+| `AmazonBedrock` | Adapter bibliothèque | API directe AWS `ConverseStream` | Chaîne AWS officielle ou Bedrock API key, jamais de header OpenAI | Catalogue statique, région, account state et modèles préférés explicites |
 
-Le tableau ci-dessous couvre les adapters publics/BYOK futurs et conserve Ollama comme contexte historique retiré du scope, pas comme promesse de livraison.
+**Coût du SDK Bedrock mesuré pour EP-005.** Le premier build focalisé après téléchargement a pris 16,68 s sur la machine de développement. Le lockfile final ajoute 55 packages, dont 24 packages `aws-*` uniques dans `cargo tree -p agent-provider`. La première mesure des artefacts AWS `.rlib`/`.rmeta` du profil debug occupait 372 585 545 octets dans 69 fichiers. Ce dernier nombre mesure le cache de compilation debug, pas l'augmentation d'un binaire release. Les features TLS legacy du SDK sont désactivées : le client HTTPS moderne est sélectionné explicitement et `cargo audit` ne trouve aucune vulnérabilité. L'ajout est accepté parce qu'il évite une implémentation locale de SigV4 et du framing event-stream.
 
-| Axe | Anthropic | OpenAI **Chat** (BYOK futur) | OpenAI **Responses** public (future/gated) | Gemini | Ollama (retiré du scope) | OpenRouter | Bedrock / Vertex / Azure |
+Le tableau ci-dessous couvre les autres adapters publics/BYOK futurs et conserve Ollama comme contexte historique retiré du scope, pas comme promesse de livraison. Bedrock n'est plus inclus dans la colonne cloud historique : son adapter direct est décrit ci-dessus.
+
+| Axe | Anthropic | OpenAI **Chat** (BYOK futur) | OpenAI **Responses** configuré | Gemini | Ollama (retiré du scope) | OpenRouter | Vertex / Azure |
 |---|---|---|---|---|---|---|---|
 | **Surface** | Messages API | `/chat/completions` | `/responses` | `generateContent` (stream) | OpenAI-compat | OpenAI-compat (méta) | Réutilise l'adapter sous-jacent |
 | **Tool schema** | `tools[].input_schema` (JSON Schema) — **canonique** | `tools[].function.parameters` | idem Chat mais sous `tools` Responses | `functionDeclarations[].parameters` (sous-ensemble OpenAPI) | comme Chat | comme Chat | hérité de l'adapter de base |
@@ -209,17 +216,17 @@ Le tableau ci-dessous couvre les adapters publics/BYOK futurs et conserve Ollama
 | **Caching** | `cache_control: ephemeral`, TTL 1h, explicite | implicite (prefix auto, non contrôlable) | implicite + `previous_response_id` | `cachedContent` (contexte explicite, API séparée) | aucun | dépend du modèle routé | hérité (Bedrock : prompt caching propre) |
 | **Thinking / reasoning** | `thinking` blocks, budget adaptatif | `reasoning_effort` (o-series), reasoning **non visible** | reasoning items (résumés) | `thinkingConfig` / `thinkingBudget` | rarement | dépend du modèle | hérité |
 | **État conversation** | client-side (transcript) | **client-side** (transcript) → mappe proprement | **server-side** (`previous_response_id`) → **ne mappe pas** (§4.1) | client-side | client-side | client-side | hérité |
-| **Auth** | API key **ou** OAuth (go/no-go §6) | API key | API key | API key Google | aucune (local) | API key OpenRouter | **SigV4** / **OAuth Google** / **endpoint custom** injectés via `agent-auth` |
+| **Auth** | API key **ou** OAuth (go/no-go §6) | API key | modes scopés de `agent-auth` | API key Google | aucune (local) | API key OpenRouter | **OAuth Google** / **endpoint custom** injectés via `agent-auth` |
 | **Multimodal** | `image` content block | `image_url` parts | input items image | `inlineData` parts | selon modèle | selon modèle | hérité |
 | **Betas** | en-têtes `anthropic-beta` (gated `kind==Anthropic`) | — | — | — | — | — | n/a |
 
-**Lecture clé.** L'adapter Anthropic est une quasi-identité. OpenAI Chat Completions reste un adapter BYOK propre à ajouter plus tard (état client-side, tool result trivial), mais il n'est plus la cible MVP depuis ADR-11. Bedrock/Vertex/Azure ne sont **pas des adapters complets** : ce sont des couches d'auth/endpoint au-dessus d'Anthropic/OpenAI/Gemini — toutes les creds passent par `agent-auth`.
+**Lecture clé.** L'adapter Anthropic est une quasi-identité. OpenAI Chat Completions reste un adapter BYOK propre à ajouter plus tard (état client-side, tool result trivial), mais il n'est plus la cible MVP depuis ADR-11. Azure est une convention du provider Responses configuré. Bedrock possède son propre adapter direct et son auth reste isolée par `agent-auth`; Vertex reste futur.
 
 ---
 
 ## 4. Pièges explicites
 
-### 4.1 OpenAI Responses public ne mappe pas sur le canonique
+### 4.1 Le mode Responses à état serveur ne mappe pas sur le canonique
 
 La Responses API publique peut maintenir l'**état conversationnel côté serveur** (`previous_response_id`). Notre canonique repose sur un **transcript client-side** (on reconstruit l'historique à chaque tour, indispensable pour la compaction, le resume JSONL, le replay des sessions). Les deux modèles sont **incompatibles par design**.
 
@@ -228,7 +235,7 @@ La Responses API publique peut maintenir l'**état conversationnel côté serveu
 Décision :
 - **`OpenAiChatGpt` = cible MVP courante.** Transcript client-side, WebSocket comme optimisation de transport, HTTP/SSE comme repli déterministe.
 - **Chat Completions BYOK = adapter futur.** Transcript client-side → mapping propre vers le canonique.
-- **Responses API publique = mode gated optionnel**, exposé via `capabilities().server_side_state == true`. **Jamais le défaut.** `agent-core` ne l'active que sur opt-in explicite, et la compaction / le resume sont alors dégradés (l'état vit côté OpenAI).
+- **Responses configuré = adapter livré, état client-side par défaut.** Le mode à état serveur reste gated et différé, exposé uniquement via `capabilities().server_side_state == true`. Il n'est jamais activé implicitement; la compaction et le resume seraient alors dégradés parce que l'état vit côté provider.
 
 ```rust
 // agent-core, avant d'envoyer : ne PAS supposer le server-side state.

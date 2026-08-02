@@ -41,10 +41,10 @@
     {
       "id": "EP-005",
       "title": "Providers configurables et authentification",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "stories_total": 3,
-      "stories_done": 0
+      "stories_done": 3
     },
     {
       "id": "EP-006",
@@ -229,37 +229,40 @@
       "id": "US-014",
       "title": "Ajouter un provider OpenAI-compatible configuré",
       "epic": "EP-005",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "L",
       "blocked_by": ["US-004", "US-013"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-02T08:54:10+02:00",
+      "completed_at": "2026-08-02T09:43:31+02:00",
+      "reviewed_at": "2026-08-02T09:43:31+02:00",
+      "note": "ConfiguredOpenAiProvider applies validated name, endpoint kind, origin, path, query, default headers, retry, timeouts, compression and WebSocket policy to one Responses contract shared by HTTP/SSE and WebSocket. Azure store semantics are isolated, static catalogs never fetch, remote catalogs are provider/endpoint/identity scoped, and invalid transport, auth or capability combinations fail locally without ChatGPT fallback."
     },
     {
       "id": "US-015",
       "title": "Aligner modes d'auth et récupération 401",
       "epic": "EP-005",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "L",
       "blocked_by": ["US-014"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-02T08:54:10+02:00",
+      "completed_at": "2026-08-02T09:43:31+02:00",
+      "reviewed_at": "2026-08-02T09:43:31+02:00",
+      "note": "API keys, experimental bearer, ChatGPT OAuth, PAT, prebuilt headers, agent identity and Bedrock keys resolve only inside their provider and endpoint/region scope. Account and FedRAMP headers are exact; values, account identities and signed query data are redacted. The core attempts one scoped 401 recovery and preserves success, permanent, transient and unavailable outcomes. Permanent ChatGPT revocation clears memory, keyring, WebSocket and catalog state; transient failure preserves the current scope. Credential replacement or disconnect cancels old streams and clears connection/catalog state."
     },
     {
       "id": "US-016",
       "title": "Ajouter le provider Amazon Bedrock",
       "epic": "EP-005",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "L",
       "blocked_by": ["US-002", "US-015"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-02T08:54:10+02:00",
+      "completed_at": "2026-08-02T09:43:31+02:00",
+      "reviewed_at": "2026-08-02T09:43:31+02:00",
+      "note": "AmazonBedrockProvider uses the official SDK's direct ConverseStream path with region/profile AWS credential-chain auth or a region-scoped Bedrock API key, static catalog, account state and preferred models. Text, reasoning, tools, usage, stop and stream exceptions map to canonical events; structured output and tool schemas are capability gated; Bedrock validation is typed 400/nonretryable and WebSocket or cross-provider credentials fail locally. The modern AWS HTTPS client avoids the legacy Rustls advisories; the measured SDK cost and clean audit are documented."
     },
     {
       "id": "US-017",
