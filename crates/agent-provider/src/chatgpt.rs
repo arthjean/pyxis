@@ -188,6 +188,7 @@ impl OpenAiChatGptProvider {
             cache: CacheCapabilities {
                 prompt_cache_key: true,
             },
+            auxiliary: Default::default(),
         };
         capabilities.validate()?;
         Ok(Self {

@@ -23,7 +23,7 @@ async-stream.workspace = true
 futures-util.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-reqwest = { workspace = true, features = ["stream"] }
+reqwest = { workspace = true, features = ["multipart", "stream"] }
 eventsource-stream.workspace = true
 tokio-tungstenite = { workspace = true, features = ["connect", "rustls-tls-webpki-roots"] }
 thiserror.workspace = true
@@ -44,4 +44,4 @@ aws-smithy-types.workspace = true
 aws-types.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }

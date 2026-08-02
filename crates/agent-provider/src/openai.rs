@@ -19,6 +19,7 @@ use crate::responses;
 use crate::responses::catalog::RemoteCatalogManager;
 
 mod auth;
+mod auxiliary;
 mod catalog;
 mod config;
 
@@ -150,6 +151,10 @@ impl Provider for ConfiguredOpenAiProvider {
 
     fn capabilities(&self) -> &Capabilities {
         &self.capabilities
+    }
+
+    fn auxiliary(&self) -> Option<&dyn agent_core::auxiliary::AuxiliaryProvider> {
+        Some(self)
     }
 
     fn max_context_for_model(&self, model: &str) -> u32 {

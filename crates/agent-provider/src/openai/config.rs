@@ -1,8 +1,8 @@
 use agent_auth::ProviderId;
 use agent_core::model::ModelDescriptor;
 use agent_core::provider::{
-    CacheCapabilities, Capabilities, CapabilityLimits, ProviderError, ReasoningCapabilities,
-    ToolCallingCapabilities,
+    AuxiliaryCapabilities, CacheCapabilities, Capabilities, CapabilityLimits, ProviderError,
+    ReasoningCapabilities, ToolCallingCapabilities,
 };
 
 use crate::chatgpt_error::invalid_request;
@@ -96,6 +96,11 @@ impl ConfiguredOpenAiConfig {
         self
     }
 
+    pub fn with_auxiliary_capabilities(mut self, capabilities: AuxiliaryCapabilities) -> Self {
+        self.capabilities.auxiliary = capabilities;
+        self
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -106,6 +111,10 @@ impl ConfiguredOpenAiConfig {
 
     pub(super) fn allow_unauthenticated(&self) -> bool {
         self.auth_policy == OpenAiAuthPolicy::AllowUnauthenticated
+    }
+
+    pub(super) fn uses_chatgpt_backend(&self) -> bool {
+        self.auth_provider == ProviderId::OpenAiChatGpt
     }
 
     pub(super) fn validate(&self) -> Result<(), ProviderError> {
@@ -170,5 +179,6 @@ fn default_capabilities() -> Capabilities {
         cache: CacheCapabilities {
             prompt_cache_key: true,
         },
+        auxiliary: AuxiliaryCapabilities::default(),
     }
 }
