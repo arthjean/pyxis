@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use agent_code_mode::nested::{NestedToolBinding, NestedToolDispatcher};
+use agent_code_mode::nested::{NestedLoopGuard, NestedToolBinding, NestedToolDispatcher};
 use agent_code_mode::protocol::{
     CellId, CodeModeError, ExecuteRequest, NestedTool, OutputItem, RuntimeResponse, SessionId,
     ShutdownReport, WaitRequest,
@@ -62,6 +62,7 @@ pub struct CodeModeHandle {
     binding: NestedToolBinding,
     catalog: Mutex<Vec<NestedTool>>,
     code_mode_only: AtomicBool,
+    loop_guard: NestedLoopGuard,
 }
 
 impl CodeModeHandle {
@@ -72,6 +73,7 @@ impl CodeModeHandle {
             binding,
             catalog: Mutex::new(Vec::new()),
             code_mode_only: AtomicBool::new(false),
+            loop_guard: NestedLoopGuard::default(),
         }
     }
 
@@ -87,6 +89,7 @@ impl CodeModeHandle {
             previous.shutdown(SESSION_SHUTDOWN_DEADLINE).await;
         }
         let session = self.factory.open(SessionId::new(thread))?;
+        self.loop_guard.reset();
         *lock(&self.session) = Some(session);
         Ok(())
     }
@@ -118,6 +121,20 @@ impl CodeModeHandle {
 
     pub fn catalog(&self) -> Vec<NestedTool> {
         lock(&self.catalog).clone()
+    }
+
+    pub fn loop_guard(&self) -> NestedLoopGuard {
+        self.loop_guard.clone()
+    }
+
+    pub fn begin_turn(&self) {
+        self.loop_guard.reset();
+    }
+
+    fn finish_cell_if_terminal(&self, response: &RuntimeResponse) {
+        if response.state().is_terminal() {
+            self.loop_guard.finish_cell(response.cell_id());
+        }
     }
 
     fn code_mode_only(&self) -> bool {
@@ -238,6 +255,7 @@ impl Tool for ExecTool {
             .execute(request)
             .await
             .map_err(session_error)?;
+        self.handle.finish_cell_if_terminal(&response);
         Ok(render(response))
     }
 }
@@ -322,6 +340,7 @@ impl Tool for WaitTool {
             .wait(request)
             .await
             .map_err(session_error)?;
+        self.handle.finish_cell_if_terminal(&response);
         Ok(render(response))
     }
 }

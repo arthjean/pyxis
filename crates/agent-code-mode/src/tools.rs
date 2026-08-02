@@ -219,10 +219,16 @@ fn render_catalog(catalog: &[NestedTool]) -> String {
                 tool.binding
             ));
         } else {
+            let output = tool
+                .output_schema
+                .as_ref()
+                .map(|schema| schema_to_typescript(Some(schema)))
+                .unwrap_or_else(|| "string".to_string());
             rendered.push_str(&format!(
-                "declare function {}(input: {}): Promise<string>;\n\n",
+                "declare function {}(input: {}): Promise<{}>;\n\n",
                 tool.binding,
-                schema_to_typescript(tool.input_schema.as_ref())
+                schema_to_typescript(tool.input_schema.as_ref()),
+                output,
             ));
         }
     }

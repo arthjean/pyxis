@@ -260,6 +260,7 @@ impl Tool for Bash {
             signal: status.as_ref().and_then(exit_signal),
             timed_out,
             cancelled: false,
+            session_closed: false,
             stderr_tail: (!stderr_text.is_empty()).then(|| truncate_tail(&stderr_text, 8 * 1024)),
         };
 

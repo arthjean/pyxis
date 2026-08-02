@@ -224,6 +224,8 @@ pub struct NestedTool {
     pub freeform: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
 }
 
 impl NestedTool {
@@ -234,6 +236,7 @@ impl NestedTool {
             description: spec.description.clone(),
             freeform: spec.is_freeform(),
             input_schema: spec.input_schema().cloned(),
+            output_schema: spec.output_schema().cloned(),
         }
     }
 }

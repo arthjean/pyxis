@@ -61,6 +61,8 @@ pub struct ToolExecution {
     pub timed_out: bool,
     #[serde(default)]
     pub cancelled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub session_closed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr_tail: Option<String>,
 }
@@ -347,6 +349,9 @@ fn render_execution(
     if execution.cancelled {
         fields.push("cancelled=true".to_string());
     }
+    if execution.session_closed {
+        fields.push("session_closed=true".to_string());
+    }
     if let Some(duration) = duration_ms {
         fields.push(format!("duration_ms={duration}"));
     }
@@ -398,6 +403,10 @@ fn render_execution(
     } else {
         core
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn render_feedback(text: &str, structured: Option<&str>, execution: Option<&str>) -> String {

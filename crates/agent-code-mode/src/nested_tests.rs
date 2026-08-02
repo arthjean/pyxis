@@ -103,8 +103,12 @@ fn dispatch_off_runtime(
 }
 
 fn call(tool: &str, input: NestedToolInput) -> NestedToolCall {
+    call_in_cell(0, tool, input)
+}
+
+fn call_in_cell(ordinal: u64, tool: &str, input: NestedToolInput) -> NestedToolCall {
     NestedToolCall {
-        cell_id: CellId::new(&SessionId::new("thread-a"), 0),
+        cell_id: CellId::new(&SessionId::new("thread-a"), ordinal),
         call_id: format!("nested-{tool}"),
         tool: tool.to_string(),
         input,
@@ -115,6 +119,20 @@ fn dispatcher(tools: Arc<RecordingTools>, specs: Vec<ToolSpec>) -> Arc<PlanDispa
     Arc::new(PlanDispatcher::new(
         &snapshot(tools, specs),
         &[crate::tools::EXEC_TOOL_NAME, crate::tools::WAIT_TOOL_NAME],
+        ToolEventSink::default(),
+        tokio::runtime::Handle::current(),
+    ))
+}
+
+fn dispatcher_with_guard(
+    tools: Arc<RecordingTools>,
+    specs: Vec<ToolSpec>,
+    loop_guard: NestedLoopGuard,
+) -> Arc<PlanDispatcher> {
+    Arc::new(PlanDispatcher::new_with_loop_guard(
+        &snapshot(tools, specs),
+        &[crate::tools::EXEC_TOOL_NAME, crate::tools::WAIT_TOOL_NAME],
+        loop_guard,
         ToolEventSink::default(),
         tokio::runtime::Handle::current(),
     ))
@@ -270,6 +288,121 @@ async fn several_nested_calls_stay_correlated_and_ordered() {
     // Two calls to the same tool never share an invocation identifier.
     let ids: HashSet<String> = tools.seen().into_iter().map(|entry| entry.0).collect();
     assert_eq!(ids.len(), 3);
+}
+
+#[tokio::test]
+async fn repeated_nested_effects_are_guarded_across_outer_cells() {
+    let tools = Arc::new(RecordingTools::default());
+    let loop_guard = NestedLoopGuard::default();
+    let mut outcomes = Vec::new();
+
+    for ordinal in 0..3 {
+        let dispatcher = dispatcher_with_guard(
+            Arc::clone(&tools),
+            vec![function_spec("write")],
+            loop_guard.clone(),
+        );
+        outcomes.extend(dispatch_off_runtime(
+            dispatcher,
+            vec![call_in_cell(
+                ordinal,
+                "write",
+                NestedToolInput::Json(serde_json::json!({"value": "same"})),
+            )],
+        ));
+        loop_guard.finish_cell(&CellId::new(&SessionId::new("thread-a"), ordinal));
+    }
+
+    assert!(!outcomes[0].is_error);
+    assert!(!outcomes[1].is_error);
+    assert_eq!(outcomes[2].error_kind, Some("semantic"));
+    assert!(outcomes[2].content.contains("Loop detected on write (x3)"));
+    assert_eq!(tools.seen().len(), 2, "the third effect never executes");
+}
+
+#[tokio::test]
+async fn pure_cells_and_turn_boundaries_break_nested_effect_repetition() {
+    let tools = Arc::new(RecordingTools::default());
+    let loop_guard = NestedLoopGuard::default();
+
+    for ordinal in 0..2 {
+        let dispatcher = dispatcher_with_guard(
+            Arc::clone(&tools),
+            vec![function_spec("write")],
+            loop_guard.clone(),
+        );
+        let outcome = dispatch_off_runtime(
+            dispatcher,
+            vec![call_in_cell(
+                ordinal,
+                "write",
+                NestedToolInput::Json(serde_json::json!({"value": "same"})),
+            )],
+        );
+        assert!(!outcome[0].is_error);
+        loop_guard.finish_cell(&CellId::new(&SessionId::new("thread-a"), ordinal));
+    }
+
+    let pure_cell = CellId::new(&SessionId::new("thread-a"), 2);
+    loop_guard.finish_cell(&pure_cell);
+    let after_pure = dispatcher_with_guard(
+        Arc::clone(&tools),
+        vec![function_spec("write")],
+        loop_guard.clone(),
+    );
+    let outcome = dispatch_off_runtime(
+        after_pure,
+        vec![call_in_cell(
+            3,
+            "write",
+            NestedToolInput::Json(serde_json::json!({"value": "same"})),
+        )],
+    );
+    assert!(!outcome[0].is_error, "a pure cell resets the run");
+
+    loop_guard.reset();
+    let next_turn = dispatcher_with_guard(
+        Arc::clone(&tools),
+        vec![function_spec("write")],
+        loop_guard.clone(),
+    );
+    let outcome = dispatch_off_runtime(
+        next_turn,
+        vec![call_in_cell(
+            4,
+            "write",
+            NestedToolInput::Json(serde_json::json!({"value": "same"})),
+        )],
+    );
+    assert!(!outcome[0].is_error, "a new turn starts a fresh guard");
+}
+
+#[tokio::test]
+async fn nested_terminal_polls_reset_the_effect_loop_guard() {
+    let tools = Arc::new(RecordingTools::default());
+    let loop_guard = NestedLoopGuard::default();
+
+    for _ in 0..4 {
+        let dispatcher = dispatcher_with_guard(
+            Arc::clone(&tools),
+            vec![function_spec("write_stdin")],
+            loop_guard.clone(),
+        );
+        let outcome = dispatch_off_runtime(
+            dispatcher,
+            vec![call(
+                "write_stdin",
+                NestedToolInput::Json(serde_json::json!({
+                    "session_id": 7,
+                    "chars": "",
+                    "terminate": false
+                })),
+            )],
+        );
+        assert!(!outcome[0].is_error, "polls must stay repeatable");
+    }
+
+    assert_eq!(tools.seen().len(), 4);
 }
 
 #[tokio::test]

@@ -8,9 +8,12 @@
 //! policy decides.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
+use agent_core::guardrail::{
+    DEFAULT_LOOP_GUARD_THRESHOLD, LoopDecision, LoopGuard, guarded_batch_signature,
+};
 use agent_core::message::{ToolCallFormat, ToolErrorKind};
 use agent_core::provider::ToolSpec;
 use agent_core::tools::{
@@ -63,6 +66,60 @@ impl NestedToolOutcome {
     }
 }
 
+/// Loop state shared by the successive step dispatchers of one agent turn.
+/// Polling controls and terminal pure cells reset it; identical nested effects
+/// are stopped at the same threshold as direct tool calls.
+#[derive(Clone)]
+pub struct NestedLoopGuard {
+    inner: Arc<Mutex<NestedLoopState>>,
+}
+
+struct NestedLoopState {
+    guard: LoopGuard,
+    effect_cells: HashSet<CellId>,
+}
+
+impl Default for NestedLoopGuard {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(NestedLoopState {
+                guard: LoopGuard::new(DEFAULT_LOOP_GUARD_THRESHOLD),
+                effect_cells: HashSet::new(),
+            })),
+        }
+    }
+}
+
+impl NestedLoopGuard {
+    fn observe(&self, cell_id: &CellId, invocation: &ToolInvocation) -> (LoopDecision, u32) {
+        let mut state = lock(&self.inner);
+        let decision = match guarded_batch_signature(std::slice::from_ref(invocation)) {
+            Some(signature) => {
+                state.effect_cells.insert(cell_id.clone());
+                state.guard.observe(signature)
+            }
+            None => {
+                state.guard.reset();
+                LoopDecision::Proceed
+            }
+        };
+        (decision, state.guard.count())
+    }
+
+    pub fn finish_cell(&self, cell_id: &CellId) {
+        let mut state = lock(&self.inner);
+        if !state.effect_cells.remove(cell_id) {
+            state.guard.reset();
+        }
+    }
+
+    pub fn reset(&self) {
+        let mut state = lock(&self.inner);
+        state.guard.reset();
+        state.effect_cells.clear();
+    }
+}
+
 /// Runs one nested call. Implementations are called from the CELL thread,
 /// which is a plain OS thread, so blocking there is legitimate.
 pub trait NestedToolDispatcher: Send + Sync {
@@ -76,6 +133,7 @@ pub trait NestedToolDispatcher: Send + Sync {
 pub struct PlanDispatcher {
     plan: StepToolPlan,
     events: ToolEventSink,
+    loop_guard: NestedLoopGuard,
     runtime: tokio::runtime::Handle,
     callable: HashSet<String>,
     ordinal: AtomicU64,
@@ -94,6 +152,24 @@ impl PlanDispatcher {
         events: ToolEventSink,
         runtime: tokio::runtime::Handle,
     ) -> Self {
+        Self::new_with_loop_guard(
+            snapshot,
+            hidden,
+            NestedLoopGuard::default(),
+            events,
+            runtime,
+        )
+    }
+
+    /// Uses loop state owned by the Code Mode session so a repeated nested
+    /// effect cannot evade detection by starting a fresh outer `exec` cell.
+    pub fn new_with_loop_guard(
+        snapshot: &ToolDispatchSnapshot,
+        hidden: &[&str],
+        loop_guard: NestedLoopGuard,
+        events: ToolEventSink,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
         let specs: Vec<ToolSpec> = snapshot
             .specs()
             .iter()
@@ -107,6 +183,7 @@ impl PlanDispatcher {
         Self {
             plan,
             events,
+            loop_guard,
             runtime,
             callable,
             ordinal: AtomicU64::new(0),
@@ -151,6 +228,17 @@ impl NestedToolDispatcher for PlanDispatcher {
             input,
             format,
         };
+        let (loop_decision, loop_count) = self.loop_guard.observe(&call.cell_id, &invocation);
+        if loop_decision != LoopDecision::Proceed {
+            return NestedToolOutcome::error(
+                &call,
+                "semantic",
+                format!(
+                    "Loop detected on {} (x{loop_count}). Stopping nested dispatch. Reframe the approach.",
+                    invocation.name
+                ),
+            );
+        }
 
         let events = self.events.clone();
         let plan = self.plan.clone();
@@ -182,6 +270,13 @@ impl NestedToolDispatcher for PlanDispatcher {
 
     fn catalog(&self) -> Vec<ToolSpec> {
         self.plan.specs().to_vec()
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 

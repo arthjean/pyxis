@@ -1963,6 +1963,65 @@ async fn default_registry_exposes_every_native_tool_spec() {
 }
 
 #[tokio::test]
+async fn terminal_tools_publish_their_structured_output_contract() {
+    let reg = crate::default_registry("/tmp", PermissionMode::Default, allow_approver());
+    let specs = reg.tool_specs();
+
+    for name in ["exec_command", "write_stdin"] {
+        let spec = specs
+            .iter()
+            .find(|spec| spec.name == name)
+            .unwrap_or_else(|| panic!("missing {name} spec"));
+        let schema = spec
+            .output_schema()
+            .unwrap_or_else(|| panic!("missing {name} output schema"));
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+        assert_eq!(
+            schema["required"],
+            serde_json::json!([
+                "chunk_id",
+                "wall_time_seconds",
+                "exit_code",
+                "signal",
+                "session_id",
+                "original_token_count",
+                "output",
+                "output_omitted_bytes"
+            ])
+        );
+        spec.validate().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_dead_terminal_session_publishes_structured_closure() {
+    let reg = crate::default_registry("/tmp", PermissionMode::Default, allow_approver());
+    let mut outcomes = reg
+        .dispatch(vec![ToolInvocation::json(
+            "poll-dead",
+            "write_stdin",
+            serde_json::json!({
+                "session_id": 999,
+                "chars": "",
+                "yield_time_ms": null,
+                "max_output_tokens": null,
+                "terminate": false
+            }),
+        )])
+        .await;
+    let outcome = outcomes.pop().expect("one correlated outcome");
+
+    assert!(outcome.is_error);
+    assert_eq!(outcome.error_kind, Some(ToolErrorKind::Rejected));
+    assert!(
+        outcome
+            .execution
+            .is_some_and(|execution| execution.session_closed),
+        "session closure must survive as structured metadata"
+    );
+}
+
+#[tokio::test]
 async fn nullable_tool_schema_fields_are_required_for_strict_mode() {
     let reg = crate::default_registry("/tmp", PermissionMode::Default, allow_approver());
     let specs = reg.tool_specs();

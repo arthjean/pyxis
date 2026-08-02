@@ -14,8 +14,8 @@ pub mod session;
 pub mod tools;
 
 pub use nested::{
-    NestedToolBinding, NestedToolCall, NestedToolDispatcher, NestedToolInput, NestedToolOutcome,
-    NoNestedTools, PlanDispatcher,
+    NestedLoopGuard, NestedToolBinding, NestedToolCall, NestedToolDispatcher, NestedToolInput,
+    NestedToolOutcome, NoNestedTools, PlanDispatcher,
 };
 pub use protocol::{
     CellFailure, CellFailureKind, CellId, CellState, CodeModeError, DEFAULT_TERMINATE_GRACE,

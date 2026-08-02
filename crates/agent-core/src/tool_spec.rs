@@ -193,6 +193,18 @@ impl ToolSpec {
         }
     }
 
+    /// Structured value returned by a function tool, when it publishes one.
+    /// Freeform and provider-native tools keep their provider-defined result.
+    pub fn output_schema(&self) -> Option<&serde_json::Value> {
+        match &self.kind {
+            ToolKind::Function { output_schema, .. } => output_schema.as_ref(),
+            ToolKind::Freeform { .. }
+            | ToolKind::Namespace { .. }
+            | ToolKind::ToolSearch { .. }
+            | ToolKind::WebSearch { .. } => None,
+        }
+    }
+
     pub fn is_freeform(&self) -> bool {
         matches!(self.kind, ToolKind::Freeform { .. })
     }

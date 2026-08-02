@@ -16,6 +16,10 @@ use crate::provider::TokenUsage;
 use crate::tools::ToolInvocation;
 use crate::transition::ExhaustReason;
 
+/// Default number of identical effectful calls accepted before the guard
+/// signals. Shared by the outer agent loop and Code Mode nested dispatch.
+pub const DEFAULT_LOOP_GUARD_THRESHOLD: u32 = 3;
+
 /// Loop guardrail decision for a tool batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopDecision {
@@ -51,6 +55,14 @@ impl LoopGuard {
         self.count
     }
 
+    /// Breaks the consecutive run when a batch is intentionally outside loop
+    /// detection. Without this, two guarded calls separated by a legitimate
+    /// poll would still be counted as consecutive.
+    pub fn reset(&mut self) {
+        self.last_sig = None;
+        self.count = 0;
+    }
+
     /// Folds in the signature of the current batch and decides.
     pub fn observe(&mut self, signature: String) -> LoopDecision {
         if self.last_sig.as_deref() == Some(signature.as_str()) {
@@ -74,12 +86,52 @@ impl LoopGuard {
 /// (`serde_json::Map` without `preserve_order`) -> signature stable from one turn
 /// to the next. The order of calls in the batch does not change the signature.
 pub fn batch_signature(calls: &[ToolInvocation]) -> String {
+    signature(calls.iter()).unwrap_or_default()
+}
+
+/// Signature used by the loop guard, excluding calls whose repetition is the
+/// protocol for making progress. `exec` and `wait` are Code Mode orchestration
+/// cells; an empty `write_stdin` is a terminal poll. A non-empty stdin write is
+/// still guarded because repeating it changes process state.
+pub fn guarded_batch_signature(calls: &[ToolInvocation]) -> Option<String> {
+    signature(
+        calls
+            .iter()
+            .filter(|call| !is_repeatable_control_call(call)),
+    )
+}
+
+fn signature<'a>(calls: impl Iterator<Item = &'a ToolInvocation>) -> Option<String> {
     let mut parts: Vec<String> = calls
-        .iter()
-        .map(|c| format!("{}\u{0}{}", c.name, c.input))
+        .map(|call| format!("{}\u{0}{}", call.name, call.input))
         .collect();
+    if parts.is_empty() {
+        return None;
+    }
     parts.sort();
-    parts.join("\u{1}")
+    Some(parts.join("\u{1}"))
+}
+
+fn is_repeatable_control_call(call: &ToolInvocation) -> bool {
+    match call.name.as_str() {
+        "exec" => true,
+        "wait" => !terminates(call),
+        "write_stdin" => {
+            !terminates(call)
+                && match call.input.get("chars") {
+                    None => true,
+                    Some(chars) => chars.as_str() == Some(""),
+                }
+        }
+        _ => false,
+    }
+}
+
+fn terminates(call: &ToolInvocation) -> bool {
+    call.input
+        .get("terminate")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Pricing of a model, in micro-USD (1e-6 $) per thousand tokens. `u64` to
@@ -231,6 +283,63 @@ mod tests {
         assert_eq!(g.observe("b".into()), LoopDecision::Proceed); // reset
         assert_eq!(g.observe("b".into()), LoopDecision::Proceed);
         assert_eq!(g.observe("b".into()), LoopDecision::Signal);
+    }
+
+    #[test]
+    fn loop_guard_ignores_repeatable_orchestration_calls() {
+        let inv = |name: &str, input: serde_json::Value| ToolInvocation::json("x", name, input);
+
+        assert_eq!(
+            guarded_batch_signature(&[inv("exec", serde_json::json!("text('tick')"))]),
+            None
+        );
+        assert_eq!(
+            guarded_batch_signature(&[inv("wait", serde_json::json!({"cell_id": "cell-1"}))]),
+            None
+        );
+        assert!(
+            guarded_batch_signature(&[inv(
+                "wait",
+                serde_json::json!({"cell_id": "cell-1", "terminate": true})
+            )])
+            .is_some(),
+            "terminating a Code Mode cell changes state"
+        );
+        assert_eq!(
+            guarded_batch_signature(&[inv(
+                "write_stdin",
+                serde_json::json!({"session_id": 7, "chars": ""})
+            )]),
+            None
+        );
+        assert!(
+            guarded_batch_signature(&[inv(
+                "write_stdin",
+                serde_json::json!({"session_id": 7, "chars": "", "terminate": true})
+            )])
+            .is_some(),
+            "terminating a terminal session changes state"
+        );
+        assert!(
+            guarded_batch_signature(&[inv(
+                "write_stdin",
+                serde_json::json!({"session_id": 7, "chars": "yes\n"})
+            )])
+            .is_some(),
+            "repeated writes still need loop protection"
+        );
+    }
+
+    #[test]
+    fn an_ignored_batch_breaks_a_repetition_run() {
+        let mut guard = LoopGuard::new(3);
+        assert_eq!(guard.observe("same".into()), LoopDecision::Proceed);
+        assert_eq!(guard.observe("same".into()), LoopDecision::Proceed);
+
+        guard.reset();
+
+        assert_eq!(guard.observe("same".into()), LoopDecision::Proceed);
+        assert_eq!(guard.count(), 1);
     }
 
     #[test]

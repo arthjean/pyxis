@@ -367,6 +367,8 @@ pub struct TranscriptMapper {
     active_reasoning_id: Option<TranscriptItemId>,
     active_permission: Option<ActivePermission>,
     active_exec_tools: HashMap<String, ExecToolDisplay>,
+    active_terminal_sessions: HashMap<u64, ActiveTerminalSession>,
+    terminal_control_calls: HashMap<String, ActiveTerminalControl>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -375,6 +377,18 @@ struct ActivePermission {
     tool: String,
     reason: String,
     input_summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveTerminalSession {
+    exec_call_id: String,
+    display: ExecToolDisplay,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ActiveTerminalControl {
+    session_id: u64,
+    input: serde_json::Value,
 }
 
 impl TranscriptMapper {
@@ -459,6 +473,19 @@ impl TranscriptMapper {
             )],
             AgentEvent::ToolCall(view) => {
                 let mut updates = self.drain_active_streams();
+                if view.name == "write_stdin"
+                    && let Some(session_id) = terminal_session_id(&view.input)
+                    && self.active_terminal_sessions.contains_key(&session_id)
+                {
+                    self.terminal_control_calls.insert(
+                        view.id.clone(),
+                        ActiveTerminalControl {
+                            session_id,
+                            input: view.input.clone(),
+                        },
+                    );
+                    return updates;
+                }
                 // An MCP call is named by its server and its tool, which is the
                 // fact; `mcp__server__tool` is only how we encode it for the
                 // model. The pipeline qualifies it, so no client has to guess.
@@ -532,23 +559,77 @@ impl TranscriptMapper {
                 } else {
                     TranscriptItemStatus::Complete
                 };
-                if let Some(display) = self.active_exec_tools.remove(&view.id) {
-                    updates.push(TranscriptUpdate::new(
-                        TranscriptLifecycle::Completed,
-                        TranscriptItem::new(
-                            Some(TranscriptItemId::derived("exec", &view.id)),
-                            TranscriptRole::Assistant,
-                            TranscriptItemKind::ExecCommand,
-                            status,
-                            TranscriptPayload::ExecOutput {
-                                content: display.format_output(&view.content, view.is_error),
-                                is_error: view.is_error,
-                                stream: TranscriptExecStream::Combined,
-                                untrusted: view.untrusted,
-                                duration_ms: view.duration_ms,
-                            },
-                        ),
+                if let Some(control) = self.terminal_control_calls.remove(&view.id) {
+                    if view.is_error
+                        && !terminal_execution_proves_closed(
+                            &control.input,
+                            view.execution.as_ref(),
+                        )
+                    {
+                        updates.extend(tool_error_updates(
+                            &view.id,
+                            "write_stdin",
+                            control.input,
+                            view,
+                        ));
+                        return updates;
+                    }
+                    let Some(session) = self
+                        .active_terminal_sessions
+                        .get(&control.session_id)
+                        .cloned()
+                    else {
+                        return updates;
+                    };
+                    let still_running = !view.is_error
+                        && result_session_id(view).is_some_and(|id| id == control.session_id);
+                    if !still_running {
+                        self.active_terminal_sessions.remove(&control.session_id);
+                    }
+                    updates.push(exec_result_update(
+                        &session.exec_call_id,
+                        &session.display,
+                        view,
+                        if still_running {
+                            TranscriptLifecycle::Delta
+                        } else {
+                            TranscriptLifecycle::Completed
+                        },
+                        if still_running {
+                            TranscriptItemStatus::Running
+                        } else {
+                            status
+                        },
                     ));
+                    return updates;
+                }
+                if let Some(display) = self.active_exec_tools.remove(&view.id) {
+                    if !view.is_error
+                        && let Some(session_id) = result_session_id(view)
+                    {
+                        self.active_terminal_sessions.insert(
+                            session_id,
+                            ActiveTerminalSession {
+                                exec_call_id: view.id.clone(),
+                                display: display.clone(),
+                            },
+                        );
+                        updates.push(exec_result_update(
+                            &view.id,
+                            &display,
+                            view,
+                            TranscriptLifecycle::Delta,
+                            TranscriptItemStatus::Running,
+                        ));
+                    } else {
+                        updates.push(exec_result_update(
+                            &view.id,
+                            &display,
+                            view,
+                            TranscriptLifecycle::Completed,
+                            status,
+                        ));
+                    }
                 } else {
                     updates.push(TranscriptUpdate::new(
                         TranscriptLifecycle::Completed,
@@ -941,6 +1022,94 @@ impl TranscriptMapper {
     }
 }
 
+pub(crate) fn terminal_session_id(input: &serde_json::Value) -> Option<u64> {
+    input.get("session_id").and_then(serde_json::Value::as_u64)
+}
+
+fn result_session_id(result: &agent_core::event::ToolResultView) -> Option<u64> {
+    result
+        .structured_content
+        .as_ref()
+        .and_then(terminal_session_id)
+}
+
+pub(crate) fn terminal_execution_proves_closed(
+    input: &serde_json::Value,
+    execution: Option<&agent_core::tools::ToolExecution>,
+) -> bool {
+    execution.is_some_and(|execution| {
+        execution.exit_code.is_some()
+            || execution.signal.is_some()
+            || execution.session_closed
+            || (execution.cancelled
+                && input.get("terminate").and_then(serde_json::Value::as_bool) == Some(true))
+    })
+}
+
+fn tool_error_updates(
+    call_id: &str,
+    name: &str,
+    input: serde_json::Value,
+    result: &agent_core::event::ToolResultView,
+) -> [TranscriptUpdate; 2] {
+    let id = TranscriptItemId::derived("tool", call_id);
+    [
+        TranscriptUpdate::new(
+            TranscriptLifecycle::Started,
+            TranscriptItem::new(
+                Some(id.clone()),
+                TranscriptRole::Assistant,
+                TranscriptItemKind::ToolCall,
+                TranscriptItemStatus::Running,
+                TranscriptPayload::ToolCall {
+                    name: name.to_string(),
+                    input,
+                },
+            ),
+        ),
+        TranscriptUpdate::new(
+            TranscriptLifecycle::Completed,
+            TranscriptItem::new(
+                Some(id),
+                TranscriptRole::Assistant,
+                TranscriptItemKind::ToolCall,
+                TranscriptItemStatus::Failed,
+                TranscriptPayload::ToolResult {
+                    content: result.content.clone(),
+                    is_error: true,
+                    error_kind: result.error_kind.map(TranscriptToolErrorKind::from),
+                    untrusted: result.untrusted,
+                },
+            ),
+        ),
+    ]
+}
+
+fn exec_result_update(
+    call_id: &str,
+    display: &ExecToolDisplay,
+    result: &agent_core::event::ToolResultView,
+    lifecycle: TranscriptLifecycle,
+    status: TranscriptItemStatus,
+) -> TranscriptUpdate {
+    TranscriptUpdate::new(
+        lifecycle,
+        TranscriptItem::new(
+            Some(TranscriptItemId::derived("exec", call_id)),
+            TranscriptRole::Assistant,
+            TranscriptItemKind::ExecCommand,
+            status,
+            TranscriptPayload::ExecOutput {
+                content: display.format_output(&result.content, result.is_error),
+                is_error: result.is_error,
+                stream: TranscriptExecStream::Combined,
+                untrusted: result.untrusted,
+                duration_ms: result.duration_ms,
+            },
+        ),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecToolDisplay {
     command: String,
@@ -1232,6 +1401,122 @@ mod tests {
             result[0].item.id.as_ref().map(TranscriptItemId::as_str),
             Some("exec:call-1")
         );
+    }
+
+    #[test]
+    fn write_stdin_continues_the_original_exec_cell() {
+        let mut mapper = TranscriptMapper::new();
+        let exec = mapper.map_event(&AgentEvent::ToolCall(ToolCallView {
+            id: "exec-1".into(),
+            name: "exec_command".into(),
+            input: serde_json::json!({"cmd": "cargo test"}),
+            kind: agent_core::event::ToolCallKind::Exec {
+                command: "cargo test".into(),
+                cwd: None,
+            },
+        }));
+        let running = mapper.map_event(&AgentEvent::ToolResult(ToolResultView {
+            id: "exec-1".into(),
+            content: "Process running with session ID 42".into(),
+            status: None,
+            structured_content: Some(serde_json::json!({
+                "session_id": 42,
+                "output": "compiling\n"
+            })),
+            is_error: false,
+            error_kind: None,
+            untrusted: true,
+            duration_ms: None,
+            truncation: None,
+            execution: None,
+        }));
+
+        let invalid_poll = mapper.map_event(&AgentEvent::ToolCall(ToolCallView {
+            id: "poll-1".into(),
+            name: "write_stdin".into(),
+            input: serde_json::json!({"session_id": 42, "chars": "", "unknown": true}),
+            kind: Default::default(),
+        }));
+        let invalid_result = mapper.map_event(&AgentEvent::ToolResult(ToolResultView {
+            id: "poll-1".into(),
+            content: "invalid argument: unknown field `unknown`".into(),
+            status: None,
+            structured_content: None,
+            is_error: true,
+            error_kind: Some(ToolErrorKind::Parse),
+            untrusted: false,
+            duration_ms: None,
+            truncation: None,
+            execution: Some(agent_core::tools::ToolExecution {
+                cancelled: true,
+                ..Default::default()
+            }),
+        }));
+
+        let poll = mapper.map_event(&AgentEvent::ToolCall(ToolCallView {
+            id: "poll-2".into(),
+            name: "write_stdin".into(),
+            input: serde_json::json!({"session_id": 42, "chars": ""}),
+            kind: Default::default(),
+        }));
+        let finished = mapper.map_event(&AgentEvent::ToolResult(ToolResultView {
+            id: "poll-2".into(),
+            content: "Process exited with code 0\nOutput:\nok".into(),
+            status: None,
+            structured_content: Some(serde_json::json!({
+                "session_id": null,
+                "exit_code": 0,
+                "output": "ok\n"
+            })),
+            is_error: false,
+            error_kind: None,
+            untrusted: true,
+            duration_ms: None,
+            truncation: None,
+            execution: None,
+        }));
+
+        assert_eq!(exec[0].lifecycle, TranscriptLifecycle::Started);
+        assert_eq!(running[0].lifecycle, TranscriptLifecycle::Delta);
+        assert_eq!(running[0].item.status, TranscriptItemStatus::Running);
+        assert_eq!(running[0].item.id, exec[0].item.id);
+        assert!(
+            invalid_poll.is_empty(),
+            "known terminal controls stay internal"
+        );
+        assert_eq!(invalid_result.len(), 2);
+        assert_eq!(invalid_result[0].lifecycle, TranscriptLifecycle::Started);
+        assert_eq!(invalid_result[1].lifecycle, TranscriptLifecycle::Completed);
+        assert_eq!(invalid_result[1].item.status, TranscriptItemStatus::Failed);
+        assert!(poll.is_empty(), "poll control cells stay internal");
+        assert_eq!(finished[0].lifecycle, TranscriptLifecycle::Completed);
+        assert_eq!(finished[0].item.id, exec[0].item.id);
+        assert_eq!(finished[0].item.status, TranscriptItemStatus::Complete);
+    }
+
+    #[test]
+    fn only_terminal_evidence_closes_a_correlated_session() {
+        let cancelled = agent_core::tools::ToolExecution {
+            cancelled: true,
+            ..Default::default()
+        };
+        assert!(!terminal_execution_proves_closed(
+            &serde_json::json!({"terminate": false}),
+            Some(&cancelled),
+        ));
+        assert!(terminal_execution_proves_closed(
+            &serde_json::json!({"terminate": true}),
+            Some(&cancelled),
+        ));
+
+        let closed = agent_core::tools::ToolExecution {
+            session_closed: true,
+            ..Default::default()
+        };
+        assert!(terminal_execution_proves_closed(
+            &serde_json::json!({"terminate": false}),
+            Some(&closed),
+        ));
     }
 
     #[test]

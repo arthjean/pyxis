@@ -19,8 +19,8 @@ use agent_core::event::PermissionReq;
 use agent_core::message::ToolErrorKind;
 use agent_core::provider::ToolSpec;
 use agent_core::tools::{
-    ToolDispatch, ToolDispatchEvent, ToolDispatchSnapshot, ToolEventSink, ToolInvocation,
-    ToolOutcome, ToolResultStatus,
+    ToolDispatch, ToolDispatchEvent, ToolDispatchSnapshot, ToolEventSink, ToolExecution,
+    ToolInvocation, ToolOutcome, ToolResultStatus,
 };
 use async_trait::async_trait;
 use futures_util::FutureExt;
@@ -531,7 +531,7 @@ impl Registry {
                 if untrusted {
                     self.taint.mark();
                 }
-                err_outcome_tainted(id.clone(), e.to_string(), untrusted, e.kind())
+                tool_error_outcome(id.clone(), e, untrusted)
             }
             Ok(Ok(Ok(out))) => {
                 // 5. taint: an untrusted output just entered the context.
@@ -691,7 +691,7 @@ impl Registry {
                 if untrusted {
                     self.taint.mark();
                 }
-                err_outcome_tainted(id, e.to_string(), untrusted, e.kind())
+                tool_error_outcome(id, e, untrusted)
             }
             Ok(Ok(Ok(out))) => {
                 if untrusted {
@@ -876,6 +876,22 @@ fn err_outcome_tainted(
     error_kind: ToolErrorKind,
 ) -> ToolOutcome {
     ToolOutcome::new(id, msg, true, untrusted, Some(error_kind))
+}
+
+fn tool_error_outcome(
+    id: agent_core::message::ToolCallId,
+    error: ToolError,
+    untrusted: bool,
+) -> ToolOutcome {
+    let session_closed = matches!(&error, ToolError::SessionClosed(_));
+    let mut outcome = err_outcome_tainted(id, error.to_string(), untrusted, error.kind());
+    if session_closed {
+        outcome.execution = Some(ToolExecution {
+            session_closed: true,
+            ..ToolExecution::default()
+        });
+    }
+    outcome
 }
 
 /// Projects a hook decision into the client view. `Ask` counts as blocked: the

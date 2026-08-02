@@ -21,7 +21,7 @@ use crate::event::{
     AgentEvent, CredentialRefreshOutcome, CredentialRefreshView, InterruptReason,
     RetryScheduledView, ToolCallView, ToolOutputDeltaView, ToolResultView,
 };
-use crate::guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget, batch_signature};
+use crate::guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget, guarded_batch_signature};
 use crate::input::InputQueue;
 use crate::message::{
     ContentBlock, INTERRUPTED_TOOL_RESULT, Message, ToolCallId, unanswered_tool_calls,
@@ -78,7 +78,7 @@ impl Default for RunConfig {
             micro_keep_recent: 2,
             compaction_breaker_limit: 3,
             backoff_base_ms: 50,
-            loop_guard_threshold: 3,
+            loop_guard_threshold: crate::guardrail::DEFAULT_LOOP_GUARD_THRESHOLD,
             token_budget: None,
             cost_budget: None,
             overload_fallback_model: None,
@@ -1585,7 +1585,14 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     // US-014: deterministic loop guardrail (FR-05). It OVERRIDES the
                     // model's logic. At the threshold -> signal without executing;
                     // past it -> deterministic stop (iter_cap stays the last resort).
-                    match loop_guard.observe(batch_signature(&calls)) {
+                    let loop_decision = match guarded_batch_signature(&calls) {
+                        Some(signature) => loop_guard.observe(signature),
+                        None => {
+                            loop_guard.reset();
+                            LoopDecision::Proceed
+                        }
+                    };
+                    match loop_decision {
                         LoopDecision::Abort => {
                             yield AgentEvent::Exhausted(ExhaustReason::ToolLoop {
                                 count: loop_guard.count(),

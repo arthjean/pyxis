@@ -49,7 +49,9 @@ pub use event::{
     InterruptReason, InterruptedView, ModelTurnView, PlanStatus, PlanStep, PlanView,
     RetryScheduledView, TurnDiffView,
 };
-pub use guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget};
+pub use guardrail::{
+    CostBudget, DEFAULT_LOOP_GUARD_THRESHOLD, LoopDecision, LoopGuard, UsageBudget,
+};
 pub use input::InputQueue;
 pub use message::{
     ContentBlock, INTERRUPTED_TOOL_RESULT, Message, Role, ToolErrorKind, unanswered_tool_calls,
@@ -588,11 +590,29 @@ mod loop_tests {
     }
 
     fn tool_turn(id: &str) -> MockTurn {
+        named_tool_turn(id, "bash", "{\"cmd\":\"ls\"}")
+    }
+
+    fn named_tool_turn(id: &str, name: &str, input_delta: &str) -> MockTurn {
         MockTurn::Stream(vec![
-            StreamEvent::tool_call_start(id, "bash"),
+            StreamEvent::tool_call_start(id, name),
             StreamEvent::ToolCallDelta {
                 id: id.into(),
-                input_delta: "{\"cmd\":\"ls\"}".into(),
+                input_delta: input_delta.into(),
+            },
+            StreamEvent::ToolCallEnd { id: id.into() },
+            StreamEvent::Done {
+                stop: StopReason::ToolUse,
+            },
+        ])
+    }
+
+    fn freeform_tool_turn(id: &str, name: &str, input_delta: &str) -> MockTurn {
+        MockTurn::Stream(vec![
+            StreamEvent::custom_tool_call_start(id, name),
+            StreamEvent::ToolCallDelta {
+                id: id.into(),
+                input_delta: input_delta.into(),
             },
             StreamEvent::ToolCallEnd { id: id.into() },
             StreamEvent::Done {
@@ -2147,6 +2167,37 @@ mod loop_tests {
             "no loop should be detected: {events:?}"
         );
         assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
+    }
+
+    #[tokio::test]
+    async fn loop_guardrail_allows_repeated_code_mode_cells() {
+        let h = harness(
+            vec![
+                freeform_tool_turn("cell-1", "exec", "text('tick')"),
+                freeform_tool_turn("cell-2", "exec", "text('tick')"),
+                freeform_tool_turn("cell-3", "exec", "text('tick')"),
+                freeform_tool_turn("cell-4", "exec", "text('tick')"),
+                text_turn("done"),
+            ],
+            false,
+            100_000,
+        );
+        let mut ctx = AgentContext::new("mock").push(Message::user("poll until done"));
+        ctx.tools
+            .push(ToolSpec::freeform("exec", "code mode", None));
+        let events = drive(ctx, h.deps).await;
+
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ToolResult(result) if result.content.contains("Loop detected")
+            )),
+            "Code Mode cells are orchestration, not a semantic loop: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(AgentEvent::EndTurn)),
+            "expected normal end: {events:?}"
+        );
     }
 
     // US-014 AC2: cumulated token budget reached -> kill-switch (edge case #3).

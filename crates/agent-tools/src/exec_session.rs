@@ -35,6 +35,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use agent_core::provider::ToolKind;
 use agent_core::tools::ToolExecution;
 
 use crate::error::{ToolError, ValidationError};
@@ -329,7 +330,7 @@ impl Store {
             ),
             None => format!("unknown shell session {id}: no session carries that id"),
         };
-        ToolError::Rejected(message)
+        ToolError::SessionClosed(message)
     }
 }
 
@@ -555,6 +556,9 @@ impl Tool for ExecCommand {
             "additionalProperties": false
         })
     }
+    fn tool_kind(&self) -> ToolKind {
+        terminal_tool_kind(self.input_schema())
+    }
     fn is_read_only(&self) -> bool {
         false
     }
@@ -705,6 +709,9 @@ impl Tool for WriteStdin {
             "required": ["session_id", "chars", "yield_time_ms", "max_output_tokens", "terminate"],
             "additionalProperties": false
         })
+    }
+    fn tool_kind(&self) -> ToolKind {
+        terminal_tool_kind(self.input_schema())
     }
     fn is_read_only(&self) -> bool {
         false
@@ -1182,26 +1189,16 @@ fn finish(
     sections.push(body.clone());
     let text = sections.join("\n");
 
-    let mut structured = serde_json::json!({
+    let structured = serde_json::json!({
         "chunk_id": chunk_id.to_string(),
         "wall_time_seconds": wall_time.as_secs_f64(),
+        "exit_code": exit_code,
+        "signal": signal,
+        "session_id": session_id,
         "original_token_count": original_tokens,
         "output": body,
+        "output_omitted_bytes": (buffer.omitted > 0).then_some(buffer.omitted),
     });
-    if let Some(map) = structured.as_object_mut() {
-        if let Some(code) = exit_code {
-            map.insert("exit_code".to_string(), code.into());
-        }
-        if let Some(signal) = signal {
-            map.insert("signal".to_string(), signal.into());
-        }
-        if let Some(session_id) = session_id {
-            map.insert("session_id".to_string(), session_id.into());
-        }
-        if buffer.omitted > 0 {
-            map.insert("output_omitted_bytes".to_string(), buffer.omitted.into());
-        }
-    }
 
     // A terminated session ended on request: that is an outcome, not a failure.
     let failed = !terminated && (exit_code.is_some_and(|c| c != 0) || signal.is_some());
@@ -1217,8 +1214,45 @@ fn finish(
             signal,
             timed_out: false,
             cancelled: terminated,
+            session_closed: false,
             stderr_tail: None,
         })
+}
+
+fn terminal_tool_kind(input_schema: serde_json::Value) -> ToolKind {
+    ToolKind::Function {
+        input_schema,
+        strict: true,
+        defer_loading: false,
+        output_schema: Some(terminal_output_schema()),
+    }
+}
+
+fn terminal_output_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "chunk_id": { "type": "string" },
+            "wall_time_seconds": { "type": "number" },
+            "exit_code": { "type": ["integer", "null"] },
+            "signal": { "type": ["integer", "null"] },
+            "session_id": { "type": ["integer", "null"] },
+            "original_token_count": { "type": "integer" },
+            "output": { "type": "string" },
+            "output_omitted_bytes": { "type": ["integer", "null"] }
+        },
+        "required": [
+            "chunk_id",
+            "wall_time_seconds",
+            "exit_code",
+            "signal",
+            "session_id",
+            "original_token_count",
+            "output",
+            "output_omitted_bytes"
+        ],
+        "additionalProperties": false
+    })
 }
 
 /// Model-facing byte budget of one chunk, from the baseline token budget.
@@ -1350,7 +1384,11 @@ mod tests {
         assert_eq!(field(&out, "exit_code"), Some(&serde_json::json!(0)));
         assert_eq!(field(&out, "chunk_id"), Some(&serde_json::json!("1")));
         assert!(field(&out, "wall_time_seconds").is_some());
-        assert!(field(&out, "session_id").is_none(), "the session is over");
+        assert_eq!(
+            field(&out, "session_id"),
+            Some(&serde_json::Value::Null),
+            "the strict output contract represents an ended session as null"
+        );
         assert!(
             ctx.sessions.is_empty(),
             "an exited session must not stay in the store"
@@ -1631,6 +1669,7 @@ mod tests {
             .call(poll(999, Some(250)), &ctx)
             .await
             .expect_err("an unknown session must be refused");
+        assert!(matches!(&unknown, ToolError::SessionClosed(_)));
         assert!(
             unknown.to_string().contains("unknown shell session"),
             "{unknown}"
@@ -1645,6 +1684,7 @@ mod tests {
             .call(poll(1, Some(250)), &ctx)
             .await
             .expect_err("an ended session must be refused");
+        assert!(matches!(&ended, ToolError::SessionClosed(_)));
         assert!(ended.to_string().contains("already ended"), "{ended}");
 
         // Expired: the watchdog closed an idle session.
@@ -1657,6 +1697,7 @@ mod tests {
             .call(poll(2, Some(250)), &ctx)
             .await
             .expect_err("an expired session must be refused");
+        assert!(matches!(&expired, ToolError::SessionClosed(_)));
         assert!(expired.to_string().contains("expired"), "{expired}");
     }
 

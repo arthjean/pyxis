@@ -275,6 +275,12 @@ impl CliStepSource {
         }
     }
 
+    fn begin_turn(&self) {
+        if let Some(handle) = &self.code_mode {
+            handle.begin_turn();
+        }
+    }
+
     /// Closes the Code Mode session of the run, if any.
     pub async fn shutdown_code_mode(&self) {
         if let Some(handle) = &self.code_mode
@@ -371,9 +377,10 @@ impl CliStepSource {
             (Some(handle), true) => {
                 if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                     handle.bind_step(
-                        Arc::new(agent_code_mode::PlanDispatcher::new(
+                        Arc::new(agent_code_mode::PlanDispatcher::new_with_loop_guard(
                             &captured,
                             &CODE_MODE_TOOLS,
+                            handle.loop_guard(),
                             agent_core::tools::ToolEventSink::default(),
                             runtime,
                         )),
@@ -616,7 +623,9 @@ impl SessionRuntime {
             let conversation = Arc::clone(&conversation);
             let settings = Arc::clone(&settings);
             let registry = Arc::clone(&registry);
+            let turn_steps = Arc::clone(&steps);
             Arc::new(RunAgentRunner::new(engine_deps, move |request| {
+                turn_steps.begin_turn();
                 build_context(&conversation, &settings, &step_source, &registry, request)
             }))
         };

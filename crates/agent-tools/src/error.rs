@@ -35,6 +35,10 @@ pub enum ToolError {
     /// I/O error (file not found, OS permission, etc.).
     #[error("io: {0}")]
     Io(String),
+    /// A terminal session is no longer writable. Kept distinct so the
+    /// registry can publish closure as structured execution metadata.
+    #[error("{0}")]
+    SessionClosed(String),
     /// Input rejected for a domain reason (ambiguous anchor, binary file, ...).
     #[error("{0}")]
     Rejected(String),
@@ -50,6 +54,7 @@ impl ToolError {
             ToolError::Validation(_) => ToolErrorKind::Validation,
             ToolError::OutsideWorkspace(_) => ToolErrorKind::OutsideWorkspace,
             ToolError::Io(_) => ToolErrorKind::Io,
+            ToolError::SessionClosed(_) => ToolErrorKind::Rejected,
             ToolError::Rejected(_) => ToolErrorKind::Rejected,
             ToolError::Timeout => ToolErrorKind::Timeout,
         }

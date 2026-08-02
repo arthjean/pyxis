@@ -1376,14 +1376,9 @@ impl ToolCell {
         }
     }
 
-    fn result(content: &str, is_error: bool, status: TranscriptItemStatus) -> Self {
-        let title = if is_error {
-            "Tool failed"
-        } else {
-            "Tool result"
-        };
+    fn result(content: &str, _is_error: bool, status: TranscriptItemStatus) -> Self {
         Self {
-            title: title.into(),
+            title: "Tool result".into(),
             detail: first_non_empty_line(content),
             status,
             name: None,
@@ -1399,9 +1394,6 @@ impl ToolCell {
                 content, is_error, ..
             } => {
                 self.detail = first_non_empty_line(content);
-                if *is_error {
-                    self.title = "Tool failed".into();
-                }
                 self.file_change =
                     self.name
                         .as_deref()
@@ -3784,6 +3776,8 @@ fn extend_surface_lines(out: &mut Vec<Line<'static>>, mut lines: Vec<Line<'stati
 pub fn cells_from_messages(messages: &[Message]) -> Vec<HistoryCellKind> {
     let mut cells = Vec::new();
     let mut pending_exec_calls = HashMap::<ToolCallId, PendingExecReplay>::new();
+    let mut active_terminal_sessions = HashMap::<u64, PendingExecReplay>::new();
+    let mut pending_terminal_controls = HashMap::<ToolCallId, PendingTerminalReplay>::new();
     for message in messages {
         match message.role {
             Role::System => {
@@ -3817,7 +3811,19 @@ pub fn cells_from_messages(messages: &[Message]) -> Vec<HistoryCellKind> {
                         ContentBlock::ToolUse {
                             id, name, input, ..
                         } => {
-                            if let Some(mapping) = tool_exec_mapping_from_tool(name, input) {
+                            if name == "write_stdin"
+                                && let Some(session_id) =
+                                    crate::app_event::terminal_session_id(input)
+                                && active_terminal_sessions.contains_key(&session_id)
+                            {
+                                pending_terminal_controls.insert(
+                                    id.clone(),
+                                    PendingTerminalReplay {
+                                        session_id,
+                                        input: input.clone(),
+                                    },
+                                );
+                            } else if let Some(mapping) = tool_exec_mapping_from_tool(name, input) {
                                 cells.push(HistoryCellKind::Exec(ExecCell::command_with_id(
                                     Some(TranscriptItemId::derived("exec", id)),
                                     &mapping.command,
@@ -3829,6 +3835,7 @@ pub fn cells_from_messages(messages: &[Message]) -> Vec<HistoryCellKind> {
                                     id.clone(),
                                     PendingExecReplay {
                                         index,
+                                        tool_use_id: id.clone(),
                                         strip_read_line_numbers: mapping.strip_read_line_numbers,
                                     },
                                 );
@@ -3858,7 +3865,10 @@ pub fn cells_from_messages(messages: &[Message]) -> Vec<HistoryCellKind> {
                     if let ContentBlock::ToolResult {
                         tool_use_id,
                         content,
+                        structured_content,
                         is_error,
+                        error_kind,
+                        execution,
                         ..
                     } = block
                     {
@@ -3867,31 +3877,75 @@ pub fn cells_from_messages(messages: &[Message]) -> Vec<HistoryCellKind> {
                         } else {
                             TranscriptItemStatus::Complete
                         };
-                        if let Some(pending) = pending_exec_calls.get(tool_use_id).copied()
-                            && let Some(HistoryCellKind::Exec(cell)) = cells.get_mut(pending.index)
-                        {
-                            let content = if pending.strip_read_line_numbers && !*is_error {
-                                strip_numbered_read_output(content)
-                            } else {
-                                content.clone()
+                        if let Some(control) = pending_terminal_controls.remove(tool_use_id) {
+                            if *is_error
+                                && !crate::app_event::terminal_execution_proves_closed(
+                                    &control.input,
+                                    execution.as_ref(),
+                                )
+                            {
+                                let mut cell = ToolCell::calling(
+                                    "write_stdin",
+                                    &control.input,
+                                    TranscriptItemStatus::Running,
+                                );
+                                cell.apply_item(&TranscriptItem::new(
+                                    Some(TranscriptItemId::derived("tool", tool_use_id)),
+                                    TranscriptRole::Assistant,
+                                    TranscriptItemKind::ToolCall,
+                                    status,
+                                    TranscriptPayload::ToolResult {
+                                        content: content.clone(),
+                                        is_error: true,
+                                        error_kind: error_kind
+                                            .map(crate::app_event::TranscriptToolErrorKind::from),
+                                        untrusted: true,
+                                    },
+                                ));
+                                cells.push(HistoryCellKind::Tool(cell));
+                                continue;
+                            }
+                            let Some(pending) =
+                                active_terminal_sessions.get(&control.session_id).cloned()
+                            else {
+                                continue;
                             };
-                            let item = TranscriptItem::new(
-                                Some(TranscriptItemId::derived("exec", tool_use_id)),
-                                TranscriptRole::Assistant,
-                                TranscriptItemKind::ExecCommand,
-                                status,
-                                TranscriptPayload::ExecOutput {
-                                    content,
-                                    is_error: *is_error,
-                                    stream: TranscriptExecStream::Combined,
-                                    untrusted: true,
-                                    // Replayed history carries no timing: the
-                                    // durations were never persisted.
-                                    duration_ms: None,
+                            let still_running = structured_content
+                                .as_ref()
+                                .and_then(crate::app_event::terminal_session_id)
+                                == Some(control.session_id);
+                            apply_replayed_exec_result(
+                                &mut cells,
+                                &pending,
+                                content,
+                                *is_error,
+                                if still_running {
+                                    TranscriptItemStatus::Running
+                                } else {
+                                    status
                                 },
                             );
-                            cell.apply_item(&item);
-                            cell.mark_status(status);
+                            if !still_running {
+                                active_terminal_sessions.remove(&control.session_id);
+                            }
+                        } else if let Some(pending) = pending_exec_calls.get(tool_use_id).cloned() {
+                            let session_id = structured_content
+                                .as_ref()
+                                .and_then(crate::app_event::terminal_session_id);
+                            apply_replayed_exec_result(
+                                &mut cells,
+                                &pending,
+                                content,
+                                *is_error,
+                                if session_id.is_some() {
+                                    TranscriptItemStatus::Running
+                                } else {
+                                    status
+                                },
+                            );
+                            if let Some(session_id) = session_id {
+                                active_terminal_sessions.insert(session_id, pending);
+                            }
                         } else {
                             cells.push(HistoryCellKind::Tool(ToolCell::result(
                                 content, *is_error, status,
@@ -3903,6 +3957,40 @@ pub fn cells_from_messages(messages: &[Message]) -> Vec<HistoryCellKind> {
         }
     }
     cells
+}
+
+fn apply_replayed_exec_result(
+    cells: &mut [HistoryCellKind],
+    pending: &PendingExecReplay,
+    content: &str,
+    is_error: bool,
+    status: TranscriptItemStatus,
+) {
+    let Some(HistoryCellKind::Exec(cell)) = cells.get_mut(pending.index) else {
+        return;
+    };
+    let content = if pending.strip_read_line_numbers && !is_error {
+        strip_numbered_read_output(content)
+    } else {
+        content.to_string()
+    };
+    let item = TranscriptItem::new(
+        Some(TranscriptItemId::derived("exec", &pending.tool_use_id)),
+        TranscriptRole::Assistant,
+        TranscriptItemKind::ExecCommand,
+        status,
+        TranscriptPayload::ExecOutput {
+            content,
+            is_error,
+            stream: TranscriptExecStream::Combined,
+            untrusted: true,
+            // Replayed history carries no timing: durations were never
+            // available before structured results became durable.
+            duration_ms: None,
+        },
+    );
+    cell.apply_item(&item);
+    cell.mark_status(status);
 }
 
 fn image_notices(message: &Message) -> Vec<HistoryCellKind> {
@@ -4839,10 +4927,17 @@ fn output_screen_ellipsis_line(omitted: usize) -> Line<'static> {
     ])
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingExecReplay {
     index: usize,
+    tool_use_id: ToolCallId,
     strip_read_line_numbers: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PendingTerminalReplay {
+    session_id: u64,
+    input: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4853,8 +4948,8 @@ struct ToolExecMapping {
 
 fn tool_exec_mapping_from_tool(name: &str, input: &Value) -> Option<ToolExecMapping> {
     match name {
-        "bash" => input
-            .get("command")
+        "bash" | "exec_command" => input
+            .get(if name == "bash" { "command" } else { "cmd" })
             .and_then(Value::as_str)
             .map(|command| ToolExecMapping {
                 command: command.to_string(),
@@ -5067,6 +5162,33 @@ mod tests {
         assert!(text.iter().any(|line| line.starts_with('•')));
         assert!(text.iter().any(|line| line.contains("checking")));
         assert!(cells.desired_height(0) >= 1);
+    }
+
+    #[test]
+    fn tool_errors_name_the_tool_without_repeating_failed() {
+        let mut cell = ToolCell::calling(
+            "custom_tool",
+            &serde_json::json!({}),
+            TranscriptItemStatus::Running,
+        );
+        let original_title = cell.title.clone();
+        cell.apply_item(&TranscriptItem::new(
+            Some(TranscriptItemId::local("tool", 1)),
+            TranscriptRole::Assistant,
+            TranscriptItemKind::ToolCall,
+            TranscriptItemStatus::Failed,
+            TranscriptPayload::ToolResult {
+                content: "invalid argument: unknown field `command`".into(),
+                is_error: true,
+                error_kind: None,
+                untrusted: false,
+            },
+        ));
+
+        let rendered = flatten(&cell.display_lines(80)).join("\n");
+        assert_eq!(cell.title, original_title);
+        assert!(rendered.contains("Failed"));
+        assert!(!rendered.contains("Tool failed Failed"));
     }
 
     #[test]
@@ -6635,6 +6757,79 @@ mod tests {
         assert!(text.contains("Ran echo ok"));
         assert!(text.contains("ok"));
         assert!(!text.contains("Tool result"));
+    }
+
+    #[test]
+    fn replay_correlates_terminal_controls_with_the_original_exec() {
+        let mut opened = agent_core::tools::ModelToolResult::new(
+            "exec-1".into(),
+            "compiling".into(),
+            false,
+            true,
+            None,
+        );
+        opened.structured_content = Some(serde_json::json!({
+            "session_id": 42,
+            "output": "compiling\n"
+        }));
+        let invalid = agent_core::tools::ModelToolResult::new(
+            "poll-1".into(),
+            "invalid argument: unknown field `unknown`".into(),
+            true,
+            false,
+            Some(agent_core::message::ToolErrorKind::Parse),
+        );
+        let mut invalid = invalid;
+        invalid.execution = Some(agent_core::tools::ToolExecution {
+            cancelled: true,
+            ..Default::default()
+        });
+        let mut finished = agent_core::tools::ModelToolResult::new(
+            "poll-2".into(),
+            "ok".into(),
+            false,
+            true,
+            None,
+        );
+        finished.structured_content = Some(serde_json::json!({
+            "session_id": null,
+            "exit_code": 0,
+            "output": "ok\n"
+        }));
+        finished.execution = Some(agent_core::tools::ToolExecution {
+            exit_code: Some(0),
+            ..Default::default()
+        });
+
+        let messages = vec![
+            Message::assistant(vec![ContentBlock::tool_use(
+                "exec-1",
+                "exec_command",
+                serde_json::json!({"cmd": "cargo test"}),
+            )]),
+            Message::tool_result_from_model(&opened),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "poll-1",
+                "write_stdin",
+                serde_json::json!({"session_id": 42, "chars": "", "unknown": true}),
+            )]),
+            Message::tool_result_from_model(&invalid),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "poll-2",
+                "write_stdin",
+                serde_json::json!({"session_id": 42, "chars": ""}),
+            )]),
+            Message::tool_result_from_model(&finished),
+        ];
+
+        let surface = ChatSurface::from_messages(&messages);
+        let text = flatten(&surface.display_lines(100)).join("\n");
+
+        assert!(text.contains("Ran cargo test"), "{text}");
+        assert!(text.contains("compiling"), "{text}");
+        assert!(text.contains("ok"), "{text}");
+        assert!(text.contains("write_stdin Failed"), "{text}");
+        assert!(!text.contains("Tool result"), "{text}");
     }
 
     #[test]

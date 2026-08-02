@@ -88,7 +88,7 @@ fn wait_is_a_strict_function_tool() {
 
 #[test]
 fn the_catalog_projects_function_and_freeform_tools_differently() {
-    let function = NestedTool::from_spec(&ToolSpec::function(
+    let function = NestedTool::from_spec(&ToolSpec::function_with_options(
         "read-file",
         "Reads a file.",
         serde_json::json!({
@@ -100,6 +100,17 @@ fn the_catalog_projects_function_and_freeform_tools_differently() {
                 "limit": { "type": ["integer", "null"] }
             }
         }),
+        true,
+        false,
+        Some(serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["output", "exit_code"],
+            "properties": {
+                "output": { "type": "string" },
+                "exit_code": { "type": ["integer", "null"] }
+            }
+        })),
     ));
     let freeform =
         NestedTool::from_spec(&ToolSpec::freeform("apply_patch", "Applies a patch.", None));
@@ -107,7 +118,7 @@ fn the_catalog_projects_function_and_freeform_tools_differently() {
     let description = exec_tool_spec(&[function, freeform], true).description;
     assert!(
         description.contains(
-            "declare function read_file(input: { limit: number | null; path: string }): Promise<string>;"
+            "declare function read_file(input: { limit: number | null; path: string }): Promise<{ exit_code: number | null; output: string }>;"
         ),
         "{description}"
     );
