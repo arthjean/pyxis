@@ -480,19 +480,23 @@ impl Registry {
             .hooks
             .intercepts(HookEvent::PostToolUse, &call.name)
             .then(|| call.input.clone());
-        let ctx = self.ctx.for_call(id.clone(), {
-            let events = events.clone();
-            let id = id.clone();
-            std::sync::Arc::new(
-                move |stream: agent_core::event::OutputStream, chunk: Vec<u8>| {
-                    events.emit(ToolDispatchEvent::OutputDelta {
-                        id: id.clone(),
-                        stream,
-                        chunk,
-                    });
-                },
-            )
-        });
+        let ctx = self.ctx.for_call(
+            id.clone(),
+            {
+                let events = events.clone();
+                let id = id.clone();
+                std::sync::Arc::new(
+                    move |stream: agent_core::event::OutputStream, chunk: Vec<u8>| {
+                        events.emit(ToolDispatchEvent::OutputDelta {
+                            id: id.clone(),
+                            stream,
+                            chunk,
+                        });
+                    },
+                )
+            },
+            events.clone(),
+        );
         let untrusted = tool.returns_untrusted();
         // The retry of an escalation (US-004) needs the input again. Cloned only
         // when a perimeter can actually be widened: without an escalator, no

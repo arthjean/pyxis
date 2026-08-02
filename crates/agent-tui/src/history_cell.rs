@@ -4,7 +4,7 @@
 //! stays pure: no terminal I/O, no core mutation, and no ANSI coming from
 //! `agent-core`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use agent_core::message::{ContentBlock, Message, Role, ToolCallId};
@@ -3778,6 +3778,7 @@ pub fn cells_from_messages(messages: &[Message]) -> Vec<HistoryCellKind> {
     let mut pending_exec_calls = HashMap::<ToolCallId, PendingExecReplay>::new();
     let mut active_terminal_sessions = HashMap::<u64, PendingExecReplay>::new();
     let mut pending_terminal_controls = HashMap::<ToolCallId, PendingTerminalReplay>::new();
+    let mut hidden_code_mode_calls = HashSet::<ToolCallId>::new();
     for message in messages {
         match message.role {
             Role::System => {
@@ -3823,6 +3824,8 @@ pub fn cells_from_messages(messages: &[Message]) -> Vec<HistoryCellKind> {
                                         input: input.clone(),
                                     },
                                 );
+                            } else if crate::app_event::is_code_mode_orchestrator(name) {
+                                hidden_code_mode_calls.insert(id.clone());
                             } else if let Some(mapping) = tool_exec_mapping_from_tool(name, input) {
                                 cells.push(HistoryCellKind::Exec(ExecCell::command_with_id(
                                     Some(TranscriptItemId::derived("exec", id)),
@@ -3872,6 +3875,9 @@ pub fn cells_from_messages(messages: &[Message]) -> Vec<HistoryCellKind> {
                         ..
                     } = block
                     {
+                        if hidden_code_mode_calls.contains(tool_use_id) {
+                            continue;
+                        }
                         let status = if *is_error {
                             TranscriptItemStatus::Failed
                         } else {
@@ -6830,6 +6836,28 @@ mod tests {
         assert!(text.contains("ok"), "{text}");
         assert!(text.contains("write_stdin Failed"), "{text}");
         assert!(!text.contains("Tool result"), "{text}");
+    }
+
+    #[test]
+    fn replay_hides_code_mode_orchestration_cells() {
+        let messages = vec![
+            Message::user("before"),
+            Message::assistant(vec![ContentBlock::tool_use(
+                "exec-1",
+                "exec",
+                serde_json::json!("text(ALL_TOOLS)"),
+            )]),
+            Message::tool_result("exec-1", "Cell failed", true),
+            Message::assistant_text("after"),
+        ];
+
+        let surface = ChatSurface::from_messages(&messages);
+        let text = flatten(&surface.display_lines(80)).join("\n");
+
+        assert!(text.contains("before"));
+        assert!(text.contains("after"));
+        assert!(!text.contains("Cell failed"));
+        assert!(!text.contains("Tool result"));
     }
 
     #[test]

@@ -1773,6 +1773,7 @@ mod tests {
         let ctx = ctx().for_call(
             agent_core::message::ToolCallId::from("c1".to_string()),
             sink,
+            agent_core::ToolEventSink::default(),
         );
         let out = ExecCommand
             .call(exec("echo un; sleep 0.2; echo deux", Some(5_000)), &ctx)

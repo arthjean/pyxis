@@ -4,6 +4,7 @@
 //! that the agent-cli loop interprets (submit, permission, quit, scroll).
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -756,6 +757,7 @@ pub struct AppState {
     /// (US-015). Cleared when the result arrives, except on interruption: what the
     /// command had already produced then stays visible.
     pub live_output: Option<LiveOutput>,
+    hidden_code_mode_calls: HashSet<ToolCallId>,
 }
 
 /// Partial output of a tool call still in flight.
@@ -877,6 +879,7 @@ impl AppState {
             stream_start: None,
             pastes: Vec::new(),
             live_output: None,
+            hidden_code_mode_calls: HashSet::new(),
         }
     }
 
@@ -1282,12 +1285,16 @@ impl AppState {
             AgentEvent::ToolCall(view) => {
                 self.finalize_streaming();
                 self.live_output = None;
-                self.blocks.push(Block::ToolCall {
-                    id: view.id.clone(),
-                    name: view.name.clone(),
-                    input: view.input.clone(),
-                    input_hash: crate::cache::value_hash(&view.input),
-                });
+                if crate::app_event::is_code_mode_orchestrator(&view.name) {
+                    self.hidden_code_mode_calls.insert(view.id.clone());
+                } else {
+                    self.blocks.push(Block::ToolCall {
+                        id: view.id.clone(),
+                        name: view.name.clone(),
+                        input: view.input.clone(),
+                        input_hash: crate::cache::value_hash(&view.input),
+                    });
+                }
             }
             AgentEvent::ToolOutputDelta(view) => {
                 // Decoding happens HERE, at the display boundary: the core hands
@@ -1296,6 +1303,9 @@ impl AppState {
                 self.push_live_output(&view.id, &view.chunk_lossy());
             }
             AgentEvent::ToolResult(view) => {
+                if self.hidden_code_mode_calls.remove(&view.id) {
+                    return;
+                }
                 // AC4: on interruption, the output already produced stays displayed;
                 // the synthetic result does not contain it. Otherwise, the final
                 // result replaces the live preview.
@@ -2687,6 +2697,31 @@ mod tests {
                 input_hash: crate::cache::value_hash(&serde_json::json!({ "command": "ls -la" })),
             }
         );
+    }
+
+    #[test]
+    fn code_mode_orchestration_stays_out_of_the_legacy_blocks() {
+        let mut state = AppState::new("gpt-5", false);
+        state.apply(&AgentEvent::ToolCall(ToolCallView {
+            id: "exec-1".into(),
+            name: "exec".into(),
+            input: serde_json::json!("text(ALL_TOOLS)"),
+            kind: Default::default(),
+        }));
+        state.apply(&AgentEvent::ToolResult(ToolResultView {
+            id: "exec-1".into(),
+            content: "cell failed".into(),
+            status: None,
+            structured_content: None,
+            is_error: true,
+            untrusted: false,
+            error_kind: Some(ToolErrorKind::Semantic),
+            duration_ms: None,
+            truncation: None,
+            execution: None,
+        }));
+
+        assert!(state.blocks.is_empty());
     }
 
     fn delta(id: &str, chunk: &str) -> AgentEvent {

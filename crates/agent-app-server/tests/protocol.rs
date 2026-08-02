@@ -809,8 +809,11 @@ async fn a_dynamic_tool_travels_the_ordinary_dispatch() {
     );
     assert!(rejected.is_empty());
     let tool = tools.into_iter().next().expect("one tool");
-    let ctx = agent_tools::tool::ToolCtx::new(std::env::temp_dir())
-        .for_call(ToolCallId::from("call_7".to_string()), Arc::new(|_, _| {}));
+    let ctx = agent_tools::tool::ToolCtx::new(std::env::temp_dir()).for_call(
+        ToolCallId::from("call_7".to_string()),
+        Arc::new(|_, _| {}),
+        agent_core::ToolEventSink::default(),
+    );
     let called = tokio::spawn(async move { tool.invoke(json!({"id": "42"}), &ctx).await });
 
     let request = harness.next_notification("item/tool/call").await;

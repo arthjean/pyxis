@@ -11,13 +11,15 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use agent_core::event::{ToolCallView, ToolResultView};
 use agent_core::guardrail::{
     DEFAULT_LOOP_GUARD_THRESHOLD, LoopDecision, LoopGuard, guarded_batch_signature,
 };
 use agent_core::message::{ToolCallFormat, ToolErrorKind};
 use agent_core::provider::ToolSpec;
 use agent_core::tools::{
-    StepToolPlan, ToolDispatchSnapshot, ToolEventSink, ToolInvocation, ToolResultStatus,
+    ModelToolResult, StepToolPlan, ToolDispatchEvent, ToolDispatchSnapshot, ToolEventSink,
+    ToolInvocation, ToolResultStatus,
 };
 
 use crate::protocol::CellId;
@@ -127,12 +129,47 @@ pub trait NestedToolDispatcher: Send + Sync {
 
     /// Tools a cell may call, for the catalog the cell sees.
     fn catalog(&self) -> Vec<ToolSpec>;
+
+    /// Connects nested lifecycle events to the outer `exec` or `wait` call
+    /// currently being driven. Dispatchers without observable calls ignore it.
+    fn bind_events(&self, _events: ToolEventSink) {}
+}
+
+#[derive(Default)]
+struct NestedEventBridge {
+    state: Mutex<NestedEventState>,
+}
+
+#[derive(Default)]
+struct NestedEventState {
+    sink: ToolEventSink,
+    pending: Vec<ToolDispatchEvent>,
+}
+
+impl NestedEventBridge {
+    fn bind(&self, sink: ToolEventSink) {
+        let mut state = lock(&self.state);
+        state.sink = sink;
+        let pending = std::mem::take(&mut state.pending);
+        for event in pending {
+            if let Err(event) = state.sink.try_emit(event) {
+                state.pending.push(event);
+            }
+        }
+    }
+
+    fn emit(&self, event: ToolDispatchEvent) {
+        let mut state = lock(&self.state);
+        if let Err(event) = state.sink.try_emit(event) {
+            state.pending.push(event);
+        }
+    }
 }
 
 /// Dispatcher over the step's own tool plan.
 pub struct PlanDispatcher {
     plan: StepToolPlan,
-    events: ToolEventSink,
+    events: Arc<NestedEventBridge>,
     loop_guard: NestedLoopGuard,
     runtime: tokio::runtime::Handle,
     callable: HashSet<String>,
@@ -180,9 +217,11 @@ impl PlanDispatcher {
         // Serial dispatch: one nested call at a time, so the terminal order of
         // a cell's calls is the order the cell made them.
         let plan = StepToolPlan::capture(snapshot.with_specs(specs), false);
+        let event_bridge = NestedEventBridge::default();
+        event_bridge.bind(events);
         Self {
             plan,
-            events,
+            events: Arc::new(event_bridge),
             loop_guard,
             runtime,
             callable,
@@ -228,6 +267,7 @@ impl NestedToolDispatcher for PlanDispatcher {
             input,
             format,
         };
+        let invocation_id = invocation.id.clone();
         let (loop_decision, loop_count) = self.loop_guard.observe(&call.cell_id, &invocation);
         if loop_decision != LoopDecision::Proceed {
             return NestedToolOutcome::error(
@@ -239,21 +279,35 @@ impl NestedToolDispatcher for PlanDispatcher {
                 ),
             );
         }
+        let kind = self.plan.dispatcher().call_kind(&invocation);
+        self.events
+            .emit(ToolDispatchEvent::NestedToolCall(ToolCallView {
+                id: invocation.id.clone(),
+                name: invocation.name.clone(),
+                input: invocation.input.clone(),
+                kind,
+            }));
 
-        let events = self.events.clone();
+        let events = {
+            let bridge = Arc::clone(&self.events);
+            ToolEventSink::forwarding(move |event| bridge.emit(event))
+        };
         let plan = self.plan.clone();
         // The cell thread is not a Tokio worker, so blocking it here parks
         // exactly one OS thread and never the runtime.
         let mut outcomes = self
             .runtime
             .block_on(async move { plan.dispatch(vec![invocation], events).await });
-        let Some(outcome) = outcomes.pop() else {
-            return NestedToolOutcome::error(
-                &call,
-                "engine_error",
+        let outcome = outcomes.pop().unwrap_or_else(|| {
+            ModelToolResult::rejected(
+                invocation_id,
                 "the tool pipeline returned no result",
-            );
-        };
+                ToolErrorKind::Semantic,
+            )
+        });
+        self.events.emit(ToolDispatchEvent::NestedToolResult(
+            ToolResultView::from_model(&outcome),
+        ));
 
         NestedToolOutcome {
             call_id: call.call_id,
@@ -270,6 +324,10 @@ impl NestedToolDispatcher for PlanDispatcher {
 
     fn catalog(&self) -> Vec<ToolSpec> {
         self.plan.specs().to_vec()
+    }
+
+    fn bind_events(&self, events: ToolEventSink) {
+        self.events.bind(events);
     }
 }
 

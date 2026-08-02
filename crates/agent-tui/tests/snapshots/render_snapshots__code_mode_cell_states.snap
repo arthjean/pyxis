@@ -4,13 +4,13 @@ expression: "harness::frame(\"code_mode_cell_states\", &s, W, H)"
 ---
 › Compte les crates du workspace
 
-● exec
-  ⎿ Script running with cell ID cell_1. Call `wait` with this cell_id to resume.
-● wait
-  ⎿ Cell cell_1 completed.
-● exec
-  ⎿ Cell cell_2 failed.
-  ⎿ Error: script_error: Error: boom
+
+
+
+
+
+
+
 
 
 

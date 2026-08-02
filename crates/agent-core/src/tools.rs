@@ -693,6 +693,11 @@ fn tool_plan_fingerprint(specs: &[ToolSpec], parallel_allowed: bool) -> String {
 #[derive(Debug, Clone)]
 pub enum ToolDispatchEvent {
     PermissionAsk(PermissionReq),
+    /// A tool invoked from a Code Mode cell started. The outer `exec`/`wait`
+    /// call is orchestration only; clients render this native call instead.
+    NestedToolCall(crate::event::ToolCallView),
+    /// Terminal result of a tool invoked from a Code Mode cell.
+    NestedToolResult(crate::event::ToolResultView),
     /// Output fragment of a tool still running (US-015), correlated by `id`.
     /// Raw bytes and stream of origin, both preserved up to the client.
     OutputDelta {
@@ -708,19 +713,42 @@ pub enum ToolDispatchEvent {
     Hook(crate::event::HookRunView),
 }
 
+type ToolEventEmitter =
+    Arc<dyn Fn(ToolDispatchEvent) -> Result<(), ToolDispatchEvent> + Send + Sync>;
+
 #[derive(Clone, Default)]
 pub struct ToolEventSink {
-    tx: Option<mpsc::UnboundedSender<ToolDispatchEvent>>,
+    emit: Option<ToolEventEmitter>,
 }
 
 impl ToolEventSink {
     pub fn new(tx: mpsc::UnboundedSender<ToolDispatchEvent>) -> Self {
-        Self { tx: Some(tx) }
+        let emit: ToolEventEmitter = Arc::new(move |event| tx.send(event).map_err(|error| error.0));
+        Self { emit: Some(emit) }
+    }
+
+    /// Builds a sink that forwards into another event transport. This keeps
+    /// nested pipeline events on Code Mode's buffered bridge while preserving
+    /// the same dispatch interface as a direct tool call.
+    pub fn forwarding(forward: impl Fn(ToolDispatchEvent) + Send + Sync + 'static) -> Self {
+        let emit: ToolEventEmitter = Arc::new(move |event| {
+            forward(event);
+            Ok(())
+        });
+        Self { emit: Some(emit) }
     }
 
     pub fn emit(&self, event: ToolDispatchEvent) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(event);
+        let _ = self.try_emit(event);
+    }
+
+    /// Emits when a receiver is attached, returning the event otherwise. Code
+    /// Mode retains lifecycle events produced between `exec` and a later
+    /// `wait` instead of losing them with the first dispatch channel.
+    pub fn try_emit(&self, event: ToolDispatchEvent) -> Result<(), ToolDispatchEvent> {
+        match &self.emit {
+            Some(emit) => emit(event),
+            None => Err(event),
         }
     }
 }

@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use agent_core::message::{ToolCallFormat, ToolErrorKind};
 use agent_core::tools::{
-    ModelToolResult, ToolDispatch, ToolEventSink, ToolInvocation, ToolOutcome,
+    ModelToolResult, ToolDispatch, ToolDispatchEvent, ToolEventSink, ToolInvocation, ToolOutcome,
 };
 
 use super::*;
@@ -17,6 +17,7 @@ use crate::protocol::SessionId;
 struct RecordingTools {
     seen: Mutex<Vec<(String, String, ToolCallFormat)>>,
     denied: HashSet<String>,
+    emit_output: bool,
 }
 
 impl RecordingTools {
@@ -33,10 +34,17 @@ impl ToolDispatch for RecordingTools {
     async fn dispatch(
         &self,
         calls: Vec<ToolInvocation>,
-        _events: ToolEventSink,
+        events: ToolEventSink,
     ) -> Vec<ToolOutcome> {
         let mut outcomes = Vec::with_capacity(calls.len());
         for call in calls {
+            if self.emit_output {
+                events.emit(ToolDispatchEvent::OutputDelta {
+                    id: call.id.clone(),
+                    stream: agent_core::event::OutputStream::Stdout,
+                    chunk: b"progress".to_vec(),
+                });
+            }
             let rendered = match call.format {
                 ToolCallFormat::Text => call.input.as_str().unwrap_or_default().to_string(),
                 ToolCallFormat::Json => call.input.to_string(),
@@ -162,6 +170,85 @@ async fn a_nested_call_reaches_the_same_pipeline_a_direct_call_would() {
         "the invocation id correlates the cell and the call: {}",
         seen[0].0
     );
+}
+
+#[tokio::test]
+async fn a_nested_call_publishes_its_native_client_lifecycle() {
+    let tools = Arc::new(RecordingTools::default());
+    let dispatcher = dispatcher(Arc::clone(&tools), vec![function_spec("read")]);
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    dispatcher.bind_events(ToolEventSink::new(event_tx));
+
+    let outcomes = dispatch_off_runtime(
+        Arc::clone(&dispatcher),
+        vec![call(
+            "read",
+            NestedToolInput::Json(serde_json::json!({ "value": "x" })),
+        )],
+    );
+    assert!(!outcomes[0].is_error);
+
+    let events: Vec<ToolDispatchEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+    assert_eq!(events.len(), 2, "one start and one terminal event");
+    let (started_id, finished_id) = match (&events[0], &events[1]) {
+        (
+            ToolDispatchEvent::NestedToolCall(started),
+            ToolDispatchEvent::NestedToolResult(finished),
+        ) => {
+            assert_eq!(started.name, "read");
+            assert!(!finished.is_error);
+            (&started.id, &finished.id)
+        }
+        unexpected => panic!("unexpected nested lifecycle: {unexpected:?}"),
+    };
+    assert_eq!(started_id, finished_id);
+}
+
+#[tokio::test]
+async fn nested_events_survive_the_gap_between_exec_and_wait() {
+    let tools = Arc::new(RecordingTools::default());
+    let dispatcher = dispatcher(Arc::clone(&tools), vec![function_spec("read")]);
+    let (stale_tx, stale_rx) = tokio::sync::mpsc::unbounded_channel();
+    dispatcher.bind_events(ToolEventSink::new(stale_tx));
+    drop(stale_rx);
+
+    let outcomes = dispatch_off_runtime(
+        Arc::clone(&dispatcher),
+        vec![call(
+            "read",
+            NestedToolInput::Json(serde_json::json!({ "value": "late" })),
+        )],
+    );
+    assert!(!outcomes[0].is_error);
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    dispatcher.bind_events(ToolEventSink::new(event_tx));
+    let events: Vec<ToolDispatchEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+    assert_eq!(events.len(), 2, "pending lifecycle must flush on wait");
+}
+
+#[tokio::test]
+async fn nested_pipeline_events_use_the_same_buffered_bridge() {
+    let tools = Arc::new(RecordingTools {
+        emit_output: true,
+        ..RecordingTools::default()
+    });
+    let dispatcher = dispatcher(Arc::clone(&tools), vec![function_spec("read")]);
+    let outcomes = dispatch_off_runtime(
+        Arc::clone(&dispatcher),
+        vec![call(
+            "read",
+            NestedToolInput::Json(serde_json::json!({ "value": "late" })),
+        )],
+    );
+    assert!(!outcomes[0].is_error);
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    dispatcher.bind_events(ToolEventSink::new(event_tx));
+    let events: Vec<ToolDispatchEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+    assert!(matches!(events[0], ToolDispatchEvent::NestedToolCall(_)));
+    assert!(matches!(events[1], ToolDispatchEvent::OutputDelta { .. }));
+    assert!(matches!(events[2], ToolDispatchEvent::NestedToolResult(_)));
 }
 
 #[tokio::test]

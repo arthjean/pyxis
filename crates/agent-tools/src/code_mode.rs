@@ -114,6 +114,12 @@ impl CodeModeHandle {
         self.binding.set(dispatcher);
     }
 
+    fn bind_events(&self, events: agent_core::tools::ToolEventSink) {
+        if let Some(dispatcher) = self.binding.get() {
+            dispatcher.bind_events(events);
+        }
+    }
+
     /// Session of the current thread. `None` before `bind_thread`.
     pub fn session(&self) -> Option<Arc<CodeModeSession>> {
         lock(&self.session).clone()
@@ -237,7 +243,8 @@ impl Tool for ExecTool {
         PermissionDecision::Allow
     }
 
-    async fn call(&self, input: Self::Input, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+    async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        self.handle.bind_events(ctx.events.clone());
         let (pragma, source) =
             parse_exec_source(&input).map_err(|error| ToolError::Parse(error.to_string()))?;
         let mut request =
@@ -323,7 +330,8 @@ impl Tool for WaitTool {
         PermissionDecision::Allow
     }
 
-    async fn call(&self, input: Self::Input, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+    async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        self.handle.bind_events(ctx.events.clone());
         let Some(cell_id) = CellId::parse(input.cell_id) else {
             return Err(ToolError::Validation(ValidationError::new(
                 "cell_id must not be empty",

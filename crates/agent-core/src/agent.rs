@@ -1654,6 +1654,12 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                             Some(ToolDispatchEvent::PermissionAsk(req)) => {
                                                 yield AgentEvent::PermissionAsk(req);
                                             }
+                                            Some(ToolDispatchEvent::NestedToolCall(view)) => {
+                                                yield AgentEvent::ToolCall(view);
+                                            }
+                                            Some(ToolDispatchEvent::NestedToolResult(view)) => {
+                                                yield AgentEvent::ToolResult(view);
+                                            }
                                             Some(ToolDispatchEvent::OutputDelta { id, stream, chunk }) => {
                                                 yield AgentEvent::ToolOutputDelta(ToolOutputDeltaView { id, stream, chunk });
                                             }
@@ -1690,6 +1696,12 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 match event {
                                     ToolDispatchEvent::PermissionAsk(req) => {
                                         yield AgentEvent::PermissionAsk(req);
+                                    }
+                                    ToolDispatchEvent::NestedToolCall(view) => {
+                                        yield AgentEvent::ToolCall(view);
+                                    }
+                                    ToolDispatchEvent::NestedToolResult(view) => {
+                                        yield AgentEvent::ToolResult(view);
                                     }
                                     ToolDispatchEvent::OutputDelta { id, stream, chunk } => {
                                         yield AgentEvent::ToolOutputDelta(ToolOutputDeltaView { id, stream, chunk });

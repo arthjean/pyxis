@@ -14,7 +14,7 @@ use std::time::Duration;
 use agent_core::event::PlanView;
 use agent_core::provider::ToolKind;
 use agent_core::sandbox::SandboxPolicy;
-use agent_core::tools::{ToolExecution, ToolImage};
+use agent_core::tools::{ToolEventSink, ToolExecution, ToolImage};
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 
@@ -85,6 +85,9 @@ pub struct ToolCtx {
     /// is showing (an app-server dynamic tool) reads it here rather than
     /// guessing from its own arguments.
     pub call_id: Option<agent_core::message::ToolCallId>,
+    /// Client event channel of the current dispatch. Code Mode forwards it to
+    /// nested calls so clients see their native lifecycle.
+    pub events: ToolEventSink,
 }
 
 impl std::fmt::Debug for ToolCtx {
@@ -122,6 +125,7 @@ impl ToolCtx {
             harden: None,
             output: None,
             call_id: None,
+            events: ToolEventSink::default(),
         }
     }
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -147,12 +151,18 @@ impl ToolCtx {
         self.sandbox_observer = Some(observer);
         self
     }
-    /// Context derived for ONE call: its identifier and its output emitter
-    /// (US-015). Both are per-call facts, so they are set in one place.
-    pub fn for_call(&self, call_id: agent_core::message::ToolCallId, output: OutputSink) -> Self {
+    /// Context derived for ONE call: its identifier, output emitter and event
+    /// transport. They are per-call facts, so they are set in one place.
+    pub fn for_call(
+        &self,
+        call_id: agent_core::message::ToolCallId,
+        output: OutputSink,
+        events: ToolEventSink,
+    ) -> Self {
         let mut ctx = self.clone();
         ctx.call_id = Some(call_id);
         ctx.output = Some(output);
+        ctx.events = events;
         ctx
     }
     /// Publishes an output fragment when a consumer is listening. No-op otherwise.

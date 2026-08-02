@@ -7,7 +7,7 @@
 
 use agent_core::AgentEvent;
 use agent_core::message::ToolErrorKind;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TranscriptItemId(String);
@@ -369,6 +369,7 @@ pub struct TranscriptMapper {
     active_exec_tools: HashMap<String, ExecToolDisplay>,
     active_terminal_sessions: HashMap<u64, ActiveTerminalSession>,
     terminal_control_calls: HashMap<String, ActiveTerminalControl>,
+    hidden_code_mode_calls: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -473,6 +474,10 @@ impl TranscriptMapper {
             )],
             AgentEvent::ToolCall(view) => {
                 let mut updates = self.drain_active_streams();
+                if is_code_mode_orchestrator(&view.name) {
+                    self.hidden_code_mode_calls.insert(view.id.clone());
+                    return updates;
+                }
                 if view.name == "write_stdin"
                     && let Some(session_id) = terminal_session_id(&view.input)
                     && self.active_terminal_sessions.contains_key(&session_id)
@@ -554,6 +559,9 @@ impl TranscriptMapper {
             AgentEvent::ToolOutputDelta(_) => Vec::new(),
             AgentEvent::ToolResult(view) => {
                 let mut updates = self.drain_active_streams();
+                if self.hidden_code_mode_calls.remove(&view.id) {
+                    return updates;
+                }
                 let status = if view.is_error {
                     TranscriptItemStatus::Failed
                 } else {
@@ -1110,6 +1118,10 @@ fn exec_result_update(
     )
 }
 
+pub(crate) fn is_code_mode_orchestrator(name: &str) -> bool {
+    matches!(name, "exec" | "wait")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExecToolDisplay {
     command: String,
@@ -1317,6 +1329,36 @@ mod tests {
             Some("tool:call-1")
         );
         assert_eq!(result[0].item.id, call[0].item.id);
+    }
+
+    #[test]
+    fn code_mode_orchestration_cells_stay_out_of_the_transcript() {
+        let mut mapper = TranscriptMapper::new();
+
+        for name in ["exec", "wait"] {
+            let id = format!("{name}-1");
+            let call = mapper.map_event(&AgentEvent::ToolCall(ToolCallView {
+                id: id.clone(),
+                name: name.into(),
+                input: serde_json::json!({}),
+                kind: Default::default(),
+            }));
+            let result = mapper.map_event(&AgentEvent::ToolResult(ToolResultView {
+                id,
+                content: "Cell cell-1 failed.\nscript_error: nested tool failed".into(),
+                status: None,
+                structured_content: None,
+                is_error: true,
+                error_kind: None,
+                untrusted: false,
+                duration_ms: None,
+                truncation: None,
+                execution: None,
+            }));
+
+            assert!(call.is_empty(), "{name} call should stay internal");
+            assert!(result.is_empty(), "{name} result should stay internal");
+        }
     }
 
     #[test]
