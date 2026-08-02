@@ -1240,14 +1240,11 @@ impl AppState {
                 )));
             }
             // Semantic text/tool events render the same lifecycle in the TUI;
-            // the canonical item itself remains available to app-server users.
-            AgentEvent::ResponseItem { .. } | AgentEvent::ResponseMetadata(_) => {}
-            AgentEvent::ProviderExtension(extension) => {
-                self.blocks.push(Block::Notice(format!(
-                    "the backend sent an additive `{}` event",
-                    extension.event_type()
-                )));
-            }
+            // canonical items, metadata and provider extensions remain available
+            // to app-server users without leaking transport noise into chat.
+            AgentEvent::ResponseItem { .. }
+            | AgentEvent::ResponseMetadata(_)
+            | AgentEvent::ProviderExtension(_) => {}
             AgentEvent::UnmappedResponseItem { item_type, .. } => {
                 self.blocks.push(Block::Notice(format!(
                     "the backend sent a `{item_type}` item this build does not render"
@@ -2649,6 +2646,19 @@ mod tests {
                 streaming: false
             }]
         );
+    }
+
+    #[test]
+    fn provider_extensions_stay_out_of_the_legacy_transcript() {
+        let mut s = AppState::new("gpt-5", false);
+        let extension = agent_core::provider::ProviderExtension::from_value(
+            "response.in_progress",
+            serde_json::json!({"type": "response.in_progress"}),
+        );
+
+        s.apply(&AgentEvent::ProviderExtension(extension));
+
+        assert!(s.blocks.is_empty());
     }
 
     #[test]

@@ -611,25 +611,13 @@ impl TranscriptMapper {
             // An item the adapter could not read: shown as a notice precisely
             // because there is nothing else to show. Staying silent would let
             // the user believe the model produced only what is on screen.
-            // Canonical response items are projected in full by app-server.
-            // The TUI keeps using the semantic text/tool events emitted beside
-            // them, otherwise one wire item would render twice.
-            AgentEvent::ResponseItem { .. } | AgentEvent::ResponseMetadata(_) => Vec::new(),
-            AgentEvent::ProviderExtension(extension) => vec![TranscriptUpdate::new(
-                TranscriptLifecycle::Completed,
-                TranscriptItem::new(
-                    Some(self.next_local("notice")),
-                    TranscriptRole::System,
-                    TranscriptItemKind::Notice,
-                    TranscriptItemStatus::Complete,
-                    TranscriptPayload::Notice {
-                        message: format!(
-                            "the backend sent an additive `{}` event",
-                            extension.event_type()
-                        ),
-                    },
-                ),
-            )],
+            // Canonical response data and additive provider extensions remain
+            // available to app-server consumers. The TUI renders the semantic
+            // text/tool events emitted beside them, otherwise transport details
+            // would duplicate useful content and bury the conversation.
+            AgentEvent::ResponseItem { .. }
+            | AgentEvent::ResponseMetadata(_)
+            | AgentEvent::ProviderExtension(_) => Vec::new(),
             AgentEvent::UnmappedResponseItem { item_type, .. } => vec![TranscriptUpdate::new(
                 TranscriptLifecycle::Completed,
                 TranscriptItem::new(
@@ -1112,6 +1100,21 @@ mod tests {
         assert_eq!(reset[0].lifecycle, TranscriptLifecycle::Reset);
         assert_eq!(reset[0].item.status, TranscriptItemStatus::Cancelled);
         assert_eq!(reset[0].item.id, text[0].item.id);
+    }
+
+    #[test]
+    fn provider_extensions_stay_out_of_the_transcript() {
+        let mut mapper = TranscriptMapper::new();
+        let extension = agent_core::provider::ProviderExtension::from_value(
+            "response.in_progress",
+            serde_json::json!({"type": "response.in_progress"}),
+        );
+
+        assert!(
+            mapper
+                .map_event(&AgentEvent::ProviderExtension(extension))
+                .is_empty()
+        );
     }
 
     #[test]
