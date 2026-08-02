@@ -1,0 +1,16 @@
+{
+  "name": "EP-006 search preserves typed commands and pagination",
+  "note": "EP-006/US-019: search success, provider error and timeout remain provider-scoped and typed.",
+  "auxiliary": {
+    "family": "search",
+    "success": {
+      "path": "/v1/alpha/search",
+      "command": "Pyxis",
+      "result_count": 1,
+      "item_count": 1,
+      "next_page": "cursor-2"
+    },
+    "error": { "operation": "search", "status": 503 },
+    "timeout": { "operation": "search", "phase": "request", "max_ms": 100 }
+  }
+}

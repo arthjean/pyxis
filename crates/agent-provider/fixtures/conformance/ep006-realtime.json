@@ -1,0 +1,22 @@
+{
+  "name": "EP-006 realtime preserves explicit call and websocket dialects",
+  "note": "EP-006/US-020: Realtime success, provider error and timeout remain provider-scoped and typed.",
+  "auxiliary": {
+    "family": "realtime",
+    "success": {
+      "call_path": "/v1/realtime/calls?intent=quicksilver&architecture=avas",
+      "call_method": "POST",
+      "multipart": true,
+      "has_session": true,
+      "call_id": "rtc_fixture",
+      "sdp": "v=0\r\n",
+      "websocket_path": "/v1/realtime?model=gpt-realtime",
+      "websocket_auth": true,
+      "session_id": "session-1",
+      "session_type": "realtime",
+      "context_type": "conversation.item.create"
+    },
+    "error": { "operation": "realtime_call", "status": 503 },
+    "timeout": { "operation": "realtime_websocket", "phase": "connect", "max_ms": 100 }
+  }
+}

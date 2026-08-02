@@ -1,0 +1,15 @@
+{
+  "name": "EP-006 memories preserve typed trace correlation",
+  "note": "EP-006/US-017: memories success, provider error and timeout remain provider-scoped and typed.",
+  "auxiliary": {
+    "family": "memories",
+    "success": {
+      "path": "/v1/memories/trace_summarize",
+      "trace_id": "trace-1",
+      "trace_summary": "trace summary",
+      "memory_summary": "memory summary"
+    },
+    "error": { "operation": "memories", "status": 503 },
+    "timeout": { "operation": "memories", "phase": "request", "max_ms": 100 }
+  }
+}

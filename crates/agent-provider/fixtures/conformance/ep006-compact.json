@@ -1,0 +1,17 @@
+{
+  "name": "EP-006 compact preserves typed transactional state",
+  "note": "EP-006/US-017: compact success, provider error and timeout remain provider-scoped and typed.",
+  "auxiliary": {
+    "family": "compact",
+    "success": {
+      "path": "/v1/responses/compact",
+      "auth": true,
+      "input_type": "message",
+      "turn_state": "turn-state-1",
+      "output_kind": "message",
+      "durable_before_memory": true
+    },
+    "error": { "operation": "remote_compact", "status": 503 },
+    "timeout": { "operation": "remote_compact", "phase": "request", "max_ms": 100 }
+  }
+}

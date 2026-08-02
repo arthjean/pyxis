@@ -1,0 +1,21 @@
+{
+  "name": "EP-006 files preserve atomic credential-safe lifecycle",
+  "note": "EP-006/US-019: files success, provider error and timeout remain provider-scoped and typed.",
+  "auxiliary": {
+    "family": "files",
+    "success": {
+      "create_path": "/v1/files",
+      "create_name": "fixture.txt",
+      "blob_path": "/blob",
+      "blob_auth": false,
+      "blob_provider_header": false,
+      "blob_request_id": true,
+      "blob_size": 4,
+      "finalize_path": "/v1/files/file_123/uploaded",
+      "uri": "sediment://file_123",
+      "download_debug_redacted": true
+    },
+    "error": { "operation": "file_upload", "status": 503 },
+    "timeout": { "operation": "file_upload", "phase": "request", "max_ms": 100 }
+  }
+}

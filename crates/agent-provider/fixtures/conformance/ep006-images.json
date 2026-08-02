@@ -1,0 +1,21 @@
+{
+  "name": "EP-006 images preserve typed redacted media contracts",
+  "note": "EP-006/US-018: image success, provider error and timeout remain provider-scoped and typed.",
+  "auxiliary": {
+    "family": "images",
+    "success": {
+      "generation_path": "/v1/images/generations",
+      "generation_prompt": "a red fox",
+      "generation_has_binary": true,
+      "metadata_marks_redaction": true,
+      "format": "png",
+      "edit_path": "/v1/images/edits",
+      "edit_image_count": 1,
+      "edit_has_mask": true,
+      "edit_has_signed_url": true,
+      "debug_redacted": true
+    },
+    "error": { "operation": "image_generation", "status": 503 },
+    "timeout": { "operation": "image_generation", "phase": "request", "max_ms": 100 }
+  }
+}

@@ -1,4 +1,4 @@
-//! Offline provider conformance suite (EP-001 through EP-005).
+//! Offline provider conformance suite (EP-001 through EP-006).
 //!
 //! Each fixture is a golden derived from the Codex baseline contract: either a
 //! canonical request with the exact Responses body it must produce, or an SSE
@@ -18,6 +18,8 @@ use serde_json::Value;
 
 #[path = "conformance/ep005.rs"]
 mod ep005;
+#[path = "conformance/ep006/mod.rs"]
+mod ep006;
 
 #[derive(Debug, Deserialize)]
 struct Fixture {
@@ -32,6 +34,8 @@ struct Fixture {
     error: Option<ErrorCase>,
     #[serde(default)]
     provider: Option<ProviderCase>,
+    #[serde(default)]
+    auxiliary: Option<AuxiliaryCase>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +82,27 @@ struct ProviderCase {
     expected: Value,
 }
 
+#[derive(Debug, Deserialize)]
+struct AuxiliaryCase {
+    family: String,
+    success: Value,
+    error: AuxiliaryErrorExpectation,
+    timeout: AuxiliaryTimeoutExpectation,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuxiliaryErrorExpectation {
+    operation: String,
+    status: u16,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuxiliaryTimeoutExpectation {
+    operation: String,
+    phase: String,
+    max_ms: u64,
+}
+
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/conformance")
 }
@@ -110,7 +135,8 @@ fn every_fixture_covers_exactly_one_contract() {
                 fixture.request.is_some(),
                 fixture.stream.is_some(),
                 fixture.error.is_some(),
-                fixture.provider.is_some()
+                fixture.provider.is_some(),
+                fixture.auxiliary.is_some()
             ]
             .into_iter()
             .filter(|present| *present)
@@ -120,6 +146,36 @@ fn every_fixture_covers_exactly_one_contract() {
             path.display()
         );
     }
+}
+
+#[tokio::test]
+async fn ep006_auxiliary_fixtures_cover_success_error_and_timeout_per_family() {
+    let mut families = std::collections::BTreeSet::new();
+    for (_path, _, fixture) in load_fixtures() {
+        let Some(case) = fixture.auxiliary else {
+            continue;
+        };
+        assert!(
+            fixture.note.contains("EP-006"),
+            "{} must cite EP-006",
+            fixture.name
+        );
+        assert!(
+            families.insert(case.family.clone()),
+            "duplicate EP-006 family"
+        );
+        ep006::assert_auxiliary_fixture(&fixture.name, &case).await;
+    }
+    assert_eq!(
+        families,
+        [
+            "compact", "files", "images", "memories", "realtime", "search"
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        "EP-006 must cover each auxiliary family exactly once"
+    );
 }
 
 #[tokio::test]
