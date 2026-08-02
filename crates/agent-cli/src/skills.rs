@@ -9,8 +9,8 @@
 //! with a trace and the others keep working.
 //!
 //! No YAML dependency: the spec only needs a few scalar keys, so the reader accepts
-//! exactly `key: value` pairs, ignores unknown keys as the spec requires, and
-//! rejects a skill whose `name`, `description` or policy is not a simple scalar.
+//! `key: value` pairs plus YAML block strings for descriptions, ignores unknown
+//! keys as the spec requires, and rejects complex values for the policy fields.
 //!
 //! Two scopes (US-018): the user root outside the workspace, and the project root
 //! inside it. A skill declares NO capability whatever its scope: the only keys
@@ -237,26 +237,39 @@ struct Frontmatter {
     allow_implicit: bool,
 }
 
-/// Reads the spec keys. Unknown keys are ignored, as the spec requires; a
-/// `name`, `description` or policy that is not a simple scalar rejects the skill.
+/// Reads the spec keys. Unknown keys are ignored, as the spec requires. Names and
+/// policy values stay single-line scalars; descriptions also accept the common
+/// YAML folded and literal block forms used by installed skills.
 fn parse_frontmatter(front: &str) -> Result<Frontmatter, String> {
     let mut name: Option<String> = None;
     let mut description: Option<String> = None;
     let mut allow_implicit = true;
-    for line in front.lines() {
+    let lines: Vec<&str> = front.lines().collect();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let line = lines[index];
         // An indented line continues a key we do not read (nested block, list):
         // ignored like any unknown key.
         if line.starts_with([' ', '\t']) {
+            index += 1;
             continue;
         }
         let Some((key, value)) = line.split_once(':') else {
+            index += 1;
             continue;
         };
         let key = key.trim();
         match key {
             "name" => name = Some(scalar(value).ok_or("name is not a simple scalar")?),
             "description" => {
-                description = Some(scalar(value).ok_or("description is not a simple scalar")?);
+                let indicator = value.trim();
+                if matches!(indicator, ">" | ">-" | ">+" | "|" | "|-" | "|+") {
+                    let (block, next) = description_block(&lines, index + 1, indicator)?;
+                    description = Some(block);
+                    index = next;
+                    continue;
+                }
+                description = Some(scalar(value).ok_or("description is not a scalar")?);
             }
             // US-018 AC2. Both spellings are accepted: the open spec writes its
             // keys in kebab-case, the reference implementation in snake_case.
@@ -275,6 +288,7 @@ fn parse_frontmatter(front: &str) -> Result<Frontmatter, String> {
             }
             _ => {}
         }
+        index += 1;
     }
     let name = name.ok_or("frontmatter without a name")?;
     let description = description.ok_or("frontmatter without a description")?;
@@ -285,9 +299,53 @@ fn parse_frontmatter(front: &str) -> Result<Frontmatter, String> {
     })
 }
 
+/// Reads one indented YAML block scalar. Chomping markers do not affect the
+/// catalog because descriptions are normalized to one trimmed terminal-safe
+/// line later. This intentionally remains a narrow scalar reader, not a second
+/// general-purpose YAML implementation.
+fn description_block(
+    lines: &[&str],
+    start: usize,
+    indicator: &str,
+) -> Result<(String, usize), String> {
+    let mut end = start;
+    while end < lines.len() && (lines[end].trim().is_empty() || lines[end].starts_with([' ', '\t']))
+    {
+        end += 1;
+    }
+    let block = &lines[start..end];
+    let indentation = block
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.bytes()
+                .take_while(|byte| matches!(byte, b' ' | b'\t'))
+                .count()
+        })
+        .min()
+        .ok_or("description block is empty")?;
+    if indentation == 0 {
+        return Err("description block must be indented".to_string());
+    }
+
+    let content: Vec<&str> = block
+        .iter()
+        .map(|line| &line[indentation.min(line.len())..])
+        .collect();
+    let value = if indicator.starts_with('>') {
+        content.join(" ")
+    } else {
+        content.join("\n")
+    };
+    if value.trim().is_empty() {
+        return Err("description block is empty".to_string());
+    }
+    Ok((value, end))
+}
+
 /// A simple single-line scalar, quotes stripped. `None` for everything the
-/// restricted reader refuses to interpret: block scalar, flow collection, anchor,
-/// alias, tag.
+/// restricted reader refuses to interpret here: block scalar, flow collection,
+/// anchor, alias, tag. Description block scalars are handled by the caller.
 fn scalar(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -565,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_keys_are_ignored_and_complex_values_reject_the_skill() {
+    fn unknown_keys_are_ignored_and_block_descriptions_are_folded() {
         let root = root("keys");
         write_skill(
             &root,
@@ -575,15 +633,18 @@ mod tests {
         write_skill(
             &root,
             "block",
-            "---\nname: block\ndescription: |\n  folded\n---\nbody\n",
+            "---\nname: block\ndescription: >-\n  Folded descriptions are valid YAML\n  and common in installed skills.\n---\nbody\n",
         );
         let catalog = load(&root, SkillScope::User);
-        assert_eq!(catalog.names(), vec!["extra".to_string()]);
+        assert!(catalog.issues.is_empty(), "{:?}", catalog.issues);
+        assert_eq!(
+            catalog.names(),
+            vec!["block".to_string(), "extra".to_string()]
+        );
         assert_eq!(catalog.find("extra").unwrap().description, "Simple.");
-        assert!(
-            catalog.issues.join("\n").contains("not a simple scalar"),
-            "{:?}",
-            catalog.issues
+        assert_eq!(
+            catalog.find("block").unwrap().description,
+            "Folded descriptions are valid YAML and common in installed skills."
         );
         let _ = std::fs::remove_dir_all(&root);
     }
