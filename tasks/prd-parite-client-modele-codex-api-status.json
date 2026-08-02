@@ -33,10 +33,10 @@
     {
       "id": "EP-004",
       "title": "Outils, items et catalogue de modèles",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 3,
-      "stories_done": 0
+      "stories_done": 3
     },
     {
       "id": "EP-005",
@@ -190,37 +190,40 @@
       "id": "US-011",
       "title": "Compléter l'algèbre des outils Responses",
       "epic": "EP-004",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": ["US-002"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01T23:43:19+02:00",
+      "completed_at": "2026-08-02T00:16:10+02:00",
+      "reviewed_at": "2026-08-02T08:37:19+02:00",
+      "note": "The canonical tool algebra is isolated behind one validated boundary and preserves function strictness, deferred loading, output schemas, freeform grammars, namespaces, tool search and complete web search controls. Provider and resolved-model capability refusals, strict input/output schemas, namespace uniqueness and deferred lookup resolution are proven before credentials or network."
     },
     {
       "id": "US-012",
       "title": "Préserver le vocabulaire complet des response items",
       "epic": "EP-004",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": ["US-002", "US-011"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-01T23:50:49+02:00",
+      "completed_at": "2026-08-02T00:16:10+02:00",
+      "reviewed_at": "2026-08-02T08:37:19+02:00",
+      "note": "Every baseline response item has a typed canonical kind plus complete bounded payload. Private fields and defensive deserialization prevent kind, identity, status or diagnostic contradictions; one atomic lifecycle registry correlates added/done coordinates and rejects unresolved items at completion. Malformed known items fail before publication, while unknown and sensitive payloads remain bounded, diagnosed and redacted through app-server projection."
     },
     {
       "id": "US-013",
       "title": "Rendre le catalogue fidèle, scoped et disponible en headless",
       "epic": "EP-004",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": ["US-004"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-02T00:08:15+02:00",
+      "completed_at": "2026-08-02T00:16:10+02:00",
+      "reviewed_at": "2026-08-02T08:37:19+02:00",
+      "note": "The remote catalog preserves rich baseline metadata and carries model-specific tool capabilities into the immutable sampling runtime. It is atomically keyed by provider, normalized endpoint and hashed account identity, conditionally refreshes on response ETags, exposes an uncached path, and clears cross-scope state. Interactive and headless share the bounded startup refresh; decoding, embedded descriptors and tests are split into focused modules."
     },
     {
       "id": "US-014",
