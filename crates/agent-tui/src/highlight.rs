@@ -28,12 +28,13 @@
 
 use std::sync::OnceLock;
 
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme, ThemeSet};
+use syntect::highlighting::{FontStyle, Theme};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
+use two_face::theme::EmbeddedThemeName;
 
 use crate::theme::Theme as UiTheme;
 
@@ -50,13 +51,14 @@ fn syntaxes() -> &'static SyntaxSet {
     SS.get_or_init(two_face::syntax::extra_newlines)
 }
 
-/// Coloring theme: `base16-ocean.dark`, sober and dark. Code color
-/// is FUNCTIONAL (readability), not decorative. Loaded once from the syntect
-/// embedded themes; `None` when absent (degrades to uncolored, never a panic).
-fn theme() -> Option<&'static Theme> {
-    static TH: OnceLock<Option<Theme>> = OnceLock::new();
-    TH.get_or_init(|| ThemeSet::load_defaults().themes.remove("base16-ocean.dark"))
-        .as_ref()
+/// Codex's default syntax theme on dark terminals.
+fn theme() -> &'static Theme {
+    static TH: OnceLock<Theme> = OnceLock::new();
+    TH.get_or_init(|| {
+        two_face::theme::extra()
+            .get(EmbeddedThemeName::CatppuccinMocha)
+            .clone()
+    })
 }
 
 /// Resolves a language label (or an extension) into a grammar. Normalizes common
@@ -86,6 +88,14 @@ fn to_color(c: syntect::highlighting::Color) -> Color {
     Color::Rgb(c.r, c.g, c.b)
 }
 
+fn to_style(style: syntect::highlighting::Style) -> Style {
+    let mut out = Style::default().fg(to_color(style.foreground));
+    if style.font_style.contains(FontStyle::BOLD) {
+        out = out.add_modifier(Modifier::BOLD);
+    }
+    out
+}
+
 /// Colors a MULTI-LINE code block: stateful line-by-line rendering (the context of
 /// multi-line strings/comments is preserved). Returns the colored spans per
 /// line (without indentation: the caller lays out the gutter). `None` when not truecolor
@@ -102,7 +112,7 @@ pub fn code_block(code: &str, lang: &str, ui: &UiTheme) -> Option<Vec<Vec<Span<'
     }
     let ss = syntaxes();
     let syntax = syntax_for(ss, lang)?;
-    let theme = theme()?;
+    let theme = theme();
     let mut h = HighlightLines::new(syntax, theme);
     let mut out = Vec::new();
     for line in LinesWithEndings::from(code) {
@@ -131,7 +141,7 @@ pub fn line_colors(line: &str, lang: &str, ui: &UiTheme) -> Option<Vec<Color>> {
     }
     let ss = syntaxes();
     let syntax = syntax_for(ss, lang)?;
-    let theme = theme()?;
+    let theme = theme();
     let mut h = HighlightLines::new(syntax, theme);
     let with_nl = format!("{line}\n");
     let ranges = h.highlight_line(&with_nl, ss).ok()?;
@@ -152,8 +162,7 @@ fn spans_from_ranges(ranges: &[(syntect::highlighting::Style, &str)]) -> Vec<Spa
         .iter()
         .filter_map(|(st, text)| {
             let t = text.trim_end_matches(['\n', '\r']);
-            (!t.is_empty())
-                .then(|| Span::styled(t.to_string(), Style::default().fg(to_color(st.foreground))))
+            (!t.is_empty()).then(|| Span::styled(t.to_string(), to_style(*st)))
         })
         .collect()
 }
@@ -213,6 +222,14 @@ mod tests {
             lines[0]
                 .iter()
                 .any(|s| matches!(s.style.fg, Some(Color::Rgb(..))))
+        );
+    }
+
+    #[test]
+    fn syntax_theme_matches_codex_dark_default() {
+        assert_eq!(
+            theme(),
+            two_face::theme::extra().get(EmbeddedThemeName::CatppuccinMocha)
         );
     }
 

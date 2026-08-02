@@ -1,7 +1,7 @@
 //! Markdown rendering -> styled ratatui lines (assistant replies). Parses through
 //! pulldown-cmark (CommonMark + strikethrough/tables) and maps the events into
-//! `Span`s reusing the `Theme` palette: headers and inline code = accent
-//! (sky blue), bold/italic through modifiers, lists as bullets. Code blocks are
+//! `Span`s reusing the `Theme` palette: headers use bold terminal text, inline
+//! code and links use ANSI cyan, and bold/italic use modifiers. Code blocks are
 //! syntax-colored (US-042, through `highlight`), tables aligned and
 //! blockquotes prefixed with a muted `▎` bar (US-043).
 //!
@@ -376,7 +376,7 @@ impl<'t> Renderer<'t> {
 
     fn text_style(&self) -> Style {
         let mut st = if self.heading {
-            self.theme.accent()
+            self.theme.fg()
         } else if self.blockquote > 0 {
             self.theme.dim()
         } else {
@@ -652,6 +652,25 @@ mod tests {
 
     fn rendered(md: &str) -> String {
         flat(&render_markdown(md, &Theme::new(true), 80)).join("\n")
+    }
+
+    #[test]
+    fn headings_and_inline_code_follow_codex_styles() {
+        let lines = render_markdown("# Heading\n\n`code`", &Theme::new(true), 80);
+        let heading = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains("Heading"))
+            .expect("heading span");
+        let code = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content == "code")
+            .expect("inline code span");
+
+        assert_eq!(heading.style.fg, None);
+        assert!(heading.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(code.style.fg, Some(ratatui::style::Color::Cyan));
     }
 
     /// The label is prose; the path is what the reader will open. A local link

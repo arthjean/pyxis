@@ -1,10 +1,9 @@
-//! Ratatui rendering (US-019). Aesthetics: **monochrome + one accent**, spare,
-//! no heavy border. Hierarchy through weight/tint and negative space, not through
-//! color. Visual signature: a `▌` gutter that lights up (accent) on the
-//! assistant turn being streamed, and calms down (faint) once finished.
+//! Ratatui rendering (US-019). Colors follow the Codex TUI semantic palette:
+//! terminal-default primary text, dim secondary text, cyan interaction, green
+//! success, red failure, and magenta Codex identity.
 //!
-//! `render` is PURE -> testable through `TestBackend`. Degradation without truecolor
-//! (AC4) replaces the accent with bold; the layout is unchanged.
+//! `render` is PURE -> testable through `TestBackend`. Without truecolor, the
+//! ANSI semantic foregrounds remain and subtle RGB backgrounds disappear.
 
 use crate::custom_terminal::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -663,7 +662,7 @@ fn welcome_parts(state: &AppState, theme: &Theme) -> (Vec<Line<'static>>, Vec<Li
     info.push(Line::from(meta));
     if state.provider_connected {
         info.push(Line::from(vec![
-            Span::styled("✓ codex", theme.accent()),
+            Span::styled("✓ codex", theme.brand()),
             Span::styled("  ChatGPT subscription", theme.dim()),
         ]));
     } else {
@@ -956,7 +955,7 @@ fn push_block<'a>(
             );
         }
         Block::Assistant { text, streaming } => {
-            // Rendered markdown, ANCHORED by a sky-blue bullet; body aligned at 2 columns
+            // Rendered markdown, anchored by a dim bullet; body aligned at 2 columns
             // (hanging gutter: bullet on the 1st subline, rest indented). The
             // CONTENT width (gutter excluded) sizes the markdown tables
             // (US-043), the same value as the `emit_block` wrap.
@@ -967,7 +966,7 @@ fn push_block<'a>(
             } else {
                 crate::markdown::render_markdown(&clean, theme, avail)
             };
-            emit_block(lines, &md, Span::styled("● ", theme.accent()), width);
+            emit_block(lines, &md, Span::styled("● ", theme.dim()), width);
         }
         Block::Reasoning(text) => {
             // Collapsed into a discreet label; while in progress (last block), a short
@@ -2056,8 +2055,8 @@ mod tests {
 
     #[test]
     /// The input is a bounded field: one full-width rule above, one below, and
-    /// the status line directly under the closing rule. The input row itself
-    /// keeps the terminal background (no filled block).
+    /// the status line directly under the closing rule. Its content row keeps
+    /// the terminal background.
     fn composer_uses_rules_without_filled_background() {
         let mut s = AppState::new("gpt-5", true);
         s.set_input("Try something".into());

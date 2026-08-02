@@ -47,15 +47,19 @@ const RAW_TOOL_OUTPUT_WIDTH: usize = 120;
 const SESSION_HEADER_MAX_INNER_WIDTH: usize = 56;
 
 fn accent_style() -> Style {
-    Style::default().fg(Color::Rgb(0x6c, 0xcb, 0xff))
+    Theme::current().accent()
 }
 
 fn secondary_accent_style() -> Style {
-    Style::default().fg(Color::Rgb(0x8f, 0xa7, 0xff))
+    Theme::current().accent().add_modifier(Modifier::DIM)
 }
 
 fn fault_style() -> Style {
-    Style::default().fg(Color::Rgb(0xff, 0x6b, 0x78))
+    Theme::current().error()
+}
+
+fn success_style() -> Style {
+    Theme::current().success()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -462,24 +466,15 @@ impl HistoryCell for UserCell {
 }
 
 fn user_message_style() -> Style {
-    Style::default().bg(user_message_bg())
-}
-
-fn user_message_bg() -> Color {
-    Color::Rgb(0x32, 0x32, 0x36)
+    Theme::current().user_message()
 }
 
 fn user_message_body_style() -> Style {
-    Style::default()
-        .fg(Color::Rgb(0xee, 0xee, 0xf0))
-        .bg(user_message_bg())
+    user_message_style()
 }
 
 fn user_message_prefix_style() -> Style {
-    Style::default()
-        .fg(Color::Rgb(0xb8, 0xb8, 0xbf))
-        .bg(user_message_bg())
-        .add_modifier(Modifier::BOLD)
+    user_message_style().add_modifier(Modifier::BOLD | Modifier::DIM)
 }
 
 fn user_message_padding_line(style: Style) -> Line<'static> {
@@ -861,7 +856,7 @@ impl NoticeCell {
 
 impl HistoryCell for NoticeCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let lines = text_lines(&self.message, Style::default().add_modifier(Modifier::DIM));
+        let lines = text_lines(&self.message, Style::default());
         render_prefixed(
             &lines,
             Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
@@ -890,13 +885,9 @@ impl ErrorCell {
 
 impl HistoryCell for ErrorCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let lines = text_lines(&self.message, Style::default().add_modifier(Modifier::BOLD));
-        render_prefixed(
-            &lines,
-            Span::styled("✗ ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("  "),
-            width,
-        )
+        let style = fault_style();
+        let lines = text_lines(&self.message, style);
+        render_prefixed(&lines, Span::styled("■ ", style), Span::raw("  "), width)
     }
 
     fn raw_lines(&self) -> Vec<Line<'static>> {
@@ -1248,7 +1239,7 @@ impl ExecCall {
         } else if self.is_running() {
             Style::default().add_modifier(Modifier::DIM)
         } else {
-            accent_style().add_modifier(Modifier::BOLD)
+            success_style().add_modifier(Modifier::BOLD)
         };
         let command_lines = command_logical_lines(title, &self.command);
         let mut out = render_prefixed(
@@ -1285,7 +1276,7 @@ impl ExecCall {
         } else {
             vec![Span::styled(
                 "  ✓",
-                accent_style().add_modifier(Modifier::BOLD),
+                success_style().add_modifier(Modifier::BOLD),
             )]
         };
         if let Some(duration) = self.duration {
@@ -1424,6 +1415,15 @@ impl HistoryCell for ToolCell {
             TranscriptItemStatus::Failed => "Failed",
             TranscriptItemStatus::Cancelled => "Cancelled",
         };
+        let bullet_style = match self.status {
+            TranscriptItemStatus::Failed | TranscriptItemStatus::Cancelled => {
+                fault_style().add_modifier(Modifier::BOLD)
+            }
+            TranscriptItemStatus::Complete => success_style().add_modifier(Modifier::BOLD),
+            TranscriptItemStatus::Pending | TranscriptItemStatus::Running => {
+                Style::default().add_modifier(Modifier::DIM)
+            }
+        };
         let mut lines = vec![Line::from(vec![
             Span::styled(
                 self.title.clone(),
@@ -1442,7 +1442,7 @@ impl HistoryCell for ToolCell {
         }
         let mut out = render_prefixed(
             &lines,
-            Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("• ", bullet_style),
             Span::styled("  └ ", Style::default().add_modifier(Modifier::DIM)),
             width,
         );
@@ -1548,8 +1548,9 @@ impl HistoryCell for ApprovalCell {
             None => "? ",
         };
         let prefix_style = match self.decision {
-            Some(false) => Style::default().add_modifier(Modifier::BOLD),
-            _ => Style::default().add_modifier(Modifier::DIM),
+            Some(true) => success_style().add_modifier(Modifier::BOLD),
+            Some(false) => fault_style().add_modifier(Modifier::BOLD),
+            None => accent_style().add_modifier(Modifier::BOLD),
         };
         let mut lines = vec![Line::from(vec![
             Span::styled(self.title(), Style::default().add_modifier(Modifier::BOLD)),
@@ -4884,18 +4885,12 @@ fn compact_output_preview_lines(lines: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-fn exec_output_body_style(is_error: bool) -> Style {
-    if is_error {
-        Style::default()
-            .fg(Color::Rgb(0xd0, 0x6a, 0x6a))
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Rgb(0xb8, 0xb8, 0xbf))
-    }
+fn exec_output_body_style(_is_error: bool) -> Style {
+    Theme::current().dim()
 }
 
 fn exec_output_chrome_style() -> Style {
-    Style::default().fg(Color::Rgb(0x78, 0x78, 0x84))
+    Theme::current().dim()
 }
 
 fn is_output_hint_line(line: &str) -> bool {
@@ -5171,6 +5166,39 @@ mod tests {
     }
 
     #[test]
+    fn operational_cells_use_codex_semantic_status_colors() {
+        let completed = ExecCell::command_with_id(
+            None,
+            "cargo test",
+            TranscriptExecSource::Agent,
+            TranscriptItemStatus::Complete,
+        );
+        let completed_lines = completed.display_lines(80);
+        assert_eq!(
+            completed_lines[0].spans[0].style,
+            success_style().add_modifier(Modifier::BOLD)
+        );
+        let outcome = completed_lines
+            .iter()
+            .find_map(|line| line.spans.iter().find(|span| span.content == "  ✓"))
+            .expect("completed exec outcome");
+        assert_eq!(outcome.style, success_style().add_modifier(Modifier::BOLD));
+
+        let failed_tool = ToolCell::result("denied", true, TranscriptItemStatus::Failed);
+        assert_eq!(
+            failed_tool.display_lines(80)[0].spans[0].style,
+            fault_style().add_modifier(Modifier::BOLD)
+        );
+
+        let error_lines = ErrorCell::new("failure").display_lines(80);
+        assert_eq!(error_lines[0].spans[0].content, "■ ");
+        assert_eq!(error_lines[0].spans[0].style, fault_style());
+        assert_eq!(error_lines[0].spans[1].style, fault_style());
+
+        assert_eq!(exec_output_body_style(true), Theme::current().dim());
+    }
+
+    #[test]
     fn tool_errors_name_the_tool_without_repeating_failed() {
         let mut cell = ToolCell::calling(
             "custom_tool",
@@ -5207,9 +5235,10 @@ mod tests {
         assert_eq!(flat[0], "");
         assert!(flat[1].starts_with("› hello world"));
         assert_eq!(flat[2], "");
-        assert_eq!(lines[0].style.bg, Some(user_message_bg()));
-        assert_eq!(lines[1].style.bg, Some(user_message_bg()));
-        assert_eq!(lines[2].style.bg, Some(user_message_bg()));
+        let expected_bg = Theme::current().user_message().bg;
+        assert_eq!(lines[0].style.bg, expected_bg);
+        assert_eq!(lines[1].style.bg, expected_bg);
+        assert_eq!(lines[2].style.bg, expected_bg);
     }
 
     #[test]
