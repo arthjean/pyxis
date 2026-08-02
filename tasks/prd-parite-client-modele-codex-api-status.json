@@ -3,7 +3,7 @@
     "file": "tasks/prd-parite-client-modele-codex-api.md",
     "title": "Parité du client modèle et des API provider Codex",
     "created_at": "2026-08-01",
-    "status": "IN_PROGRESS"
+    "status": "DONE"
   },
   "epics": [
     {
@@ -49,10 +49,10 @@
     {
       "id": "EP-006",
       "title": "API auxiliaires de codex-api",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "stories_total": 4,
-      "stories_done": 0
+      "stories_done": 4
     }
   ],
   "stories": [
@@ -268,49 +268,53 @@
       "id": "US-017",
       "title": "Porter remote compact et memories",
       "epic": "EP-006",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "L",
       "blocked_by": ["US-006", "US-014"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-02T11:58:20+02:00",
+      "completed_at": "2026-08-02T12:42:45+02:00",
+      "reviewed_at": "2026-08-02T13:28:27+02:00",
+      "note": "The object-safe agent_core auxiliary surface exposes capability-gated /responses/compact and memories/trace_summarize through dyn Provider, with canonical ResponseItem inputs and outputs, bounded turn state and operation/phase errors. The core compaction transaction commits the complete validated candidate before replacing live memory; commit failure and malformed/provider/timeout paths leave the caller's transcript byte-identical."
     },
     {
       "id": "US-018",
       "title": "Porter génération et édition d'images",
       "epic": "EP-006",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "L",
       "blocked_by": ["US-014"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-02T12:14:16+02:00",
+      "completed_at": "2026-08-02T12:42:45+02:00",
+      "reviewed_at": "2026-08-02T13:28:27+02:00",
+      "note": "Canonical generation and edit contracts are callable through dyn Provider while OpenAI wire DTOs stay private to the adapter. They preserve source images, optional mask, prompt, model, quality, size, format and response metadata under the configured provider/auth scope. Binary data and signed URLs are removed from Debug and metadata projections; invalid input, malformed payloads, HTTP failures, timeouts and missing capability remain typed image operations without synthetic text."
     },
     {
       "id": "US-019",
       "title": "Porter search et le cycle de fichiers",
       "epic": "EP-006",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "L",
       "blocked_by": ["US-014"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-02T12:14:16+02:00",
+      "completed_at": "2026-08-02T12:42:45+02:00",
+      "reviewed_at": "2026-08-02T13:28:27+02:00",
+      "note": "Canonical search and file contracts are callable through dyn Provider; OpenAI projections remain adapter-local. Search has typed commands, settings, response items, results and pagination. File upload validates actual and declared size against 536870912 bytes before network, keeps create/blob/finalize under one cancellation/auth scope, sends the signed blob URL through a bare client with no provider headers, preserves Azure diagnostics, retries finalize boundedly and publishes sediment:// plus download metadata only after success."
     },
     {
       "id": "US-020",
       "title": "Porter Realtime call et Realtime WebSocket",
       "epic": "EP-006",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "L",
       "blocked_by": ["US-008", "US-014"],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-02T12:14:16+02:00",
+      "completed_at": "2026-08-02T12:42:45+02:00",
+      "reviewed_at": "2026-08-02T13:28:27+02:00",
+      "note": "Realtime call and WebSocket are callable through dyn Provider with closed V1, FramelessBidi and RealtimeV2 configuration variants, so a connection cannot emit another dialect. Routing uses the explicit provider auth scope, multipart encoding is delegated to reqwest, and dialect codecs own their session, context, audio and event contracts. Frameless sideband joins by path without reinitialization; scoped cancellation wins over reads/writes, close is bounded to five seconds, errors name connect/write/read/close, and ownership-local split halves create no background task or orphan actor."
     }
   ]
 }
