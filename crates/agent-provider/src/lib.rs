@@ -12,6 +12,7 @@
 //! later, each as a module here. Ollama is out of scope (dropped).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod bedrock;
 pub mod chatgpt;
 mod chatgpt_error;
 pub mod chatgpt_events;
@@ -25,6 +26,7 @@ pub mod openai;
 pub mod quota;
 mod responses;
 
+pub use bedrock::{AmazonBedrockConfig, AmazonBedrockProvider, BedrockAccountState};
 pub use chatgpt::{
     DEFAULT_MAX_CONTEXT, DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, KEYRING_ACCOUNT,
     OpenAiChatGptProvider,

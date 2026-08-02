@@ -44,6 +44,19 @@ hex = "0.4"
 url = "2"
 zstd = "0.13"
 thiserror = "2"
+# EP-005/US-016: the official Bedrock Runtime SDK owns AWS credential-chain
+# resolution, SigV4 and ConverseStream event framing. These releases declare an
+# MSRV of 1.94.1, within this workspace's Rust 1.95 contract.
+aws-config = { version = "1.10.1", features = ["behavior-version-latest"] }
+aws-credential-types = "1"
+aws-sdk-bedrockruntime = { version = "1.139.0", default-features = false, features = [
+    "behavior-version-latest",
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
+aws-types = "1"
 keyring = { version = "3", features = [
     "apple-native",
     "sync-secret-service",

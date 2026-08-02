@@ -30,11 +30,18 @@ thiserror.workspace = true
 # US-029: generation of the session_id (UUID v4) for prompt_cache_key. `rand` is
 # already pinned at the workspace level (agent-auth) -> no new crate downloaded.
 rand.workspace = true
+base64.workspace = true
 hex.workspace = true
 sha2.workspace = true
 tracing.workspace = true
 url.workspace = true
 zstd.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
+aws-sdk-bedrockruntime.workspace = true
+aws-smithy-runtime-api.workspace = true
+aws-smithy-types.workspace = true
+aws-types.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
