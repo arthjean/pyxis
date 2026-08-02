@@ -357,6 +357,11 @@ impl CliStepSource {
         captured: ToolDispatchSnapshot,
     ) -> (Vec<ToolSpec>, Option<ToolDispatchSnapshot>) {
         let mode = self.tool_mode();
+        // Codex keeps its legacy shell handler registered for internal callers,
+        // but hides it whenever unified exec is model-visible. Exposing both
+        // gives the model two overlapping contracts and makes it pick the
+        // smaller legacy schema for ordinary commands.
+        let captured = hide_legacy_shell_when_unified_exec(captured);
         // A model that does not drive the v2 protocol loses the six tools from
         // BOTH views, not just from what it sees: a nested call must not reach
         // an orchestration surface the model was never trained on, and a
@@ -416,6 +421,23 @@ const CODE_MODE_TOOLS: [&str; 2] = [
 
 fn is_code_mode_tool(spec: &ToolSpec) -> bool {
     CODE_MODE_TOOLS.contains(&spec.name.as_str())
+}
+
+fn hide_legacy_shell_when_unified_exec(captured: ToolDispatchSnapshot) -> ToolDispatchSnapshot {
+    let unified_exec_visible = captured
+        .specs()
+        .iter()
+        .any(|spec| spec.name == "exec_command");
+    if !unified_exec_visible {
+        return captured;
+    }
+    let visible = captured
+        .specs()
+        .iter()
+        .filter(|spec| spec.name != "bash")
+        .cloned()
+        .collect();
+    captured.with_specs(visible)
 }
 
 fn is_multi_agent_tool(spec: &ToolSpec) -> bool {
@@ -1221,14 +1243,29 @@ mod code_mode_plan_tests {
         mode: ModelToolMode,
         multi_agent: agent_core::model::MultiAgentVersion,
     ) -> Arc<CliStepSource> {
+        source_with_shell_surface(mode, multi_agent, false)
+    }
+
+    fn source_with_shell_surface(
+        mode: ModelToolMode,
+        multi_agent: agent_core::model::MultiAgentVersion,
+        unified_shell: bool,
+    ) -> Arc<CliStepSource> {
         let handle = Arc::new(CodeModeHandle::new(
             Arc::new(NoEngineFactory),
             NestedToolBinding::default(),
         ));
         let agents = Arc::new(agent_tools::AgentHandle::new());
+        let mut registry =
+            agent_tools::Registry::builder(std::env::temp_dir()).register(agent_tools::read::Read);
+        if unified_shell {
+            registry = registry
+                .register(agent_tools::Bash)
+                .register(agent_tools::ExecCommand)
+                .register(agent_tools::WriteStdin);
+        }
         let registry = Arc::new(
-            agent_tools::Registry::builder(std::env::temp_dir())
-                .register(agent_tools::read::Read)
+            registry
                 .register(ExecTool::new(Arc::clone(&handle)))
                 .register(WaitTool::new(Arc::clone(&handle)))
                 .register(agent_tools::SpawnAgent::new(Arc::clone(&agents)))
@@ -1276,6 +1313,39 @@ mod code_mode_plan_tests {
             visible(ModelToolMode::CodeModeOnly),
             vec!["exec".to_string(), "wait".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn unified_exec_hides_the_legacy_shell_from_model_and_cells() {
+        let source = source_with_shell_surface(
+            ModelToolMode::CodeMode,
+            agent_core::model::MultiAgentVersion::Disabled,
+            true,
+        );
+
+        let snapshot = source.snapshot();
+        let visible = names_of(&snapshot.tools);
+        assert!(visible.contains(&"exec_command".to_string()), "{visible:?}");
+        assert!(visible.contains(&"write_stdin".to_string()), "{visible:?}");
+        assert!(!visible.contains(&"bash".to_string()), "{visible:?}");
+
+        let nested = source
+            .code_mode
+            .as_ref()
+            .map(|handle| {
+                let mut names = handle
+                    .catalog()
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect::<Vec<_>>();
+                names.sort();
+                names
+            })
+            .unwrap_or_default();
+
+        assert!(nested.contains(&"exec_command".to_string()), "{nested:?}");
+        assert!(nested.contains(&"write_stdin".to_string()), "{nested:?}");
+        assert!(!nested.contains(&"bash".to_string()), "{nested:?}");
     }
 
     /// AC2: a `code_mode` model keeps its direct tools AND the pair.
