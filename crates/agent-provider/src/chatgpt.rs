@@ -194,6 +194,9 @@ impl OpenAiChatGptProvider {
                     // The Responses wire carries `type: "custom"` tools, so a
                     // freeform plan reaches the backend intact.
                     freeform_tools: true,
+                    namespace_tools: true,
+                    tool_search: true,
+                    web_search: true,
                 },
                 reasoning_options: ReasoningCapabilities {
                     encrypted_replay: true,

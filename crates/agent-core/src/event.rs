@@ -28,6 +28,14 @@ pub enum AgentEvent {
     /// Response/header metadata that must remain observable without becoming
     /// transcript text.
     ResponseMetadata(Box<crate::provider::ResponseMetadata>),
+    /// Provider-neutral response item lifecycle, with a bounded/redacted full
+    /// payload for transcript consumers that understand more than text/tools.
+    ResponseItem {
+        phase: crate::provider::ResponseItemPhase,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_index: Option<u64>,
+        item: Box<crate::provider::ResponseItem>,
+    },
     /// Additive provider event with a bounded and redacted payload.
     ProviderExtension(crate::provider::ProviderExtension),
     /// The backend served a response item the provider adapter does not map, so

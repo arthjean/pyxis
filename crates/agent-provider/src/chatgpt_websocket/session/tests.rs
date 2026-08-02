@@ -365,11 +365,13 @@ async fn a_late_missing_baseline_never_replays_published_events() {
             .await
             .expect("reject baseline after a delta");
         while let Some(message) = socket.next().await {
-            match message {
-                Ok(Message::Text(_)) => panic!("published events must never be replayed"),
-                Ok(Message::Close(_)) => break,
-                _ => {}
+            if matches!(&message, Ok(Message::Close(_))) {
+                break;
             }
+            assert!(
+                !matches!(message, Ok(Message::Text(_))),
+                "published events must never be replayed"
+            );
         }
     });
     let commands = spawn_actor();

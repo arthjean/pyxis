@@ -11,11 +11,17 @@
     ],
     "expected": [
       {
-        "type": "provider_extension",
+        "type": "response_item",
         "data": {
-          "extension": {
-            "event_type": "response.output_item.added",
-            "payload": { "type": "response.output_item.added", "output_index": 0, "item": { "type": "custom_tool_call", "call_id": "call_c", "id": "ctc_1", "name": "exec", "input": "" } }
+          "phase": "added",
+          "output_index": 0,
+          "item": {
+            "id": "ctc_1",
+            "kind": "custom_tool_call",
+            "payload": {
+              "event_type": "response.item.custom_tool_call",
+              "payload": { "type": "custom_tool_call", "call_id": "call_c", "id": "ctc_1", "name": "exec", "input": "" }
+            }
           }
         }
       },
@@ -23,11 +29,16 @@
       { "type": "tool_call_delta", "data": { "id": "call_c", "input_delta": "// @exec: cell\n" } },
       { "type": "tool_call_delta", "data": { "id": "call_c", "input_delta": "const n = 1;" } },
       {
-        "type": "provider_extension",
+        "type": "response_item",
         "data": {
-          "extension": {
-            "event_type": "response.output_item.done",
-            "payload": { "type": "response.output_item.done", "item": { "type": "custom_tool_call", "call_id": "call_c", "id": "ctc_1", "name": "exec", "input": "// @exec: cell\nconst n = 1;" } }
+          "phase": "done",
+          "item": {
+            "id": "ctc_1",
+            "kind": "custom_tool_call",
+            "payload": {
+              "event_type": "response.item.custom_tool_call",
+              "payload": { "type": "custom_tool_call", "call_id": "call_c", "id": "ctc_1", "name": "exec", "input": "// @exec: cell\nconst n = 1;" }
+            }
           }
         }
       },

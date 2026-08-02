@@ -266,6 +266,9 @@ pub trait Tool: Send + Sync {
     fn tool_kind(&self) -> ToolKind {
         ToolKind::Function {
             input_schema: self.input_schema(),
+            strict: true,
+            defer_loading: false,
+            output_schema: None,
         }
     }
 
@@ -344,6 +347,9 @@ pub trait DynTool: Send + Sync {
     fn kind(&self) -> ToolKind {
         ToolKind::Function {
             input_schema: self.input_schema(),
+            strict: true,
+            defer_loading: false,
+            output_schema: None,
         }
     }
     /// Nature of one call, for the clients. Declared by the tool because it is

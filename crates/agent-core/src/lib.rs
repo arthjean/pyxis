@@ -24,10 +24,12 @@ mod provider_extension;
 pub mod quota;
 pub mod redaction;
 mod request;
+mod response_item;
 mod response_metadata;
 pub mod sandbox;
 pub mod session;
 pub mod step;
+mod tool_spec;
 pub mod tools;
 pub mod transition;
 
@@ -514,6 +516,7 @@ mod loop_tests {
                     parallel_tool_calls: true,
                     strict_json_schema: false,
                     freeform_tools: false,
+                    ..crate::provider::ToolCallingCapabilities::default()
                 },
                 ..Capabilities::default()
             },

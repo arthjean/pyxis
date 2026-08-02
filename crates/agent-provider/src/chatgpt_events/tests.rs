@@ -186,12 +186,12 @@ fn terminal_items_reconstruct_complete_calls_but_reject_missing_identity() {
         });
         let events = CodexEventMapper::new().ingest(&event.to_string()).unwrap();
         assert!(matches!(
-            events.first(),
+            events.get(1),
             Some(StreamEvent::ToolCallStart { id, format, .. })
                 if id == "call_1" && *format == expected_format
         ));
         assert!(matches!(
-            events.get(1),
+            events.get(2),
             Some(StreamEvent::ToolCallInputDone { id, input: value })
                 if id == "call_1" && value == input
         ));
@@ -452,16 +452,20 @@ fn known_and_unknown_output_items_preserve_complete_bounded_payloads() {
         r#"{"type":"response.output_item.added","output_index":2,"item":{"type":"message","id":"msg_1","status":"in_progress","content":[]}}"#,
         r#"{"type":"response.output_item.done","output_index":3,"item":{"type":"web_search_call","id":"ws_1","status":"completed"}}"#,
     ]);
-    assert!(extensions(&events).iter().any(|extension| {
-        extension.event_type() == "response.output_item.added"
-            && extension.payload()["item"]["id"] == "msg_1"
-            && extension.payload()["output_index"] == 2
-    }));
     assert!(events.iter().any(|event| matches!(
         event,
-        StreamEvent::UnmappedItem { item_type, extension: Some(extension) }
-            if item_type == "web_search_call"
-                && extension.payload()["id"] == "ws_1"
+        StreamEvent::ResponseItem {
+            phase: ResponseItemPhase::Added,
+            output_index: Some(2),
+            item,
+        } if item.kind() == &ResponseItemKind::Message
+            && item.payload().payload()["id"] == "msg_1"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::ResponseItem { phase: ResponseItemPhase::Done, item, .. }
+            if item.kind() == &ResponseItemKind::WebSearchCall
+                && item.payload().payload()["id"] == "ws_1"
     )));
 }
 
@@ -483,7 +487,7 @@ fn known_output_item_frames_without_an_item_remain_observable() {
 
 #[test]
 fn encrypted_reasoning_is_gated_but_reasoning_metadata_is_not() {
-    let event = r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","status":"completed","encrypted_content":"opaque"}}"#;
+    let event = r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","status":"completed","summary":[],"encrypted_content":"opaque"}}"#;
     let without_replay = CodexEventMapper::new().ingest(event).unwrap();
     assert!(
         !without_replay
@@ -496,4 +500,57 @@ fn encrypted_reasoning_is_gated_but_reasoning_metadata_is_not() {
         StreamEvent::EncryptedReasoning { id, encrypted_content }
             if id == "rs_1" && encrypted_content == "opaque"
     )));
+}
+
+#[test]
+fn item_identity_cannot_change_between_added_and_done() {
+    let mut mapper = CodexEventMapper::new();
+    mapper
+        .ingest(r#"{"type":"response.output_item.added","output_index":4,"item":{"type":"web_search_call","id":"ws_1","status":"in_progress"}}"#)
+        .unwrap();
+    let error = mapper
+        .ingest(r#"{"type":"response.output_item.done","output_index":4,"item":{"type":"image_generation_call","id":"ig_1","status":"completed","result":"bytes"}}"#)
+        .expect_err("identity mutation is a contract failure");
+    assert!(
+        matches!(error, ProviderError::Decode(message) if message.contains("identity changed"))
+    );
+}
+
+#[test]
+fn item_identity_rejects_a_wrong_index_even_when_the_id_matches() {
+    let mut mapper = CodexEventMapper::new();
+    mapper
+        .ingest(r#"{"type":"response.output_item.added","output_index":4,"item":{"type":"web_search_call","id":"ws_1","status":"in_progress"}}"#)
+        .unwrap();
+    let error = mapper
+        .ingest(r#"{"type":"response.output_item.done","output_index":5,"item":{"type":"web_search_call","id":"ws_1","status":"completed"}}"#)
+        .expect_err("both identity coordinates must agree");
+    assert!(
+        matches!(error, ProviderError::Decode(message) if message.contains("identity changed"))
+    );
+}
+
+#[test]
+fn completed_rejects_an_output_item_without_a_terminal_pair() {
+    let mut mapper = CodexEventMapper::new();
+    mapper
+        .ingest(r#"{"type":"response.output_item.added","output_index":4,"item":{"type":"web_search_call","id":"ws_1","status":"in_progress"}}"#)
+        .unwrap();
+    let error = mapper
+        .ingest(r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed"}}"#)
+        .expect_err("terminal success cannot strand an open item");
+    assert!(matches!(
+        error,
+        ProviderError::Decode(message) if message.contains("output item(s) still open")
+    ));
+}
+
+#[test]
+fn malformed_known_item_fails_before_publication() {
+    let error = CodexEventMapper::new()
+        .ingest(r#"{"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","name":"read"}}"#)
+        .expect_err("missing call identity and arguments are not publishable");
+    assert!(
+        matches!(error, ProviderError::Decode(message) if message.contains("malformed known response item"))
+    );
 }

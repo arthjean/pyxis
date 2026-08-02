@@ -25,17 +25,47 @@ pub struct ProviderExtension {
 
 impl ProviderExtension {
     pub fn from_value(event_type: impl Into<String>, payload: Value) -> Self {
+        Self::from_value_with_redaction(event_type, payload, false)
+    }
+
+    /// Builds an extension after a caller has already removed a payload that is
+    /// sensitive by contract rather than by field name (for example generated
+    /// image bytes). The flag remains observable after the value is replaced.
+    pub fn from_value_with_redaction(
+        event_type: impl Into<String>,
+        payload: Value,
+        already_redacted: bool,
+    ) -> Self {
+        Self::build(event_type, payload, already_redacted, None)
+    }
+
+    pub fn from_redacted_value(
+        event_type: impl Into<String>,
+        payload: Value,
+        original_bytes: u64,
+    ) -> Self {
+        Self::build(event_type, payload, true, Some(original_bytes))
+    }
+
+    fn build(
+        event_type: impl Into<String>,
+        payload: Value,
+        already_redacted: bool,
+        original_bytes_override: Option<u64>,
+    ) -> Self {
         let event_type: String = event_type
             .into()
             .chars()
             .take(MAX_PROVIDER_EXTENSION_TYPE_CHARS)
             .collect();
         let (event_type, type_redacted) = redact_string(event_type);
-        let original_bytes = serde_json::to_vec(&payload)
-            .map(|bytes| bytes.len() as u64)
-            .unwrap_or(u64::MAX);
+        let original_bytes = original_bytes_override.unwrap_or_else(|| {
+            serde_json::to_vec(&payload)
+                .map(|bytes| bytes.len() as u64)
+                .unwrap_or(u64::MAX)
+        });
         let (payload, payload_redacted) = redact_json_value(payload);
-        let redacted = type_redacted || payload_redacted;
+        let redacted = already_redacted || type_redacted || payload_redacted;
         if original_bytes > MAX_PROVIDER_EXTENSION_BYTES as u64 {
             return Self {
                 event_type,

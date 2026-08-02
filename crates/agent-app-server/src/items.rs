@@ -45,6 +45,11 @@ pub enum Projected {
         delta: String,
     },
     ResponseMetadata(Box<agent_core::provider::ResponseMetadata>),
+    ResponseItem {
+        phase: agent_core::provider::ResponseItemPhase,
+        output_index: Option<u64>,
+        item: Box<agent_core::provider::ResponseItem>,
+    },
     ProviderExtension(agent_core::provider::ProviderExtension),
 }
 
@@ -142,6 +147,15 @@ impl Projector {
             AgentEvent::ResponseMetadata(metadata) => {
                 vec![Projected::ResponseMetadata(metadata.clone())]
             }
+            AgentEvent::ResponseItem {
+                phase,
+                output_index,
+                item,
+            } => vec![Projected::ResponseItem {
+                phase: *phase,
+                output_index: *output_index,
+                item: item.clone(),
+            }],
             AgentEvent::ProviderExtension(extension) => {
                 vec![Projected::ProviderExtension(extension.clone())]
             }
@@ -635,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn response_metadata_and_unknown_items_are_never_lost_by_the_projector() {
+    fn response_metadata_and_response_items_are_never_lost_by_the_projector() {
         let mut projector = Projector::default();
         let metadata = agent_core::provider::ResponseMetadata {
             response_id: Some("resp_1".into()),
@@ -666,6 +680,26 @@ mod tests {
                 .engine(&AgentEvent::ResponseMetadata(Box::new(metadata)))
                 .as_slice(),
             [Projected::ResponseMetadata(metadata)] if metadata.response_id.as_deref() == Some("resp_1")
+        ));
+
+        let item = agent_core::provider::ResponseItem::from_wire(&serde_json::json!({
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "search", "query": "safe"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            projector
+                .engine(&AgentEvent::ResponseItem {
+                    phase: agent_core::provider::ResponseItemPhase::Done,
+                    output_index: Some(2),
+                    item: Box::new(item),
+                })
+                .as_slice(),
+            [Projected::ResponseItem { phase, output_index: Some(2), item }]
+                if *phase == agent_core::provider::ResponseItemPhase::Done
+                    && item.id() == Some("ws_1")
         ));
 
         let extension = agent_core::provider::ProviderExtension::from_value(

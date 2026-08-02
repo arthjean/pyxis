@@ -14,27 +14,27 @@
     ],
     "expected": [
       {
-        "type": "provider_extension",
-        "data": { "extension": { "event_type": "response.output_item.added", "payload": { "type": "response.output_item.added", "output_index": 0, "item": { "type": "custom_tool_call", "call_id": "call_c", "id": "ctc_1", "name": "exec", "input": "" } } } }
+        "type": "response_item",
+        "data": { "phase": "added", "output_index": 0, "item": { "id": "ctc_1", "kind": "custom_tool_call", "payload": { "event_type": "response.item.custom_tool_call", "payload": { "type": "custom_tool_call", "call_id": "call_c", "id": "ctc_1", "name": "exec", "input": "" } } } }
       },
       { "type": "tool_call_start", "data": { "id": "call_c", "name": "exec", "format": "text" } },
       { "type": "tool_call_delta", "data": { "id": "call_c", "input_delta": "partial(" } },
       { "type": "tool_call_delta", "data": { "id": "call_c", "input_delta": "partial(" } },
       {
-        "type": "provider_extension",
-        "data": { "extension": { "event_type": "response.output_item.done", "payload": { "type": "response.output_item.done", "item": { "type": "custom_tool_call", "call_id": "call_c", "id": "ctc_1", "name": "exec", "input": "final()" } } } }
+        "type": "response_item",
+        "data": { "phase": "done", "item": { "id": "ctc_1", "kind": "custom_tool_call", "payload": { "event_type": "response.item.custom_tool_call", "payload": { "type": "custom_tool_call", "call_id": "call_c", "id": "ctc_1", "name": "exec", "input": "final()" } } } }
       },
       { "type": "tool_call_input_done", "data": { "id": "call_c", "input": "final()" } },
       { "type": "tool_call_end", "data": { "id": "call_c" } },
       {
-        "type": "provider_extension",
-        "data": { "extension": { "event_type": "response.output_item.added", "payload": { "type": "response.output_item.added", "output_index": 1, "item": { "type": "function_call", "call_id": "call_f", "id": "fc_1", "name": "read", "arguments": "" } } } }
+        "type": "response_item",
+        "data": { "phase": "added", "output_index": 1, "item": { "id": "fc_1", "kind": "function_call", "payload": { "event_type": "response.item.function_call", "payload": { "type": "function_call", "call_id": "call_f", "id": "fc_1", "name": "read", "arguments": "" } } } }
       },
       { "type": "tool_call_start", "data": { "id": "call_f", "name": "read", "format": "json" } },
       { "type": "tool_call_delta", "data": { "id": "call_f", "input_delta": "{\"path\":\"stale\"}" } },
       {
-        "type": "provider_extension",
-        "data": { "extension": { "event_type": "response.output_item.done", "payload": { "type": "response.output_item.done", "item": { "type": "function_call", "call_id": "call_f", "id": "fc_1", "name": "read", "arguments": "{\"path\":\"fresh\"}" } } } }
+        "type": "response_item",
+        "data": { "phase": "done", "item": { "id": "fc_1", "kind": "function_call", "payload": { "event_type": "response.item.function_call", "payload": { "type": "function_call", "call_id": "call_f", "id": "fc_1", "name": "read", "arguments": "{\"path\":\"fresh\"}" } } } }
       },
       { "type": "tool_call_input_done", "data": { "id": "call_f", "input": "{\"path\":\"fresh\"}" } },
       { "type": "tool_call_end", "data": { "id": "call_f" } },

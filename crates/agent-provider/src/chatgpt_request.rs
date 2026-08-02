@@ -29,7 +29,9 @@ use agent_core::message::{
     ContentBlock, INTERRUPTED_TOOL_RESULT, Message, Role, ToolCallFormat, unanswered_tool_calls,
 };
 use agent_core::model::ResponsesDialect;
-use agent_core::provider::{CanonicalRequest, GrammarSyntax, ToolKind, ToolSpec};
+use agent_core::provider::{
+    CanonicalRequest, GrammarSyntax, ToolKind, ToolSpec, WebSearchContextSize,
+};
 use serde_json::{Value, json};
 
 #[derive(Debug, Clone, Copy)]
@@ -456,34 +458,108 @@ fn untrusted_tool_output_payload(
 /// before exposure); a freeform tool becomes `type: "custom"` and carries its
 /// grammar, never a fabricated `parameters` object.
 fn build_tools(tools: &[ToolSpec]) -> Value {
-    let arr: Vec<Value> = tools
-        .iter()
-        .map(|t| match &t.kind {
-            ToolKind::Function { input_schema } => json!({
-                "type": "function",
-                "name": t.name,
-                "description": t.description,
-                "parameters": input_schema,
-                "strict": true,
-            }),
-            ToolKind::Freeform { grammar } => json!({
-                "type": "custom",
-                "name": t.name,
-                "description": t.description,
-                "format": match grammar {
-                    Some(grammar) => json!({
-                        "type": "grammar",
-                        "syntax": match grammar.syntax {
-                            GrammarSyntax::Lark => "lark",
-                        },
-                        "definition": grammar.definition,
-                    }),
-                    None => json!({ "type": "text" }),
-                },
-            }),
-        })
-        .collect();
+    let arr: Vec<Value> = tools.iter().map(tool_wire).collect();
     Value::Array(arr)
+}
+
+fn tool_wire(tool: &ToolSpec) -> Value {
+    match &tool.kind {
+        ToolKind::Function {
+            input_schema,
+            strict,
+            defer_loading,
+            ..
+        } => {
+            let mut value = json!({
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": input_schema,
+                "strict": strict,
+            });
+            if *defer_loading {
+                value["defer_loading"] = Value::Bool(true);
+            }
+            value
+        }
+        ToolKind::Freeform { grammar } => json!({
+            "type": "custom",
+            "name": tool.name,
+            "description": tool.description,
+            "format": match grammar {
+                Some(grammar) => json!({
+                    "type": "grammar",
+                    "syntax": match grammar.syntax {
+                        GrammarSyntax::Lark => "lark",
+                    },
+                    "definition": grammar.definition,
+                }),
+                None => json!({ "type": "text" }),
+            },
+        }),
+        ToolKind::Namespace { tools } => json!({
+            "type": "namespace",
+            "name": tool.name,
+            "description": tool.description,
+            "tools": tools.iter().map(tool_wire).collect::<Vec<_>>(),
+        }),
+        ToolKind::ToolSearch {
+            execution,
+            parameters,
+        } => json!({
+            "type": "tool_search",
+            "execution": execution,
+            "description": tool.description,
+            "parameters": parameters,
+        }),
+        ToolKind::WebSearch {
+            external_web_access,
+            indexed_web_access,
+            filters,
+            location,
+            context_size,
+            content_types,
+        } => {
+            let mut value = json!({"type": "web_search"});
+            if let Some(access) = external_web_access {
+                value["external_web_access"] = Value::Bool(*access);
+            }
+            if let Some(access) = indexed_web_access {
+                value["indexed_web_access"] = Value::Bool(*access);
+            }
+            if let Some(filters) = filters {
+                value["filters"] = json!({"allowed_domains": filters.allowed_domains});
+            }
+            if let Some(location) = location {
+                let mut wire = json!({"type": "approximate"});
+                for (key, field) in [
+                    ("country", location.country.as_deref()),
+                    ("region", location.region.as_deref()),
+                    ("city", location.city.as_deref()),
+                    ("timezone", location.timezone.as_deref()),
+                ] {
+                    if let Some(field) = field {
+                        wire[key] = Value::String(field.to_string());
+                    }
+                }
+                value["user_location"] = wire;
+            }
+            if let Some(size) = context_size {
+                value["search_context_size"] = Value::String(
+                    match size {
+                        WebSearchContextSize::Low => "low",
+                        WebSearchContextSize::Medium => "medium",
+                        WebSearchContextSize::High => "high",
+                    }
+                    .into(),
+                );
+            }
+            if !content_types.is_empty() {
+                value["search_content_types"] = json!(content_types);
+            }
+            value
+        }
+    }
 }
 
 #[cfg(test)]

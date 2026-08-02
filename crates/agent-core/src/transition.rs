@@ -252,6 +252,7 @@ impl Accumulator {
             StreamEvent::Usage { .. }
             | StreamEvent::Quota { .. }
             | StreamEvent::ResponseMetadata { .. }
+            | StreamEvent::ResponseItem { .. }
             | StreamEvent::ProviderExtension { .. }
             | StreamEvent::UnmappedItem { .. }
             | StreamEvent::ReasoningReplayDisabled { .. } => {}

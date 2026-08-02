@@ -12,11 +12,17 @@
     ],
     "expected": [
       {
-        "type": "provider_extension",
+        "type": "response_item",
         "data": {
-          "extension": {
-            "event_type": "response.output_item.added",
-            "payload": { "type": "response.output_item.added", "output_index": 0, "item": { "type": "function_call", "call_id": "call_f", "id": "fc_1", "name": "read", "arguments": "" } }
+          "phase": "added",
+          "output_index": 0,
+          "item": {
+            "id": "fc_1",
+            "kind": "function_call",
+            "payload": {
+              "event_type": "response.item.function_call",
+              "payload": { "type": "function_call", "call_id": "call_f", "id": "fc_1", "name": "read", "arguments": "" }
+            }
           }
         }
       },
@@ -33,11 +39,16 @@
         }
       },
       {
-        "type": "provider_extension",
+        "type": "response_item",
         "data": {
-          "extension": {
-            "event_type": "response.output_item.done",
-            "payload": { "type": "response.output_item.done", "item": { "type": "function_call", "call_id": "call_f", "id": "fc_1", "name": "read", "arguments": "{\"path\":\"a.txt\"}" } }
+          "phase": "done",
+          "item": {
+            "id": "fc_1",
+            "kind": "function_call",
+            "payload": {
+              "event_type": "response.item.function_call",
+              "payload": { "type": "function_call", "call_id": "call_f", "id": "fc_1", "name": "read", "arguments": "{\"path\":\"a.txt\"}" }
+            }
           }
         }
       },

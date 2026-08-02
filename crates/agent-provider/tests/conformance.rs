@@ -247,18 +247,17 @@ fn every_output_item_is_mapped_or_preserved_with_its_type_and_position() {
                     path.display()
                 )
             });
-            if MAPPED_OUTPUT_ITEM_TYPES.contains(&item_type) {
-                continue;
-            }
             assert!(
                 produced.iter().any(|event| matches!(
                     event,
-                    StreamEvent::UnmappedItem {
-                        item_type: found,
-                        extension: Some(extension),
-                    } if found == item_type
-                        && extension.event_type().contains(item_type)
-                        && !extension.is_truncated()
+                    StreamEvent::ResponseItem {
+                        phase: _,
+                        output_index: _,
+                        item,
+                    } if item.kind().wire_type() == item_type
+                        && MAPPED_OUTPUT_ITEM_TYPES.contains(&item_type) != item.kind().is_other()
+                        && item.payload().event_type().contains(item_type)
+                        && !item.payload().is_truncated()
                 )),
                 "{} ({}): additive item `{item_type}` at position {index} was not preserved",
                 fixture.name,

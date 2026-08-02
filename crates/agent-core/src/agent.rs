@@ -1182,6 +1182,17 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     yield AgentEvent::ResponseMetadata(metadata);
                                 }
                             }
+                            Ok(StreamEvent::ResponseItem {
+                                phase,
+                                output_index,
+                                item,
+                            }) => {
+                                yield AgentEvent::ResponseItem {
+                                    phase,
+                                    output_index,
+                                    item,
+                                };
+                            }
                             Ok(StreamEvent::ProviderExtension { extension }) => {
                                 yield AgentEvent::ProviderExtension(extension);
                             }

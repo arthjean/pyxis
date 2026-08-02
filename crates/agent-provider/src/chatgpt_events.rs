@@ -8,8 +8,8 @@
 
 use agent_core::message::ToolCallFormat;
 use agent_core::provider::{
-    ProviderError, ProviderErrorCategory, ProviderExtension, ReasoningMetadata, ResponseMetadata,
-    StopReason, StreamEvent, TokenUsage,
+    ProviderError, ProviderErrorCategory, ProviderExtension, ReasoningMetadata, ResponseItem,
+    ResponseItemKind, ResponseItemPhase, ResponseMetadata, StopReason, StreamEvent, TokenUsage,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -21,14 +21,117 @@ struct ActiveCall {
     call_id: String,
     args: String,
     format: ToolCallFormat,
+    output_index: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct AddedItem {
+    output_index: Option<u64>,
+    id: Option<String>,
+    kind: ResponseItemKind,
+}
+
+#[derive(Default)]
+struct ItemLifecycle {
+    open: Vec<AddedItem>,
+}
+
+impl ItemLifecycle {
+    fn add(&mut self, item: AddedItem) -> Result<(), ProviderError> {
+        if let Some(index) = item.output_index
+            && self
+                .open
+                .iter()
+                .any(|candidate| candidate.output_index == Some(index))
+        {
+            return Err(ProviderError::Decode(format!(
+                "duplicate response item output_index {index}"
+            )));
+        }
+        if let Some(id) = item.id.as_deref()
+            && self
+                .open
+                .iter()
+                .any(|candidate| candidate.id.as_deref() == Some(id))
+        {
+            return Err(ProviderError::Decode(format!(
+                "duplicate response item id {id}"
+            )));
+        }
+        self.open.push(item);
+        Ok(())
+    }
+
+    fn finish(
+        &mut self,
+        output_index: Option<u64>,
+        id: Option<&str>,
+        kind: &ResponseItemKind,
+    ) -> Result<(), ProviderError> {
+        let by_index = output_index.and_then(|index| {
+            self.open
+                .iter()
+                .position(|candidate| candidate.output_index == Some(index))
+        });
+        let by_id = id.and_then(|id| {
+            self.open
+                .iter()
+                .position(|candidate| candidate.id.as_deref() == Some(id))
+        });
+        if matches!((by_index, by_id), (Some(left), Some(right)) if left != right) {
+            return Err(identity_changed());
+        }
+        let Some(position) = by_index.or(by_id) else {
+            // Responses may send a complete terminal item without its opening.
+            return Ok(());
+        };
+        let added = &self.open[position];
+        if output_index.is_some_and(|index| added.output_index != Some(index))
+            || id.is_some_and(|id| added.id.as_deref() != Some(id))
+            || &added.kind != kind
+        {
+            return Err(identity_changed());
+        }
+        self.open.swap_remove(position);
+        Ok(())
+    }
+
+    fn ensure_closed(&self) -> Result<(), ProviderError> {
+        if self.open.is_empty() {
+            return Ok(());
+        }
+        Err(ProviderError::Decode(format!(
+            "response completed with {} output item(s) still open",
+            self.open.len()
+        )))
+    }
+}
+
+fn identity_changed() -> ProviderError {
+    ProviderError::Decode("response output item identity changed between added and done".into())
 }
 
 /// Responses output item types this mapper knowingly handles: projected here
 /// (`function_call`, `custom_tool_call`, `reasoning`) or carried by their own
 /// delta events (`message`). The conformance suite reads it so an item the
 /// wire starts sending fails a test instead of disappearing from the stream.
-pub const MAPPED_OUTPUT_ITEM_TYPES: &[&str] =
-    &["message", "reasoning", "function_call", "custom_tool_call"];
+pub const MAPPED_OUTPUT_ITEM_TYPES: &[&str] = &[
+    "message",
+    "agent_message",
+    "reasoning",
+    "local_shell_call",
+    "function_call",
+    "function_call_output",
+    "custom_tool_call",
+    "custom_tool_call_output",
+    "tool_search_call",
+    "tool_search_output",
+    "web_search_call",
+    "image_generation_call",
+    "compaction",
+    "compaction_trigger",
+    "context_compaction",
+];
 
 /// Baseline lifecycle events preserved as extensions because the canonical
 /// vocabulary has no dedicated projection for them.
@@ -46,8 +149,7 @@ const KNOWN_UNPROJECTED_EVENTS: &[&str] = &[
 #[derive(Default)]
 pub struct CodexEventMapper {
     active: HashMap<String, ActiveCall>,
-    output_index_to_item: HashMap<u64, String>,
-    last_active_item: Option<String>,
+    item_lifecycle: ItemLifecycle,
     /// Has at least one tool call been emitted? (overrides stop `completed` -> `ToolUse`).
     saw_tool_call: bool,
     /// US-031: capture the encrypted reasoning items for replay? The raw mapper
@@ -103,7 +205,7 @@ impl CodexEventMapper {
             | "response.reasoning_summary_part.done"
             | "response.reasoning_summary_text.done"
             | "response.reasoning_text.done" => Ok(vec![extension_event(typ, &v)]),
-            "response.output_item.added" => Ok(self.on_item_added(&v)),
+            "response.output_item.added" => self.on_item_added(&v),
             "response.function_call_arguments.delta" => {
                 if let (Some(key), Some(delta)) = (
                     self.event_item_key(&v, "function_call_arguments.delta")?,
@@ -224,20 +326,14 @@ impl CodexEventMapper {
         Ok(events)
     }
 
-    fn on_item_added(&mut self, v: &Value) -> Vec<StreamEvent> {
+    fn on_item_added(&mut self, v: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
         let item = match v.get("item") {
             Some(i) => i,
-            None => return vec![extension_event("response.output_item.added", v)],
+            None => return Ok(vec![extension_event("response.output_item.added", v)]),
         };
+        let item_event = self.response_item_event(v, ResponseItemPhase::Added)?;
         let Some(format) = call_format(item) else {
-            if item
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|item_type| MAPPED_OUTPUT_ITEM_TYPES.contains(&item_type))
-            {
-                return vec![extension_event("response.output_item.added", v)];
-            }
-            return unmapped_item_event(item, "added");
+            return Ok(vec![item_event]);
         };
         let call_id = item
             .get("call_id")
@@ -252,27 +348,30 @@ impl CodexEventMapper {
         // Input is often "" at opening time; we accumulate what follows.
         let args = initial_call_input(item, format).to_string();
         let item_id = item_id(item).unwrap_or(call_id.as_str()).to_string();
-        if let Some(index) = v.get("output_index").and_then(Value::as_u64) {
-            self.output_index_to_item.insert(index, item_id.clone());
-        }
+        let output_index = v.get("output_index").and_then(Value::as_u64);
         self.saw_tool_call = true;
-        self.last_active_item = Some(item_id.clone());
+        if self.active.contains_key(&item_id) {
+            return Err(ProviderError::Decode(format!(
+                "duplicate active response item {item_id}"
+            )));
+        }
         self.active.insert(
             item_id,
             ActiveCall {
                 call_id: call_id.clone(),
                 args,
                 format,
+                output_index,
             },
         );
-        vec![
-            extension_event("response.output_item.added", v),
+        Ok(vec![
+            item_event,
             StreamEvent::ToolCallStart {
                 id: call_id,
                 name,
                 format,
             },
-        ]
+        ])
     }
 
     fn on_item_done(&mut self, v: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
@@ -288,7 +387,7 @@ impl CodexEventMapper {
                 None => return Ok(Vec::new()),
             };
             let mut events = vec![
-                extension_event("response.output_item.done", v),
+                self.response_item_event(v, ResponseItemPhase::Done)?,
                 StreamEvent::ResponseMetadata {
                     metadata: Box::new(ResponseMetadata {
                         reasoning: ReasoningMetadata {
@@ -324,26 +423,21 @@ impl CodexEventMapper {
         let Some(item) = v.get("item") else {
             return Ok(vec![extension_event("response.output_item.done", v)]);
         };
+        let item_event = self.response_item_event(v, ResponseItemPhase::Done)?;
         let Some(format) = call_format(item) else {
-            if item
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|item_type| MAPPED_OUTPUT_ITEM_TYPES.contains(&item_type))
-            {
-                return Ok(vec![extension_event("response.output_item.done", v)]);
-            }
-            // Everything outside the mapped set is content we cannot read. It is
-            // REPORTED rather than dropped: a web search or an image generation
-            // served by the backend would otherwise leave no trace at all.
-            return Ok(unmapped_item_event(item, "done"));
+            return Ok(vec![item_event]);
         };
         // The terminal item is authoritative over every delta that preceded it.
         let item_args = terminal_call_input(item, format);
         let Some(key) = self.event_item_key(v, "output_item.done")? else {
-            return self.reconstruct_done_call(item, format);
+            let mut events = vec![item_event];
+            events.extend(self.reconstruct_done_call(item, format)?);
+            return Ok(events);
         };
         let Some(active) = self.active.remove(&key) else {
-            return self.reconstruct_done_call(item, format);
+            let mut events = vec![item_event];
+            events.extend(self.reconstruct_done_call(item, format)?);
+            return Ok(events);
         };
         if active.format != format {
             return Err(ProviderError::Decode(format!(
@@ -351,14 +445,11 @@ impl CodexEventMapper {
                 active.call_id
             )));
         }
-        if self.last_active_item.as_deref() == Some(key.as_str()) {
-            self.last_active_item = None;
-        }
         let args = match item_args {
             Some(a) if !a.is_empty() => a.to_string(),
             _ => active.args,
         };
-        let mut out = vec![extension_event("response.output_item.done", v)];
+        let mut out = vec![item_event];
         // Deltas were emitted at arrival time. The terminal item is carried as
         // an authoritative replacement, never as a duplicate delta.
         if !args.is_empty() {
@@ -369,6 +460,36 @@ impl CodexEventMapper {
         }
         out.push(StreamEvent::ToolCallEnd { id: active.call_id });
         Ok(out)
+    }
+
+    fn response_item_event(
+        &mut self,
+        event: &Value,
+        phase: ResponseItemPhase,
+    ) -> Result<StreamEvent, ProviderError> {
+        let value = event.get("item").ok_or_else(|| {
+            ProviderError::Decode("response output item event is missing item".into())
+        })?;
+        let item = ResponseItem::from_wire_at_phase(value, phase).map_err(|error| {
+            ProviderError::Decode(format!("malformed known response item: {error}"))
+        })?;
+        let output_index = event.get("output_index").and_then(Value::as_u64);
+        match phase {
+            ResponseItemPhase::Added => self.item_lifecycle.add(AddedItem {
+                output_index,
+                id: item.id().map(str::to_string),
+                kind: item.kind().clone(),
+            })?,
+            ResponseItemPhase::Done => {
+                self.item_lifecycle
+                    .finish(output_index, item.id(), item.kind())?
+            }
+        }
+        Ok(StreamEvent::ResponseItem {
+            phase,
+            output_index,
+            item: Box::new(item),
+        })
     }
 
     /// Terminal item for a call whose opening was never observed. The item
@@ -419,7 +540,10 @@ impl CodexEventMapper {
             return Ok(Some(id.to_string()));
         }
         if let Some(index) = v.get("output_index").and_then(Value::as_u64)
-            && let Some(id) = self.output_index_to_item.get(&index)
+            && let Some((id, _)) = self
+                .active
+                .iter()
+                .find(|(_, active)| active.output_index == Some(index))
         {
             return Ok(Some(id.clone()));
         }
@@ -450,6 +574,13 @@ impl CodexEventMapper {
     }
 
     fn on_completed(&mut self, v: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
+        self.item_lifecycle.ensure_closed()?;
+        if !self.active.is_empty() {
+            return Err(ProviderError::Decode(format!(
+                "response completed with {} tool call(s) still open",
+                self.active.len()
+            )));
+        }
         let response = v.get("response");
         if response
             .and_then(|response| response.get("id"))
@@ -539,34 +670,6 @@ fn call_format(item: &Value) -> Option<ToolCallFormat> {
         Some("custom_tool_call") => Some(ToolCallFormat::Text),
         _ => None,
     }
-}
-
-/// Reports an output item this mapper cannot read, and nothing at all for the
-/// types it handles elsewhere (`message` travels through its own text deltas,
-/// `reasoning` is captured before this point). An item with no readable `type`
-/// is reported under a placeholder rather than ignored: a malformed item is
-/// still an item we dropped.
-fn unmapped_item_event(item: &Value, phase: &str) -> Vec<StreamEvent> {
-    let raw_item_type = item
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("<untyped>");
-    let item_type: String = raw_item_type.chars().take(128).collect();
-    let item_type = if item_type.is_empty()
-        || !item_type.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
-        }) {
-        "<invalid-type>".to_string()
-    } else {
-        item_type
-    };
-    vec![StreamEvent::UnmappedItem {
-        item_type: item_type.clone(),
-        extension: Some(ProviderExtension::from_value(
-            format!("response.item.{item_type}.{phase}"),
-            item.clone(),
-        )),
-    }]
 }
 
 /// Input carried by an opening item: `arguments` for a function call,

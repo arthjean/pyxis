@@ -1,0 +1,127 @@
+{
+  "name": "complete Responses tool algebra",
+  "note": "EP-004/US-011: function options, namespace, tool search and web search keep their canonical values on the Responses wire.",
+  "request": {
+    "canonical": {
+      "model": "gpt-5.5",
+      "messages": [
+        { "role": "user", "content": [{ "type": "text", "text": "go" }] }
+      ],
+      "tools": [
+        {
+          "name": "records",
+          "description": "record tools",
+          "kind": "namespace",
+          "tools": [
+            {
+              "name": "lookup",
+              "description": "looks up a record",
+              "kind": "function",
+              "input_schema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } }
+              },
+              "strict": false,
+              "defer_loading": true,
+              "output_schema": {
+                "type": "object",
+                "properties": { "found": { "type": "boolean" } }
+              }
+            }
+          ]
+        },
+        {
+          "name": "tool_search",
+          "description": "find relevant tools",
+          "kind": "tool_search",
+          "execution": "client",
+          "parameters": {
+            "type": "object",
+            "properties": { "query": { "type": "string" } }
+          }
+        },
+        {
+          "name": "web_search",
+          "description": "",
+          "kind": "web_search",
+          "external_web_access": true,
+          "indexed_web_access": false,
+          "filters": { "allowed_domains": ["example.com"] },
+          "location": {
+            "country": "FR",
+            "city": "Paris",
+            "timezone": "Europe/Paris"
+          },
+          "context_size": "high",
+          "content_types": ["text", "image"]
+        }
+      ],
+      "max_output_tokens": 4096
+    },
+    "options": {
+      "reasoning_effort": null,
+      "include_encrypted_reasoning": false,
+      "parallel_tool_calls": true,
+      "text_verbosity": "low",
+      "dialect": "standard"
+    },
+    "body": {
+      "model": "gpt-5.5",
+      "store": false,
+      "stream": true,
+      "tool_choice": "auto",
+      "parallel_tool_calls": true,
+      "text": { "verbosity": "low" },
+      "input": [
+        {
+          "type": "message",
+          "role": "user",
+          "content": [{ "type": "input_text", "text": "go" }]
+        }
+      ],
+      "tools": [
+        {
+          "type": "namespace",
+          "name": "records",
+          "description": "record tools",
+          "tools": [
+            {
+              "type": "function",
+              "name": "lookup",
+              "description": "looks up a record",
+              "parameters": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } }
+              },
+              "strict": false,
+              "defer_loading": true
+            }
+          ]
+        },
+        {
+          "type": "tool_search",
+          "execution": "client",
+          "description": "find relevant tools",
+          "parameters": {
+            "type": "object",
+            "properties": { "query": { "type": "string" } }
+          }
+        },
+        {
+          "type": "web_search",
+          "external_web_access": true,
+          "indexed_web_access": false,
+          "filters": { "allowed_domains": ["example.com"] },
+          "user_location": {
+            "type": "approximate",
+            "country": "FR",
+            "city": "Paris",
+            "timezone": "Europe/Paris"
+          },
+          "search_context_size": "high",
+          "search_content_types": ["text", "image"]
+        }
+      ]
+    }
+  }
+}

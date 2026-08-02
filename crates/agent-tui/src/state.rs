@@ -1239,7 +1239,9 @@ impl AppState {
                     "reasoning replay disabled: {reason}"
                 )));
             }
-            AgentEvent::ResponseMetadata(_) => {}
+            // Semantic text/tool events render the same lifecycle in the TUI;
+            // the canonical item itself remains available to app-server users.
+            AgentEvent::ResponseItem { .. } | AgentEvent::ResponseMetadata(_) => {}
             AgentEvent::ProviderExtension(extension) => {
                 self.blocks.push(Block::Notice(format!(
                     "the backend sent an additive `{}` event",

@@ -18,7 +18,8 @@ use serde_json::Value;
 use crate::jsonrpc::{ErrorObject, error_code};
 pub use crate::protocol_metadata::{
     ProviderErrorCategoryView, ProviderEventNotification, ProviderExtensionView,
-    ReasoningMetadataView, ResponseMetadataView, SafetyMetadataView, TurnMetadataNotification,
+    ReasoningMetadataView, ResponseItemKindView, ResponseItemNotification, ResponseItemPhaseView,
+    ResponseItemView, ResponseMetadataView, SafetyMetadataView, TurnMetadataNotification,
 };
 
 /// Protocol version this build speaks. Bumped when an already published shape
@@ -231,6 +232,8 @@ server_notifications! {
     TurnReasoningDelta => "turn/reasoning/delta" (TurnDeltaNotification),
     /// Provider response/header metadata, additive and turn-scoped.
     TurnMetadata => "turn/metadata" (TurnMetadataNotification),
+    /// Complete bounded response item at the provider added/done boundary.
+    TurnResponseItem => "turn/responseItem" (ResponseItemNotification),
     /// Additive provider data that has no dedicated client type yet. The core
     /// bounded and redacted the payload before this projection.
     TurnProviderEvent => "turn/providerEvent" (ProviderEventNotification),

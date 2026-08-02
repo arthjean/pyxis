@@ -611,7 +611,10 @@ impl TranscriptMapper {
             // An item the adapter could not read: shown as a notice precisely
             // because there is nothing else to show. Staying silent would let
             // the user believe the model produced only what is on screen.
-            AgentEvent::ResponseMetadata(_) => Vec::new(),
+            // Canonical response items are projected in full by app-server.
+            // The TUI keeps using the semantic text/tool events emitted beside
+            // them, otherwise one wire item would render twice.
+            AgentEvent::ResponseItem { .. } | AgentEvent::ResponseMetadata(_) => Vec::new(),
             AgentEvent::ProviderExtension(extension) => vec![TranscriptUpdate::new(
                 TranscriptLifecycle::Completed,
                 TranscriptItem::new(

@@ -123,16 +123,19 @@
         }
       },
       {
-        "type": "unmapped_item",
+        "type": "response_item",
         "data": {
-          "item_type": "future_item",
-          "extension": {
-            "event_type": "response.item.future_item.done",
+          "phase": "done",
+          "item": {
+            "kind": { "other": "future_item" },
             "payload": {
-              "type": "future_item",
-              "value": 1
+              "event_type": "response.item.future_item",
+              "payload": {
+                "type": "future_item",
+                "value": 1
+              }
             },
-            "original_bytes": 32
+            "diagnostic": "unknown response item type preserved as bounded Other"
           }
         }
       }

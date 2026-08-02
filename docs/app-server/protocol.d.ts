@@ -168,6 +168,59 @@ export type ReasoningMetadataView = {
   status?: string | null;
 };
 
+export type ResponseItemKindView = {
+  kind: "message";
+} | {
+  kind: "agentMessage";
+} | {
+  kind: "reasoning";
+} | {
+  kind: "localShellCall";
+} | {
+  kind: "functionCall";
+} | {
+  kind: "functionCallOutput";
+} | {
+  kind: "customToolCall";
+} | {
+  kind: "customToolCallOutput";
+} | {
+  kind: "toolSearchCall";
+} | {
+  kind: "toolSearchOutput";
+} | {
+  kind: "webSearchCall";
+} | {
+  kind: "imageGenerationCall";
+} | {
+  kind: "compaction";
+} | {
+  kind: "compactionTrigger";
+} | {
+  kind: "contextCompaction";
+} | {
+  kind: "other";
+  wire_type: string;
+};
+
+export type ResponseItemNotification = {
+  item: ResponseItemView;
+  outputIndex?: number | null;
+  phase: ResponseItemPhaseView;
+  threadId: string;
+  turnId?: string | null;
+};
+
+export type ResponseItemPhaseView = "added" | "done";
+
+export type ResponseItemView = {
+  diagnostic?: string | null;
+  id?: string | null;
+  kind: ResponseItemKindView;
+  payload: ProviderExtensionView;
+  status?: string | null;
+};
+
 export type ResponseMetadataView = {
   endTurn?: boolean | null;
   model?: string | null;
@@ -467,6 +520,7 @@ export interface ServerNotifications {
   "item/commandExecution/outputDelta": { params: ItemDeltaNotification };
   "turn/reasoning/delta": { params: TurnDeltaNotification };
   "turn/metadata": { params: TurnMetadataNotification };
+  "turn/responseItem": { params: ResponseItemNotification };
   "turn/providerEvent": { params: ProviderEventNotification };
   "serverRequest/resolved": { params: ServerRequestResolvedNotification };
 }
@@ -480,6 +534,6 @@ export interface ServerRequests {
 
 export type ClientMethod = "initialize" | "thread/start" | "thread/resume" | "thread/unsubscribe" | "thread/items/list" | "turn/start" | "turn/steer" | "turn/interrupt";
 
-export type ServerNotificationMethod = "error" | "thread/started" | "thread/closed" | "turn/started" | "turn/completed" | "item/started" | "item/completed" | "item/agentMessage/delta" | "item/commandExecution/outputDelta" | "turn/reasoning/delta" | "turn/metadata" | "turn/providerEvent" | "serverRequest/resolved";
+export type ServerNotificationMethod = "error" | "thread/started" | "thread/closed" | "turn/started" | "turn/completed" | "item/started" | "item/completed" | "item/agentMessage/delta" | "item/commandExecution/outputDelta" | "turn/reasoning/delta" | "turn/metadata" | "turn/responseItem" | "turn/providerEvent" | "serverRequest/resolved";
 
 export type ServerRequestMethod = "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" | "item/tool/requestApproval" | "item/tool/call";

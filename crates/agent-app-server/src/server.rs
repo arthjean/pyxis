@@ -718,6 +718,17 @@ impl Pump {
                         metadata: Box::new(ResponseMetadataView::from(metadata.as_ref())),
                     })
                 }
+                Projected::ResponseItem {
+                    phase,
+                    output_index,
+                    item,
+                } => ServerNotification::TurnResponseItem(ResponseItemNotification {
+                    thread_id: self.thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    phase: phase.into(),
+                    output_index,
+                    item: Box::new(ResponseItemView::from(item.as_ref())),
+                }),
                 Projected::ProviderExtension(extension) => {
                     ServerNotification::TurnProviderEvent(ProviderEventNotification {
                         thread_id: self.thread_id.clone(),

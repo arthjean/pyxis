@@ -9,7 +9,6 @@
 
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
 use crate::message::{ToolCallFormat, ToolCallId};
 use crate::model::{ModelRuntimeError, ResolvedModelRuntime};
@@ -19,7 +18,14 @@ pub use crate::request::{
     CanonicalRequest, CanonicalRequestValidationError, OutputSchema, ReasoningSummaryDelivery,
     RequestStreamOptions, TURN_ID_METADATA_KEY,
 };
+pub use crate::response_item::{
+    ResponseItem, ResponseItemError, ResponseItemKind, ResponseItemPhase,
+};
 pub use crate::response_metadata::{ReasoningMetadata, ResponseMetadata, SafetyMetadata};
+pub use crate::tool_spec::{
+    GrammarSyntax, ToolGrammar, ToolKind, ToolSpec, ToolSpecValidationError, WebSearchContextSize,
+    WebSearchFilters, WebSearchLocation,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -99,6 +105,15 @@ pub enum StreamEvent {
     /// fabricating a complete response envelope.
     ResponseMetadata {
         metadata: Box<ResponseMetadata>,
+    },
+    /// Complete bounded Responses item at its wire lifecycle boundary. Added
+    /// and done remain separate; the done payload is authoritative and never
+    /// replayed as content deltas.
+    ResponseItem {
+        phase: ResponseItemPhase,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_index: Option<u64>,
+        item: Box<ResponseItem>,
     },
     /// An additive provider event that has no canonical variant yet. Its
     /// payload is sanitized and bounded before it crosses the provider seam.
@@ -264,14 +279,45 @@ impl Capabilities {
             });
         }
         for tool in tools {
-            if tool.is_freeform() && !self.tool_calling.freeform_tools {
-                return Err(ProviderError::UnsupportedTool {
-                    tool: tool.name.clone(),
-                    reason: "provider does not support freeform tools".into(),
-                });
-            }
+            self.ensure_tool_supported(tool)?;
         }
         Ok(())
+    }
+
+    fn ensure_tool_supported(&self, tool: &ToolSpec) -> Result<(), ProviderError> {
+        let unsupported = |reason: &str| ProviderError::UnsupportedTool {
+            tool: tool.name.clone(),
+            reason: reason.into(),
+        };
+        match &tool.kind {
+            ToolKind::Function { strict, .. }
+                if *strict && !self.tool_calling.strict_json_schema =>
+            {
+                Err(unsupported("provider does not support strict JSON schemas"))
+            }
+            ToolKind::Function { .. } => Ok(()),
+            ToolKind::Freeform { .. } if !self.tool_calling.freeform_tools => {
+                Err(unsupported("provider does not support freeform tools"))
+            }
+            ToolKind::Freeform { .. } => Ok(()),
+            ToolKind::Namespace { .. } if !self.tool_calling.namespace_tools => {
+                Err(unsupported("provider does not support tool namespaces"))
+            }
+            ToolKind::Namespace { tools } => {
+                for member in tools {
+                    self.ensure_tool_supported(member)?;
+                }
+                Ok(())
+            }
+            ToolKind::ToolSearch { .. } if !self.tool_calling.tool_search => {
+                Err(unsupported("provider does not support tool search"))
+            }
+            ToolKind::ToolSearch { .. } => Ok(()),
+            ToolKind::WebSearch { .. } if !self.tool_calling.web_search => {
+                Err(unsupported("provider does not support web search"))
+            }
+            ToolKind::WebSearch { .. } => Ok(()),
+        }
     }
 }
 
@@ -290,6 +336,12 @@ pub struct ToolCallingCapabilities {
     /// freeform tool into a function one.
     #[serde(default)]
     pub freeform_tools: bool,
+    #[serde(default)]
+    pub namespace_tools: bool,
+    #[serde(default)]
+    pub tool_search: bool,
+    #[serde(default)]
+    pub web_search: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -300,244 +352,6 @@ pub struct ReasoningCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CacheCapabilities {
     pub prompt_cache_key: bool,
-}
-
-/// Grammar syntax a freeform tool constrains its text input with. Kept as an
-/// enum, not a free string: an unknown syntax must fail to build rather than
-/// reach a backend that would reject the whole request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GrammarSyntax {
-    Lark,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolGrammar {
-    pub syntax: GrammarSyntax,
-    pub definition: String,
-}
-
-/// How a tool receives its input. This is the provider-neutral algebra: a
-/// function takes JSON validated by a schema, a freeform tool takes text with
-/// an optional grammar. A freeform tool carries NO `input_schema`, so no
-/// adapter can invent one to fit a function-shaped wire.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ToolKind {
-    Function {
-        input_schema: serde_json::Value,
-    },
-    Freeform {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        grammar: Option<ToolGrammar>,
-    },
-}
-
-/// Tool definition exposed to the model.
-///
-/// `PartialEq` is what lets US-006 decide that a step frame did not move: a
-/// catalog compared equal keeps its generation, hence its bytes and its cache
-/// prefix.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ToolSpec {
-    pub name: String,
-    pub description: String,
-    #[serde(flatten)]
-    pub kind: ToolKind,
-}
-
-impl ToolSpec {
-    pub fn function(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        input_schema: serde_json::Value,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            description: description.into(),
-            kind: ToolKind::Function { input_schema },
-        }
-    }
-
-    pub fn freeform(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        grammar: Option<ToolGrammar>,
-    ) -> Self {
-        Self {
-            name: name.into(),
-            description: description.into(),
-            kind: ToolKind::Freeform { grammar },
-        }
-    }
-
-    /// `None` for a freeform tool: callers that need a schema must handle its
-    /// absence instead of receiving an empty object that looks like one.
-    pub fn input_schema(&self) -> Option<&serde_json::Value> {
-        match &self.kind {
-            ToolKind::Function { input_schema } => Some(input_schema),
-            ToolKind::Freeform { .. } => None,
-        }
-    }
-
-    pub fn is_freeform(&self) -> bool {
-        matches!(self.kind, ToolKind::Freeform { .. })
-    }
-
-    pub fn validate(&self) -> Result<(), ToolSpecValidationError> {
-        if self.name.trim().is_empty() {
-            return Err(ToolSpecValidationError::EmptyName);
-        }
-        if self.name.len() > 64
-            || !self
-                .name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            return Err(ToolSpecValidationError::InvalidName {
-                tool: self.name.clone(),
-            });
-        }
-        match &self.kind {
-            ToolKind::Function { input_schema } => {
-                let Some(schema) = input_schema.as_object() else {
-                    return Err(ToolSpecValidationError::SchemaMustBeObject {
-                        tool: self.name.clone(),
-                    });
-                };
-                if !schema_has_object_type(schema) {
-                    return Err(ToolSpecValidationError::SchemaMustBeObject {
-                        tool: self.name.clone(),
-                    });
-                }
-                validate_strict_schema_object(&self.name, input_schema)?;
-            }
-            ToolKind::Freeform { grammar } => {
-                if let Some(grammar) = grammar
-                    && grammar.definition.trim().is_empty()
-                {
-                    return Err(ToolSpecValidationError::EmptyGrammarDefinition {
-                        tool: self.name.clone(),
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-fn schema_has_object_type(schema: &serde_json::Map<String, serde_json::Value>) -> bool {
-    match schema.get("type") {
-        Some(serde_json::Value::String(kind)) => kind == "object",
-        Some(serde_json::Value::Array(kinds)) => {
-            kinds.iter().any(|kind| kind.as_str() == Some("object"))
-        }
-        _ => false,
-    }
-}
-
-fn validate_strict_schema_object(
-    tool: &str,
-    schema: &serde_json::Value,
-) -> Result<(), ToolSpecValidationError> {
-    let Some(obj) = schema.as_object() else {
-        return Ok(());
-    };
-
-    if schema_has_object_type(obj) {
-        if obj.get("additionalProperties") != Some(&serde_json::Value::Bool(false)) {
-            return Err(
-                ToolSpecValidationError::SchemaMustDenyAdditionalProperties {
-                    tool: tool.to_string(),
-                },
-            );
-        }
-        let property_names: HashSet<String> = match obj.get("properties") {
-            None => HashSet::new(),
-            Some(serde_json::Value::Object(props)) => props.keys().cloned().collect(),
-            Some(_) => {
-                return Err(ToolSpecValidationError::SchemaPropertiesMustBeObject {
-                    tool: tool.to_string(),
-                });
-            }
-        };
-        let required_names = required_names(tool, obj)?;
-        if required_names != property_names {
-            return Err(ToolSpecValidationError::RequiredMustMatchProperties {
-                tool: tool.to_string(),
-            });
-        }
-    }
-
-    if let Some(serde_json::Value::Object(props)) = obj.get("properties") {
-        for schema in props.values() {
-            validate_strict_schema_object(tool, schema)?;
-        }
-    }
-    for key in ["items", "additionalItems", "contains"] {
-        if let Some(schema) = obj.get(key) {
-            validate_strict_schema_object(tool, schema)?;
-        }
-    }
-    for key in ["anyOf", "oneOf", "allOf"] {
-        if let Some(serde_json::Value::Array(items)) = obj.get(key) {
-            for schema in items {
-                validate_strict_schema_object(tool, schema)?;
-            }
-        }
-    }
-    for key in ["$defs", "definitions"] {
-        if let Some(serde_json::Value::Object(defs)) = obj.get(key) {
-            for schema in defs.values() {
-                validate_strict_schema_object(tool, schema)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn required_names(
-    tool: &str,
-    schema: &serde_json::Map<String, serde_json::Value>,
-) -> Result<HashSet<String>, ToolSpecValidationError> {
-    match schema.get("required") {
-        None => Ok(HashSet::new()),
-        Some(serde_json::Value::Array(items)) => {
-            let mut names = HashSet::new();
-            for item in items {
-                let Some(name) = item.as_str() else {
-                    return Err(ToolSpecValidationError::SchemaRequiredMustBeStringArray {
-                        tool: tool.to_string(),
-                    });
-                };
-                names.insert(name.to_string());
-            }
-            Ok(names)
-        }
-        Some(_) => Err(ToolSpecValidationError::SchemaRequiredMustBeStringArray {
-            tool: tool.to_string(),
-        }),
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ToolSpecValidationError {
-    #[error("tool name is empty")]
-    EmptyName,
-    #[error("tool {tool} name must be <=64 chars and use only ASCII letters, digits, _ or -")]
-    InvalidName { tool: String },
-    #[error("tool {tool} input_schema must be a JSON schema object")]
-    SchemaMustBeObject { tool: String },
-    #[error("tool {tool} input_schema must set additionalProperties=false")]
-    SchemaMustDenyAdditionalProperties { tool: String },
-    #[error("tool {tool} input_schema properties must be an object")]
-    SchemaPropertiesMustBeObject { tool: String },
-    #[error("tool {tool} input_schema required must be an array of strings")]
-    SchemaRequiredMustBeStringArray { tool: String },
-    #[error("tool {tool} required fields must include every property for strict schema mode")]
-    RequiredMustMatchProperties { tool: String },
-    #[error("tool {tool} declares a grammar with an empty definition")]
-    EmptyGrammarDefinition { tool: String },
 }
 
 /// Non-stream response (utility: titles, compaction summaries).
@@ -771,119 +585,13 @@ mod tests {
     }
 
     #[test]
-    fn strict_tool_schema_requires_all_properties() {
-        let spec = ToolSpec::function(
-            "read",
-            "lit",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "offset": { "type": ["integer", "null"] }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
-        );
-        assert!(matches!(
-            spec.validate(),
-            Err(ToolSpecValidationError::RequiredMustMatchProperties { tool }) if tool == "read"
-        ));
-    }
-
-    #[test]
-    fn strict_tool_schema_accepts_nullable_required_optionals() {
-        let spec = ToolSpec::function(
-            "read",
-            "lit",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "offset": { "type": ["integer", "null"] }
-                },
-                "required": ["path", "offset"],
-                "additionalProperties": false
-            }),
-        );
-        spec.validate().unwrap();
-    }
-
-    fn exec_grammar() -> ToolGrammar {
-        ToolGrammar {
-            syntax: GrammarSyntax::Lark,
-            definition: "start: SOURCE\nSOURCE: /[\\s\\S]+/".into(),
-        }
-    }
-
-    #[test]
-    fn freeform_tool_carries_no_schema_and_survives_a_round_trip() {
-        let spec = ToolSpec::freeform("exec", "run javascript", Some(exec_grammar()));
-        spec.validate().unwrap();
-        assert!(spec.is_freeform());
-        assert!(
-            spec.input_schema().is_none(),
-            "a freeform tool must not expose a fabricated schema"
-        );
-
-        let encoded = serde_json::to_value(&spec).unwrap();
-        assert_eq!(encoded["kind"], "freeform");
-        assert!(encoded.get("input_schema").is_none());
-        assert_eq!(encoded["grammar"]["syntax"], "lark");
-        let decoded: ToolSpec = serde_json::from_value(encoded).unwrap();
-        assert_eq!(decoded, spec);
-
-        // A text-only freeform tool keeps no grammar at all.
-        let plain = ToolSpec::freeform("notes", "free text", None);
-        plain.validate().unwrap();
-        let encoded = serde_json::to_value(&plain).unwrap();
-        assert!(encoded.get("grammar").is_none());
-        assert_eq!(
-            serde_json::from_value::<ToolSpec>(encoded).unwrap(),
-            plain,
-            "an absent grammar round-trips as absent"
-        );
-    }
-
-    #[test]
-    fn function_tool_keeps_its_name_description_and_schema_through_the_algebra() {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": { "path": { "type": "string" } },
-            "required": ["path"],
-            "additionalProperties": false
-        });
-        let spec = ToolSpec::function("read", "reads a file", schema.clone());
-        spec.validate().unwrap();
-        assert_eq!(spec.name, "read");
-        assert_eq!(spec.description, "reads a file");
-        assert_eq!(spec.input_schema(), Some(&schema));
-        assert!(!spec.is_freeform());
-        let decoded: ToolSpec =
-            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
-        assert_eq!(decoded, spec);
-    }
-
-    #[test]
-    fn empty_grammar_definition_is_rejected_before_exposure() {
-        let spec = ToolSpec::freeform(
-            "exec",
-            "run",
-            Some(ToolGrammar {
-                syntax: GrammarSyntax::Lark,
-                definition: "   ".into(),
-            }),
-        );
-        assert!(matches!(
-            spec.validate(),
-            Err(ToolSpecValidationError::EmptyGrammarDefinition { tool }) if tool == "exec"
-        ));
-    }
-
-    #[test]
     fn provider_without_freeform_support_refuses_the_plan_before_any_call() {
         let mut capabilities = Capabilities {
             tools: true,
+            tool_calling: ToolCallingCapabilities {
+                strict_json_schema: true,
+                ..ToolCallingCapabilities::default()
+            },
             ..Capabilities::default()
         };
         let plan = vec![
@@ -897,7 +605,7 @@ mod tests {
                     "additionalProperties": false
                 }),
             ),
-            ToolSpec::freeform("exec", "run javascript", Some(exec_grammar())),
+            ToolSpec::freeform("exec", "run javascript", None),
         ];
         let error = capabilities
             .ensure_tools_supported(&plan)

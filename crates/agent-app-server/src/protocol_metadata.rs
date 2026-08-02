@@ -65,6 +65,106 @@ pub struct ProviderEventNotification {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct ResponseItemNotification {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub phase: ResponseItemPhaseView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_index: Option<u64>,
+    pub item: Box<ResponseItemView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum ResponseItemPhaseView {
+    Added,
+    Done,
+}
+
+impl From<agent_core::provider::ResponseItemPhase> for ResponseItemPhaseView {
+    fn from(phase: agent_core::provider::ResponseItemPhase) -> Self {
+        match phase {
+            agent_core::provider::ResponseItemPhase::Added => Self::Added,
+            agent_core::provider::ResponseItemPhase::Done => Self::Done,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseItemView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    pub kind: ResponseItemKindView,
+    pub payload: ProviderExtensionView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ResponseItemKindView {
+    Message,
+    AgentMessage,
+    Reasoning,
+    LocalShellCall,
+    FunctionCall,
+    FunctionCallOutput,
+    CustomToolCall,
+    CustomToolCallOutput,
+    ToolSearchCall,
+    ToolSearchOutput,
+    WebSearchCall,
+    ImageGenerationCall,
+    Compaction,
+    CompactionTrigger,
+    ContextCompaction,
+    Other { wire_type: String },
+}
+
+impl From<&agent_core::provider::ResponseItemKind> for ResponseItemKindView {
+    fn from(kind: &agent_core::provider::ResponseItemKind) -> Self {
+        use agent_core::provider::ResponseItemKind as Kind;
+        match kind {
+            Kind::Message => Self::Message,
+            Kind::AgentMessage => Self::AgentMessage,
+            Kind::Reasoning => Self::Reasoning,
+            Kind::LocalShellCall => Self::LocalShellCall,
+            Kind::FunctionCall => Self::FunctionCall,
+            Kind::FunctionCallOutput => Self::FunctionCallOutput,
+            Kind::CustomToolCall => Self::CustomToolCall,
+            Kind::CustomToolCallOutput => Self::CustomToolCallOutput,
+            Kind::ToolSearchCall => Self::ToolSearchCall,
+            Kind::ToolSearchOutput => Self::ToolSearchOutput,
+            Kind::WebSearchCall => Self::WebSearchCall,
+            Kind::ImageGenerationCall => Self::ImageGenerationCall,
+            Kind::Compaction => Self::Compaction,
+            Kind::CompactionTrigger => Self::CompactionTrigger,
+            Kind::ContextCompaction => Self::ContextCompaction,
+            Kind::Other(wire_type) => Self::Other {
+                wire_type: wire_type.clone(),
+            },
+        }
+    }
+}
+
+impl From<&agent_core::provider::ResponseItem> for ResponseItemView {
+    fn from(item: &agent_core::provider::ResponseItem) -> Self {
+        Self {
+            id: item.id().map(str::to_string),
+            status: item.status().map(str::to_string),
+            kind: ResponseItemKindView::from(item.kind()),
+            payload: ProviderExtensionView::from(item.payload()),
+            diagnostic: item.diagnostic().map(str::to_string),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ProviderExtensionView {
     pub event_type: String,
     pub payload: Value,

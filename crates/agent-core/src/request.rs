@@ -178,6 +178,14 @@ impl CanonicalRequest {
                 });
             }
         }
+        if self.tools.iter().any(ToolSpec::is_deferred)
+            && !self
+                .tools
+                .iter()
+                .any(|tool| matches!(tool.kind, crate::provider::ToolKind::ToolSearch { .. }))
+        {
+            return Err(CanonicalRequestValidationError::MissingDeferredToolSearch);
+        }
         Ok(())
     }
 }
@@ -210,6 +218,8 @@ pub enum CanonicalRequestValidationError {
     InvalidTool(#[from] ToolSpecValidationError),
     #[error("duplicate tool name: {tool}")]
     DuplicateToolName { tool: String },
+    #[error("deferred tools require a tool_search reference in the same catalog")]
+    MissingDeferredToolSearch,
 }
 
 fn validate_client_metadata(
@@ -402,6 +412,44 @@ mod tests {
             request.validate(),
             Err(CanonicalRequestValidationError::DuplicateToolName { tool }) if tool == "read"
         ));
+    }
+
+    #[test]
+    fn deferred_tools_require_a_search_reference() {
+        let deferred = ToolSpec::function_with_options(
+            "deferred",
+            "loaded by search",
+            serde_json::json!({"type": "object", "properties": {}}),
+            false,
+            true,
+            None,
+        );
+        let request = CanonicalRequest {
+            model: "gpt".into(),
+            messages: vec![Message::user("ok")],
+            tools: vec![deferred.clone()],
+            max_output_tokens: 100,
+            ..CanonicalRequest::default()
+        };
+        assert!(matches!(
+            request.validate(),
+            Err(CanonicalRequestValidationError::MissingDeferredToolSearch)
+        ));
+
+        let valid = CanonicalRequest {
+            tools: vec![
+                deferred,
+                ToolSpec::tool_search(
+                    "find tools",
+                    "client",
+                    serde_json::json!({"type": "object", "properties": {}}),
+                ),
+            ],
+            ..request
+        };
+        valid
+            .validate()
+            .expect("search resolves deferred references");
     }
 
     #[test]

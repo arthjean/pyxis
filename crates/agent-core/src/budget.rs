@@ -213,14 +213,27 @@ pub fn estimate_static_input(
             .saturating_add(counter.count_text(&tool.name))
             .saturating_add(counter.count_text(&tool.description))
             .saturating_add(match &tool.kind {
-                crate::provider::ToolKind::Function { input_schema } => {
-                    counter.count_text(&input_schema.to_string())
-                }
+                crate::provider::ToolKind::Function {
+                    input_schema,
+                    output_schema,
+                    ..
+                } => counter
+                    .count_text(&input_schema.to_string())
+                    .saturating_add(
+                        output_schema
+                            .as_ref()
+                            .map_or(0, |schema| counter.count_text(&schema.to_string())),
+                    ),
                 // A freeform tool spends its budget on the grammar it ships,
                 // not on a schema it does not have.
                 crate::provider::ToolKind::Freeform { grammar } => grammar
                     .as_ref()
                     .map_or(0, |grammar| counter.count_text(&grammar.definition)),
+                crate::provider::ToolKind::Namespace { .. }
+                | crate::provider::ToolKind::ToolSearch { .. }
+                | crate::provider::ToolKind::WebSearch { .. } => {
+                    serde_json::to_string(tool).map_or(0, |wire| counter.count_text(&wire))
+                }
             });
     }
     u32::try_from(total).unwrap_or(u32::MAX)
