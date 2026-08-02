@@ -184,8 +184,9 @@ fn protected_error(display_path: &str, zone: &Path) -> ToolError {
 /// command is never proven to write: a redirection, a substitution or a
 /// computed argument makes the intent undecidable. So a command that is not
 /// proven side-effect free is refused as soon as it NAMES a protected path,
-/// whether or not the write can be demonstrated. Two consequences, both
-/// deliberate:
+/// whether or not the write can be demonstrated. The sole semantic exception
+/// is a literal `find -not -path PATTERN` exclusion, which cannot be a target.
+/// Two consequences, both deliberate:
 /// - a command of the side-effect-free set is exempt, so `cat .git/config`
 ///   stays a read and stays allowed;
 /// - a read performed by a program outside that set (`tar --exclude=.git ...`)
@@ -210,11 +211,12 @@ pub fn guard_command_paths(
     if matches!(class, crate::command::CommandClass::SideEffectFree(_)) {
         return Ok(());
     }
+    let masked_command = mask_find_exclusion_patterns(command);
     let fragments: Vec<&str> = match class.tokens() {
         Some(tokens) => tokens.iter().map(String::as_str).collect(),
         // Opaque command: there is no argv to read, so the raw text is split on
         // everything a shell would interpret and every piece is tested.
-        None => split_shell_fragments(command).collect(),
+        None => split_shell_fragments(&masked_command).collect(),
     };
     for candidate in path_candidates(fragments) {
         // Two tests, because a shell command has no knowable working directory.
@@ -276,6 +278,150 @@ fn split_shell_fragments(command: &str) -> impl Iterator<Item = &str> {
 }
 
 const SHELL_SEPARATORS: &str = ";&|<>$`(){}[]*?'\"\\!#";
+
+#[derive(Debug)]
+struct ShellToken {
+    value: String,
+    start: usize,
+    end: usize,
+    separator: bool,
+}
+
+/// Masks only the pattern operand of `find -not -path PATTERN` (and its `!`
+/// spelling). Such an operand excludes matches and can never be a write target.
+/// Everything else stays visible to the conservative protected-path scan, so a
+/// later `-exec ... .git/config` in the same command is still refused.
+fn mask_find_exclusion_patterns(command: &str) -> String {
+    let tokens = shell_tokens(command);
+    let mut ranges = Vec::new();
+    let mut in_find = false;
+    let mut read_only_find = false;
+    let mut at_command_start = true;
+
+    for (index, token) in tokens.iter().enumerate() {
+        if token.separator {
+            at_command_start = true;
+            in_find = false;
+            read_only_find = false;
+            continue;
+        }
+        if at_command_start {
+            in_find = token.value == "find";
+            read_only_find = in_find && find_segment_is_statically_read_only(&tokens[index..]);
+            at_command_start = false;
+        }
+        if !in_find || !read_only_find {
+            continue;
+        }
+        let Some(path_flag) = tokens.get(index + 1) else {
+            continue;
+        };
+        let Some(pattern) = tokens.get(index + 2) else {
+            continue;
+        };
+        if !path_flag.separator
+            && !pattern.separator
+            && matches!(token.value.as_str(), "-not" | "!")
+            && path_flag.value == "-path"
+        {
+            ranges.push((pattern.start, pattern.end));
+        }
+    }
+
+    let mut masked = command.to_string();
+    for (start, end) in ranges.into_iter().rev() {
+        masked.replace_range(start..end, &" ".repeat(end.saturating_sub(start)));
+    }
+    masked
+}
+
+/// The exclusion is semantic only while the `find` segment contains no action
+/// and no dynamic shell construct. Looking across the whole segment matters:
+/// `-not -path .git -o -delete` can still delete the excluded path.
+fn find_segment_is_statically_read_only(tokens: &[ShellToken]) -> bool {
+    const ACTIONS: &[&str] = &[
+        "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls",
+    ];
+
+    tokens
+        .iter()
+        .take_while(|token| !token.separator)
+        .all(|token| {
+            !ACTIONS.contains(&token.value.as_str())
+                && !token
+                    .value
+                    .chars()
+                    .any(|ch| matches!(ch, '$' | '`' | '(' | ')'))
+        })
+}
+
+/// Small lexer for the one semantic exception above. It recognizes shell word
+/// boundaries and quotes, but deliberately does not evaluate expansions.
+fn shell_tokens(command: &str) -> Vec<ShellToken> {
+    let mut tokens = Vec::new();
+    let mut chars = command.char_indices().peekable();
+    while let Some((start, ch)) = chars.next() {
+        if matches!(ch, '\n' | '\r') {
+            tokens.push(ShellToken {
+                value: ch.to_string(),
+                start,
+                end: start + ch.len_utf8(),
+                separator: true,
+            });
+            continue;
+        }
+        if ch.is_whitespace() {
+            continue;
+        }
+        if matches!(ch, ';' | '&' | '|') {
+            tokens.push(ShellToken {
+                value: ch.to_string(),
+                start,
+                end: start + ch.len_utf8(),
+                separator: true,
+            });
+            continue;
+        }
+
+        let mut value = String::new();
+        let mut end = start + ch.len_utf8();
+        let mut quote = None;
+        let mut current = Some((start, ch));
+        while let Some((offset, current_ch)) = current {
+            end = offset + current_ch.len_utf8();
+            match quote {
+                Some(delimiter) if current_ch == delimiter => quote = None,
+                Some(_) => value.push(current_ch),
+                None if matches!(current_ch, '\'' | '"') => quote = Some(current_ch),
+                None if current_ch == '\\' => {
+                    if let Some((escaped_at, escaped)) = chars.next() {
+                        value.push(escaped);
+                        end = escaped_at + escaped.len_utf8();
+                    }
+                }
+                None => value.push(current_ch),
+            }
+
+            current = match chars.peek().copied() {
+                Some((_, next))
+                    if quote.is_none()
+                        && (next.is_whitespace() || matches!(next, ';' | '&' | '|')) =>
+                {
+                    None
+                }
+                Some(_) => chars.next(),
+                None => None,
+            };
+        }
+        tokens.push(ShellToken {
+            value,
+            start,
+            end,
+            separator: false,
+        });
+    }
+    tokens
+}
 
 /// Keeps the fragments that can designate a path, splitting the ones that carry
 /// a value (`--exclude=.git`, `a:b`). Deduplicated: a repeated argument costs
@@ -746,6 +892,13 @@ mod tests {
             "tee .pyxis/config.toml < payload",
             // a valued flag carries its path in the same token.
             "rsync --exclude=x --log-file=.git/log a b",
+            "find . -not -path '*/.git*' -exec sh -c 'echo evil > .git/config' ';'",
+            "find . -exec sh -c 'echo evil > \"$1\"' _ -not -path .git/config ';'",
+            "find . -exec sh -c 'echo evil > \"$2\"' _ + -not -path .git/config ';'",
+            "find .\nsh -c 'echo evil > \"$1\"' _ -not -path .git/config",
+            "find . $(sh -c 'echo evil > \"$1\"' _ -not -path .git/config)",
+            "find . -delete -not -path .git/config",
+            "find . -not -path .git/config -o -delete",
         ] {
             let err = guard_command_paths(&policy, &ws, command)
                 .unwrap_err()
@@ -776,6 +929,7 @@ mod tests {
             // close but distinct: the comparison is component-wise.
             "sed -i s/a/b/ .gitignore",
             "cp x .gitmodules",
+            "find . -maxdepth 2 -type d -not -path '*/.git*' -not -path '*/node_modules*' | sort",
         ] {
             assert!(
                 guard_command_paths(&policy, &ws, command).is_ok(),
