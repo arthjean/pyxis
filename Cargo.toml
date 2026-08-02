@@ -35,6 +35,9 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", 
 # direct dependency instead of maintaining a second supervision mechanism.
 tokio-util = { version = "0.7", features = ["rt"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# The final binary also embeds the AWS SDK, so rustls sees both of its built-in
+# crypto backends. The application selects one explicitly at process startup.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

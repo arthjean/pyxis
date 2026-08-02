@@ -838,7 +838,16 @@ fn enforce_sandbox(
     }
 }
 
+/// Selects the process-wide provider before any TLS client or Tokio worker can
+/// ask rustls to infer one from the unified dependency features. The binary
+/// contains both `ring` (reqwest) and `aws-lc-rs` (AWS SDK), so inference is
+/// deliberately ambiguous.
+fn install_tls_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 fn main() -> anyhow::Result<()> {
+    install_tls_crypto_provider();
     let mut args = parse_args()?;
     if args.help {
         print!("{HELP}");
@@ -1927,6 +1936,12 @@ mod tests {
             emit_schemas: None,
             help: false,
         }
+    }
+
+    #[test]
+    fn tls_builder_has_an_unambiguous_process_provider() {
+        super::install_tls_crypto_provider();
+        let _ = rustls::ClientConfig::builder();
     }
 
     /// US-016 AC6: the global configuration also drives the permission mode
