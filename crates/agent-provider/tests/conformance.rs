@@ -1,4 +1,4 @@
-//! Offline provider conformance suite (EP-001/US-004).
+//! Offline provider conformance suite (EP-001 through EP-005).
 //!
 //! Each fixture is a golden derived from the Codex baseline contract: either a
 //! canonical request with the exact Responses body it must produce, or an SSE
@@ -16,6 +16,9 @@ use agent_provider::chatgpt_request::{ResponsesBodyOptions, build_responses_body
 use serde::Deserialize;
 use serde_json::Value;
 
+#[path = "conformance/ep005.rs"]
+mod ep005;
+
 #[derive(Debug, Deserialize)]
 struct Fixture {
     name: String,
@@ -27,6 +30,8 @@ struct Fixture {
     stream: Option<StreamCase>,
     #[serde(default)]
     error: Option<ErrorCase>,
+    #[serde(default)]
+    provider: Option<ProviderCase>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +71,13 @@ struct ErrorExpectation {
     auth_request_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ProviderCase {
+    wire: String,
+    canonical: CanonicalRequest,
+    expected: Value,
+}
+
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/conformance")
 }
@@ -97,7 +109,8 @@ fn every_fixture_covers_exactly_one_contract() {
             [
                 fixture.request.is_some(),
                 fixture.stream.is_some(),
-                fixture.error.is_some()
+                fixture.error.is_some(),
+                fixture.provider.is_some()
             ]
             .into_iter()
             .filter(|present| *present)
@@ -107,6 +120,36 @@ fn every_fixture_covers_exactly_one_contract() {
             path.display()
         );
     }
+}
+
+#[tokio::test]
+async fn ep005_provider_fixtures_cover_configured_responses_and_bedrock() {
+    let mut wires = Vec::new();
+    for (path, _, fixture) in load_fixtures() {
+        let Some(case) = fixture.provider else {
+            continue;
+        };
+        case.canonical.validate().unwrap_or_else(|error| {
+            panic!(
+                "{} ({}): invalid canonical request: {error}",
+                fixture.name,
+                path.display()
+            )
+        });
+        ep005::assert_wire_snapshot(&fixture.name, &case).await;
+        assert!(
+            fixture.note.contains("EP-005"),
+            "{} must cite EP-005",
+            fixture.name
+        );
+        wires.push(case.wire);
+    }
+    wires.sort();
+    assert_eq!(
+        wires,
+        ["bedrock_converse_stream", "configured_responses"],
+        "EP-005 must pin both new provider wires"
+    );
 }
 
 #[test]

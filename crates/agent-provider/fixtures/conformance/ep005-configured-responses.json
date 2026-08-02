@@ -1,0 +1,57 @@
+{
+  "name": "EP-005 configured Responses keeps one HTTP and WebSocket contract",
+  "note": "EP-005/US-014: configured headers and the canonical body must reach both transports without changing the terminal stream.",
+  "provider": {
+    "wire": "configured_responses",
+    "canonical": {
+      "model": "test-model",
+      "messages": [
+        { "role": "user", "content": [{ "type": "text", "text": "hello" }] }
+      ],
+      "tools": [],
+      "max_output_tokens": 100
+    },
+    "expected": {
+      "http_sse": {
+        "path": "/v1/responses",
+        "configured_headers": { "x-tenant": "fixture-tenant" },
+        "auth_header_present": true,
+        "body": {
+          "model": "test-model",
+          "input": [
+            {
+              "type": "message",
+              "role": "user",
+              "content": [{ "type": "input_text", "text": "hello" }]
+            }
+          ],
+          "tool_choice": "auto",
+          "parallel_tool_calls": true,
+          "stream": true,
+          "store": false
+        }
+      },
+      "websocket": {
+        "path": "/v1/responses",
+        "configured_headers": { "x-tenant": "fixture-tenant" },
+        "auth_header_present": true,
+        "beta_header": "responses_websockets=2026-02-06",
+        "body": {
+          "type": "response.create",
+          "model": "test-model",
+          "input": [
+            {
+              "type": "message",
+              "role": "user",
+              "content": [{ "type": "input_text", "text": "hello" }]
+            }
+          ],
+          "tool_choice": "auto",
+          "parallel_tool_calls": true,
+          "stream": true,
+          "store": false
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,81 @@
+{
+  "name": "EP-005 Bedrock builds a complete ConverseStream request",
+  "note": "EP-005/US-016: model input, system text, tool schema, structured output and max tokens are present in one official SDK request plan.",
+  "provider": {
+    "wire": "bedrock_converse_stream",
+    "canonical": {
+      "model": "anthropic.claude-test-v1:0",
+      "system": "Be precise.",
+      "output_schema": {
+        "name": "answer",
+        "schema": {
+          "type": "object",
+          "properties": { "value": { "type": "string" } },
+          "required": ["value"],
+          "additionalProperties": false
+        },
+        "strict": true
+      },
+      "messages": [
+        { "role": "user", "content": [{ "type": "text", "text": "go" }] }
+      ],
+      "tools": [
+        {
+          "name": "read",
+          "description": "read a file",
+          "kind": "function",
+          "input_schema": {
+            "type": "object",
+            "properties": { "path": { "type": "string" } },
+            "required": ["path"],
+            "additionalProperties": false
+          },
+          "strict": true
+        }
+      ],
+      "max_output_tokens": 512
+    },
+    "expected": {
+      "path": "/model/anthropic.claude-test-v1%3A0/converse-stream",
+      "configured_headers": null,
+      "auth_header_present": true,
+      "body": {
+        "system": [{ "text": "Be precise." }],
+        "messages": [
+          { "role": "user", "content": [{ "text": "go" }] }
+        ],
+        "inferenceConfig": { "maxTokens": 512 },
+        "toolConfig": {
+          "tools": [
+            {
+              "toolSpec": {
+                "name": "read",
+                "description": "read a file",
+                "inputSchema": {
+                  "json": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                    "additionalProperties": false
+                  }
+                },
+                "strict": true
+              }
+            }
+          ]
+        },
+        "outputConfig": {
+          "textFormat": {
+            "type": "json_schema",
+            "structure": {
+              "jsonSchema": {
+                "name": "answer",
+                "schema": "{\"additionalProperties\":false,\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"type\":\"object\"}"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
