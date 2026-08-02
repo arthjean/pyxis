@@ -170,3 +170,16 @@ Structurally derived from Codex, written against Pyxis types:
   path is a cell diff with no room for out-of-band output.
 
 Reference source inventory: `docs/codex-port-inventory.md`.
+
+As of EP-006 of `tasks/prd-parite-client-modele-codex-api.md` (2026-08-02),
+the canonical auxiliary contracts and provider clients study the read-only Codex baseline at commit
+`ee0247f95a6fe2b094ba2253d82cae2a2b4c2dff`. No module is structurally
+transplanted. Endpoint names, JSON field names, Realtime event tags, the
+`sediment://` URI prefix and the two model-facing Realtime V2 tool descriptions
+are retained as wire contracts; the object-safe capability surface, typed
+errors, bounded transport, redaction, durable-before-memory seam, closed
+Realtime dialect model and conformance harness are Pyxis implementations. The
+two tool descriptions are the only verbatim source
+text retained for this epic.
+The exact source paths and divergences are recorded in
+`docs/codex-port-inventory.md`.
