@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+use crate::tool_spec::{ToolKind, ToolSpec};
+
 pub const MAX_MODEL_INSTRUCTIONS_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +28,7 @@ pub enum ModelRuntimeSource {
 pub enum InputModality {
     Text,
     Image,
+    Audio,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +156,70 @@ pub enum ReasoningReplaySupport {
     Enabled,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchToolType {
+    #[default]
+    Text,
+    TextAndImage,
+}
+
+/// Model-specific tool contract resolved from the catalog.
+///
+/// Provider capabilities answer whether the adapter can encode a tool. These
+/// fields answer the independent question of whether the selected model was
+/// declared capable of using it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelToolCapabilities {
+    #[serde(default)]
+    pub supports_search_tool: bool,
+    #[serde(default)]
+    pub web_search_tool_type: WebSearchToolType,
+    #[serde(default)]
+    pub experimental_supported_tools: Vec<String>,
+}
+
+impl ModelToolCapabilities {
+    pub fn ensure_tools_supported(
+        &self,
+        tools: &[ToolSpec],
+    ) -> Result<(), ModelToolCompatibilityError> {
+        for tool in tools {
+            self.ensure_tool_supported(tool)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_tool_supported(&self, tool: &ToolSpec) -> Result<(), ModelToolCompatibilityError> {
+        match &tool.kind {
+            ToolKind::Namespace { tools } => self.ensure_tools_supported(tools),
+            ToolKind::ToolSearch { .. } if !self.supports_search_tool => {
+                Err(ModelToolCompatibilityError {
+                    tool: tool.name.clone(),
+                    reason: "selected model does not support tool search".into(),
+                })
+            }
+            ToolKind::WebSearch { content_types, .. }
+                if content_types.iter().any(|kind| kind == "image")
+                    && self.web_search_tool_type != WebSearchToolType::TextAndImage =>
+            {
+                Err(ModelToolCompatibilityError {
+                    tool: tool.name.clone(),
+                    reason: "selected model supports text-only web search".into(),
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("tool {tool} is unsupported by the selected model: {reason}")]
+pub struct ModelToolCompatibilityError {
+    pub tool: String,
+    pub reason: String,
+}
+
 /// One complete catalog entry before session configuration is applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelDescriptor {
@@ -168,6 +235,8 @@ pub struct ModelDescriptor {
     pub supports_verbosity: bool,
     pub default_verbosity: Option<String>,
     pub supports_parallel_tool_calls: bool,
+    #[serde(default)]
+    pub tool_capabilities: ModelToolCapabilities,
     #[serde(default)]
     pub service_tiers: Vec<String>,
     #[serde(default)]
@@ -282,6 +351,29 @@ impl ModelDescriptor {
                 detail: "requires verbosity support".into(),
             });
         }
+        let unique_experimental_tools = self
+            .tool_capabilities
+            .experimental_supported_tools
+            .iter()
+            .map(|tool| tool.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        if self.tool_capabilities.experimental_supported_tools.len() > 64
+            || self
+                .tool_capabilities
+                .experimental_supported_tools
+                .iter()
+                .any(|tool| {
+                    tool.trim().is_empty() || tool.len() > 128 || tool.chars().any(char::is_control)
+                })
+            || unique_experimental_tools.len()
+                != self.tool_capabilities.experimental_supported_tools.len()
+        {
+            return Err(ModelRuntimeError::InvalidField {
+                field: "tool_capabilities.experimental_supported_tools",
+                detail: "must contain at most 64 unique non-empty names of at most 128 bytes"
+                    .into(),
+            });
+        }
         if self.default_verbosity.as_ref().is_some_and(|verbosity| {
             verbosity.is_empty() || verbosity.len() > 64 || verbosity.chars().any(char::is_control)
         }) {
@@ -344,6 +436,8 @@ pub struct ResolvedModelRuntime {
     pub verbosity: Option<String>,
     pub supports_parallel_tool_calls: bool,
     #[serde(default)]
+    pub tool_capabilities: ModelToolCapabilities,
+    #[serde(default)]
     pub service_tiers: Vec<String>,
     #[serde(default)]
     pub reasoning_replay: ReasoningReplaySupport,
@@ -372,6 +466,7 @@ impl ResolvedModelRuntime {
             supports_verbosity: self.supports_verbosity,
             default_verbosity: self.verbosity.clone(),
             supports_parallel_tool_calls: self.supports_parallel_tool_calls,
+            tool_capabilities: self.tool_capabilities.clone(),
             service_tiers: self.service_tiers.clone(),
             reasoning_replay: self.reasoning_replay,
             responses_dialect: self.responses_dialect,
@@ -425,6 +520,17 @@ impl ResolvedModelRuntime {
         self.input_modalities.contains(&InputModality::Image)
     }
 
+    pub fn accepts_audio(&self) -> bool {
+        self.input_modalities.contains(&InputModality::Audio)
+    }
+
+    pub fn ensure_tools_supported(
+        &self,
+        tools: &[ToolSpec],
+    ) -> Result<(), ModelToolCompatibilityError> {
+        self.tool_capabilities.ensure_tools_supported(tools)
+    }
+
     /// The baseline's `use_responses_lite`, read back from the dialect it was
     /// resolved into. Kept as a named question so a caller never has to know
     /// that "lite" and "standard" are what the flag became.
@@ -471,6 +577,7 @@ mod tests {
             supports_verbosity: false,
             default_verbosity: None,
             supports_parallel_tool_calls: false,
+            tool_capabilities: ModelToolCapabilities::default(),
             service_tiers: Vec::new(),
             reasoning_replay: ReasoningReplaySupport::Disabled,
             responses_dialect: ResponsesDialect::Standard,
@@ -503,6 +610,7 @@ mod tests {
             supports_verbosity: false,
             default_verbosity: None,
             supports_parallel_tool_calls: false,
+            tool_capabilities: ModelToolCapabilities::default(),
             service_tiers: Vec::new(),
             reasoning_replay: ReasoningReplaySupport::Disabled,
             responses_dialect: ResponsesDialect::Standard,
@@ -544,6 +652,7 @@ mod tests {
             supports_verbosity: false,
             default_verbosity: None,
             supports_parallel_tool_calls: false,
+            tool_capabilities: ModelToolCapabilities::default(),
             service_tiers: Vec::new(),
             reasoning_replay: ReasoningReplaySupport::Disabled,
             responses_dialect: ResponsesDialect::Standard,
@@ -590,5 +699,45 @@ mod tests {
                 "backoff_base_ms": 50
             })
         );
+    }
+
+    #[test]
+    fn model_tool_capabilities_reject_only_the_unsupported_model_surface() {
+        let search = ToolSpec::tool_search(
+            "find tools",
+            "client",
+            serde_json::json!({"type":"object","properties":{}}),
+        );
+        let web_with_images = ToolSpec {
+            name: "web_search".into(),
+            description: String::new(),
+            kind: ToolKind::WebSearch {
+                external_web_access: Some(true),
+                indexed_web_access: None,
+                filters: None,
+                location: None,
+                context_size: None,
+                content_types: vec!["text".into(), "image".into()],
+            },
+        };
+        let text_only = ModelToolCapabilities::default();
+        assert!(matches!(
+            text_only.ensure_tools_supported(std::slice::from_ref(&search)),
+            Err(ModelToolCompatibilityError { tool, .. }) if tool == "tool_search"
+        ));
+        assert!(
+            text_only
+                .ensure_tools_supported(std::slice::from_ref(&web_with_images))
+                .is_err()
+        );
+
+        let complete = ModelToolCapabilities {
+            supports_search_tool: true,
+            web_search_tool_type: WebSearchToolType::TextAndImage,
+            experimental_supported_tools: vec!["tool_search".into()],
+        };
+        complete
+            .ensure_tools_supported(&[search, web_with_images])
+            .unwrap();
     }
 }

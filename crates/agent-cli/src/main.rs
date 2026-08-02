@@ -1447,35 +1447,31 @@ async fn run(
     // exists in this process. Set before any resolve, and before the model list
     // is published, so no surface ever shows a compatibility the run lacks.
     chatgpt.set_code_mode(code_mode_available);
-    // `/models` catalog discovered on the connected account, off the critical path:
-    // the session starts on the bundled catalog and switches as soon as the answer arrives. A
-    // failure (offline, expired token) simply leaves the bundled catalog.
-    if !headless {
-        let catalog_source = Arc::clone(&chatgpt);
-        tokio::spawn(async move {
-            match catalog_source.list_models().await {
-                Ok(models) => {
-                    agent_tui::set_models(
-                        models
-                            .into_iter()
-                            .map(|model| agent_tui::ModelCatalogEntry {
-                                slug: model.slug,
-                                default_reasoning_effort: model.default_reasoning_effort,
-                                supported_reasoning_efforts: model.supported_reasoning_efforts,
-                                incompatibility_reason: model.incompatibility_reason,
-                            })
-                            .collect(),
-                    );
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        target: "pyxis::models",
-                        error = %error,
-                        "remote model catalog unavailable; using embedded descriptors"
-                    );
-                }
+    // Interactive and headless resolve through the same scoped refresh before
+    // the first turn. A failure keeps the embedded descriptor for this scope.
+    match chatgpt.list_models().await {
+        Ok(models) => {
+            if !headless {
+                agent_tui::set_models(
+                    models
+                        .into_iter()
+                        .map(|model| agent_tui::ModelCatalogEntry {
+                            slug: model.slug,
+                            default_reasoning_effort: model.default_reasoning_effort,
+                            supported_reasoning_efforts: model.supported_reasoning_efforts,
+                            incompatibility_reason: model.incompatibility_reason,
+                        })
+                        .collect(),
+                );
             }
-        });
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "pyxis::models",
+                error = %error,
+                "remote model catalog unavailable; using embedded descriptors"
+            );
+        }
     }
     let provider: Arc<dyn Provider> = chatgpt;
 

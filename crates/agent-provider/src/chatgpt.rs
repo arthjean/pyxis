@@ -9,7 +9,7 @@
 //! reasoning replay is explicitly enabled. By default, that path stays OFF
 //! until the post-rename wire format is validated live.
 
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use agent_auth::OAuthCredential;
@@ -25,6 +25,7 @@ use eventsource_stream::Eventsource;
 use futures_util::Stream;
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
+use sha2::Digest;
 
 use crate::chatgpt_error::{
     bounded_error_body, from_http_response, invalid_request, is_terminal_rate_limit,
@@ -38,7 +39,7 @@ use crate::chatgpt_websocket::{
     ChatGptWebSocket, WebSocketOutcome, WebSocketProbeAuthorization, WebSocketProbeReport,
 };
 use crate::credential::CredentialManager;
-use crate::models::ModelCatalog;
+use crate::models::{CatalogModel, CatalogScope, ModelCatalog};
 
 /// Keyring key of the ChatGPT subscription credential (rotating refresh rewritten here).
 pub const KEYRING_ACCOUNT: &str = "oauth:openai_chatgpt";
@@ -84,7 +85,7 @@ const MAX_MODELS_BODY: usize = 4 * 1024 * 1024;
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct OpenAiChatGptProvider {
-    creds: CredentialManager,
+    creds: Arc<CredentialManager>,
     http: reqwest::Client,
     capabilities: Capabilities,
     reasoning_effort: Option<String>,
@@ -94,7 +95,10 @@ pub struct OpenAiChatGptProvider {
     session_id: RwLock<String>,
     /// Last valid remote catalog layered over the versioned embedded fallback.
     /// Shared by interactive discovery and headless turn resolution.
-    catalog: RwLock<ModelCatalog>,
+    catalog: Arc<RwLock<ModelCatalog>>,
+    /// Serializes explicit and ETag-driven refreshes. This prevents a slower
+    /// stale response from overwriting a newer atomic snapshot.
+    catalog_refresh: Arc<tokio::sync::Mutex<()>>,
     websocket: ChatGptWebSocket,
 }
 
@@ -170,7 +174,7 @@ impl OpenAiChatGptProvider {
             .connect_timeout(config.connect_timeout())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        let creds = CredentialManager::new(cred, http.clone(), KEYRING_ACCOUNT);
+        let creds = Arc::new(CredentialManager::new(cred, http.clone(), KEYRING_ACCOUNT));
         Self {
             creds,
             http,
@@ -208,7 +212,8 @@ impl OpenAiChatGptProvider {
             reasoning_effort,
             config,
             session_id: RwLock::new(new_session_id()),
-            catalog: RwLock::new(ModelCatalog::embedded()),
+            catalog: Arc::new(RwLock::new(ModelCatalog::embedded())),
+            catalog_refresh: Arc::new(tokio::sync::Mutex::new(())),
             websocket: ChatGptWebSocket::new(),
         }
     }
@@ -274,8 +279,14 @@ impl OpenAiChatGptProvider {
         mut req: CanonicalRequest,
     ) -> Result<(CanonicalRequest, ResolvedModelRuntime, serde_json::Value), ProviderError> {
         req.validate().map_err(invalid_request)?;
-        self.capabilities.ensure_tools_supported(&req.tools)?;
         let runtime = self.runtime_for_request(&req)?;
+        self.capabilities.ensure_tools_supported(&req.tools)?;
+        runtime
+            .ensure_tools_supported(&req.tools)
+            .map_err(|error| ProviderError::UnsupportedTool {
+                tool: error.tool,
+                reason: error.reason,
+            })?;
         if req.model_runtime.is_none() {
             req.reasoning_effort = runtime.reasoning_effort.clone();
             req.model_runtime = Some(runtime.clone());
@@ -343,58 +354,84 @@ impl OpenAiChatGptProvider {
     /// backend priority. Discovered at runtime: never a list frozen in the
     /// binary (the backend removes/adds slugs without notice). Outside the
     /// `Provider` trait: the notion of a catalog is specific to this adapter.
-    pub async fn list_models(&self) -> Result<Vec<crate::models::CatalogModel>, ProviderError> {
-        let spec = self.creds.models_spec().await?;
-        let mut req = self.http.get(&spec.url).timeout(MODELS_TIMEOUT);
-        for (name, value) in &spec.headers {
-            req = req.header(name, value);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(format!("models: {e}")))?;
-        let status = resp.status();
-        let mut body_bytes = Vec::new();
-        let mut body_stream = resp.bytes_stream();
-        while let Some(chunk) = body_stream.next().await {
-            let chunk =
-                chunk.map_err(|error| ProviderError::Transport(format!("models body: {error}")))?;
-            if body_bytes.len().saturating_add(chunk.len()) > MAX_MODELS_BODY {
-                return Err(ProviderError::Decode(format!(
-                    "models: response exceeds {MAX_MODELS_BODY} bytes"
-                )));
-            }
-            body_bytes.extend_from_slice(&chunk);
-        }
-        let body = String::from_utf8(body_bytes)
-            .map_err(|error| ProviderError::Decode(format!("models: invalid UTF-8: {error}")))?;
-        if !status.is_success() {
-            let message = bounded_error_body(&body);
-            return Err(ProviderError::Http {
-                status: status.as_u16(),
-                message,
-                retry_after_ms: None,
-            });
-        }
-        let fetched_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_secs().to_string())
-            .unwrap_or_else(|_| "unknown".into());
-        let mut catalog = self
-            .catalog
-            .write()
-            .map_err(|_| ProviderError::Decode("models: catalog lock poisoned".into()))?;
-        let models = catalog
-            .install_remote(&body, &fetched_at)
-            .map_err(|error| ProviderError::Decode(format!("models: {error}")))?;
-        for diagnostic in catalog.diagnostics() {
-            tracing::warn!(
-                target: "pyxis::models",
-                diagnostic,
-                "remote model descriptor was not used"
-            );
-        }
-        Ok(models)
+    pub async fn list_models(&self) -> Result<Vec<CatalogModel>, ProviderError> {
+        self.refresh_models(true, None).await
+    }
+
+    /// Forces a network fetch without sending the cached ETag. The resulting
+    /// snapshot is still installed atomically and scoped like the normal path.
+    pub async fn list_models_uncached(&self) -> Result<Vec<CatalogModel>, ProviderError> {
+        self.refresh_models(false, None).await
+    }
+
+    async fn refresh_models(
+        &self,
+        cache_enabled: bool,
+        etag_hint: Option<String>,
+    ) -> Result<Vec<CatalogModel>, ProviderError> {
+        let response_endpoint = self.config.endpoint()?.to_string();
+        refresh_model_catalog(
+            Arc::clone(&self.creds),
+            self.http.clone(),
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.catalog_refresh),
+            response_endpoint,
+            cache_enabled,
+            etag_hint,
+        )
+        .await
+    }
+
+    fn observe_catalog_etag(
+        &self,
+        stream: BoxStream<'static, Result<StreamEvent, ProviderError>>,
+    ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+        let creds = Arc::clone(&self.creds);
+        let http = self.http.clone();
+        let catalog = Arc::clone(&self.catalog);
+        let refresh_gate = Arc::clone(&self.catalog_refresh);
+        let response_endpoint = self
+            .config
+            .endpoint()
+            .map(|endpoint| endpoint.to_string())
+            .unwrap_or_default();
+        stream
+            .map(move |event| {
+                let etag = match &event {
+                    Ok(StreamEvent::ResponseMetadata { metadata }) => metadata.models_etag.clone(),
+                    _ => None,
+                };
+                if let Some(etag) = etag.filter(|value| !value.trim().is_empty())
+                    && catalog_etag_changed(&catalog, &etag)
+                {
+                    let creds = Arc::clone(&creds);
+                    let http = http.clone();
+                    let catalog = Arc::clone(&catalog);
+                    let refresh_gate = Arc::clone(&refresh_gate);
+                    let response_endpoint = response_endpoint.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = refresh_model_catalog(
+                            creds,
+                            http,
+                            catalog,
+                            refresh_gate,
+                            response_endpoint,
+                            true,
+                            Some(etag),
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                target: "pyxis::models",
+                                error = %error,
+                                "ETag-driven model catalog refresh failed"
+                            );
+                        }
+                    });
+                }
+                event
+            })
+            .boxed()
     }
 
     fn catalog_window(&self, model: &str) -> Option<u32> {
@@ -403,6 +440,141 @@ impl OpenAiChatGptProvider {
             .ok()
             .and_then(|catalog| catalog.context_window(model.trim()))
     }
+}
+
+async fn refresh_model_catalog(
+    creds: Arc<CredentialManager>,
+    http: reqwest::Client,
+    catalog: Arc<RwLock<ModelCatalog>>,
+    refresh_gate: Arc<tokio::sync::Mutex<()>>,
+    response_endpoint: String,
+    cache_enabled: bool,
+    etag_hint: Option<String>,
+) -> Result<Vec<CatalogModel>, ProviderError> {
+    let _refresh = refresh_gate.lock().await;
+    let spec = creds.models_spec().await?;
+    let scope = catalog_scope(&spec, &response_endpoint)?;
+    let cached_etag = {
+        let mut state = catalog
+            .write()
+            .map_err(|_| ProviderError::Decode("models: catalog lock poisoned".into()))?;
+        state.ensure_scope(scope.clone());
+        state.etag().map(str::to_string)
+    };
+    if cache_enabled
+        && etag_hint.as_deref().is_some()
+        && cached_etag.as_deref() == etag_hint.as_deref()
+    {
+        return catalog
+            .read()
+            .map(|catalog| catalog.models())
+            .map_err(|_| ProviderError::Decode("models: catalog lock poisoned".into()));
+    }
+    let mut req = http.get(&spec.url).timeout(MODELS_TIMEOUT);
+    for (name, value) in &spec.headers {
+        req = req.header(name, value);
+    }
+    if cache_enabled && let Some(etag) = cached_etag.as_deref() {
+        req = req.header(reqwest::header::IF_NONE_MATCH, etag);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| ProviderError::Transport(format!("models: {e}")))?;
+    let status = resp.status();
+    let response_etag = resp
+        .headers()
+        .get("x-models-etag")
+        .or_else(|| resp.headers().get(reqwest::header::ETAG))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or(etag_hint);
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        return catalog
+            .read()
+            .map(|catalog| catalog.models())
+            .map_err(|_| ProviderError::Decode("models: catalog lock poisoned".into()));
+    }
+    let mut body_bytes = Vec::new();
+    let mut body_stream = resp.bytes_stream();
+    while let Some(chunk) = body_stream.next().await {
+        let chunk =
+            chunk.map_err(|error| ProviderError::Transport(format!("models body: {error}")))?;
+        if body_bytes.len().saturating_add(chunk.len()) > MAX_MODELS_BODY {
+            return Err(ProviderError::Decode(format!(
+                "models: response exceeds {MAX_MODELS_BODY} bytes"
+            )));
+        }
+        body_bytes.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8(body_bytes)
+        .map_err(|error| ProviderError::Decode(format!("models: invalid UTF-8: {error}")))?;
+    if !status.is_success() {
+        let message = bounded_error_body(&body);
+        return Err(ProviderError::Http {
+            status: status.as_u16(),
+            message,
+            retry_after_ms: None,
+        });
+    }
+    let fetched_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    let mut catalog = catalog
+        .write()
+        .map_err(|_| ProviderError::Decode("models: catalog lock poisoned".into()))?;
+    let models = catalog
+        .install_remote_scoped(&body, &fetched_at, scope, response_etag)
+        .map_err(|error| ProviderError::Decode(format!("models: {error}")))?;
+    for diagnostic in catalog.diagnostics() {
+        tracing::warn!(
+            target: "pyxis::models",
+            diagnostic,
+            "remote model descriptor was not used"
+        );
+    }
+    Ok(models)
+}
+
+fn catalog_scope(
+    spec: &agent_auth::oauth::openai_chatgpt::RequestSpec,
+    response_endpoint: &str,
+) -> Result<CatalogScope, ProviderError> {
+    let account_id = spec
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("chatgpt-account-id"))
+        .map(|(_, value)| value.as_str())
+        .ok_or(ProviderError::Credential(AuthError::ReconnectRequired))?;
+    let identity_fingerprint = hex::encode(sha2::Sha256::digest(account_id.as_bytes()));
+    let endpoint = format!(
+        "responses={};models={}",
+        normalized_catalog_endpoint(response_endpoint)?,
+        normalized_catalog_endpoint(&spec.url)?
+    );
+    Ok(CatalogScope {
+        provider: "openai_chatgpt".into(),
+        endpoint,
+        identity_fingerprint,
+    })
+}
+
+fn normalized_catalog_endpoint(raw: &str) -> Result<String, ProviderError> {
+    let mut url = url::Url::parse(raw)
+        .map_err(|_| ProviderError::Decode("models: invalid scoped endpoint".into()))?;
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+fn catalog_etag_changed(catalog: &RwLock<ModelCatalog>, observed: &str) -> bool {
+    catalog
+        .read()
+        .ok()
+        .and_then(|catalog| catalog.etag().map(str::to_string))
+        .as_deref()
+        != Some(observed)
 }
 
 /// SSE watchdog (US-022): wraps a canonical event stream in a per-event
@@ -534,7 +706,9 @@ impl Provider for OpenAiChatGptProvider {
                 )
                 .await?
             {
-                WebSocketOutcome::Stream(stream) => return Ok(stream),
+                WebSocketOutcome::Stream(stream) => {
+                    return Ok(self.observe_catalog_etag(stream));
+                }
                 WebSocketOutcome::FallbackHttp => {
                     tracing::warn!(
                         target: "pyxis::provider",
@@ -613,7 +787,8 @@ impl Provider for OpenAiChatGptProvider {
             }
             yield Err(ProviderError::Stream("missing terminal event".to_string()));
         };
-        Ok(idle_guarded(mapped.boxed(), self.config.idle_timeout()).boxed())
+        Ok(self
+            .observe_catalog_etag(idle_guarded(mapped.boxed(), self.config.idle_timeout()).boxed()))
     }
 
     async fn complete(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError> {
@@ -641,12 +816,22 @@ impl Provider for OpenAiChatGptProvider {
     async fn refresh_auth(&self) -> Result<(), ProviderError> {
         self.creds.force_refresh().await?;
         self.websocket.reset_scope();
+        let spec = self.creds.models_spec().await?;
+        let endpoint = self.config.endpoint()?;
+        let scope = catalog_scope(&spec, endpoint.as_str())?;
+        self.catalog
+            .write()
+            .map_err(|_| ProviderError::Decode("models: catalog lock poisoned".into()))?
+            .ensure_scope(scope);
         Ok(())
     }
 
     async fn disconnect_auth(&self) -> Result<(), ProviderError> {
         self.websocket.disconnect(&self.config).await;
         self.creds.disconnect().await;
+        if let Ok(mut catalog) = self.catalog.write() {
+            catalog.clear_remote();
+        }
         Ok(())
     }
 
@@ -730,7 +915,7 @@ impl Provider for OpenAiChatGptProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::provider::ProviderErrorCategory;
+    use agent_core::provider::{ProviderErrorCategory, ToolSpec};
 
     use crate::chatgpt_error::{
         api_category_for_http, days_from_civil, parse_imf_fixdate_ms, parse_retry_after_ms,
@@ -812,6 +997,26 @@ mod tests {
     }
 
     #[test]
+    fn selected_model_rejects_unsupported_tools_before_transport_preparation() {
+        let provider = provider();
+        let request = CanonicalRequest {
+            model: "gpt-5.5".into(),
+            tools: vec![ToolSpec::tool_search(
+                "find tools",
+                "client",
+                serde_json::json!({"type":"object","properties":{}}),
+            )],
+            max_output_tokens: 4096,
+            ..CanonicalRequest::default()
+        };
+        assert!(matches!(
+            provider.prepare_request(request),
+            Err(ProviderError::UnsupportedTool { tool, reason })
+                if tool == "tool_search" && reason.contains("selected model")
+        ));
+    }
+
+    #[test]
     fn encrypted_reasoning_transport_is_available_but_descriptor_gated() {
         let p = provider();
         assert!(p.capabilities().reasoning_options.encrypted_replay);
@@ -877,6 +1082,50 @@ mod tests {
             .expect("fixture installs");
         assert_eq!(p.context_window_for_model("fixture-lite"), Some(200_000));
         assert_eq!(p.max_context_for_model("fixture-lite"), 200_000);
+    }
+
+    #[test]
+    fn catalog_scope_hashes_identity_and_ignores_request_query() {
+        let spec = agent_auth::oauth::openai_chatgpt::RequestSpec {
+            url: "https://chatgpt.com/backend-api/codex/models?client_version=1.2.3".into(),
+            headers: vec![("chatgpt-account-id".into(), "account-secret-id".into())],
+        };
+        let scope = catalog_scope(
+            &spec,
+            "https://chatgpt.com/backend-api/codex/responses?feature=test",
+        )
+        .expect("scope builds");
+        assert_eq!(scope.provider, "openai_chatgpt");
+        assert!(!scope.endpoint.contains("client_version"));
+        assert!(!scope.endpoint.contains("feature=test"));
+        assert!(!scope.identity_fingerprint.contains("account-secret-id"));
+
+        let mut other = spec;
+        other.headers[0].1 = "other-account".into();
+        let other_scope = catalog_scope(&other, "https://chatgpt.com/backend-api/codex/responses")
+            .expect("other scope builds");
+        assert_ne!(scope.identity_fingerprint, other_scope.identity_fingerprint);
+    }
+
+    #[test]
+    fn a_changed_response_etag_requires_refresh() {
+        let catalog = RwLock::new(ModelCatalog::embedded());
+        catalog
+            .write()
+            .expect("catalog lock")
+            .install_remote_scoped(
+                include_str!("../fixtures/models-2026-07-28.json"),
+                "2026-07-28",
+                CatalogScope {
+                    provider: "openai_chatgpt".into(),
+                    endpoint: "scope".into(),
+                    identity_fingerprint: "identity".into(),
+                },
+                Some("etag-a".into()),
+            )
+            .expect("fixture installs");
+        assert!(!catalog_etag_changed(&catalog, "etag-a"));
+        assert!(catalog_etag_changed(&catalog, "etag-b"));
     }
 
     #[test]

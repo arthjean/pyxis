@@ -78,22 +78,21 @@ pub const RESPONSES_PATH: &str = "/responses";
 pub const MODELS_PATH: &str = "/models";
 pub const OPENAI_BETA_SSE: &str = "responses=experimental";
 
-/// Client version announced to the backend on `/models`. The backend FILTERS the
-/// catalog on the `minimal_client_version` of each model: announcing a
-/// too low version returns an empty list (measured on 2026-07-24: `0.1.0` -> 0
-/// models, `0.98.0` -> 3, `0.124.0` -> 5, `0.145.0` -> 8). So it is NOT the
-/// Pyxis version but a Codex catalog compatibility number.
-/// **Volatile, manually updated**: mirror the latest `rust-vX.Y.Z` tag of
-/// `openai/codex` (`gh release view --repo openai/codex --json tagName`) on every
-/// release, otherwise the models introduced since stay invisible in `/models`.
-/// Overridable at runtime through `PYXIS_CODEX_CLIENT_VERSION`.
-pub const CODEX_CLIENT_VERSION: &str = "0.145.0"; // openai/codex rust-v0.145.0, 2026-07-21
+/// Effective build version sent on `/models`. Release builds can inject the
+/// compatibility version through `PYXIS_CODEX_CLIENT_VERSION` at compile time;
+/// local builds fall back to the package version. A runtime override remains
+/// available for diagnostics and compatibility probes.
+pub const fn build_codex_client_version() -> &'static str {
+    match option_env!("PYXIS_CODEX_CLIENT_VERSION") {
+        Some(version) => version,
+        None => env!("CARGO_PKG_VERSION"),
+    }
+}
 
-/// Effective `client_version` sent on `/models` (see `CODEX_CLIENT_VERSION`).
 pub fn codex_client_version() -> String {
     match std::env::var("PYXIS_CODEX_CLIENT_VERSION") {
         Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
-        _ => CODEX_CLIENT_VERSION.to_string(),
+        _ => build_codex_client_version().to_string(),
     }
 }
 
@@ -346,7 +345,7 @@ pub fn responses_request(cred: &OAuthCredential) -> Result<RequestSpec, AuthErro
 
 /// Model catalog discovery request (`GET /models`). The backend
 /// returns the models accessible TO THE connected ACCOUNT (`available_in_plans` field
-/// already applied), filtered by `client_version` (see `CODEX_CLIENT_VERSION`).
+/// already applied), filtered by the current build's `client_version`.
 pub fn models_request(cred: &OAuthCredential) -> Result<RequestSpec, AuthError> {
     let mut headers = auth_headers(cred)?;
     headers.push(("accept".to_string(), "application/json".to_string()));
@@ -704,6 +703,14 @@ mod tests {
         }
         // encoded redirect_uri
         assert!(url.contains("redirect_uri=http"));
+    }
+
+    #[test]
+    fn default_catalog_client_version_is_derived_from_the_build() {
+        assert_eq!(
+            build_codex_client_version(),
+            option_env!("PYXIS_CODEX_CLIENT_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[test]

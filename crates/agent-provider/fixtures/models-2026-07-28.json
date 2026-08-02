@@ -10,11 +10,7 @@
       "base_instructions",
       "numeric_limits"
     ],
-    "omitted_fields": [
-      "availability_nux",
-      "model_messages",
-      "service_tiers"
-    ],
+    "omitted_fields": ["model_messages"],
     "proprietary_fields": [
       "use_responses_lite",
       "tool_mode",
@@ -25,28 +21,56 @@
     {
       "slug": "fixture-lite",
       "display_name": "Fixture Lite",
+      "description": "Complete fixture model",
       "visibility": "list",
+      "supported_in_api": true,
       "priority": 1,
       "base_instructions": "fixture base instructions",
       "default_reasoning_level": "medium",
       "supported_reasoning_levels": [
-        { "effort": "low" },
-        { "effort": "medium" },
-        { "effort": "high" }
+        { "effort": "low", "description": "Fast" },
+        { "effort": "medium", "description": "Balanced" },
+        { "effort": "high", "description": "Deep" }
       ],
+      "shell_type": "unified_exec",
+      "additional_speed_tiers": ["fast"],
+      "service_tiers": [
+        { "id": "priority", "name": "Priority", "description": "Low latency" }
+      ],
+      "default_service_tier": "priority",
+      "availability_nux": { "message": "Available now" },
+      "upgrade": {
+        "id": "fixture-next",
+        "migration_config_key": "fixture_migration",
+        "model_link": null,
+        "upgrade_copy": "Upgrade",
+        "migration_markdown": null
+      },
+      "include_skills_usage_instructions": true,
+      "supports_reasoning_summary_parameter": false,
+      "default_reasoning_summary": "concise",
       "support_verbosity": true,
       "default_verbosity": "low",
+      "apply_patch_tool_type": "freeform",
+      "web_search_tool_type": "text_and_image",
       "truncation_policy": {
         "mode": "tokens",
         "limit": 9000
       },
       "supports_parallel_tool_calls": true,
+      "supports_image_detail_original": true,
       "context_window": 200000,
+      "max_context_window": 240000,
       "auto_compact_token_limit": 170000,
+      "effective_context_window_percent": 87,
       "comp_hash": "fixture-1",
+      "experimental_supported_tools": ["tool_search"],
       "input_modalities": ["text", "image"],
+      "supports_search_tool": true,
       "use_responses_lite": true,
-      "tool_mode": "direct"
+      "auto_review_model_override": "fixture-review",
+      "tool_mode": "direct",
+      "future_catalog_capability": { "enabled": true }
     },
     {
       "slug": "gpt-5.5",

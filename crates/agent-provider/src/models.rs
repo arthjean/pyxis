@@ -5,22 +5,23 @@
 //! as a whole to the versioned embedded entry. Explicit unknown required
 //! capabilities stay incompatible rather than degrading to direct tools.
 
+mod embedded;
+mod wire;
+
 use std::collections::HashMap;
 
 use agent_core::model::{
     InputModality, ModelDescriptor, ModelRetryPolicy, ModelRuntimeError, ModelRuntimeSource,
-    ModelToolMode, MultiAgentVersion, ReasoningReplaySupport, ResolvedModelRuntime,
-    ResponsesDialect, TruncationMode, TruncationPolicy,
+    ModelToolMode, MultiAgentVersion, ResolvedModelRuntime,
 };
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
+
+use embedded::embedded_descriptors;
+use wire::{WireCatalog, bounded_wire_text, catalog_metadata_from_wire, descriptor_from_wire};
 
 pub const EMBEDDED_CATALOG_VERSION: &str = "2026-07-28.codex-8e271dc02b23";
 pub const MODELS_ENDPOINT: &str = "/backend-api/codex/models";
 const MAX_CATALOG_MODELS: usize = 256;
-
-const GENERIC_INSTRUCTIONS: &str = include_str!("../../agent-cli/prompts/gpt5_generic.md");
-const CODEX_INSTRUCTIONS: &str = include_str!("../../agent-cli/prompts/codex_finetuned.md");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogModel {
@@ -29,23 +30,75 @@ pub struct CatalogModel {
     pub default_reasoning_effort: Option<String>,
     pub supported_reasoning_efforts: Vec<String>,
     pub context_window: Option<u32>,
+    pub metadata: CatalogMetadata,
     pub source: ModelRuntimeSource,
     pub incompatibility_reason: Option<String>,
+}
+
+/// Provider catalog fields which affect discovery or capability selection but
+/// are not part of the sampling runtime yet. Keeping them typed here prevents
+/// `/models` from becoming a lossy slug-only endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CatalogMetadata {
+    pub description: Option<String>,
+    pub visibility: Option<String>,
+    pub supported_in_api: Option<bool>,
+    pub priority: i32,
+    pub reasoning_level_descriptions: Vec<(String, String)>,
+    pub additional_speed_tiers: Vec<String>,
+    pub service_tiers: Vec<CatalogServiceTier>,
+    pub default_service_tier: Option<String>,
+    pub availability_nux: Option<serde_json::Value>,
+    pub upgrade: Option<serde_json::Value>,
+    pub include_skills_usage_instructions: bool,
+    pub supports_reasoning_summary_parameter: bool,
+    pub default_reasoning_summary: Option<serde_json::Value>,
+    pub shell_type: Option<String>,
+    pub apply_patch_tool_type: Option<serde_json::Value>,
+    pub web_search_tool_type: Option<serde_json::Value>,
+    pub supports_image_detail_original: bool,
+    pub max_context_window: Option<u32>,
+    pub effective_context_window_percent: u8,
+    pub experimental_supported_tools: Vec<String>,
+    pub input_modalities: Vec<String>,
+    pub supports_search_tool: bool,
+    pub auto_review_model_override: Option<String>,
+    /// Unknown top-level field names are retained as diagnostics. Values are
+    /// deliberately not retained because future catalog fields may be secret.
+    pub unrecognized_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogServiceTier {
+    pub id: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CatalogScope {
+    pub provider: String,
+    pub endpoint: String,
+    /// SHA-256 of the provider's non-secret account identifier.
+    pub identity_fingerprint: String,
 }
 
 #[derive(Debug, Clone)]
 enum RemoteEntry {
     Complete {
-        descriptor: ModelDescriptor,
+        descriptor: Box<ModelDescriptor>,
+        metadata: Box<CatalogMetadata>,
         source: ModelRuntimeSource,
     },
     Partial {
         display_name: String,
+        metadata: Box<CatalogMetadata>,
         reason: String,
         source: ModelRuntimeSource,
     },
     Incompatible {
         display_name: String,
+        metadata: Box<CatalogMetadata>,
         reason: String,
         source: ModelRuntimeSource,
     },
@@ -53,6 +106,8 @@ enum RemoteEntry {
 
 #[derive(Debug, Clone)]
 struct RemoteCatalog {
+    scope: CatalogScope,
+    etag: Option<String>,
     ordered_slugs: Vec<String>,
     entries: HashMap<String, RemoteEntry>,
 }
@@ -113,19 +168,38 @@ impl ModelCatalog {
         body: &str,
         fetched_at: &str,
     ) -> Result<Vec<CatalogModel>, CatalogError> {
+        self.install_remote_scoped(
+            body,
+            fetched_at,
+            CatalogScope {
+                provider: "openai_chatgpt".into(),
+                endpoint: MODELS_ENDPOINT.into(),
+                identity_fingerprint: "legacy-local-scope".into(),
+            },
+            None,
+        )
+    }
+
+    /// Installs a snapshot under an explicit provider, endpoint and identity
+    /// key. Changing scope first evicts the old remote data, including when the
+    /// new response is malformed, so stale retention can never cross accounts.
+    pub fn install_remote_scoped(
+        &mut self,
+        body: &str,
+        fetched_at: &str,
+        scope: CatalogScope,
+        etag: Option<String>,
+    ) -> Result<Vec<CatalogModel>, CatalogError> {
+        self.ensure_scope(scope.clone());
         let wire: WireCatalog = serde_json::from_str(body)
             .map_err(|error| CatalogError::Malformed(error.to_string()))?;
-        let mut models: Vec<WireModel> = wire
-            .models
-            .into_iter()
-            .filter(|model| matches!(model.visibility.as_deref(), None | Some("list")))
-            .collect();
+        let mut models = wire.models;
         if models.is_empty() {
             return Err(CatalogError::Empty);
         }
         if models.len() > MAX_CATALOG_MODELS {
             return Err(CatalogError::Malformed(format!(
-                "catalog contains more than {MAX_CATALOG_MODELS} listed models"
+                "catalog contains more than {MAX_CATALOG_MODELS} models"
             )));
         }
         models.sort_by_key(|model| model.priority);
@@ -139,6 +213,7 @@ impl ModelCatalog {
         let mut diagnostics = Vec::new();
         for model in models {
             let slug = model.slug.clone();
+            let listed = matches!(model.visibility.as_deref(), None | Some("list"));
             if slug.trim().is_empty() || slug.len() > 256 || slug.chars().any(char::is_control) {
                 return Err(CatalogError::Malformed(
                     "model slug must contain 1 to 256 bytes and no control characters".into(),
@@ -150,26 +225,65 @@ impl ModelCatalog {
                     bounded_wire_text(&slug, 128)
                 )));
             }
-            ordered_slugs.push(slug.clone());
-            let entry = match descriptor_from_wire(model, source.clone()) {
-                Ok(entry) => entry,
-                Err(reason) => {
-                    diagnostics.push(format!("{slug}: {reason}"));
-                    RemoteEntry::Partial {
-                        display_name: slug.clone(),
-                        reason,
-                        source: source.clone(),
+            if listed {
+                ordered_slugs.push(slug.clone());
+            }
+            let metadata = catalog_metadata_from_wire(&model);
+            for field in &metadata.unrecognized_fields {
+                diagnostics.push(format!("{slug}: unrecognized catalog field {field}"));
+            }
+            let entry =
+                match descriptor_from_wire(model, Box::new(metadata.clone()), source.clone()) {
+                    Ok(entry) => entry,
+                    Err(reason) => {
+                        diagnostics.push(format!("{slug}: {reason}"));
+                        RemoteEntry::Partial {
+                            display_name: slug.clone(),
+                            metadata: Box::new(metadata),
+                            reason,
+                            source: source.clone(),
+                        }
                     }
-                }
-            };
+                };
+            if let RemoteEntry::Incompatible { reason, .. } = &entry {
+                diagnostics.push(format!("{slug}: {reason}"));
+            }
             entries.insert(slug, entry);
         }
         self.remote = Some(RemoteCatalog {
+            scope,
+            etag: etag.filter(|value| !value.trim().is_empty()),
             ordered_slugs,
             entries,
         });
         self.diagnostics = diagnostics;
         Ok(self.models())
+    }
+
+    pub fn ensure_scope(&mut self, scope: CatalogScope) {
+        if self
+            .remote
+            .as_ref()
+            .is_some_and(|remote| remote.scope != scope)
+        {
+            self.remote = None;
+            self.diagnostics.clear();
+        }
+    }
+
+    pub fn clear_remote(&mut self) {
+        self.remote = None;
+        self.diagnostics.clear();
+    }
+
+    pub fn scope(&self) -> Option<&CatalogScope> {
+        self.remote.as_ref().map(|remote| &remote.scope)
+    }
+
+    pub fn etag(&self) -> Option<&str> {
+        self.remote
+            .as_ref()
+            .and_then(|remote| remote.etag.as_deref())
     }
 
     pub fn models(&self) -> Vec<CatalogModel> {
@@ -182,6 +296,12 @@ impl ModelCatalog {
             .iter()
             .filter_map(|slug| self.catalog_model(slug))
             .collect()
+    }
+
+    /// Looks up any decoded entry, including a hidden model omitted from picker
+    /// ordering. Visibility is a presentation property, not data deletion.
+    pub fn model(&self, slug: &str) -> Option<CatalogModel> {
+        self.catalog_model(slug)
     }
 
     pub fn diagnostics(&self) -> &[String] {
@@ -255,6 +375,7 @@ impl ModelCatalog {
             supports_verbosity: descriptor.supports_verbosity,
             verbosity: descriptor.default_verbosity.clone(),
             supports_parallel_tool_calls: descriptor.supports_parallel_tool_calls,
+            tool_capabilities: descriptor.tool_capabilities.clone(),
             service_tiers: descriptor.service_tiers.clone(),
             reasoning_replay: descriptor.reasoning_replay,
             responses_dialect: descriptor.responses_dialect,
@@ -278,9 +399,9 @@ impl ModelCatalog {
             && let Some(entry) = remote.entries.get(slug)
         {
             return match entry {
-                RemoteEntry::Complete { descriptor, source } => {
-                    Ok((descriptor.clone(), source.clone()))
-                }
+                RemoteEntry::Complete {
+                    descriptor, source, ..
+                } => Ok((descriptor.as_ref().clone(), source.clone())),
                 RemoteEntry::Incompatible { reason, .. } => Err(ModelRuntimeError::Incompatible {
                     slug: slug.into(),
                     reason: reason.clone(),
@@ -327,17 +448,26 @@ impl ModelCatalog {
             .as_ref()
             .and_then(|catalog| catalog.entries.get(slug));
         match remote {
-            Some(RemoteEntry::Complete { descriptor, source }) => Some(
-                catalog_model_from_descriptor(descriptor, source.clone(), self.code_mode),
-            ),
+            Some(RemoteEntry::Complete {
+                descriptor,
+                metadata,
+                source,
+            }) => Some(catalog_model_from_descriptor(
+                descriptor,
+                metadata.as_ref().clone(),
+                source.clone(),
+                self.code_mode,
+            )),
             Some(RemoteEntry::Partial {
                 display_name,
+                metadata,
                 reason,
                 source,
             }) => embedded
                 .map(|descriptor| {
                     catalog_model_from_descriptor(
                         descriptor,
+                        metadata.as_ref().clone(),
                         ModelRuntimeSource::Embedded {
                             version: EMBEDDED_CATALOG_VERSION.into(),
                         },
@@ -351,6 +481,7 @@ impl ModelCatalog {
                         default_reasoning_effort: None,
                         supported_reasoning_efforts: Vec::new(),
                         context_window: None,
+                        metadata: metadata.as_ref().clone(),
                         source: source.clone(),
                         incompatibility_reason: Some(format!(
                             "remote descriptor is partial: {reason}"
@@ -359,6 +490,7 @@ impl ModelCatalog {
                 }),
             Some(RemoteEntry::Incompatible {
                 display_name,
+                metadata,
                 reason,
                 source,
             }) => Some(CatalogModel {
@@ -367,12 +499,14 @@ impl ModelCatalog {
                 default_reasoning_effort: None,
                 supported_reasoning_efforts: Vec::new(),
                 context_window: None,
+                metadata: metadata.as_ref().clone(),
                 source: source.clone(),
                 incompatibility_reason: Some(reason.clone()),
             }),
             None => embedded.map(|descriptor| {
                 catalog_model_from_descriptor(
                     descriptor,
+                    embedded_catalog_metadata(descriptor),
                     ModelRuntimeSource::Embedded {
                         version: EMBEDDED_CATALOG_VERSION.into(),
                     },
@@ -391,286 +525,6 @@ pub enum CatalogError {
     Malformed(String),
 }
 
-#[derive(Deserialize)]
-struct WireCatalog {
-    #[serde(default)]
-    models: Vec<WireModel>,
-}
-
-#[derive(Deserialize)]
-struct WireModel {
-    slug: String,
-    #[serde(default)]
-    display_name: Option<String>,
-    #[serde(default)]
-    visibility: Option<String>,
-    #[serde(default)]
-    priority: i32,
-    #[serde(default)]
-    default_reasoning_level: Option<String>,
-    #[serde(default)]
-    supported_reasoning_levels: Option<Vec<WireReasoningLevel>>,
-    #[serde(default)]
-    base_instructions: Option<String>,
-    #[serde(default)]
-    model_messages: Option<WireModelMessages>,
-    #[serde(default)]
-    support_verbosity: Option<bool>,
-    #[serde(default)]
-    default_verbosity: Option<String>,
-    #[serde(default)]
-    truncation_policy: Option<WireTruncationPolicy>,
-    #[serde(default)]
-    supports_parallel_tool_calls: Option<bool>,
-    #[serde(default)]
-    service_tiers: Vec<WireServiceTier>,
-    #[serde(default)]
-    supports_encrypted_reasoning: Option<bool>,
-    #[serde(default)]
-    supports_reasoning_replay: Option<bool>,
-    #[serde(default)]
-    context_window: Option<u32>,
-    #[serde(default)]
-    auto_compact_token_limit: Option<u32>,
-    #[serde(default)]
-    comp_hash: Option<String>,
-    #[serde(default)]
-    input_modalities: Option<Vec<String>>,
-    #[serde(default)]
-    use_responses_lite: Option<bool>,
-    #[serde(default)]
-    tool_mode: Option<serde_json::Value>,
-    #[serde(default)]
-    multi_agent_version: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
-struct WireReasoningLevel {
-    effort: String,
-}
-
-#[derive(Deserialize)]
-struct WireServiceTier {
-    id: String,
-}
-
-#[derive(Deserialize)]
-struct WireModelMessages {
-    #[serde(default)]
-    instructions_template: Option<String>,
-    #[serde(default)]
-    instructions_variables: Option<WireInstructionsVariables>,
-}
-
-#[derive(Deserialize)]
-struct WireInstructionsVariables {
-    #[serde(default)]
-    personality_default: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct WireTruncationPolicy {
-    mode: String,
-    limit: u32,
-}
-
-fn descriptor_from_wire(
-    model: WireModel,
-    source: ModelRuntimeSource,
-) -> Result<RemoteEntry, String> {
-    let display_name = model
-        .display_name
-        .clone()
-        .unwrap_or_else(|| model.slug.clone());
-    if display_name.len() > 512 || display_name.chars().any(char::is_control) {
-        return Ok(RemoteEntry::Incompatible {
-            display_name: model.slug,
-            reason: "display_name exceeds 512 bytes or contains control characters".into(),
-            source,
-        });
-    }
-    let tool_mode = match model.tool_mode {
-        None | Some(serde_json::Value::Null) => ModelToolMode::Direct,
-        Some(serde_json::Value::String(mode)) if mode == "direct" => ModelToolMode::Direct,
-        Some(serde_json::Value::String(mode)) if mode == "code_mode" => ModelToolMode::CodeMode,
-        Some(serde_json::Value::String(mode)) if mode == "code_mode_only" => {
-            ModelToolMode::CodeModeOnly
-        }
-        Some(value) => {
-            return Ok(RemoteEntry::Incompatible {
-                display_name,
-                reason: format!(
-                    "unknown required tool_mode {}",
-                    bounded_wire_text(&value.to_string(), 128)
-                ),
-                source,
-            });
-        }
-    };
-    let multi_agent_version = match model.multi_agent_version {
-        None | Some(serde_json::Value::Null) => MultiAgentVersion::Disabled,
-        Some(serde_json::Value::String(ref version)) if version == "disabled" => {
-            MultiAgentVersion::Disabled
-        }
-        Some(serde_json::Value::String(ref version)) if version == "v1" => MultiAgentVersion::V1,
-        Some(serde_json::Value::String(ref version)) if version == "v2" => MultiAgentVersion::V2,
-        Some(value) => {
-            return Ok(RemoteEntry::Incompatible {
-                display_name,
-                reason: format!(
-                    "unknown required multi_agent_version {}",
-                    bounded_wire_text(&value.to_string(), 128)
-                ),
-                source,
-            });
-        }
-    };
-    let templated_instructions = model.model_messages.and_then(|messages| {
-        let personality = messages
-            .instructions_variables
-            .and_then(|variables| variables.personality_default)
-            .unwrap_or_default();
-        messages
-            .instructions_template
-            .map(|template| template.replace("{{ personality }}", &personality))
-    });
-    let instructions = templated_instructions
-        .filter(|instructions| !instructions.is_empty())
-        .or_else(|| {
-            model
-                .base_instructions
-                .filter(|instructions| !instructions.is_empty())
-        })
-        .ok_or_else(|| "missing base instructions".to_string())?;
-    let context_window = model
-        .context_window
-        .filter(|window| *window > 0)
-        .ok_or_else(|| "missing positive context_window".to_string())?;
-    let auto_compact_token_limit = model
-        .auto_compact_token_limit
-        .unwrap_or_else(|| context_window.saturating_mul(9) / 10)
-        .min(context_window.saturating_mul(9) / 10);
-    let raw_modalities = model
-        .input_modalities
-        .ok_or_else(|| "missing input_modalities".to_string())?;
-    let mut modalities = Vec::with_capacity(raw_modalities.len());
-    for modality in raw_modalities {
-        match modality.as_str() {
-            "text" => modalities.push(InputModality::Text),
-            "image" => modalities.push(InputModality::Image),
-            other => {
-                return Ok(RemoteEntry::Incompatible {
-                    display_name,
-                    reason: format!(
-                        "unknown required input modality {}",
-                        bounded_wire_text(other, 128)
-                    ),
-                    source,
-                });
-            }
-        }
-    }
-    let reasoning = model
-        .supported_reasoning_levels
-        .ok_or_else(|| "missing supported_reasoning_levels".to_string())?
-        .into_iter()
-        .map(|level| level.effort)
-        .collect::<Vec<_>>();
-    let supports_verbosity = model
-        .support_verbosity
-        .ok_or_else(|| "missing support_verbosity".to_string())?;
-    let parallel = model
-        .supports_parallel_tool_calls
-        .ok_or_else(|| "missing supports_parallel_tool_calls".to_string())?;
-    let service_tiers = model
-        .service_tiers
-        .into_iter()
-        .map(|tier| tier.id)
-        .collect();
-    let lite = model
-        .use_responses_lite
-        .ok_or_else(|| "missing use_responses_lite".to_string())?;
-    let truncation = model
-        .truncation_policy
-        .ok_or_else(|| "missing truncation_policy".to_string())?;
-    let truncation_mode = match truncation.mode.as_str() {
-        "bytes" => TruncationMode::Bytes,
-        "tokens" => TruncationMode::Tokens,
-        other => {
-            return Ok(RemoteEntry::Incompatible {
-                display_name,
-                reason: format!(
-                    "unknown required truncation mode {}",
-                    bounded_wire_text(other, 128)
-                ),
-                source,
-            });
-        }
-    };
-    let descriptor = ModelDescriptor {
-        slug: model.slug,
-        display_name,
-        instructions,
-        context_window,
-        auto_compact_token_limit,
-        input_modalities: modalities,
-        supports_reasoning: !reasoning.is_empty(),
-        default_reasoning_effort: model.default_reasoning_level,
-        supported_reasoning_efforts: reasoning,
-        supports_verbosity,
-        default_verbosity: model.default_verbosity,
-        supports_parallel_tool_calls: parallel,
-        service_tiers,
-        reasoning_replay: if model.supports_encrypted_reasoning == Some(true)
-            && model.supports_reasoning_replay == Some(true)
-        {
-            ReasoningReplaySupport::Enabled
-        } else {
-            ReasoningReplaySupport::Disabled
-        },
-        responses_dialect: if lite {
-            ResponsesDialect::Lite
-        } else {
-            ResponsesDialect::Standard
-        },
-        tool_mode,
-        multi_agent_version,
-        truncation: TruncationPolicy {
-            mode: truncation_mode,
-            limit: truncation.limit,
-        },
-        comp_hash: model.comp_hash,
-    };
-    if let Err(error) = descriptor.validate() {
-        return Ok(RemoteEntry::Incompatible {
-            display_name: descriptor.display_name.clone(),
-            reason: error.to_string(),
-            source,
-        });
-    }
-    Ok(RemoteEntry::Complete { descriptor, source })
-}
-
-fn bounded_wire_text(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let bounded = chars
-        .by_ref()
-        .take(max_chars)
-        .map(|character| {
-            if character.is_control() {
-                '?'
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
-    if chars.next().is_some() {
-        format!("{bounded}...")
-    } else {
-        bounded
-    }
-}
-
 /// The one place that decides whether a tool mode is usable here. `None` means
 /// usable; `Some(reason)` names the missing component, which is what edge case
 /// 1 of the PRD requires the user to see instead of a silent non-answer.
@@ -683,6 +537,7 @@ fn code_mode_incompatibility(mode: ModelToolMode, code_mode_available: bool) -> 
 
 fn catalog_model_from_descriptor(
     descriptor: &ModelDescriptor,
+    metadata: CatalogMetadata,
     source: ModelRuntimeSource,
     code_mode_available: bool,
 ) -> CatalogModel {
@@ -692,11 +547,41 @@ fn catalog_model_from_descriptor(
         default_reasoning_effort: descriptor.default_reasoning_effort.clone(),
         supported_reasoning_efforts: descriptor.supported_reasoning_efforts.clone(),
         context_window: Some(descriptor.context_window),
+        metadata,
         source,
         incompatibility_reason: code_mode_incompatibility(
             descriptor.tool_mode,
             code_mode_available,
         ),
+    }
+}
+
+fn embedded_catalog_metadata(descriptor: &ModelDescriptor) -> CatalogMetadata {
+    CatalogMetadata {
+        visibility: Some("list".into()),
+        supported_in_api: Some(true),
+        service_tiers: descriptor
+            .service_tiers
+            .iter()
+            .map(|id| CatalogServiceTier {
+                id: id.clone(),
+                name: None,
+                description: None,
+            })
+            .collect(),
+        default_service_tier: descriptor.service_tiers.first().cloned(),
+        supports_reasoning_summary_parameter: true,
+        effective_context_window_percent: 95,
+        input_modalities: descriptor
+            .input_modalities
+            .iter()
+            .map(|modality| match modality {
+                InputModality::Text => "text".to_string(),
+                InputModality::Image => "image".to_string(),
+                InputModality::Audio => "audio".to_string(),
+            })
+            .collect(),
+        ..CatalogMetadata::default()
     }
 }
 
@@ -708,152 +593,6 @@ fn runtime_fingerprint(runtime: &ResolvedModelRuntime) -> Result<String, ModelRu
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn descriptor(
-    slug: &str,
-    display_name: &str,
-    instructions: &str,
-    default_reasoning_effort: &str,
-    supported_reasoning_efforts: &[&str],
-    verbosity: &str,
-    service_tiers: &[&str],
-    dialect: ResponsesDialect,
-    tool_mode: ModelToolMode,
-    multi_agent_version: MultiAgentVersion,
-    comp_hash: &str,
-) -> ModelDescriptor {
-    ModelDescriptor {
-        slug: slug.into(),
-        display_name: display_name.into(),
-        instructions: instructions.into(),
-        context_window: 272_000,
-        auto_compact_token_limit: 244_800,
-        input_modalities: vec![InputModality::Text, InputModality::Image],
-        supports_reasoning: true,
-        default_reasoning_effort: Some(default_reasoning_effort.into()),
-        supported_reasoning_efforts: supported_reasoning_efforts
-            .iter()
-            .map(|effort| (*effort).into())
-            .collect(),
-        supports_verbosity: true,
-        default_verbosity: Some(verbosity.into()),
-        supports_parallel_tool_calls: true,
-        service_tiers: service_tiers
-            .iter()
-            .map(|tier| (*tier).to_string())
-            .collect(),
-        reasoning_replay: ReasoningReplaySupport::Enabled,
-        responses_dialect: dialect,
-        tool_mode,
-        multi_agent_version,
-        truncation: TruncationPolicy {
-            mode: TruncationMode::Tokens,
-            limit: 10_000,
-        },
-        comp_hash: Some(comp_hash.into()),
-    }
-}
-
-fn embedded_descriptors() -> Vec<ModelDescriptor> {
-    const STANDARD_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
-    const FRONTIER_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
-    const PRIORITY: &[&str] = &["priority"];
-    const NO_SERVICE_TIERS: &[&str] = &[];
-    vec![
-        descriptor(
-            "gpt-5.6-sol",
-            "GPT-5.6-Sol",
-            GENERIC_INSTRUCTIONS,
-            "low",
-            FRONTIER_EFFORTS,
-            "low",
-            PRIORITY,
-            ResponsesDialect::Lite,
-            ModelToolMode::CodeModeOnly,
-            MultiAgentVersion::V2,
-            "3000",
-        ),
-        descriptor(
-            "gpt-5.6-terra",
-            "GPT-5.6-Terra",
-            GENERIC_INSTRUCTIONS,
-            "medium",
-            FRONTIER_EFFORTS,
-            "low",
-            PRIORITY,
-            ResponsesDialect::Lite,
-            ModelToolMode::CodeModeOnly,
-            MultiAgentVersion::V2,
-            "3000",
-        ),
-        descriptor(
-            "gpt-5.6-luna",
-            "GPT-5.6-Luna",
-            GENERIC_INSTRUCTIONS,
-            "medium",
-            &["low", "medium", "high", "xhigh", "max"],
-            "low",
-            PRIORITY,
-            ResponsesDialect::Lite,
-            ModelToolMode::CodeModeOnly,
-            MultiAgentVersion::V1,
-            "3000",
-        ),
-        descriptor(
-            "gpt-5.5",
-            "GPT-5.5",
-            GENERIC_INSTRUCTIONS,
-            "medium",
-            STANDARD_EFFORTS,
-            "low",
-            PRIORITY,
-            ResponsesDialect::Standard,
-            ModelToolMode::Direct,
-            MultiAgentVersion::Disabled,
-            "2911",
-        ),
-        descriptor(
-            "gpt-5.4",
-            "GPT-5.4",
-            GENERIC_INSTRUCTIONS,
-            "medium",
-            STANDARD_EFFORTS,
-            "low",
-            PRIORITY,
-            ResponsesDialect::Standard,
-            ModelToolMode::Direct,
-            MultiAgentVersion::Disabled,
-            "2911",
-        ),
-        descriptor(
-            "gpt-5.4-mini",
-            "GPT-5.4 Mini",
-            GENERIC_INSTRUCTIONS,
-            "medium",
-            STANDARD_EFFORTS,
-            "medium",
-            NO_SERVICE_TIERS,
-            ResponsesDialect::Standard,
-            ModelToolMode::Direct,
-            MultiAgentVersion::Disabled,
-            "2911",
-        ),
-        descriptor(
-            "gpt-5.3-codex-spark",
-            "GPT-5.3 Codex Spark",
-            CODEX_INSTRUCTIONS,
-            "high",
-            STANDARD_EFFORTS,
-            "low",
-            NO_SERVICE_TIERS,
-            ResponsesDialect::Standard,
-            ModelToolMode::Direct,
-            MultiAgentVersion::Disabled,
-            "2026-07-24",
-        ),
-    ]
-}
-
 /// Compatibility helper used by callers that only need an effective listing.
 pub fn parse_catalog(body: &str) -> Result<Vec<CatalogModel>, CatalogError> {
     let mut catalog = ModelCatalog::embedded();
@@ -861,496 +600,4 @@ pub fn parse_catalog(body: &str) -> Result<Vec<CatalogModel>, CatalogError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const RICH_FIXTURE: &str = include_str!("../fixtures/models-2026-07-28.json");
-
-    #[test]
-    fn rich_fixture_preserves_every_runtime_field() {
-        let mut catalog = ModelCatalog::embedded();
-        let models = catalog
-            .install_remote(RICH_FIXTURE, "2026-07-28")
-            .expect("fixture parses");
-        assert_eq!(
-            models
-                .iter()
-                .map(|model| model.slug.as_str())
-                .collect::<Vec<_>>(),
-            ["fixture-lite", "gpt-5.5"]
-        );
-        let runtime = catalog
-            .resolve(
-                "fixture-lite",
-                Some("high"),
-                4096,
-                ModelRetryPolicy {
-                    max_attempts: 4,
-                    backoff_base_ms: 50,
-                },
-            )
-            .expect("runtime resolves");
-        assert_eq!(runtime.instructions, "fixture base instructions");
-        assert_eq!(runtime.context_window, 200_000);
-        assert_eq!(runtime.auto_compact_token_limit, 170_000);
-        assert_eq!(runtime.responses_dialect, ResponsesDialect::Lite);
-        assert_eq!(runtime.tool_mode, ModelToolMode::Direct);
-        assert_eq!(runtime.truncation.limit, 9_000);
-        assert_eq!(runtime.comp_hash.as_deref(), Some("fixture-1"));
-        assert!(runtime.supports_parallel_tool_calls);
-        assert!(runtime.accepts_images());
-        assert_eq!(runtime.reasoning_replay, ReasoningReplaySupport::Disabled);
-        assert!(runtime.reasoning_replay_disabled_reason().is_some());
-    }
-
-    #[test]
-    fn remote_replay_requires_both_encrypted_and_stateless_proofs() {
-        let body = RICH_FIXTURE.replace(
-            r#""supports_parallel_tool_calls": true,"#,
-            r#""supports_parallel_tool_calls": true,
-      "supports_encrypted_reasoning": true,
-      "supports_reasoning_replay": true,"#,
-        );
-        let mut catalog = ModelCatalog::embedded();
-        catalog.install_remote(&body, "2026-07-28").unwrap();
-        let runtime = catalog
-            .resolve(
-                "fixture-lite",
-                None,
-                4096,
-                ModelRetryPolicy {
-                    max_attempts: 4,
-                    backoff_base_ms: 50,
-                },
-            )
-            .unwrap();
-        assert_eq!(runtime.reasoning_replay, ReasoningReplaySupport::Enabled);
-        assert!(runtime.reasoning_replay_disabled_reason().is_none());
-    }
-
-    #[test]
-    fn remote_complete_wins_and_partial_uses_whole_embedded_descriptor() {
-        let mut catalog = ModelCatalog::embedded();
-        catalog
-            .install_remote(RICH_FIXTURE, "2026-07-28")
-            .expect("fixture parses");
-        let runtime = catalog
-            .resolve(
-                "gpt-5.5",
-                None,
-                4096,
-                ModelRetryPolicy {
-                    max_attempts: 4,
-                    backoff_base_ms: 50,
-                },
-            )
-            .expect("embedded fallback resolves");
-        assert!(matches!(
-            runtime.source,
-            ModelRuntimeSource::Embedded { .. }
-        ));
-        assert_eq!(runtime.context_window, 272_000);
-        assert!(
-            catalog
-                .diagnostics()
-                .iter()
-                .any(|diagnostic| diagnostic.contains("missing base instructions"))
-        );
-    }
-
-    #[test]
-    fn null_auto_compact_limit_uses_the_reference_ninety_percent_rule() {
-        let mut catalog = ModelCatalog::embedded();
-        catalog
-            .install_remote(
-                &RICH_FIXTURE.replace(
-                    r#""auto_compact_token_limit": 170000"#,
-                    r#""auto_compact_token_limit": null"#,
-                ),
-                "2026-07-28",
-            )
-            .expect("current catalog null remains a complete descriptor");
-        let runtime = catalog
-            .resolve(
-                "fixture-lite",
-                None,
-                4096,
-                ModelRetryPolicy {
-                    max_attempts: 4,
-                    backoff_base_ms: 50,
-                },
-            )
-            .expect("runtime resolves");
-        assert_eq!(runtime.auto_compact_token_limit, 180_000);
-    }
-
-    #[test]
-    fn instruction_template_and_default_personality_override_base_instructions() {
-        let body = RICH_FIXTURE.replace(
-            r#""base_instructions": "fixture base instructions","#,
-            r#""base_instructions": "fixture base instructions",
-      "model_messages": {
-        "instructions_template": "before {{ personality }} after",
-        "instructions_variables": {
-          "personality_default": "default voice"
-        }
-      },"#,
-        );
-        let mut catalog = ModelCatalog::embedded();
-        catalog
-            .install_remote(&body, "2026-07-28")
-            .expect("templated descriptor parses");
-        let runtime = catalog
-            .resolve(
-                "fixture-lite",
-                None,
-                4096,
-                ModelRetryPolicy {
-                    max_attempts: 4,
-                    backoff_base_ms: 50,
-                },
-            )
-            .expect("runtime resolves");
-        assert_eq!(runtime.instructions, "before default voice after");
-    }
-
-    #[test]
-    fn malformed_or_empty_refresh_preserves_last_valid_catalog() {
-        let mut catalog = ModelCatalog::embedded();
-        catalog
-            .install_remote(RICH_FIXTURE, "2026-07-28")
-            .expect("fixture parses");
-        let before = catalog.models();
-        assert!(catalog.install_remote("{", "later").is_err());
-        assert_eq!(catalog.models(), before);
-        assert!(catalog.install_remote(r#"{"models":[]}"#, "later").is_err());
-        assert_eq!(catalog.models(), before);
-    }
-
-    #[test]
-    fn unknown_tool_mode_is_explicitly_incompatible() {
-        let mut catalog = ModelCatalog::embedded();
-        catalog
-            .install_remote(
-                &RICH_FIXTURE.replace("\"direct\"", "\"future_mode\""),
-                "2026-07-28",
-            )
-            .expect("catalog shape remains valid");
-        let error = catalog
-            .resolve(
-                "fixture-lite",
-                None,
-                4096,
-                ModelRetryPolicy {
-                    max_attempts: 4,
-                    backoff_base_ms: 50,
-                },
-            )
-            .expect_err("unknown required mode must fail closed");
-        assert!(error.to_string().contains("future_mode"));
-    }
-
-    #[test]
-    fn terminal_control_characters_in_catalog_identifiers_are_rejected() {
-        let mut catalog = ModelCatalog::embedded();
-        let error = catalog
-            .install_remote(
-                &RICH_FIXTURE.replace("fixture-lite", r"fixture-\u001b]52;evil"),
-                "2026-07-28",
-            )
-            .expect_err("control characters must invalidate the snapshot");
-        assert!(error.to_string().contains("control characters"));
-    }
-
-    #[test]
-    fn unknown_mandatory_capability_is_not_replaced_by_embedded_defaults() {
-        let mut catalog = ModelCatalog::embedded();
-        catalog
-            .install_remote(
-                &RICH_FIXTURE.replace(
-                    r#""input_modalities": ["text", "image"]"#,
-                    r#""input_modalities": ["text", "future_modality"]"#,
-                ),
-                "2026-07-28",
-            )
-            .expect("catalog shape remains valid");
-        let error = catalog
-            .resolve(
-                "fixture-lite",
-                None,
-                4096,
-                ModelRetryPolicy {
-                    max_attempts: 4,
-                    backoff_base_ms: 50,
-                },
-            )
-            .expect_err("unknown mandatory capability must fail closed");
-        assert!(error.to_string().contains("future_modality"));
-    }
-
-    #[test]
-    fn oversized_remote_instructions_are_incompatible_before_sampling() {
-        let oversized = "x".repeat(agent_core::model::MAX_MODEL_INSTRUCTIONS_BYTES + 1);
-        let mut catalog = ModelCatalog::embedded();
-        catalog
-            .install_remote(
-                &RICH_FIXTURE.replace("fixture base instructions", &oversized),
-                "2026-07-28",
-            )
-            .expect("catalog shape remains valid");
-        let error = catalog
-            .resolve(
-                "fixture-lite",
-                None,
-                4096,
-                ModelRetryPolicy {
-                    max_attempts: 4,
-                    backoff_base_ms: 50,
-                },
-            )
-            .expect_err("oversized instructions must fail closed");
-        assert!(error.to_string().contains("instructions exceed"));
-    }
-
-    /// Without a Code Mode runtime the behaviour is unchanged: the model stays
-    /// visible and is refused before any provider call, naming what is missing.
-    #[test]
-    fn a_code_mode_model_is_refused_when_no_runtime_is_wired() {
-        let catalog = ModelCatalog::embedded();
-        assert!(!catalog.code_mode());
-        let listed = catalog
-            .models()
-            .into_iter()
-            .find(|model| model.slug == "gpt-5.6-sol")
-            .expect("embedded frontier model");
-        assert!(
-            listed
-                .incompatibility_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("Code Mode")),
-            "{:?}",
-            listed.incompatibility_reason
-        );
-        let error = catalog
-            .resolve(
-                "gpt-5.6-sol",
-                None,
-                4096,
-                ModelRetryPolicy {
-                    max_attempts: 4,
-                    backoff_base_ms: 50,
-                },
-            )
-            .expect_err("no runtime, no start");
-        assert!(error.to_string().contains("Code Mode"), "{error}");
-    }
-
-    /// US-009 AC2: with a runtime wired, the same model resolves without any
-    /// local incompatibility and keeps its declared tool mode.
-    #[test]
-    fn a_code_mode_model_resolves_once_a_runtime_is_wired() {
-        let mut catalog = ModelCatalog::embedded();
-        catalog.set_code_mode(true);
-        let listed = catalog
-            .models()
-            .into_iter()
-            .find(|model| model.slug == "gpt-5.6-sol")
-            .expect("embedded frontier model");
-        assert_eq!(listed.incompatibility_reason, None);
-        let runtime = catalog
-            .resolve(
-                "gpt-5.6-sol",
-                None,
-                4096,
-                ModelRetryPolicy {
-                    max_attempts: 4,
-                    backoff_base_ms: 50,
-                },
-            )
-            .expect("a wired runtime makes the model usable");
-        assert_eq!(runtime.tool_mode, ModelToolMode::CodeModeOnly);
-        runtime.validate().expect("the resolved runtime is valid");
-    }
-
-    /// A direct model is untouched by the flag in either position.
-    #[test]
-    fn a_direct_model_is_unaffected_by_the_code_mode_flag() {
-        for available in [false, true] {
-            let mut catalog = ModelCatalog::embedded();
-            catalog.set_code_mode(available);
-            let runtime = catalog
-                .resolve(
-                    "gpt-5.5",
-                    None,
-                    4096,
-                    ModelRetryPolicy {
-                        max_attempts: 4,
-                        backoff_base_ms: 50,
-                    },
-                )
-                .expect("a direct model always resolves");
-            assert_eq!(runtime.tool_mode, ModelToolMode::Direct);
-        }
-    }
-
-    /// US-010 AC1: the three capabilities the frontier catalog carries survive
-    /// resolution together. A runtime that keeps the tool mode but drops the
-    /// orchestration version would compose a plan the model was not trained on.
-    #[test]
-    fn the_frontier_capabilities_survive_resolution_together() {
-        let mut catalog = ModelCatalog::embedded();
-        catalog.set_code_mode(true);
-        let runtime = catalog
-            .resolve(
-                "gpt-5.6-sol",
-                None,
-                4096,
-                ModelRetryPolicy {
-                    max_attempts: 4,
-                    backoff_base_ms: 50,
-                },
-            )
-            .expect("the frontier model resolves");
-        assert_eq!(runtime.tool_mode, ModelToolMode::CodeModeOnly);
-        assert_eq!(runtime.multi_agent_version, MultiAgentVersion::V2);
-        assert!(runtime.uses_responses_lite());
-        assert!(runtime.multi_agent_version.drives_v2());
-        runtime.validate().expect("the resolved runtime is valid");
-    }
-
-    /// The embedded catalog answers the same three values as the committed
-    /// baseline matrix, per slug. `luna` is the case that matters: it is a code
-    /// mode model on v1, so "code mode" and "v2" must not be read as one
-    /// capability.
-    #[test]
-    fn the_embedded_catalog_matches_the_baseline_rows() {
-        let mut catalog = ModelCatalog::embedded();
-        catalog.set_code_mode(true);
-        for (slug, tool_mode, version, lite) in [
-            (
-                "gpt-5.6-sol",
-                ModelToolMode::CodeModeOnly,
-                MultiAgentVersion::V2,
-                true,
-            ),
-            (
-                "gpt-5.6-terra",
-                ModelToolMode::CodeModeOnly,
-                MultiAgentVersion::V2,
-                true,
-            ),
-            (
-                "gpt-5.6-luna",
-                ModelToolMode::CodeModeOnly,
-                MultiAgentVersion::V1,
-                true,
-            ),
-            (
-                "gpt-5.5",
-                ModelToolMode::Direct,
-                MultiAgentVersion::Disabled,
-                false,
-            ),
-            (
-                "gpt-5.4",
-                ModelToolMode::Direct,
-                MultiAgentVersion::Disabled,
-                false,
-            ),
-        ] {
-            assert_eq!(catalog.tool_mode(slug), Some(tool_mode), "{slug}");
-            assert_eq!(catalog.multi_agent_version(slug), Some(version), "{slug}");
-            let runtime = catalog
-                .resolve(
-                    slug,
-                    None,
-                    4096,
-                    ModelRetryPolicy {
-                        max_attempts: 4,
-                        backoff_base_ms: 50,
-                    },
-                )
-                .expect("the embedded catalog resolves every slug it lists");
-            assert_eq!(runtime.uses_responses_lite(), lite, "{slug}");
-        }
-    }
-
-    /// US-010 AC3: an unknown orchestration version is refused with the faulty
-    /// field, never degraded to `disabled`. Silently dropping it would make a
-    /// frontier model run without the tools it expects and look merely lazy.
-    #[test]
-    fn an_unknown_multi_agent_version_is_incompatible_and_names_the_field() {
-        let mut catalog = ModelCatalog::embedded();
-        catalog
-            .install_remote(
-                &RICH_FIXTURE.replace(
-                    r#""use_responses_lite": true,"#,
-                    r#""use_responses_lite": true,
-      "multi_agent_version": "v3","#,
-                ),
-                "2026-07-28",
-            )
-            .expect("catalog shape remains valid");
-        let error = catalog
-            .resolve(
-                "fixture-lite",
-                None,
-                4096,
-                ModelRetryPolicy {
-                    max_attempts: 4,
-                    backoff_base_ms: 50,
-                },
-            )
-            .expect_err("an unknown required capability must fail closed");
-        let rendered = error.to_string();
-        assert!(rendered.contains("multi_agent_version"), "{rendered}");
-        assert!(rendered.contains("v3"), "{rendered}");
-    }
-
-    /// US-010 AC4: a remote entry that says nothing about orchestration stays
-    /// `disabled`, so a historical direct model keeps the exact contract the
-    /// earlier fixtures pinned.
-    #[test]
-    fn a_remote_entry_without_the_field_stays_disabled() {
-        let mut catalog = ModelCatalog::embedded();
-        catalog
-            .install_remote(RICH_FIXTURE, "2026-07-28")
-            .expect("fixture parses");
-        assert_eq!(
-            catalog.multi_agent_version("fixture-lite"),
-            Some(MultiAgentVersion::Disabled)
-        );
-        let runtime = catalog
-            .resolve(
-                "fixture-lite",
-                None,
-                4096,
-                ModelRetryPolicy {
-                    max_attempts: 4,
-                    backoff_base_ms: 50,
-                },
-            )
-            .expect("runtime resolves");
-        assert_eq!(runtime.multi_agent_version, MultiAgentVersion::Disabled);
-        assert_eq!(runtime.tool_mode, ModelToolMode::Direct);
-    }
-
-    #[test]
-    fn fingerprints_match_for_identical_interactive_and_headless_sources() {
-        let catalog = ModelCatalog::embedded();
-        let resolve = || {
-            catalog
-                .resolve(
-                    "gpt-5.5",
-                    Some("high"),
-                    4096,
-                    ModelRetryPolicy {
-                        max_attempts: 4,
-                        backoff_base_ms: 50,
-                    },
-                )
-                .expect("runtime resolves")
-        };
-        assert_eq!(resolve().fingerprint, resolve().fingerprint);
-    }
-}
+mod tests;

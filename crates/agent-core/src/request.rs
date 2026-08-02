@@ -278,6 +278,7 @@ mod tests {
             supports_verbosity: false,
             verbosity: None,
             supports_parallel_tool_calls: false,
+            tool_capabilities: crate::model::ModelToolCapabilities::default(),
             service_tiers: Vec::new(),
             reasoning_replay: crate::model::ReasoningReplaySupport::Disabled,
             responses_dialect: ResponsesDialect::Standard,

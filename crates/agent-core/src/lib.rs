@@ -638,6 +638,7 @@ mod loop_tests {
             supports_verbosity: true,
             verbosity: Some("low".into()),
             supports_parallel_tool_calls: false,
+            tool_capabilities: crate::model::ModelToolCapabilities::default(),
             service_tiers: Vec::new(),
             reasoning_replay: replay,
             responses_dialect: crate::model::ResponsesDialect::Standard,
