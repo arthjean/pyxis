@@ -7,6 +7,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod oauth;
+pub mod provider;
 pub mod store;
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,10 @@ pub enum ProviderId {
     OpenAiChatGpt,
     /// Token-based Chat Completions, BYOK (future provider).
     OpenAiChat,
+    /// Configured OpenAI-compatible Responses endpoint.
+    OpenAiResponses,
+    /// Amazon Bedrock Runtime.
+    AmazonBedrock,
     Anthropic,
 }
 

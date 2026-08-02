@@ -18,6 +18,7 @@ use rand::RngCore;
 use serde::Deserialize;
 
 use super::pkce::Pkce;
+use crate::provider::ProviderRequestAuth;
 use crate::{OAuthCredential, ProviderId, Secret};
 
 // ───────────────── Auth constants (auth.openai.com), verbatim from Pi ─────────────────
@@ -299,45 +300,14 @@ pub fn classify_device_poll(
     }
 }
 
-/// Inference request specification for the ChatGPT subscription (Responses API
-/// backend). To be plugged into the `agent-provider` adapter (`OpenAiChatGpt`).
-#[derive(Clone)]
-pub struct RequestSpec {
-    pub url: String,
-    pub headers: Vec<(String, String)>,
-}
-
-impl std::fmt::Debug for RequestSpec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let headers: Vec<(&str, &str)> = self
-            .headers
-            .iter()
-            .map(|(k, v)| {
-                let value = if k.eq_ignore_ascii_case("authorization")
-                    || k.eq_ignore_ascii_case("chatgpt-account-id")
-                {
-                    "Secret(***)"
-                } else {
-                    v.as_str()
-                };
-                (k.as_str(), value)
-            })
-            .collect();
-        f.debug_struct("RequestSpec")
-            .field("url", &self.url)
-            .field("headers", &headers)
-            .finish()
-    }
-}
-
 /// SSE inference headers for a ChatGPT subscription credential. The
 /// `chatgpt-account-id` (derived from the JWT) is required to route to the account.
-pub fn responses_request(cred: &OAuthCredential) -> Result<RequestSpec, AuthError> {
+pub fn responses_request(cred: &OAuthCredential) -> Result<ProviderRequestAuth, AuthError> {
     let mut headers = auth_headers(cred)?;
     headers.push(("OpenAI-Beta".to_string(), OPENAI_BETA_SSE.to_string()));
     headers.push(("accept".to_string(), "text/event-stream".to_string()));
     headers.push(("content-type".to_string(), "application/json".to_string()));
-    Ok(RequestSpec {
+    Ok(ProviderRequestAuth {
         url: format!("{CHATGPT_BASE_URL}{RESPONSES_PATH}"),
         headers,
     })
@@ -346,14 +316,14 @@ pub fn responses_request(cred: &OAuthCredential) -> Result<RequestSpec, AuthErro
 /// Model catalog discovery request (`GET /models`). The backend
 /// returns the models accessible TO THE connected ACCOUNT (`available_in_plans` field
 /// already applied), filtered by the current build's `client_version`.
-pub fn models_request(cred: &OAuthCredential) -> Result<RequestSpec, AuthError> {
+pub fn models_request(cred: &OAuthCredential) -> Result<ProviderRequestAuth, AuthError> {
     let mut headers = auth_headers(cred)?;
     headers.push(("accept".to_string(), "application/json".to_string()));
     let mut url = url::Url::parse(&format!("{CHATGPT_BASE_URL}{MODELS_PATH}"))
         .map_err(|e| AuthError::Callback(e.to_string()))?;
     url.query_pairs_mut()
         .append_pair("client_version", &codex_client_version());
-    Ok(RequestSpec {
+    Ok(ProviderRequestAuth {
         url: url.to_string(),
         headers,
     })
@@ -865,6 +835,16 @@ mod tests {
         assert!(!spec_dbg.contains("AT_SECRET"));
         assert!(!spec_dbg.contains("acct_7"));
         assert!(spec_dbg.contains("Secret(***)"));
+
+        let configured = ProviderRequestAuth {
+            url: "https://example.test/responses?api-key=QUERY_SECRET#FRAGMENT_SECRET".into(),
+            headers: vec![("x-api-key".into(), "HEADER_SECRET".into())],
+        };
+        let configured_dbg = format!("{configured:?}");
+        assert!(!configured_dbg.contains("QUERY_SECRET"));
+        assert!(!configured_dbg.contains("FRAGMENT_SECRET"));
+        assert!(!configured_dbg.contains("HEADER_SECRET"));
+        assert!(configured_dbg.contains("x-api-key"));
 
         let cb = CallbackResult {
             code: "CODE_SECRET".into(),
