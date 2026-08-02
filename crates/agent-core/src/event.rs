@@ -162,6 +162,10 @@ pub struct RetryScheduledView {
 pub enum CredentialRefreshOutcome {
     Started,
     Succeeded,
+    Permanent,
+    Transient,
+    Unavailable,
+    /// Recovery failed without a typed credential cause.
     Rejected,
     Cancelled,
 }

@@ -306,6 +306,7 @@ fn retry_jitter_ms(
         ProviderError::ContextLengthExceeded => 13,
         ProviderError::Credential(_) => 14,
         ProviderError::UnsupportedTool { .. } => 15,
+        ProviderError::UnsupportedCapability { .. } => 17,
     };
     let mut x = now_ms
         ^ ((attempt as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15))
@@ -315,6 +316,28 @@ fn retry_jitter_ms(
     x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     x ^= x >> 33;
     1 + (x % cap_ms)
+}
+
+fn recovery_failure(error: &ProviderError) -> (CredentialRefreshOutcome, AuthError) {
+    match error {
+        ProviderError::Credential(AuthError::RecoveryPermanent) => (
+            CredentialRefreshOutcome::Permanent,
+            AuthError::RecoveryPermanent,
+        ),
+        ProviderError::Credential(AuthError::RecoveryTransient) => (
+            CredentialRefreshOutcome::Transient,
+            AuthError::RecoveryTransient,
+        ),
+        ProviderError::Credential(AuthError::RecoveryUnavailable) => (
+            CredentialRefreshOutcome::Unavailable,
+            AuthError::RecoveryUnavailable,
+        ),
+        ProviderError::Credential(error) => (CredentialRefreshOutcome::Rejected, *error),
+        _ => (
+            CredentialRefreshOutcome::Rejected,
+            AuthError::ReconnectRequired,
+        ),
+    }
 }
 
 fn transient_retry_delay(
@@ -1077,14 +1100,13 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                             CredentialRefreshOutcome::Succeeded,
                                         );
                                     }
-                                    Cancellable::Completed(Err(_)) => {
+                                    Cancellable::Completed(Err(error)) => {
+                                        let (outcome, error) = recovery_failure(&error);
                                         yield attempt_context.credential_refresh(
                                             attempt_ordinal,
-                                            CredentialRefreshOutcome::Rejected,
+                                            outcome,
                                         );
-                                        yield AgentEvent::Error(AgentError::Auth(
-                                            AuthError::ReconnectRequired,
-                                        ));
+                                        yield AgentEvent::Error(AgentError::Auth(error));
                                         return;
                                     }
                                 }
@@ -1428,14 +1450,13 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                             CredentialRefreshOutcome::Succeeded,
                                         );
                                     }
-                                    Cancellable::Completed(Err(_)) => {
+                                    Cancellable::Completed(Err(error)) => {
+                                        let (outcome, error) = recovery_failure(&error);
                                         yield attempt_context.credential_refresh(
                                             attempt_ordinal,
-                                            CredentialRefreshOutcome::Rejected,
+                                            outcome,
                                         );
-                                        yield AgentEvent::Error(AgentError::Auth(
-                                            AuthError::ReconnectRequired,
-                                        ));
+                                        yield AgentEvent::Error(AgentError::Auth(error));
                                         return;
                                     }
                                 }

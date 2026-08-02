@@ -189,6 +189,16 @@ impl From<&ProviderError> for ProviderFailure {
                 request_id: None,
                 auth_request_id: None,
             },
+            ProviderError::UnsupportedCapability { capability, reason } => Self {
+                kind: ProviderFailureKind::Contract,
+                status: None,
+                message: format!("capability {capability} is unsupported: {reason}"),
+                retry_after_ms: None,
+                class: Some(ErrorClass::InvalidRequest),
+                provider_category: None,
+                request_id: None,
+                auth_request_id: None,
+            },
             ProviderError::ContextLengthExceeded => Self {
                 kind: ProviderFailureKind::ContextLengthExceeded,
                 status: Some(413),

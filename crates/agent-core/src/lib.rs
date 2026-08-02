@@ -110,6 +110,7 @@ mod loop_tests {
     enum RefreshBehavior {
         Succeed,
         Reject,
+        Auth(AuthError),
         Block,
     }
 
@@ -234,6 +235,7 @@ mod loop_tests {
                     message: "refresh rejected".into(),
                     retry_after_ms: None,
                 }),
+                RefreshBehavior::Auth(error) => Err(ProviderError::Credential(error)),
                 RefreshBehavior::Block => {
                     self.refresh_started.add_permits(1);
                     std::future::pending().await
@@ -1450,6 +1452,44 @@ mod loop_tests {
                 AuthError::ReconnectRequired
             )))
         ));
+    }
+
+    #[tokio::test]
+    async fn typed_recovery_failures_survive_the_sampling_boundary() {
+        for (expected, outcome) in [
+            (
+                AuthError::RecoveryPermanent,
+                crate::CredentialRefreshOutcome::Permanent,
+            ),
+            (
+                AuthError::RecoveryTransient,
+                crate::CredentialRefreshOutcome::Transient,
+            ),
+            (
+                AuthError::RecoveryUnavailable,
+                crate::CredentialRefreshOutcome::Unavailable,
+            ),
+        ] {
+            let h = harness(
+                vec![MockTurn::Err(ProviderError::Http {
+                    status: 401,
+                    message: "unauthorized".into(),
+                    retry_after_ms: None,
+                })],
+                false,
+                100_000,
+            );
+            *h.refresh_behavior.lock().unwrap() = RefreshBehavior::Auth(expected);
+            let events = drive(AgentContext::new("mock").push(Message::user("go")), h.deps).await;
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::CredentialRefresh(view) if view.outcome == outcome
+            )));
+            assert!(matches!(
+                events.last(),
+                Some(AgentEvent::Error(crate::AgentError::Auth(actual))) if *actual == expected
+            ));
+        }
     }
 
     #[tokio::test]

@@ -21,6 +21,8 @@ pub enum ModelRuntimeSource {
     Embedded {
         version: String,
     },
+    /// Model descriptor supplied explicitly by provider configuration.
+    Configured,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

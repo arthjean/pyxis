@@ -7,7 +7,7 @@
 //! (future) will implement this trait and depend on `agent-core`. The core consumes
 //! an injected `dyn Provider`: it knows no concrete adapter.
 
-use futures_util::stream::BoxStream;
+use futures_util::{StreamExt, stream::BoxStream};
 use serde::{Deserialize, Serialize};
 
 use crate::message::{ToolCallFormat, ToolCallId};
@@ -37,6 +37,7 @@ pub enum ProviderKind {
     /// scope, judged too unstable).
     OpenAiChatGpt,
     OpenAiResponses,
+    AmazonBedrock,
     Gemini,
     OpenRouter,
 }
@@ -249,6 +250,8 @@ pub enum StopReason {
 pub struct Capabilities {
     pub vision: bool,
     pub tools: bool,
+    #[serde(default)]
+    pub structured_output: bool,
     pub prompt_caching: bool,
     pub reasoning: bool,
     pub server_side_state: bool,
@@ -264,6 +267,78 @@ pub struct Capabilities {
 }
 
 impl Capabilities {
+    /// Validates invariants shared by every provider configuration. Wire-specific
+    /// restrictions remain the responsibility of the adapter.
+    pub fn validate(&self) -> Result<(), ProviderError> {
+        let invalid = |capability: &str, reason: &str| ProviderError::UnsupportedCapability {
+            capability: capability.into(),
+            reason: reason.into(),
+        };
+        if self.max_context == 0 {
+            return Err(invalid("max_context", "must be nonzero"));
+        }
+        if !self.tools
+            && (self.tool_calling.parallel_tool_calls
+                || self.tool_calling.strict_json_schema
+                || self.tool_calling.freeform_tools
+                || self.tool_calling.namespace_tools
+                || self.tool_calling.tool_search
+                || self.tool_calling.web_search)
+        {
+            return Err(invalid("tools", "tool modes require tool calling"));
+        }
+        if !self.reasoning && self.reasoning_options.encrypted_replay {
+            return Err(invalid(
+                "reasoning",
+                "encrypted replay requires reasoning support",
+            ));
+        }
+        if !self.prompt_caching && self.cache.prompt_cache_key {
+            return Err(invalid(
+                "prompt_caching",
+                "prompt cache keys require prompt caching",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuses canonical request features absent from the provider declaration
+    /// before credential resolution or network access.
+    pub fn ensure_request_supported(
+        &self,
+        request: &CanonicalRequest,
+    ) -> Result<(), ProviderError> {
+        let unsupported = |capability: &str, reason: &str| ProviderError::UnsupportedCapability {
+            capability: capability.into(),
+            reason: reason.into(),
+        };
+        if request.output_schema.is_some() && !self.structured_output {
+            return Err(unsupported(
+                "structured_output",
+                "provider does not support structured output",
+            ));
+        }
+        if (request.reasoning_effort.is_some() || request.reasoning_replay) && !self.reasoning {
+            return Err(unsupported(
+                "reasoning",
+                "provider does not support reasoning controls",
+            ));
+        }
+        if request.cache_key.is_some() && (!self.prompt_caching || !self.cache.prompt_cache_key) {
+            return Err(unsupported(
+                "prompt_cache_key",
+                "provider does not support prompt cache keys",
+            ));
+        }
+        if request.messages.iter().any(|message| message.has_images()) && !self.vision {
+            return Err(unsupported(
+                "vision",
+                "provider does not support image input",
+            ));
+        }
+        self.ensure_tools_supported(&request.tools)
+    }
+
     /// Refuses a tool plan this provider cannot serialize, BEFORE any network
     /// call. A freeform tool projected onto a function wire would either lose
     /// its grammar or gain a fabricated schema; both are silent corruption, so
@@ -400,6 +475,9 @@ pub enum ProviderError {
     /// Raised before opening a request: no attempt, no backoff, no retry.
     #[error("tool {tool} is unsupported: {reason}")]
     UnsupportedTool { tool: String, reason: String },
+    /// Provider-wide operation or transport capability refusal.
+    #[error("capability {capability} is unsupported: {reason}")]
+    UnsupportedCapability { capability: String, reason: String },
     /// CONTEXT error (PTL / 413). It is NOT a transient class: it feeds
     /// withholding (ARCHITECTURE 3.4), not the backoff.
     #[error("context too long (PTL/413)")]
@@ -466,6 +544,12 @@ pub enum AuthError {
     Invalid,
     /// Recovery is unavailable, rejected, or already consumed for this sampling.
     ReconnectRequired,
+    /// A configured recovery mechanism rejected the credential permanently.
+    RecoveryPermanent,
+    /// Recovery failed transiently. A later sampling may retry, this sampling may not.
+    RecoveryTransient,
+    /// This credential kind has no recovery mechanism.
+    RecoveryUnavailable,
 }
 
 /// Implemented by every adapter (in `agent-provider`). Object-safe through
@@ -534,8 +618,28 @@ pub trait Provider: Send + Sync {
         req: CanonicalRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError>;
 
-    /// Non-stream (used by compaction to produce a summary).
-    async fn complete(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError>;
+    /// Non-stream response derived from the canonical stream. Providers only
+    /// override this when their wire exposes a genuinely different operation.
+    async fn complete(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError> {
+        let stream = self.stream(req).await?;
+        futures_util::pin_mut!(stream);
+        let mut text = String::new();
+        let mut usage = TokenUsage::default();
+        let mut stop = StopReason::EndTurn;
+        while let Some(event) = stream.next().await {
+            match event? {
+                StreamEvent::TextDelta { text: delta } => text.push_str(&delta),
+                StreamEvent::Usage { usage: value } => usage = value,
+                StreamEvent::Done { stop: value } => stop = value,
+                _ => {}
+            }
+        }
+        Ok(CanonicalResponse {
+            content: vec![crate::message::ContentBlock::Text { text }],
+            usage,
+            stop,
+        })
+    }
 
     /// Classifies a transport/HTTP error into an `ErrorClass` (source of truth for
     /// the retry). Context errors do NOT go through here (see withholding).
