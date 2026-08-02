@@ -13,33 +13,26 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use agent_auth::OAuthCredential;
-use agent_core::message::ContentBlock;
 use agent_core::model::{ModelRetryPolicy, ModelRuntimeError, ResolvedModelRuntime};
 use agent_core::provider::{
-    AuthError, CacheCapabilities, CanonicalRequest, CanonicalResponse, Capabilities,
-    CapabilityLimits, ErrorClass, Provider, ProviderError, ProviderKind, ReasoningCapabilities,
-    StopReason, StreamEvent, TokenUsage, ToolCallingCapabilities,
+    AuthError, CacheCapabilities, CanonicalRequest, Capabilities, CapabilityLimits, ErrorClass,
+    Provider, ProviderError, ProviderKind, ReasoningCapabilities, StreamEvent,
+    ToolCallingCapabilities,
 };
 use async_trait::async_trait;
-use eventsource_stream::Eventsource;
-use futures_util::Stream;
-use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 use sha2::Digest;
+use tokio_util::sync::CancellationToken;
 
-use crate::chatgpt_error::{
-    bounded_error_body, from_http_response, invalid_request, is_terminal_rate_limit,
-    should_retry_without_reasoning_replay,
-};
-use crate::chatgpt_events::CodexEventMapper;
-use crate::chatgpt_http::OpenAiChatGptConfig;
-use crate::chatgpt_metadata::response_metadata_from_headers;
-use crate::chatgpt_request::{ResponsesBodyOptions, build_responses_body, inject_cache_key};
+use crate::chatgpt_error::invalid_request;
+use crate::chatgpt_http::ResponsesTransportConfig;
 use crate::chatgpt_websocket::{
-    ChatGptWebSocket, WebSocketOutcome, WebSocketProbeAuthorization, WebSocketProbeReport,
+    ResponsesWebSocket, WebSocketProbeAuthorization, WebSocketProbeExecution, WebSocketProbeReport,
 };
 use crate::credential::CredentialManager;
-use crate::models::{CatalogModel, CatalogScope, ModelCatalog};
+use crate::models::{CatalogModel, ModelCatalog};
+use crate::responses;
+use crate::responses::catalog::{CatalogCacheMode, CatalogRequest, RemoteCatalogManager};
 
 /// Keyring key of the ChatGPT subscription credential (rotating refresh rewritten here).
 pub const KEYRING_ACCOUNT: &str = "oauth:openai_chatgpt";
@@ -64,20 +57,6 @@ const DEFAULT_CHATGPT_RETRY: ModelRetryPolicy = ModelRetryPolicy {
 /// `/models` command in session (see `agent_tui::MODELS`).
 pub const DEFAULT_MODEL: &str = "gpt-5.5";
 
-fn reasoning_effort_for_request(effort: &str) -> &str {
-    if effort.eq_ignore_ascii_case("ultra") {
-        "max"
-    } else {
-        effort
-    }
-}
-
-/// Total budget of the catalog discovery (`/models`). Off the critical path:
-/// a slow backend must never delay the session, the bundled catalog takes
-/// over.
-const MODELS_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_MODELS_BODY: usize = 4 * 1024 * 1024;
-
 /// Default per-event idle timeout (US-022). An OPEN SSE stream that emits
 /// no more events (silent backend, queue) is cancelled after this delay ->
 /// `Stream("idle timeout")` (Retryable). Configurable per session (`with_idle_timeout`,
@@ -89,17 +68,15 @@ pub struct OpenAiChatGptProvider {
     http: reqwest::Client,
     capabilities: Capabilities,
     reasoning_effort: Option<String>,
-    config: OpenAiChatGptConfig,
+    config: ResponsesTransportConfig,
     /// STABLE session identifier (UUID v4), sent as `prompt_cache_key` on
     /// every request (US-029) -> the backend reuses its prefix cache.
     session_id: RwLock<String>,
     /// Last valid remote catalog layered over the versioned embedded fallback.
     /// Shared by interactive discovery and headless turn resolution.
     catalog: Arc<RwLock<ModelCatalog>>,
-    /// Serializes explicit and ETag-driven refreshes. This prevents a slower
-    /// stale response from overwriting a newer atomic snapshot.
-    catalog_refresh: Arc<tokio::sync::Mutex<()>>,
-    websocket: ChatGptWebSocket,
+    catalog_manager: RemoteCatalogManager,
+    websocket: ResponsesWebSocket,
 }
 
 /// Generates a UUID v4 (RFC 4122) from 16 random bytes. Avoids the `uuid` crate
@@ -135,12 +112,16 @@ impl OpenAiChatGptProvider {
     /// Builds the adapter from an already loaded OAuth credential (by the CLI,
     /// from the keyring). `max_context` drives the compaction; `reasoning_effort`
     /// = `None` omits the `reasoning` field.
-    pub fn new(cred: OAuthCredential, max_context: u32, reasoning_effort: Option<String>) -> Self {
+    pub fn new(
+        cred: OAuthCredential,
+        max_context: u32,
+        reasoning_effort: Option<String>,
+    ) -> Result<Self, ProviderError> {
         Self::from_validated_config(
             cred,
             max_context,
             reasoning_effort,
-            OpenAiChatGptConfig::chatgpt_default(),
+            ResponsesTransportConfig::chatgpt_default(),
         )
     }
 
@@ -150,23 +131,18 @@ impl OpenAiChatGptProvider {
         cred: OAuthCredential,
         max_context: u32,
         reasoning_effort: Option<String>,
-        config: OpenAiChatGptConfig,
+        config: ResponsesTransportConfig,
     ) -> Result<Self, ProviderError> {
         config.validate_for_chatgpt()?;
-        Ok(Self::from_validated_config(
-            cred,
-            max_context,
-            reasoning_effort,
-            config,
-        ))
+        Self::from_validated_config(cred, max_context, reasoning_effort, config)
     }
 
     fn from_validated_config(
         cred: OAuthCredential,
         max_context: u32,
         reasoning_effort: Option<String>,
-        config: OpenAiChatGptConfig,
-    ) -> Self {
+        config: ResponsesTransportConfig,
+    ) -> Result<Self, ProviderError> {
         // US-022: `connect_timeout` bounds the TCP/TLS establishment. A `build()`
         // failure (TLS backend unavailable) falls back on the default client:
         // never a panic (`panic = deny` lint).
@@ -175,51 +151,60 @@ impl OpenAiChatGptProvider {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         let creds = Arc::new(CredentialManager::new(cred, http.clone(), KEYRING_ACCOUNT));
-        Self {
+        let catalog = Arc::new(RwLock::new(ModelCatalog::embedded()));
+        let catalog_manager = RemoteCatalogManager::new(
+            http.clone(),
+            Arc::clone(&catalog),
+            Arc::new(tokio::sync::Mutex::new(())),
+        );
+        let capabilities = Capabilities {
+            vision: true,
+            tools: true,
+            structured_output: true,
+            // The adapter sends an explicit prompt cache key for every session.
+            prompt_caching: true,
+            reasoning: true,
+            // WebSocket continuation is transport-local and does not move
+            // ownership of the canonical transcript to the server.
+            server_side_state: false,
+            max_context,
+            limits: CapabilityLimits {
+                max_images_per_request: None,
+                max_tool_schema_bytes: Some(64 * 1024),
+            },
+            tool_calling: ToolCallingCapabilities {
+                parallel_tool_calls: true,
+                strict_json_schema: true,
+                // The Responses wire carries `type: "custom"` tools, so a
+                // freeform plan reaches the backend intact.
+                freeform_tools: true,
+                namespace_tools: true,
+                tool_search: true,
+                web_search: true,
+            },
+            reasoning_options: ReasoningCapabilities {
+                encrypted_replay: true,
+            },
+            cache: CacheCapabilities {
+                prompt_cache_key: true,
+            },
+        };
+        capabilities.validate()?;
+        Ok(Self {
             creds,
             http,
-            capabilities: Capabilities {
-                vision: true,
-                tools: true,
-                // implicit caching on the backend side, not explicitly controlled.
-                prompt_caching: false,
-                reasoning: true,
-                // WebSocket continuation is transport-local and does not move
-                // ownership of the canonical transcript to the server.
-                server_side_state: false,
-                max_context,
-                limits: CapabilityLimits {
-                    max_images_per_request: None,
-                    max_tool_schema_bytes: Some(64 * 1024),
-                },
-                tool_calling: ToolCallingCapabilities {
-                    parallel_tool_calls: true,
-                    strict_json_schema: true,
-                    // The Responses wire carries `type: "custom"` tools, so a
-                    // freeform plan reaches the backend intact.
-                    freeform_tools: true,
-                    namespace_tools: true,
-                    tool_search: true,
-                    web_search: true,
-                },
-                reasoning_options: ReasoningCapabilities {
-                    encrypted_replay: true,
-                },
-                cache: CacheCapabilities {
-                    prompt_cache_key: true,
-                },
-            },
+            capabilities,
             reasoning_effort,
             config,
             session_id: RwLock::new(new_session_id()),
-            catalog: Arc::new(RwLock::new(ModelCatalog::embedded())),
-            catalog_refresh: Arc::new(tokio::sync::Mutex::new(())),
-            websocket: ChatGptWebSocket::new(),
-        }
+            catalog,
+            catalog_manager,
+            websocket: ResponsesWebSocket::new(),
+        })
     }
 
     /// Convenience constructor: MVP defaults (`DEFAULT_MAX_CONTEXT`, medium effort).
-    pub fn from_credential(cred: OAuthCredential) -> Self {
+    pub fn from_credential(cred: OAuthCredential) -> Result<Self, ProviderError> {
         Self::new(
             cred,
             DEFAULT_MAX_CONTEXT,
@@ -276,56 +261,29 @@ impl OpenAiChatGptProvider {
 
     fn prepare_request(
         &self,
-        mut req: CanonicalRequest,
-    ) -> Result<(CanonicalRequest, ResolvedModelRuntime, serde_json::Value), ProviderError> {
-        req.validate().map_err(invalid_request)?;
-        let runtime = self.runtime_for_request(&req)?;
-        self.capabilities.ensure_tools_supported(&req.tools)?;
-        runtime
-            .ensure_tools_supported(&req.tools)
-            .map_err(|error| ProviderError::UnsupportedTool {
-                tool: error.tool,
-                reason: error.reason,
-            })?;
-        if req.model_runtime.is_none() {
-            req.reasoning_effort = runtime.reasoning_effort.clone();
-            req.model_runtime = Some(runtime.clone());
-        }
-        req.validate().map_err(invalid_request)?;
-        let reasoning_effort = runtime
-            .reasoning_effort
-            .as_deref()
-            .map(reasoning_effort_for_request);
-        let mut body = build_responses_body(
-            &req,
-            ResponsesBodyOptions {
-                reasoning_effort,
-                include_encrypted_reasoning: req.reasoning_replay
-                    && runtime.reasoning_effort.is_some(),
-                parallel_tool_calls: runtime.supports_parallel_tool_calls,
-                text_verbosity: if runtime.supports_verbosity {
-                    runtime.verbosity.as_deref()
-                } else {
-                    None
-                },
-                dialect: runtime.responses_dialect,
-            },
-        );
-        if body.get("prompt_cache_key").is_none() {
-            inject_cache_key(&mut body, &self.prompt_cache_key());
-        }
-        Ok((req, runtime, body))
+        req: CanonicalRequest,
+    ) -> Result<responses::ResponsesPlan, ProviderError> {
+        let cache_key = self.prompt_cache_key();
+        responses::prepare(
+            &self.config,
+            &self.capabilities,
+            req,
+            |request| self.runtime_for_request(request),
+            false,
+            Some(&cache_key),
+        )
     }
 
     /// Establishes the persistent transport without sending model input. It is
     /// safe to call repeatedly and is a no-op after session fallback to SSE.
     pub async fn preconnect_websocket(&self, req: CanonicalRequest) -> Result<(), ProviderError> {
-        let (req, runtime, _body) = self.prepare_request(req)?;
+        let plan = self.prepare_request(req)?;
         if !self.config.websocket_enabled() {
             return Ok(());
         }
+        let auth = self.creds.request_spec().await?;
         self.websocket
-            .preconnect(&self.creds, &self.config, &req, runtime.responses_dialect)
+            .preconnect(&auth, &self.config, plan.request(), plan.route())
             .await
     }
 
@@ -336,17 +294,19 @@ impl OpenAiChatGptProvider {
         authorization: WebSocketProbeAuthorization,
         req: CanonicalRequest,
     ) -> Result<WebSocketProbeReport, ProviderError> {
-        let (req, runtime, body) = self.prepare_request(req)?;
+        let plan = self.prepare_request(req)?;
+        let auth = self.creds.request_spec().await?;
         Ok(self
             .websocket
-            .probe(
+            .probe(WebSocketProbeExecution {
                 authorization,
-                &self.creds,
-                &self.config,
-                &req,
-                runtime.responses_dialect,
-                body,
-            )
+                auth: &auth,
+                config: &self.config,
+                request: plan.request(),
+                route: plan.route(),
+                full_body: plan.body().clone(),
+                body_bytes: plan.body_bytes(),
+            })
             .await)
     }
 
@@ -355,31 +315,33 @@ impl OpenAiChatGptProvider {
     /// binary (the backend removes/adds slugs without notice). Outside the
     /// `Provider` trait: the notion of a catalog is specific to this adapter.
     pub async fn list_models(&self) -> Result<Vec<CatalogModel>, ProviderError> {
-        self.refresh_models(true, None).await
+        self.catalog_manager
+            .refresh(
+                chatgpt_catalog_request(
+                    Arc::clone(&self.creds),
+                    self.catalog_manager.scope_epoch(),
+                )
+                .await?,
+                CatalogCacheMode::Revalidate,
+                None,
+            )
+            .await
     }
 
     /// Forces a network fetch without sending the cached ETag. The resulting
     /// snapshot is still installed atomically and scoped like the normal path.
     pub async fn list_models_uncached(&self) -> Result<Vec<CatalogModel>, ProviderError> {
-        self.refresh_models(false, None).await
-    }
-
-    async fn refresh_models(
-        &self,
-        cache_enabled: bool,
-        etag_hint: Option<String>,
-    ) -> Result<Vec<CatalogModel>, ProviderError> {
-        let response_endpoint = self.config.endpoint()?.to_string();
-        refresh_model_catalog(
-            Arc::clone(&self.creds),
-            self.http.clone(),
-            Arc::clone(&self.catalog),
-            Arc::clone(&self.catalog_refresh),
-            response_endpoint,
-            cache_enabled,
-            etag_hint,
-        )
-        .await
+        self.catalog_manager
+            .refresh(
+                chatgpt_catalog_request(
+                    Arc::clone(&self.creds),
+                    self.catalog_manager.scope_epoch(),
+                )
+                .await?,
+                CatalogCacheMode::Bypass,
+                None,
+            )
+            .await
     }
 
     fn observe_catalog_etag(
@@ -387,51 +349,12 @@ impl OpenAiChatGptProvider {
         stream: BoxStream<'static, Result<StreamEvent, ProviderError>>,
     ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
         let creds = Arc::clone(&self.creds);
-        let http = self.http.clone();
-        let catalog = Arc::clone(&self.catalog);
-        let refresh_gate = Arc::clone(&self.catalog_refresh);
-        let response_endpoint = self
-            .config
-            .endpoint()
-            .map(|endpoint| endpoint.to_string())
-            .unwrap_or_default();
-        stream
-            .map(move |event| {
-                let etag = match &event {
-                    Ok(StreamEvent::ResponseMetadata { metadata }) => metadata.models_etag.clone(),
-                    _ => None,
-                };
-                if let Some(etag) = etag.filter(|value| !value.trim().is_empty())
-                    && catalog_etag_changed(&catalog, &etag)
-                {
-                    let creds = Arc::clone(&creds);
-                    let http = http.clone();
-                    let catalog = Arc::clone(&catalog);
-                    let refresh_gate = Arc::clone(&refresh_gate);
-                    let response_endpoint = response_endpoint.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = refresh_model_catalog(
-                            creds,
-                            http,
-                            catalog,
-                            refresh_gate,
-                            response_endpoint,
-                            true,
-                            Some(etag),
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                target: "pyxis::models",
-                                error = %error,
-                                "ETag-driven model catalog refresh failed"
-                            );
-                        }
-                    });
-                }
-                event
-            })
-            .boxed()
+        let catalog_manager = self.catalog_manager.clone();
+        self.catalog_manager.observe(stream, move || {
+            let creds = Arc::clone(&creds);
+            let epoch = catalog_manager.scope_epoch();
+            async move { chatgpt_catalog_request(creds, epoch).await }
+        })
     }
 
     fn catalog_window(&self, model: &str) -> Option<u32> {
@@ -442,188 +365,21 @@ impl OpenAiChatGptProvider {
     }
 }
 
-async fn refresh_model_catalog(
+async fn chatgpt_catalog_request(
     creds: Arc<CredentialManager>,
-    http: reqwest::Client,
-    catalog: Arc<RwLock<ModelCatalog>>,
-    refresh_gate: Arc<tokio::sync::Mutex<()>>,
-    response_endpoint: String,
-    cache_enabled: bool,
-    etag_hint: Option<String>,
-) -> Result<Vec<CatalogModel>, ProviderError> {
-    let _refresh = refresh_gate.lock().await;
-    let spec = creds.models_spec().await?;
-    let scope = catalog_scope(&spec, &response_endpoint)?;
-    let cached_etag = {
-        let mut state = catalog
-            .write()
-            .map_err(|_| ProviderError::Decode("models: catalog lock poisoned".into()))?;
-        state.ensure_scope(scope.clone());
-        state.etag().map(str::to_string)
-    };
-    if cache_enabled
-        && etag_hint.as_deref().is_some()
-        && cached_etag.as_deref() == etag_hint.as_deref()
-    {
-        return catalog
-            .read()
-            .map(|catalog| catalog.models())
-            .map_err(|_| ProviderError::Decode("models: catalog lock poisoned".into()));
-    }
-    let mut req = http.get(&spec.url).timeout(MODELS_TIMEOUT);
-    for (name, value) in &spec.headers {
-        req = req.header(name, value);
-    }
-    if cache_enabled && let Some(etag) = cached_etag.as_deref() {
-        req = req.header(reqwest::header::IF_NONE_MATCH, etag);
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| ProviderError::Transport(format!("models: {e}")))?;
-    let status = resp.status();
-    let response_etag = resp
-        .headers()
-        .get("x-models-etag")
-        .or_else(|| resp.headers().get(reqwest::header::ETAG))
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
-        .or(etag_hint);
-    if status == reqwest::StatusCode::NOT_MODIFIED {
-        return catalog
-            .read()
-            .map(|catalog| catalog.models())
-            .map_err(|_| ProviderError::Decode("models: catalog lock poisoned".into()));
-    }
-    let mut body_bytes = Vec::new();
-    let mut body_stream = resp.bytes_stream();
-    while let Some(chunk) = body_stream.next().await {
-        let chunk =
-            chunk.map_err(|error| ProviderError::Transport(format!("models body: {error}")))?;
-        if body_bytes.len().saturating_add(chunk.len()) > MAX_MODELS_BODY {
-            return Err(ProviderError::Decode(format!(
-                "models: response exceeds {MAX_MODELS_BODY} bytes"
-            )));
-        }
-        body_bytes.extend_from_slice(&chunk);
-    }
-    let body = String::from_utf8(body_bytes)
-        .map_err(|error| ProviderError::Decode(format!("models: invalid UTF-8: {error}")))?;
-    if !status.is_success() {
-        let message = bounded_error_body(&body);
-        return Err(ProviderError::Http {
-            status: status.as_u16(),
-            message,
-            retry_after_ms: None,
-        });
-    }
-    let fetched_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs().to_string())
-        .unwrap_or_else(|_| "unknown".into());
-    let mut catalog = catalog
-        .write()
-        .map_err(|_| ProviderError::Decode("models: catalog lock poisoned".into()))?;
-    let models = catalog
-        .install_remote_scoped(&body, &fetched_at, scope, response_etag)
-        .map_err(|error| ProviderError::Decode(format!("models: {error}")))?;
-    for diagnostic in catalog.diagnostics() {
-        tracing::warn!(
-            target: "pyxis::models",
-            diagnostic,
-            "remote model descriptor was not used"
-        );
-    }
-    Ok(models)
-}
-
-fn catalog_scope(
-    spec: &agent_auth::oauth::openai_chatgpt::RequestSpec,
-    response_endpoint: &str,
-) -> Result<CatalogScope, ProviderError> {
-    let account_id = spec
+    scope_epoch: u64,
+) -> Result<CatalogRequest, ProviderError> {
+    let auth = creds.models_spec().await?;
+    let account_id = auth
         .headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("chatgpt-account-id"))
         .map(|(_, value)| value.as_str())
-        .ok_or(ProviderError::Credential(AuthError::ReconnectRequired))?;
+        .ok_or(ProviderError::Credential(
+            agent_core::provider::AuthError::ReconnectRequired,
+        ))?;
     let identity_fingerprint = hex::encode(sha2::Sha256::digest(account_id.as_bytes()));
-    let endpoint = format!(
-        "responses={};models={}",
-        normalized_catalog_endpoint(response_endpoint)?,
-        normalized_catalog_endpoint(&spec.url)?
-    );
-    Ok(CatalogScope {
-        provider: "openai_chatgpt".into(),
-        endpoint,
-        identity_fingerprint,
-    })
-}
-
-fn normalized_catalog_endpoint(raw: &str) -> Result<String, ProviderError> {
-    let mut url = url::Url::parse(raw)
-        .map_err(|_| ProviderError::Decode("models: invalid scoped endpoint".into()))?;
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url.to_string())
-}
-
-fn catalog_etag_changed(catalog: &RwLock<ModelCatalog>, observed: &str) -> bool {
-    catalog
-        .read()
-        .ok()
-        .and_then(|catalog| catalog.etag().map(str::to_string))
-        .as_deref()
-        != Some(observed)
-}
-
-/// SSE watchdog (US-022): wraps a canonical event stream in a per-event
-/// timeout. As long as an event arrives before `idle`, it is relayed as is; a
-/// silence > `idle` (frozen backend) cuts the stream with `Stream("idle timeout")`
-/// (classified `Retryable` -> the agent loop retries/gives up, never freezes). An
-/// upstream error is relayed then ends the stream (parity with the direct path).
-fn idle_guarded<S>(
-    mut inner: S,
-    idle: Duration,
-) -> impl Stream<Item = Result<StreamEvent, ProviderError>> + Send
-where
-    S: Stream<Item = Result<StreamEvent, ProviderError>> + Send + Unpin + 'static,
-{
-    async_stream::stream! {
-        loop {
-            match tokio::time::timeout(idle, inner.next()).await {
-                // no event since `idle` -> silent backend.
-                Err(_elapsed) => {
-                    yield Err(ProviderError::Stream("idle timeout".to_string()));
-                    return;
-                }
-                Ok(None) => break, // normal end of stream.
-                Ok(Some(item)) => {
-                    let stop = item.is_err();
-                    yield item;
-                    if stop {
-                        return;
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Bounds the HEADERS phase of a request (US-022 hardening). `reqwest::send()`
-/// resolves when the response headers are received -> this timeout does NOT cut the
-/// long SSE stream that follows (covered separately by `idle_guarded`). An overrun
-/// (`Elapsed`) becomes `Stream("header timeout")` -> classified `Retryable`, parity
-/// with the idle timeout. A network error from `send()` stays `Transport` (Retryable).
-async fn send_with_header_timeout(
-    client: &reqwest::Client,
-    request: reqwest::Request,
-    timeout: Duration,
-) -> Result<reqwest::Response, ProviderError> {
-    tokio::time::timeout(timeout, client.execute(request))
-        .await
-        .map_err(|_elapsed| ProviderError::Stream("header timeout".to_string()))?
-        .map_err(|e| ProviderError::Transport(e.to_string()))
+    CatalogRequest::new("openai_chatgpt", auth, identity_fingerprint, scope_epoch)
 }
 
 #[async_trait]
@@ -692,146 +448,48 @@ impl Provider for OpenAiChatGptProvider {
         &self,
         req: CanonicalRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
-        let (req, runtime, body) = self.prepare_request(req)?;
-        if self.config.websocket_enabled() {
-            match self
-                .websocket
-                .stream(
-                    &self.creds,
-                    &self.config,
-                    &req,
-                    runtime.responses_dialect,
-                    body.clone(),
-                    runtime.retry.max_attempts,
-                )
-                .await?
-            {
-                WebSocketOutcome::Stream(stream) => {
-                    return Ok(self.observe_catalog_etag(stream));
-                }
-                WebSocketOutcome::FallbackHttp => {
-                    tracing::warn!(
-                        target: "pyxis::provider",
-                        "Responses WebSocket unavailable for this session; using HTTP/SSE"
-                    );
-                }
-            }
-        }
-
-        // 3. Serialize and prepare every non-secret request component before
-        // credentials are read. Compression and metadata-header validation are
-        // therefore local failures at this boundary.
-        let body_bytes = serde_json::to_vec(&body)
-            .map_err(|_| ProviderError::Decode("responses request serialization failed".into()))?;
-        let prepared = self
-            .config
-            .prepare_request(&req, runtime.responses_dialect, &body_bytes)?;
-        let spec = self.creds.request_spec().await?;
-        let request = prepared.authorize(&self.http, &spec)?;
-        // US-022 (hardening): bounds the HEADERS phase. `connect_timeout` covers
-        // the TCP/TLS establishment and `idle_guarded` the OPEN stream, but between the
-        // two `send()` waits for the response headers without a bound: a backend that
-        // handshakes then withholds its headers (blocked proxy, queue) would freeze the loop
-        // without a signal. `send()` resolves when the headers are received -> this timeout
-        // does NOT cut the long SSE stream that follows.
-        let resp =
-            send_with_header_timeout(&self.http, request, self.config.header_timeout()).await?;
-
-        // 4. status. 413 -> context error (withholding/reactive compaction).
-        if !resp.status().is_success() {
-            return Err(from_http_response(resp).await);
-        }
-
-        // 5. SSE stream -> canonical StreamEvent (never ANSI, never a panic).
-        //    Stateful mapping (one SSE event -> 0..n StreamEvent) in an async_stream,
-        //    then the `idle_guarded` watchdog: the timeout wraps `inner.next()`, so
-        //    an `es.next()` that stalls (mute backend) triggers the idle timeout, without
-        //    cutting while draining already buffered events (US-022).
-        //    US-003: the quota state travels in the response headers, so it is read
-        //    here, before the body is consumed, and emitted first.
-        let quotas = crate::quota::parse_all_quota_headers(resp.headers());
-        let response_metadata = response_metadata_from_headers(resp.headers());
-        let mut es = resp.bytes_stream().eventsource();
-        let mapped = async_stream::stream! {
-            for snapshot in quotas {
-                yield Ok(StreamEvent::Quota { snapshot });
-            }
-            if !response_metadata.is_empty() {
-                yield Ok(StreamEvent::ResponseMetadata {
-                    metadata: Box::new(response_metadata),
-                });
-            }
-            let mut mapper = CodexEventMapper::with_replay(req.reasoning_replay);
-            while let Some(ev) = es.next().await {
-                match ev {
-                    Ok(event) => match mapper.ingest(&event.data) {
-                        Ok(events) => {
-                            for e in events {
-                                let terminal = matches!(e, StreamEvent::Done { .. });
-                                yield Ok(e);
-                                if terminal {
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            yield Err(e);
-                            return;
-                        }
-                    },
-                    Err(e) => {
-                        yield Err(ProviderError::Stream(e.to_string()));
-                        return;
-                    }
-                }
-            }
-            yield Err(ProviderError::Stream("missing terminal event".to_string()));
-        };
-        Ok(self
-            .observe_catalog_etag(idle_guarded(mapped.boxed(), self.config.idle_timeout()).boxed()))
-    }
-
-    async fn complete(&self, req: CanonicalRequest) -> Result<CanonicalResponse, ProviderError> {
-        // Reuses the stream path and aggregates (titles / compaction summaries).
-        let stream = self.stream(req).await?;
-        futures_util::pin_mut!(stream);
-        let mut text = String::new();
-        let mut usage = TokenUsage::default();
-        let mut stop = StopReason::EndTurn;
-        while let Some(ev) = stream.next().await {
-            match ev? {
-                StreamEvent::TextDelta { text: t } => text.push_str(&t),
-                StreamEvent::Usage { usage: u } => usage = u,
-                StreamEvent::Done { stop: s } => stop = s,
-                _ => {}
-            }
-        }
-        Ok(CanonicalResponse {
-            content: vec![ContentBlock::Text { text }],
-            usage,
-            stop,
-        })
+        let plan = self.prepare_request(req)?;
+        let auth = self.creds.request_spec().await?;
+        let stream = responses::stream(
+            responses::ResponsesExecution {
+                http: &self.http,
+                websocket: &self.websocket,
+                config: &self.config,
+                auth: &auth,
+            },
+            plan,
+            CancellationToken::new(),
+        )
+        .await?;
+        Ok(self.observe_catalog_etag(stream))
     }
 
     async fn refresh_auth(&self) -> Result<(), ProviderError> {
-        self.creds.force_refresh().await?;
+        if let Err(error) = self.creds.force_refresh().await {
+            if matches!(
+                error,
+                ProviderError::Credential(AuthError::RecoveryPermanent)
+            ) {
+                self.websocket.disconnect(&self.config).await;
+                if let Err(cleanup) = self.catalog_manager.invalidate_scope() {
+                    tracing::warn!(
+                        target: "pyxis::models",
+                        error = %cleanup,
+                        "catalog cleanup failed after permanent credential recovery failure"
+                    );
+                }
+            }
+            return Err(error);
+        }
         self.websocket.reset_scope();
-        let spec = self.creds.models_spec().await?;
-        let endpoint = self.config.endpoint()?;
-        let scope = catalog_scope(&spec, endpoint.as_str())?;
-        self.catalog
-            .write()
-            .map_err(|_| ProviderError::Decode("models: catalog lock poisoned".into()))?
-            .ensure_scope(scope);
+        self.catalog_manager.invalidate_scope()?;
         Ok(())
     }
 
     async fn disconnect_auth(&self) -> Result<(), ProviderError> {
         self.websocket.disconnect(&self.config).await;
         self.creds.disconnect().await;
-        if let Ok(mut catalog) = self.catalog.write() {
-            catalog.clear_remote();
-        }
+        self.catalog_manager.invalidate_scope()?;
         Ok(())
     }
 
@@ -849,77 +507,19 @@ impl Provider for OpenAiChatGptProvider {
     }
 
     fn classify_error(&self, err: &ProviderError) -> ErrorClass {
-        match err {
-            ProviderError::Credential(error) => ErrorClass::Auth(*error),
-            ProviderError::Http {
-                status, message, ..
-            } => match *status {
-                // This adapter owns a refresh-capable credential manager. A 401
-                // therefore authorizes one sampling-scoped recovery regardless
-                // of backend body wording; the core enforces the bound.
-                401 => ErrorClass::Auth(AuthError::Expired),
-                403 => ErrorClass::Auth(AuthError::Invalid),
-                400 if should_retry_without_reasoning_replay(*status, message) => {
-                    ErrorClass::ReasoningReplayRejected
-                }
-                // 429 with an exhausted quota (GoUsageLimitError/billing/... body) -> TERMINAL:
-                // never retried (US-023). A transient 429 stays `RateLimited`.
-                429 if is_terminal_rate_limit(message) => ErrorClass::InvalidRequest,
-                429 => ErrorClass::RateLimited,
-                529 => ErrorClass::Overloaded(529),
-                s if s >= 500 => ErrorClass::Retryable,
-                _ => ErrorClass::InvalidRequest,
-            },
-            ProviderError::Api {
-                category,
-                status,
-                message,
-                ..
-            } => match category {
-                agent_core::provider::ProviderErrorCategory::Authentication => {
-                    ErrorClass::Auth(AuthError::Expired)
-                }
-                agent_core::provider::ProviderErrorCategory::PermissionDenied => {
-                    ErrorClass::Auth(AuthError::Invalid)
-                }
-                agent_core::provider::ProviderErrorCategory::RateLimited => ErrorClass::RateLimited,
-                agent_core::provider::ProviderErrorCategory::Overloaded => {
-                    ErrorClass::Overloaded(status.unwrap_or(529))
-                }
-                agent_core::provider::ProviderErrorCategory::Failed
-                    if status.is_some_and(|status| status >= 500) =>
-                {
-                    ErrorClass::Retryable
-                }
-                agent_core::provider::ProviderErrorCategory::Incomplete => ErrorClass::Retryable,
-                agent_core::provider::ProviderErrorCategory::InvalidRequest
-                    if status == &Some(400)
-                        && should_retry_without_reasoning_replay(400, message) =>
-                {
-                    ErrorClass::ReasoningReplayRejected
-                }
-                _ => ErrorClass::InvalidRequest,
-            },
-            // Transient: transport, cut stream, garbled chunk -> cross-cutting retry.
-            ProviderError::Transport(_) | ProviderError::Stream(_) | ProviderError::Decode(_) => {
-                ErrorClass::Retryable
-            }
-            // Does not reach classify (is_context_error handled upstream); fail-safe.
-            ProviderError::ContextLengthExceeded => ErrorClass::InvalidRequest,
-            // Decided locally before any request: retrying cannot change it.
-            ProviderError::UnsupportedTool { .. } => ErrorClass::InvalidRequest,
-        }
+        responses::classify_error(err)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::provider::{ProviderErrorCategory, ToolSpec};
+    use agent_core::provider::{AuthError, ProviderErrorCategory, StopReason, ToolSpec};
+    use futures_util::StreamExt;
 
     use crate::chatgpt_error::{
-        api_category_for_http, days_from_civil, parse_imf_fixdate_ms, parse_retry_after_ms,
-        sanitize_error_body,
+        api_category_for_http, days_from_civil, is_terminal_rate_limit, parse_imf_fixdate_ms,
+        parse_retry_after_ms, sanitize_error_body, should_retry_without_reasoning_replay,
     };
 
     fn credential(expires_at: u64) -> OAuthCredential {
@@ -933,7 +533,7 @@ mod tests {
     }
 
     fn provider() -> OpenAiChatGptProvider {
-        OpenAiChatGptProvider::new(credential(u64::MAX), DEFAULT_MAX_CONTEXT, None)
+        OpenAiChatGptProvider::new(credential(u64::MAX), DEFAULT_MAX_CONTEXT, None).unwrap()
     }
 
     #[test]
@@ -943,7 +543,17 @@ mod tests {
         assert!(!c.server_side_state);
         assert!(c.tools && c.reasoning);
         assert!(c.reasoning_options.encrypted_replay);
+        assert!(c.prompt_caching && c.cache.prompt_cache_key);
+        c.validate().unwrap();
         assert_eq!(p.kind(), ProviderKind::OpenAiChatGpt);
+    }
+
+    #[test]
+    fn constructor_rejects_invalid_capabilities() {
+        assert!(matches!(
+            OpenAiChatGptProvider::new(credential(u64::MAX), 0, None),
+            Err(ProviderError::UnsupportedCapability { .. })
+        ));
     }
 
     #[tokio::test]
@@ -976,7 +586,8 @@ mod tests {
 
     #[tokio::test]
     async fn transport_headers_are_validated_before_expired_credentials() {
-        let provider = OpenAiChatGptProvider::new(credential(0), DEFAULT_MAX_CONTEXT, None);
+        let provider =
+            OpenAiChatGptProvider::new(credential(0), DEFAULT_MAX_CONTEXT, None).unwrap();
         let request = CanonicalRequest {
             model: "gpt-5.5".into(),
             client_metadata: std::collections::BTreeMap::from([(
@@ -1039,7 +650,7 @@ mod tests {
 
     #[test]
     fn explicit_provider_retry_is_applied_during_runtime_resolution() {
-        let config = OpenAiChatGptConfig::chatgpt_default()
+        let config = ResponsesTransportConfig::chatgpt_default()
             .with_retry(ModelRetryPolicy {
                 max_attempts: 5,
                 backoff_base_ms: 75,
@@ -1084,55 +695,46 @@ mod tests {
         assert_eq!(p.max_context_for_model("fixture-lite"), 200_000);
     }
 
-    #[test]
-    fn catalog_scope_hashes_identity_and_ignores_request_query() {
-        let spec = agent_auth::oauth::openai_chatgpt::RequestSpec {
-            url: "https://chatgpt.com/backend-api/codex/models?client_version=1.2.3".into(),
-            headers: vec![("chatgpt-account-id".into(), "account-secret-id".into())],
-        };
-        let scope = catalog_scope(
-            &spec,
-            "https://chatgpt.com/backend-api/codex/responses?feature=test",
-        )
-        .expect("scope builds");
+    #[tokio::test]
+    async fn catalog_scope_hashes_identity_and_ignores_request_query() {
+        let manager = Arc::new(CredentialManager::new(
+            OAuthCredential {
+                account_id: Some("account-secret-id".into()),
+                ..credential(u64::MAX)
+            },
+            reqwest::Client::new(),
+            KEYRING_ACCOUNT,
+        ));
+        let request = chatgpt_catalog_request(manager, 0)
+            .await
+            .expect("scope builds");
+        let scope = request.scope();
         assert_eq!(scope.provider, "openai_chatgpt");
         assert!(!scope.endpoint.contains("client_version"));
-        assert!(!scope.endpoint.contains("feature=test"));
         assert!(!scope.identity_fingerprint.contains("account-secret-id"));
 
-        let mut other = spec;
-        other.headers[0].1 = "other-account".into();
-        let other_scope = catalog_scope(&other, "https://chatgpt.com/backend-api/codex/responses")
-            .expect("other scope builds");
-        assert_ne!(scope.identity_fingerprint, other_scope.identity_fingerprint);
-    }
-
-    #[test]
-    fn a_changed_response_etag_requires_refresh() {
-        let catalog = RwLock::new(ModelCatalog::embedded());
-        catalog
-            .write()
-            .expect("catalog lock")
-            .install_remote_scoped(
-                include_str!("../fixtures/models-2026-07-28.json"),
-                "2026-07-28",
-                CatalogScope {
-                    provider: "openai_chatgpt".into(),
-                    endpoint: "scope".into(),
-                    identity_fingerprint: "identity".into(),
-                },
-                Some("etag-a".into()),
-            )
-            .expect("fixture installs");
-        assert!(!catalog_etag_changed(&catalog, "etag-a"));
-        assert!(catalog_etag_changed(&catalog, "etag-b"));
+        let other = Arc::new(CredentialManager::new(
+            OAuthCredential {
+                account_id: Some("other-account".into()),
+                ..credential(u64::MAX)
+            },
+            reqwest::Client::new(),
+            KEYRING_ACCOUNT,
+        ));
+        let other = chatgpt_catalog_request(other, 0)
+            .await
+            .expect("other scope");
+        assert_ne!(
+            scope.identity_fingerprint,
+            other.scope().identity_fingerprint
+        );
     }
 
     #[test]
     fn ultra_reasoning_effort_is_sent_as_max() {
-        assert_eq!(reasoning_effort_for_request("ultra"), "max");
-        assert_eq!(reasoning_effort_for_request("Ultra"), "max");
-        assert_eq!(reasoning_effort_for_request("xhigh"), "xhigh");
+        assert_eq!(responses::reasoning_effort_for_request("ultra"), "max");
+        assert_eq!(responses::reasoning_effort_for_request("Ultra"), "max");
+        assert_eq!(responses::reasoning_effort_for_request("xhigh"), "xhigh");
     }
 
     #[test]
@@ -1377,7 +979,8 @@ mod tests {
             },
             DEFAULT_MAX_CONTEXT,
             None,
-        );
+        )
+        .unwrap();
 
         assert!(matches!(
             p.creds.request_spec().await,
@@ -1439,7 +1042,7 @@ mod tests {
     #[tokio::test]
     async fn idle_timeout_fires_on_silent_stream() {
         let silent = futures_util::stream::pending::<Result<StreamEvent, ProviderError>>().boxed();
-        let guarded = idle_guarded(silent, Duration::from_millis(40));
+        let guarded = responses::idle_guarded(silent, Duration::from_millis(40));
         futures_util::pin_mut!(guarded);
         let first = guarded.next().await;
         assert!(
@@ -1469,7 +1072,8 @@ mod tests {
             .post(format!("http://{addr}/"))
             .build()
             .expect("local request");
-        let res = send_with_header_timeout(&client, request, Duration::from_millis(150)).await;
+        let res =
+            responses::send_with_header_timeout(&client, request, Duration::from_millis(150)).await;
         assert!(
             matches!(&res, Err(ProviderError::Stream(m)) if m == "header timeout"),
             "header timeout expected, got: {res:?}"
@@ -1487,7 +1091,7 @@ mod tests {
             }),
         ])
         .boxed();
-        let guarded = idle_guarded(inner, Duration::from_secs(5));
+        let guarded = responses::idle_guarded(inner, Duration::from_secs(5));
         let collected: Vec<_> = guarded.collect().await;
         assert_eq!(collected.len(), 2);
         assert!(matches!(collected[0], Ok(StreamEvent::TextDelta { .. })));
@@ -1511,7 +1115,7 @@ mod tests {
             }),
         ])
         .boxed();
-        let guarded = idle_guarded(inner, Duration::from_secs(5));
+        let guarded = responses::idle_guarded(inner, Duration::from_secs(5));
         let collected: Vec<_> = guarded.collect().await;
         assert_eq!(collected.len(), 2, "should stop after the error");
         assert!(matches!(collected[1], Err(ProviderError::Stream(_))));

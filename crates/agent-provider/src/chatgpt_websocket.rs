@@ -1,4 +1,4 @@
-//! Bounded Responses WebSocket session for the ChatGPT subscription adapter.
+//! Bounded Responses WebSocket session shared by Responses providers.
 //!
 //! A single session task owns the socket. Callers submit one bounded command at
 //! a time, so connection ownership, cancellation, close handshakes, fallback,
@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::Mutex as StdMutex;
 use std::task::{Context, Poll};
 
-use agent_core::model::ResponsesDialect;
+use agent_auth::provider::ProviderRequestAuth;
 use agent_core::provider::{CanonicalRequest, ProviderError, StreamEvent};
 use futures_util::Stream;
 use futures_util::stream::BoxStream;
@@ -16,8 +16,7 @@ use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::chatgpt_http::OpenAiChatGptConfig;
-use crate::credential::CredentialManager;
+use crate::chatgpt_http::{PreparedResponsesRoute, ResponsesTransportConfig};
 
 mod continuation;
 mod probe;
@@ -34,6 +33,26 @@ const EVENT_BUFFER: usize = 32;
 pub(crate) enum WebSocketOutcome {
     Stream(BoxStream<'static, Result<StreamEvent, ProviderError>>),
     FallbackHttp,
+}
+
+pub(crate) struct WebSocketExecution<'a> {
+    pub(crate) auth: &'a ProviderRequestAuth,
+    pub(crate) config: &'a ResponsesTransportConfig,
+    pub(crate) request: &'a CanonicalRequest,
+    pub(crate) route: &'a PreparedResponsesRoute,
+    pub(crate) full_body: Value,
+    pub(crate) body_bytes: &'a [u8],
+    pub(crate) provider_attempts: u32,
+}
+
+pub(crate) struct WebSocketProbeExecution<'a> {
+    pub(crate) authorization: WebSocketProbeAuthorization,
+    pub(crate) auth: &'a ProviderRequestAuth,
+    pub(crate) config: &'a ResponsesTransportConfig,
+    pub(crate) request: &'a CanonicalRequest,
+    pub(crate) route: &'a PreparedResponsesRoute,
+    pub(crate) full_body: Value,
+    pub(crate) body_bytes: &'a [u8],
 }
 
 struct ScopeState {
@@ -57,12 +76,12 @@ struct ScopeSnapshot {
 
 /// Lazily starts one actor because providers are also constructed in sync test
 /// and discovery paths where no Tokio runtime exists yet.
-pub(crate) struct ChatGptWebSocket {
+pub(crate) struct ResponsesWebSocket {
     actor: Mutex<Option<mpsc::Sender<SessionCommand>>>,
     scope: StdMutex<ScopeState>,
 }
 
-impl ChatGptWebSocket {
+impl ResponsesWebSocket {
     pub(crate) fn new() -> Self {
         Self {
             actor: Mutex::new(None),
@@ -83,7 +102,7 @@ impl ChatGptWebSocket {
         scope.cancelled = CancellationToken::new();
     }
 
-    pub(crate) async fn disconnect(&self, config: &OpenAiChatGptConfig) {
+    pub(crate) async fn disconnect(&self, config: &ResponsesTransportConfig) {
         self.reset_scope();
         let sender = self.actor.lock().await.clone();
         let Some(sender) = sender else {
@@ -104,14 +123,12 @@ impl ChatGptWebSocket {
 
     pub(crate) async fn preconnect(
         &self,
-        creds: &CredentialManager,
-        config: &OpenAiChatGptConfig,
+        auth: &ProviderRequestAuth,
+        config: &ResponsesTransportConfig,
         request: &CanonicalRequest,
-        dialect: ResponsesDialect,
+        route: &PreparedResponsesRoute,
     ) -> Result<(), ProviderError> {
-        let _validated = config.prepare_request(request, dialect, b"{}")?;
-        let auth = creds.request_spec().await?;
-        let prepared = config.prepare_websocket_request(request, dialect, &auth)?;
+        let prepared = config.prepare_websocket(route, auth)?;
         let scope = self.scope_snapshot();
         let mut cancel_guard = CancelOnDrop::new(scope.cancelled.clone());
         let (ready, response) = oneshot::channel();
@@ -136,21 +153,20 @@ impl ChatGptWebSocket {
 
     pub(crate) async fn stream(
         &self,
-        creds: &CredentialManager,
-        config: &OpenAiChatGptConfig,
-        request: &CanonicalRequest,
-        dialect: ResponsesDialect,
-        full_body: Value,
-        provider_attempts: u32,
+        execution: WebSocketExecution<'_>,
     ) -> Result<WebSocketOutcome, ProviderError> {
+        let WebSocketExecution {
+            auth,
+            config,
+            request,
+            route,
+            full_body,
+            body_bytes,
+            provider_attempts,
+        } = execution;
         // Validate every non-secret component before reading credentials.
-        let body_bytes = serde_json::to_vec(&full_body)
-            .map_err(|_| ProviderError::Decode("responses request serialization failed".into()))?;
-        validate_message_bytes(&body_bytes)?;
-        let _validated = config.prepare_request(request, dialect, &body_bytes)?;
-
-        let auth = creds.request_spec().await?;
-        let prepared = config.prepare_websocket_request(request, dialect, &auth)?;
+        validate_message_bytes(body_bytes)?;
+        let prepared = config.prepare_websocket(route, auth)?;
         let scope = self.scope_snapshot();
         let mut cancel_guard = CancelOnDrop::new(scope.cancelled.clone());
         let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER);
@@ -186,14 +202,9 @@ impl ChatGptWebSocket {
 
     pub(crate) async fn probe(
         &self,
-        authorization: WebSocketProbeAuthorization,
-        creds: &CredentialManager,
-        config: &OpenAiChatGptConfig,
-        request: &CanonicalRequest,
-        dialect: ResponsesDialect,
-        full_body: Value,
+        execution: WebSocketProbeExecution<'_>,
     ) -> WebSocketProbeReport {
-        probe::run(authorization, creds, config, request, dialect, full_body).await
+        probe::run(execution).await
     }
 
     async fn sender(&self) -> mpsc::Sender<SessionCommand> {

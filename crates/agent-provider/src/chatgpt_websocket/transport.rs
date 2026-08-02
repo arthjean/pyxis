@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::chatgpt_error::{from_http_parts, invalid_request};
-use crate::chatgpt_http::{OpenAiChatGptConfig, PreparedWebSocketRequest};
+use crate::chatgpt_http::{PreparedWebSocketRequest, ResponsesTransportConfig};
 use crate::chatgpt_metadata::response_metadata_from_headers;
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -30,7 +30,7 @@ pub(super) struct WebSocketPolicy {
 }
 
 impl WebSocketPolicy {
-    pub(super) fn from_config(config: &OpenAiChatGptConfig) -> Self {
+    pub(super) fn from_config(config: &ResponsesTransportConfig) -> Self {
         Self {
             connect_timeout: config.websocket_connect_timeout(),
             write_timeout: config.websocket_write_timeout(),
@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn websocket_limits_are_explicit_and_bounded() {
         let config =
-            OpenAiChatGptConfig::new("https://chatgpt.com/backend-api/", "codex/responses")
+            ResponsesTransportConfig::new("https://chatgpt.com/backend-api/", "codex/responses")
                 .expect("valid test config");
         let bounded = bounded_websocket_config(WebSocketPolicy::from_config(&config));
         assert_eq!(bounded.write_buffer_size, 64 * 1024);

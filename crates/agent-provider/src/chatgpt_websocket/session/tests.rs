@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::*;
-use crate::chatgpt_http::OpenAiChatGptConfig;
+use crate::chatgpt_http::ResponsesTransportConfig;
 
 fn body(input: Vec<Value>) -> Value {
     serde_json::json!({
@@ -41,7 +41,7 @@ fn prepared(address: std::net::SocketAddr) -> PreparedWebSocketRequest {
 }
 
 fn policy() -> WebSocketPolicy {
-    let config = OpenAiChatGptConfig::new("http://127.0.0.1", "responses")
+    let config = ResponsesTransportConfig::new("http://127.0.0.1", "responses")
         .expect("valid local config")
         .with_timeouts(
             Duration::from_millis(500),

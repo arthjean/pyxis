@@ -1432,7 +1432,7 @@ async fn run(
         cred,
         agent_provider::DEFAULT_MAX_CONTEXT,
         initial_reasoning_effort.clone(),
-    );
+    )?;
     // US-022: SSE idle timeout configurable per session (default 60 s). An invalid/0
     // env value is ignored -> keeps the default (watchdog never disabled).
     if let Some(secs) = std::env::var("PYXIS_IDLE_TIMEOUT_SECS")

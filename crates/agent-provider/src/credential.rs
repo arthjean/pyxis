@@ -5,7 +5,8 @@
 //! `Provider::stream` takes `&self` -> the credential lives behind a
 //! `tokio::sync::Mutex` (interior mutability; a network refresh can happen under the lock).
 
-use agent_auth::oauth::openai_chatgpt::{self, AuthError as OAuthError, RequestSpec};
+use agent_auth::oauth::openai_chatgpt::{self, AuthError as OAuthError};
+use agent_auth::provider::ProviderRequestAuth;
 use agent_auth::{Credential, OAuthCredential};
 use agent_core::provider::{AuthError, ProviderError};
 
@@ -43,21 +44,21 @@ impl CredentialManager {
 
     /// Builds an inference request spec. A locally expiring token is surfaced
     /// to the core so its one refresh is observable and cancellation-guarded.
-    pub async fn request_spec(&self) -> Result<RequestSpec, ProviderError> {
+    pub async fn request_spec(&self) -> Result<ProviderRequestAuth, ProviderError> {
         self.fresh_spec(openai_chatgpt::responses_request, false)
             .await
     }
 
     /// Catalog discovery runs outside a sampling and may refresh proactively.
-    pub async fn models_spec(&self) -> Result<RequestSpec, ProviderError> {
+    pub async fn models_spec(&self) -> Result<ProviderRequestAuth, ProviderError> {
         self.fresh_spec(openai_chatgpt::models_request, true).await
     }
 
     async fn fresh_spec(
         &self,
-        build: fn(&OAuthCredential) -> Result<RequestSpec, OAuthError>,
+        build: fn(&OAuthCredential) -> Result<ProviderRequestAuth, OAuthError>,
         refresh_expiring: bool,
-    ) -> Result<RequestSpec, ProviderError> {
+    ) -> Result<ProviderRequestAuth, ProviderError> {
         let mut state = self.state.lock().await;
         let now = openai_chatgpt::now_ms();
         if state.cred.is_none() {
@@ -65,7 +66,7 @@ impl CredentialManager {
         }
         if state.persist_dirty {
             let cred = state.cred.as_ref().ok_or_else(disconnected_error)?;
-            self.persist(cred).await?;
+            self.persist(cred).await.map_err(convert_persist_err)?;
             state.persist_dirty = false;
         }
         let cred = state.cred.as_mut().ok_or_else(disconnected_error)?;
@@ -109,12 +110,32 @@ impl CredentialManager {
             .refresh
             .expose()
             .to_string();
-        let refreshed = openai_chatgpt::refresh(&self.http, &refresh_token, now)
-            .await
-            .map_err(convert_refresh_err)?;
+        let refreshed = match openai_chatgpt::refresh(&self.http, &refresh_token, now).await {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                let error = convert_refresh_err(error);
+                if matches!(
+                    error,
+                    ProviderError::Credential(AuthError::RecoveryPermanent)
+                ) {
+                    state.cred = None;
+                    state.persist_dirty = false;
+                    if let Err(cleanup) = self.delete_persisted().await {
+                        tracing::warn!(
+                            target: "pyxis::auth",
+                            error = %cleanup,
+                            "persisted credential cleanup failed after permanent recovery failure"
+                        );
+                    }
+                }
+                return Err(error);
+            }
+        };
         state.cred = Some(refreshed.clone());
         state.persist_dirty = true;
-        self.persist(&refreshed).await?;
+        self.persist(&refreshed)
+            .await
+            .map_err(convert_persist_err)?;
         state.persist_dirty = false;
         Ok(())
     }
@@ -129,6 +150,14 @@ impl CredentialManager {
             .map_err(|e| ProviderError::Transport(format!("join keyring: {e}")))?
             .map_err(|e| ProviderError::Transport(format!("keyring: {e}")))
     }
+
+    async fn delete_persisted(&self) -> Result<(), ProviderError> {
+        let account = self.keyring_account.clone();
+        tokio::task::spawn_blocking(move || agent_auth::store::delete(&account))
+            .await
+            .map_err(|error| ProviderError::Transport(format!("join keyring: {error}")))?
+            .map_err(|error| ProviderError::Transport(format!("keyring: {error}")))
+    }
 }
 
 fn disconnected_error() -> ProviderError {
@@ -138,8 +167,34 @@ fn disconnected_error() -> ProviderError {
 /// A refresh attempted by the credential manager is already the one recovery
 /// operation for this sampling. Its failure is typed terminal state, never a
 /// synthetic 401 that could trigger a second refresh in the core.
-fn convert_refresh_err(_error: OAuthError) -> ProviderError {
-    ProviderError::Credential(AuthError::ReconnectRequired)
+fn convert_refresh_err(error: OAuthError) -> ProviderError {
+    let outcome = match error {
+        OAuthError::Http(error) => match error.status() {
+            Some(status)
+                if status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error() =>
+            {
+                AuthError::RecoveryTransient
+            }
+            Some(_) => AuthError::RecoveryPermanent,
+            None => AuthError::RecoveryTransient,
+        },
+        OAuthError::Io(_) => AuthError::RecoveryTransient,
+        OAuthError::TokenResponse(_)
+        | OAuthError::Jwt(_)
+        | OAuthError::MissingAccountId
+        | OAuthError::WrongProvider(_)
+        | OAuthError::Callback(_)
+        | OAuthError::StateMismatch
+        | OAuthError::DeviceTimeout
+        | OAuthError::DeviceDenied(_) => AuthError::RecoveryPermanent,
+    };
+    ProviderError::Credential(outcome)
+}
+
+fn convert_persist_err(_error: ProviderError) -> ProviderError {
+    ProviderError::Credential(AuthError::RecoveryTransient)
 }
 
 fn convert_auth_err(e: OAuthError) -> ProviderError {
@@ -156,5 +211,56 @@ fn convert_auth_err(e: OAuthError) -> ProviderError {
             None => ProviderError::Transport(re.to_string()),
         },
         other => ProviderError::Transport(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    async fn status_error(status: u16) -> OAuthError {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 {status} fixture\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let error = reqwest::Client::new()
+            .get(format!("http://{address}/token"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap_err();
+        server.await.unwrap();
+        OAuthError::Http(error)
+    }
+
+    #[tokio::test]
+    async fn refresh_failures_preserve_permanent_and_transient_outcomes() {
+        assert!(matches!(
+            convert_refresh_err(status_error(400).await),
+            ProviderError::Credential(AuthError::RecoveryPermanent)
+        ));
+        assert!(matches!(
+            convert_refresh_err(status_error(503).await),
+            ProviderError::Credential(AuthError::RecoveryTransient)
+        ));
+        assert!(matches!(
+            convert_refresh_err(OAuthError::TokenResponse("malformed".into())),
+            ProviderError::Credential(AuthError::RecoveryPermanent)
+        ));
+        assert!(matches!(
+            convert_persist_err(ProviderError::Transport("keyring".into())),
+            ProviderError::Credential(AuthError::RecoveryTransient)
+        ));
     }
 }

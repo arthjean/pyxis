@@ -114,8 +114,9 @@ struct RemoteCatalog {
 
 #[derive(Debug, Clone)]
 pub struct ModelCatalog {
-    embedded: HashMap<String, ModelDescriptor>,
-    embedded_order: Vec<String>,
+    local: HashMap<String, ModelDescriptor>,
+    local_order: Vec<String>,
+    local_source: Option<ModelRuntimeSource>,
     remote: Option<RemoteCatalog>,
     diagnostics: Vec<String>,
     /// Is a Code Mode runtime wired in this process? Fail-closed default
@@ -134,17 +135,64 @@ impl Default for ModelCatalog {
 impl ModelCatalog {
     pub fn embedded() -> Self {
         let descriptors = embedded_descriptors();
-        let embedded_order = descriptors
+        let local_order = descriptors
             .iter()
             .map(|descriptor| descriptor.slug.clone())
             .collect();
-        let embedded = descriptors
+        let local = descriptors
             .into_iter()
             .map(|descriptor| (descriptor.slug.clone(), descriptor))
             .collect();
         Self {
-            embedded,
-            embedded_order,
+            local,
+            local_order,
+            local_source: Some(ModelRuntimeSource::Embedded {
+                version: EMBEDDED_CATALOG_VERSION.into(),
+            }),
+            remote: None,
+            diagnostics: Vec::new(),
+            code_mode: false,
+        }
+    }
+
+    /// Authoritative in-memory catalog used when provider configuration names
+    /// every model. Callers never attach a remote fetch path to this value.
+    pub fn from_static(descriptors: Vec<ModelDescriptor>) -> Result<Self, CatalogError> {
+        if descriptors.is_empty() {
+            return Err(CatalogError::Empty);
+        }
+        let mut local = HashMap::with_capacity(descriptors.len());
+        let mut local_order = Vec::with_capacity(descriptors.len());
+        for descriptor in descriptors {
+            descriptor
+                .validate()
+                .map_err(|error| CatalogError::Malformed(error.to_string()))?;
+            if local.contains_key(&descriptor.slug) {
+                return Err(CatalogError::Malformed(format!(
+                    "duplicate model slug {}",
+                    bounded_wire_text(&descriptor.slug, 128)
+                )));
+            }
+            local_order.push(descriptor.slug.clone());
+            local.insert(descriptor.slug.clone(), descriptor);
+        }
+        Ok(Self {
+            local,
+            local_order,
+            local_source: Some(ModelRuntimeSource::Configured),
+            remote: None,
+            diagnostics: Vec::new(),
+            code_mode: false,
+        })
+    }
+
+    /// Empty catalog for providers whose only source of truth is a remote,
+    /// scope-bound snapshot. It never falls back to ChatGPT's embedded models.
+    pub fn remote_only() -> Self {
+        Self {
+            local: HashMap::new(),
+            local_order: Vec::new(),
+            local_source: None,
             remote: None,
             diagnostics: Vec::new(),
             code_mode: false,
@@ -205,7 +253,7 @@ impl ModelCatalog {
         models.sort_by_key(|model| model.priority);
 
         let source = ModelRuntimeSource::Remote {
-            endpoint: MODELS_ENDPOINT.into(),
+            endpoint: scope.endpoint.clone(),
             fetched_at: fetched_at.into(),
         };
         let mut ordered_slugs = Vec::with_capacity(models.len());
@@ -291,7 +339,7 @@ impl ModelCatalog {
             .remote
             .as_ref()
             .map(|remote| remote.ordered_slugs.as_slice())
-            .unwrap_or(self.embedded_order.as_slice());
+            .unwrap_or(self.local_order.as_slice());
         slugs
             .iter()
             .filter_map(|slug| self.catalog_model(slug))
@@ -406,43 +454,31 @@ impl ModelCatalog {
                     slug: slug.into(),
                     reason: reason.clone(),
                 }),
-                RemoteEntry::Partial { reason, .. } => self
-                    .embedded
-                    .get(slug)
-                    .cloned()
-                    .map(|descriptor| {
-                        (
-                            descriptor,
-                            ModelRuntimeSource::Embedded {
-                                version: EMBEDDED_CATALOG_VERSION.into(),
-                            },
-                        )
-                    })
-                    .ok_or_else(|| ModelRuntimeError::Incompatible {
-                        slug: slug.into(),
-                        reason: format!("remote descriptor is partial: {reason}"),
-                    }),
+                RemoteEntry::Partial { reason, .. } => {
+                    self.local_descriptor(slug)
+                        .ok_or_else(|| ModelRuntimeError::Incompatible {
+                            slug: slug.into(),
+                            reason: format!("remote descriptor is partial: {reason}"),
+                        })
+                }
             };
         }
-        self.embedded
-            .get(slug)
-            .cloned()
-            .map(|descriptor| {
-                (
-                    descriptor,
-                    ModelRuntimeSource::Embedded {
-                        version: EMBEDDED_CATALOG_VERSION.into(),
-                    },
-                )
-            })
+        self.local_descriptor(slug)
             .ok_or_else(|| ModelRuntimeError::Incompatible {
                 slug: slug.into(),
-                reason: "no complete remote or embedded descriptor".into(),
+                reason: "no complete remote or local descriptor".into(),
             })
     }
 
+    fn local_descriptor(&self, slug: &str) -> Option<(ModelDescriptor, ModelRuntimeSource)> {
+        Some((
+            self.local.get(slug)?.clone(),
+            self.local_source.as_ref()?.clone(),
+        ))
+    }
+
     fn catalog_model(&self, slug: &str) -> Option<CatalogModel> {
-        let embedded = self.embedded.get(slug);
+        let local = self.local.get(slug);
         let remote = self
             .remote
             .as_ref()
@@ -463,14 +499,13 @@ impl ModelCatalog {
                 metadata,
                 reason,
                 source,
-            }) => embedded
-                .map(|descriptor| {
+            }) => local
+                .zip(self.local_source.as_ref())
+                .map(|(descriptor, source)| {
                     catalog_model_from_descriptor(
                         descriptor,
                         metadata.as_ref().clone(),
-                        ModelRuntimeSource::Embedded {
-                            version: EMBEDDED_CATALOG_VERSION.into(),
-                        },
+                        source.clone(),
                         self.code_mode,
                     )
                 })
@@ -503,16 +538,16 @@ impl ModelCatalog {
                 source: source.clone(),
                 incompatibility_reason: Some(reason.clone()),
             }),
-            None => embedded.map(|descriptor| {
-                catalog_model_from_descriptor(
-                    descriptor,
-                    embedded_catalog_metadata(descriptor),
-                    ModelRuntimeSource::Embedded {
-                        version: EMBEDDED_CATALOG_VERSION.into(),
-                    },
-                    self.code_mode,
-                )
-            }),
+            None => local
+                .zip(self.local_source.as_ref())
+                .map(|(descriptor, source)| {
+                    catalog_model_from_descriptor(
+                        descriptor,
+                        local_catalog_metadata(descriptor),
+                        source.clone(),
+                        self.code_mode,
+                    )
+                }),
         }
     }
 }
@@ -556,7 +591,7 @@ fn catalog_model_from_descriptor(
     }
 }
 
-fn embedded_catalog_metadata(descriptor: &ModelDescriptor) -> CatalogMetadata {
+fn local_catalog_metadata(descriptor: &ModelDescriptor) -> CatalogMetadata {
     CatalogMetadata {
         visibility: Some("list".into()),
         supported_in_api: Some(true),

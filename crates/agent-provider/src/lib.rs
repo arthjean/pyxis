@@ -22,13 +22,14 @@ mod chatgpt_websocket;
 pub mod credential;
 pub mod models;
 pub mod quota;
+mod responses;
 
 pub use chatgpt::{
     DEFAULT_MAX_CONTEXT, DEFAULT_MODEL, DEFAULT_REASONING_EFFORT, KEYRING_ACCOUNT,
     OpenAiChatGptProvider,
 };
 pub use chatgpt_events::CodexEventMapper;
-pub use chatgpt_http::{OpenAiChatGptConfig, ResponsesCompression};
+pub use chatgpt_http::{ResponsesCompression, ResponsesTransportConfig};
 pub use chatgpt_request::build_responses_body;
 pub use chatgpt_websocket::{
     WebSocketProbeAuthorization, WebSocketProbeReport, WebSocketProbeVerdict,

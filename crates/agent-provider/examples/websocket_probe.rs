@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = std::env::args()
         .nth(1)
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    let provider = OpenAiChatGptProvider::from_credential(credential);
+    let provider = OpenAiChatGptProvider::from_credential(credential)?;
     let request = CanonicalRequest {
         model,
         system: Some("Return exactly: websocket probe ok".into()),

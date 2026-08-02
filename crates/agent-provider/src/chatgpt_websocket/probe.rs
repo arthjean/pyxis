@@ -2,8 +2,7 @@
 
 use std::time::Duration;
 
-use agent_core::model::ResponsesDialect;
-use agent_core::provider::{CanonicalRequest, ProviderError, StreamEvent};
+use agent_core::provider::{ProviderError, StreamEvent};
 use agent_core::redaction::is_sensitive_key;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -11,9 +10,9 @@ use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::chatgpt_events::CodexEventMapper;
-use crate::chatgpt_http::{OpenAiChatGptConfig, PreparedWebSocketRequest};
-use crate::credential::CredentialManager;
+use crate::chatgpt_http::{PreparedWebSocketRequest, ResponsesTransportConfig};
 
+use super::WebSocketProbeExecution;
 use super::continuation::{
     ContinuationInput, GenerationMode, ResponseCapture, capture_response_state,
     response_create_body, validate_turn_state,
@@ -63,22 +62,21 @@ pub struct WebSocketProbeReport {
     pub close_code: Option<u16>,
 }
 
-pub(super) async fn run(
-    _authorization: WebSocketProbeAuthorization,
-    creds: &CredentialManager,
-    config: &OpenAiChatGptConfig,
-    request: &CanonicalRequest,
-    dialect: ResponsesDialect,
-    full_body: Value,
-) -> WebSocketProbeReport {
+pub(super) async fn run(execution: WebSocketProbeExecution<'_>) -> WebSocketProbeReport {
+    let WebSocketProbeExecution {
+        authorization: _authorization,
+        auth,
+        config,
+        request,
+        route,
+        full_body,
+        body_bytes,
+    } = execution;
     let mut report = empty_report(config);
     let policy = WebSocketPolicy::from_config(config);
     let result = tokio::time::timeout(PROBE_TOTAL_TIMEOUT, async {
-        let serialized_body = serialize_probe_request(&full_body)?;
-        validate_message_bytes(serialized_body.as_bytes())?;
-        let _validated = config.prepare_request(request, dialect, serialized_body.as_bytes())?;
-        let auth = creds.request_spec().await?;
-        let prepared = config.prepare_websocket_request(request, dialect, &auth)?;
+        validate_message_bytes(body_bytes)?;
+        let prepared = config.prepare_websocket(route, auth)?;
         report.non_sensitive_request_headers = non_sensitive_header_names(&prepared);
         let mut connection = connect(prepared, policy).await?;
         report.upgrade_status = Some(101);
@@ -229,7 +227,7 @@ fn serialize_probe_request(body: &Value) -> Result<String, ProviderError> {
         .map_err(|_| ProviderError::Decode("websocket probe serialization failed".into()))
 }
 
-fn empty_report(config: &OpenAiChatGptConfig) -> WebSocketProbeReport {
+fn empty_report(config: &ResponsesTransportConfig) -> WebSocketProbeReport {
     WebSocketProbeReport {
         verdict: WebSocketProbeVerdict::Failed,
         url: sanitized_probe_url(config),
@@ -253,7 +251,7 @@ fn probe_verdict(error: &ProviderError) -> WebSocketProbeVerdict {
     }
 }
 
-fn sanitized_probe_url(config: &OpenAiChatGptConfig) -> String {
+fn sanitized_probe_url(config: &ResponsesTransportConfig) -> String {
     let Ok(mut endpoint) = config.endpoint() else {
         return "<invalid-websocket-url>".into();
     };

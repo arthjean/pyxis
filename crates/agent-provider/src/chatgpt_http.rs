@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::time::Duration;
 
-use agent_auth::oauth::openai_chatgpt::{CHATGPT_BASE_URL, RequestSpec};
+use agent_auth::oauth::openai_chatgpt::CHATGPT_BASE_URL;
+use agent_auth::provider::ProviderRequestAuth;
 use agent_core::model::{ModelRetryPolicy, ResponsesDialect};
 use agent_core::provider::{CanonicalRequest, ProviderError};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -47,7 +48,7 @@ impl std::str::FromStr for ResponsesCompression {
 }
 
 #[derive(Clone)]
-pub struct OpenAiChatGptConfig {
+pub struct ResponsesTransportConfig {
     base_url: String,
     path: String,
     query: BTreeMap<String, String>,
@@ -70,6 +71,11 @@ pub(crate) struct PreparedResponsesRequest {
     body: Vec<u8>,
 }
 
+pub(crate) struct PreparedResponsesRoute {
+    endpoint: Url,
+    headers: HeaderMap,
+}
+
 pub(crate) struct PreparedWebSocketRequest {
     pub(crate) endpoint: Url,
     pub(crate) headers: HeaderMap,
@@ -79,7 +85,7 @@ impl PreparedResponsesRequest {
     pub(crate) fn authorize(
         mut self,
         client: &reqwest::Client,
-        auth: &RequestSpec,
+        auth: &ProviderRequestAuth,
     ) -> Result<reqwest::Request, ProviderError> {
         validate_authority(&self.endpoint, &auth.url)?;
         for (name, value) in &auth.headers {
@@ -103,10 +109,10 @@ impl PreparedResponsesRequest {
     }
 }
 
-impl std::fmt::Debug for OpenAiChatGptConfig {
+impl std::fmt::Debug for ResponsesTransportConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("OpenAiChatGptConfig")
+            .debug_struct("ResponsesTransportConfig")
             .field("base_url", &self.base_url)
             .field("path", &self.path)
             .field("query_keys", &self.query.keys().collect::<Vec<_>>())
@@ -123,7 +129,7 @@ impl std::fmt::Debug for OpenAiChatGptConfig {
     }
 }
 
-impl OpenAiChatGptConfig {
+impl ResponsesTransportConfig {
     pub fn new(base_url: &str, path: &str) -> Result<Self, ProviderError> {
         let mut base_url =
             Url::parse(base_url).map_err(|_| invalid("invalid responses base URL"))?;
@@ -271,6 +277,42 @@ impl OpenAiChatGptConfig {
         Ok(endpoint)
     }
 
+    /// Builds another endpoint under the same validated base URL and query
+    /// policy. Configured providers use it for `/models`.
+    pub(crate) fn endpoint_for_path(&self, path: &str) -> Result<Url, ProviderError> {
+        validate_path(path)?;
+        let base_url =
+            Url::parse(&self.base_url).map_err(|_| invalid("invalid responses base URL"))?;
+        let mut endpoint = base_url
+            .join(path)
+            .map_err(|_| invalid("invalid provider endpoint path"))?;
+        if !self.query.is_empty() {
+            let mut pairs = endpoint.query_pairs_mut();
+            for (key, value) in &self.query {
+                pairs.append_pair(key, value);
+            }
+        }
+        Ok(endpoint)
+    }
+
+    pub(crate) fn validate_for_configured(&self) -> Result<(), ProviderError> {
+        self.endpoint().map(|_| ())
+    }
+
+    pub(crate) fn configured_endpoint_headers(
+        &self,
+    ) -> Result<Vec<(String, String)>, ProviderError> {
+        self.default_headers
+            .iter()
+            .map(|(name, value)| {
+                let value = value
+                    .to_str()
+                    .map_err(|_| invalid("invalid responses default header value"))?;
+                Ok((name.as_str().to_string(), value.to_string()))
+            })
+            .collect()
+    }
+
     pub fn retry_override(&self) -> Option<ModelRetryPolicy> {
         self.retry_override
     }
@@ -325,35 +367,21 @@ impl OpenAiChatGptConfig {
     pub(crate) fn build_request(
         &self,
         client: &reqwest::Client,
-        auth: &RequestSpec,
+        auth: &ProviderRequestAuth,
         canonical: &CanonicalRequest,
         dialect: ResponsesDialect,
         body: &[u8],
     ) -> Result<reqwest::Request, ProviderError> {
-        self.prepare_request(canonical, dialect, body)?
+        self.prepare_http(self.prepare_route(canonical, dialect)?, body)?
             .authorize(client, auth)
     }
 
-    pub(crate) fn prepare_request(
+    pub(crate) fn prepare_route(
         &self,
         canonical: &CanonicalRequest,
         dialect: ResponsesDialect,
-        body: &[u8],
-    ) -> Result<PreparedResponsesRequest, ProviderError> {
-        let encoded = match self.compression {
-            ResponsesCompression::None => body.to_vec(),
-            ResponsesCompression::Zstd => zstd::stream::encode_all(Cursor::new(body), 3)
-                .map_err(|_| invalid("responses request compression failed"))?,
-        };
+    ) -> Result<PreparedResponsesRoute, ProviderError> {
         let mut headers = self.default_headers.clone();
-        headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        headers.insert(
-            reqwest::header::ACCEPT,
-            HeaderValue::from_static("text/event-stream"),
-        );
         for &(metadata_key, header_name) in metadata_headers() {
             if let Some(value) = canonical.client_metadata.get(metadata_key) {
                 let value = HeaderValue::from_str(value)
@@ -381,6 +409,34 @@ impl OpenAiChatGptConfig {
                 HeaderValue::from_static("true"),
             );
         }
+        Ok(PreparedResponsesRoute {
+            endpoint: self.endpoint()?,
+            headers,
+        })
+    }
+
+    pub(crate) fn prepare_http(
+        &self,
+        route: PreparedResponsesRoute,
+        body: &[u8],
+    ) -> Result<PreparedResponsesRequest, ProviderError> {
+        let encoded = match self.compression {
+            ResponsesCompression::None => body.to_vec(),
+            ResponsesCompression::Zstd => zstd::stream::encode_all(Cursor::new(body), 3)
+                .map_err(|_| invalid("responses request compression failed"))?,
+        };
+        let PreparedResponsesRoute {
+            endpoint,
+            mut headers,
+        } = route;
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
         if self.compression == ResponsesCompression::Zstd {
             headers.insert(
                 reqwest::header::CONTENT_ENCODING,
@@ -388,19 +444,19 @@ impl OpenAiChatGptConfig {
             );
         }
         Ok(PreparedResponsesRequest {
-            endpoint: self.endpoint()?,
+            endpoint,
             headers,
             body: encoded,
         })
     }
 
-    pub(crate) fn prepare_websocket_request(
+    pub(crate) fn prepare_websocket(
         &self,
-        canonical: &CanonicalRequest,
-        dialect: ResponsesDialect,
-        auth: &RequestSpec,
+        route: &PreparedResponsesRoute,
+        auth: &ProviderRequestAuth,
     ) -> Result<PreparedWebSocketRequest, ProviderError> {
-        let mut endpoint = self.endpoint()?;
+        let mut endpoint = route.endpoint.clone();
+        let mut headers = route.headers.clone();
         validate_authority(&endpoint, &auth.url)?;
         let websocket_scheme = match endpoint.scheme() {
             "http" => "ws",
@@ -411,10 +467,6 @@ impl OpenAiChatGptConfig {
             .set_scheme(websocket_scheme)
             .map_err(|_| invalid("invalid responses websocket URL"))?;
 
-        let mut headers = self.prepare_request(canonical, dialect, b"{}")?.headers;
-        headers.remove(reqwest::header::ACCEPT);
-        headers.remove(reqwest::header::CONTENT_TYPE);
-        headers.remove(reqwest::header::CONTENT_ENCODING);
         for (name, value) in &auth.headers {
             if name.eq_ignore_ascii_case("accept")
                 || name.eq_ignore_ascii_case("content-type")
@@ -515,7 +567,13 @@ fn valid_component(value: &str, max: usize) -> bool {
 fn forbidden_default_header(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "authorization" | "chatgpt-account-id" | "host" | "content-length" | "content-encoding"
+        "authorization"
+            | "chatgpt-account-id"
+            | "host"
+            | "content-length"
+            | "content-encoding"
+            | "transfer-encoding"
+            | "connection"
     )
 }
 
@@ -525,8 +583,8 @@ mod tests {
     use agent_core::provider::ProviderErrorCategory;
     use std::collections::BTreeMap;
 
-    fn spec(url: &str) -> RequestSpec {
-        RequestSpec {
+    fn spec(url: &str) -> ProviderRequestAuth {
+        ProviderRequestAuth {
             url: url.into(),
             headers: vec![
                 ("authorization".into(), "Bearer secret-token".into()),
@@ -539,7 +597,7 @@ mod tests {
 
     #[test]
     fn composes_endpoint_headers_and_policy() {
-        let config = OpenAiChatGptConfig::new("https://example.test/api/", "responses")
+        let config = ResponsesTransportConfig::new("https://example.test/api/", "responses")
             .unwrap()
             .with_query("api-version", "2026-08-01")
             .unwrap()
@@ -593,7 +651,7 @@ mod tests {
         );
         assert_eq!(config.retry_override().unwrap().max_attempts, 5);
         assert_eq!(
-            OpenAiChatGptConfig::new("https://example.test/api", "responses")
+            ResponsesTransportConfig::new("https://example.test/api", "responses")
                 .unwrap()
                 .endpoint()
                 .unwrap()
@@ -601,7 +659,7 @@ mod tests {
             "https://example.test/api/responses"
         );
         assert_eq!(
-            OpenAiChatGptConfig::chatgpt_default()
+            ResponsesTransportConfig::chatgpt_default()
                 .endpoint()
                 .unwrap()
                 .as_str(),
@@ -611,9 +669,11 @@ mod tests {
 
     #[test]
     fn websocket_uses_the_same_auth_scope_and_the_baseline_beta_contract() {
-        let config = OpenAiChatGptConfig::new("https://example.test/api/", "responses")
+        let config = ResponsesTransportConfig::new("https://example.test/api/", "responses")
             .unwrap()
             .with_query("api-version", "2026-08-01")
+            .unwrap()
+            .with_default_header("x-tenant", "fixture-tenant")
             .unwrap();
         let canonical = CanonicalRequest {
             client_metadata: BTreeMap::from([
@@ -622,12 +682,11 @@ mod tests {
             ]),
             ..CanonicalRequest::default()
         };
+        let route = config
+            .prepare_route(&canonical, ResponsesDialect::Standard)
+            .unwrap();
         let request = config
-            .prepare_websocket_request(
-                &canonical,
-                ResponsesDialect::Standard,
-                &spec("https://example.test/responses"),
-            )
+            .prepare_websocket(&route, &spec("https://example.test/responses"))
             .unwrap();
         assert_eq!(
             request.endpoint.as_str(),
@@ -638,6 +697,7 @@ mod tests {
         assert_eq!(request.headers["originator"], "codex_cli_rs");
         assert_eq!(request.headers["thread-id"], "thread-1");
         assert_eq!(request.headers["session-id"], "session-1");
+        assert_eq!(request.headers["x-tenant"], "fixture-tenant");
         assert_eq!(
             request.headers["openai-beta"],
             "responses_websockets=2026-02-06"
@@ -648,7 +708,7 @@ mod tests {
 
     #[test]
     fn websocket_policy_rejects_unbounded_or_overlong_close_configuration() {
-        let config = OpenAiChatGptConfig::new("https://example.test/", "responses").unwrap();
+        let config = ResponsesTransportConfig::new("https://example.test/", "responses").unwrap();
         assert!(
             config
                 .clone()
@@ -671,7 +731,7 @@ mod tests {
     #[test]
     fn zstd_body_is_preencoded_and_exact_when_decompressed() {
         let body = br#"{"input":[{"type":"message"}]}"#;
-        let request = OpenAiChatGptConfig::new("https://example.test/", "responses")
+        let request = ResponsesTransportConfig::new("https://example.test/", "responses")
             .unwrap()
             .with_compression(ResponsesCompression::Zstd)
             .build_request(
@@ -690,7 +750,7 @@ mod tests {
 
     #[test]
     fn oauth_headers_are_never_forwarded_across_origins() {
-        let error = OpenAiChatGptConfig::new("https://example.test/", "responses")
+        let error = ResponsesTransportConfig::new("https://example.test/", "responses")
             .unwrap()
             .build_request(
                 &reqwest::Client::new(),
@@ -714,7 +774,7 @@ mod tests {
     #[test]
     fn invalid_configuration_is_typed_and_does_not_echo_values() {
         let secret = "secret-header-value";
-        let error = OpenAiChatGptConfig::new("http://example.test/", "responses").unwrap_err();
+        let error = ResponsesTransportConfig::new("http://example.test/", "responses").unwrap_err();
         assert!(matches!(
             error,
             ProviderError::Api {
@@ -722,15 +782,15 @@ mod tests {
                 ..
             }
         ));
-        let error = OpenAiChatGptConfig::new("https://example.test/", "responses")
+        let error = ResponsesTransportConfig::new("https://example.test/", "responses")
             .unwrap()
             .with_default_header("authorization", secret)
             .unwrap_err();
         assert!(!error.to_string().contains(secret));
         assert!("brotli".parse::<ResponsesCompression>().is_err());
-        assert!(OpenAiChatGptConfig::new("https://example.test/", "../responses").is_err());
+        assert!(ResponsesTransportConfig::new("https://example.test/", "../responses").is_err());
         assert!(
-            OpenAiChatGptConfig::new("https://example.test/", "responses")
+            ResponsesTransportConfig::new("https://example.test/", "responses")
                 .unwrap()
                 .with_retry(ModelRetryPolicy {
                     max_attempts: 0,
@@ -739,7 +799,7 @@ mod tests {
                 .is_err()
         );
         assert!(
-            OpenAiChatGptConfig::new("https://example.test/", "responses")
+            ResponsesTransportConfig::new("https://example.test/", "responses")
                 .unwrap()
                 .with_timeouts(
                     Duration::ZERO,

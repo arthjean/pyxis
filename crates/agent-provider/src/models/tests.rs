@@ -6,6 +6,56 @@ use agent_core::model::{
 
 const RICH_FIXTURE: &str = include_str!("../../fixtures/models-2026-07-28.json");
 
+fn retry() -> ModelRetryPolicy {
+    ModelRetryPolicy {
+        max_attempts: 4,
+        backoff_base_ms: 50,
+    }
+}
+
+#[test]
+fn configured_and_remote_only_catalogs_keep_their_own_sources() {
+    let descriptor = embedded::embedded_descriptors()
+        .into_iter()
+        .find(|descriptor| descriptor.tool_mode == ModelToolMode::Direct)
+        .expect("direct embedded fixture");
+    let slug = descriptor.slug.clone();
+    let configured = ModelCatalog::from_static(vec![descriptor]).expect("static catalog");
+    let configured_runtime = configured
+        .resolve(&slug, None, 4096, retry())
+        .expect("configured runtime");
+    assert_eq!(configured_runtime.source, ModelRuntimeSource::Configured);
+
+    let remote = ModelCatalog::remote_only();
+    assert!(remote.models().is_empty());
+    assert!(remote.resolve("gpt-5.5", None, 4096, retry()).is_err());
+}
+
+#[test]
+fn remote_runtime_source_uses_the_scoped_models_endpoint() {
+    let mut catalog = ModelCatalog::remote_only();
+    let endpoint = "https://provider.example/v1/models";
+    catalog
+        .install_remote_scoped(
+            RICH_FIXTURE,
+            "2026-07-28",
+            CatalogScope {
+                provider: "configured".into(),
+                endpoint: endpoint.into(),
+                identity_fingerprint: "identity".into(),
+            },
+            Some("etag".into()),
+        )
+        .expect("remote catalog");
+    let runtime = catalog
+        .resolve("fixture-lite", None, 4096, retry())
+        .expect("remote runtime");
+    assert!(matches!(
+        runtime.source,
+        ModelRuntimeSource::Remote { endpoint: ref actual, .. } if actual == endpoint
+    ));
+}
+
 #[test]
 fn rich_fixture_preserves_every_runtime_field() {
     let mut catalog = ModelCatalog::embedded();
