@@ -297,6 +297,13 @@ pub fn insert_history_lines<B: Backend>(
             height: viewport.height - to_draw,
             ..viewport
         });
+        // Resizing both ratatui buffers discards their knowledge of cells that
+        // remain painted inside the new viewport. Clear that physical region
+        // after the history rows have been placed above it, otherwise the
+        // welcome card (or any previous active frame) shows through blank cells
+        // on the next draw. Codex applies the same clear-before-redraw rule on
+        // every inline viewport change.
+        terminal.clear_viewport()?;
         painted += to_draw;
         remaining -= to_draw;
     }

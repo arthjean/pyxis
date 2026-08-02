@@ -92,6 +92,78 @@ fn welcome_screen_wide() {
     insta::assert_snapshot!("welcome_wide", harness::frame("welcome_wide", &s, WIDE, H));
 }
 
+/// Regression: the welcome card and the first submitted message are rendered
+/// on successive frames of the same inline terminal. A fresh-frame snapshot
+/// cannot catch stale cells left on the physical screen when the viewport gives
+/// rows to scrollback.
+#[cfg(feature = "codex_tui_parity")]
+#[test]
+fn first_user_message_clears_the_welcome_frame() {
+    use agent_tui::custom_terminal::Terminal;
+    use agent_tui::{ChatWidget, HistoryInserter, InsertHistoryMode};
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::{Position, Size};
+
+    fn screen_text(terminal: &Terminal<TestBackend>, width: u16, height: u16) -> String {
+        let buffer = terminal.backend().buffer();
+        let mut text = String::new();
+        for y in 0..height {
+            for x in 0..width {
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    let mut state = state();
+    let mut chat = ChatWidget::new(&[]);
+    let mut terminal = Terminal::with_geometry(
+        TestBackend::new(W, H),
+        Size::new(W, H),
+        Position { x: 0, y: 2 },
+    );
+
+    let welcome_height = agent_tui::parity_content_height(&state, chat.surface(), W, H);
+    terminal
+        .anchor_viewport(welcome_height)
+        .expect("welcome viewport");
+    terminal
+        .draw(|frame| chat.render(frame, &state))
+        .expect("welcome frame");
+    assert!(screen_text(&terminal, W, H).contains("PYXIS"));
+
+    let prompt = "Que penses-tu du projet ?";
+    state.push_user(prompt);
+    assert!(
+        !state.is_welcome(),
+        "the first prompt must leave welcome state"
+    );
+    chat.push_user_message(&state, prompt);
+    let insert = chat
+        .surface_mut()
+        .drain_pending_insert(W, InsertHistoryMode::InlineScrollback)
+        .expect("first user message should enter scrollback");
+    HistoryInserter::new(InsertHistoryMode::InlineScrollback)
+        .insert(&mut terminal, &insert)
+        .expect("history insertion");
+
+    let conversation_height = agent_tui::parity_content_height(&state, chat.surface(), W, H);
+    terminal
+        .anchor_viewport(conversation_height)
+        .expect("conversation viewport");
+    terminal
+        .draw(|frame| chat.render(frame, &state))
+        .expect("first conversation frame");
+
+    let screen = screen_text(&terminal, W, H);
+    assert!(screen.contains(prompt), "first message missing:\n{screen}");
+    assert!(
+        !screen.contains("PYXIS") && !screen.contains("your terminal coding agent"),
+        "welcome frame leaked into the first conversation frame:\n{screen}"
+    );
+}
+
 // ────────────────────────── Conversation turn ──────────────────────────
 
 #[test]
