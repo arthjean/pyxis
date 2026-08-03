@@ -28,7 +28,10 @@ fn generated() -> [(PathBuf, String); 2] {
     document.push('\n');
     [
         (dir.join(JSON_SCHEMA_FILE), document),
-        (dir.join(TYPESCRIPT_FILE), typescript()),
+        (
+            dir.join(TYPESCRIPT_FILE),
+            typescript().expect("every node of the published surface is nameable"),
+        ),
     ]
 }
 

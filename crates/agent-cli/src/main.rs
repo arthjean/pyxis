@@ -397,7 +397,7 @@ fn emit_schemas(dir: &std::path::Path) -> anyhow::Result<()> {
         serde_json::to_string_pretty(&agent_app_server::schema::json_schema_document())?;
     document.push('\n');
     std::fs::write(&schema, document)?;
-    std::fs::write(&types, agent_app_server::schema::typescript())?;
+    std::fs::write(&types, agent_app_server::schema::typescript()?)?;
     println!("{}", schema.display());
     println!("{}", types.display());
     Ok(())
