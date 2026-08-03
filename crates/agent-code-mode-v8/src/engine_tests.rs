@@ -577,6 +577,25 @@ async fn a_denied_tool_rejects_with_its_kind_and_the_cell_keeps_control() {
     );
 }
 
+/// A session whose binding holds nothing refuses every nested call through the
+/// canonical `NoNestedTools`, with the category it publishes.
+#[tokio::test]
+async fn a_cell_without_a_bound_dispatcher_is_refused_with_a_category() {
+    let engine = engine(EngineLimits::default());
+    let specs = vec![echo_spec("read_file")];
+    let session = session("unbound", Arc::clone(&engine));
+
+    let response = session
+        .execute(nested_request(
+            "try { await tools.read_file({ value: 'x' }); text('ran'); }\n\
+             catch (error) { text(error.name + '/' + error.kind); }",
+            &specs,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(texts(&response), vec!["ToolError/unknown_tool".to_string()]);
+}
+
 /// US-008 AC3: the terminal order of a cell's nested calls is the order it made
 /// them, correlation included.
 #[tokio::test]

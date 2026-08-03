@@ -32,7 +32,7 @@ pub(crate) struct CellRuntimeState {
     pub exit_requested: bool,
     /// Nested tools the cell may call, and the pipeline that runs them.
     pub catalog: Vec<NestedTool>,
-    pub dispatcher: Option<Arc<dyn NestedToolDispatcher>>,
+    pub dispatcher: Arc<dyn NestedToolDispatcher>,
     pub next_call: u64,
     /// Non-zero while the cell is parked inside a nested tool. The CPU
     /// watchdog stops accumulating then: a tool that takes ten seconds is not
@@ -368,7 +368,7 @@ fn nested_tool_callback(
                 entry.name.clone(),
                 entry.freeform,
                 state.cell.clone(),
-                state.dispatcher.clone(),
+                Arc::clone(&state.dispatcher),
                 Arc::clone(&state.in_tool),
             ))
         })
@@ -414,19 +414,9 @@ fn nested_tool_callback(
         tool,
         input,
     };
-    let outcome = match dispatcher {
-        Some(dispatcher) => {
-            in_tool.fetch_add(1, Ordering::AcqRel);
-            let outcome = dispatcher.dispatch(call);
-            in_tool.fetch_sub(1, Ordering::AcqRel);
-            outcome
-        }
-        None => NestedToolOutcome::error(
-            &call,
-            "unknown_tool",
-            "no nested tool is available in this cell",
-        ),
-    };
+    in_tool.fetch_add(1, Ordering::AcqRel);
+    let outcome = dispatcher.dispatch(call);
+    in_tool.fetch_sub(1, Ordering::AcqRel);
 
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
         throw(scope, "cannot allocate the nested tool promise");

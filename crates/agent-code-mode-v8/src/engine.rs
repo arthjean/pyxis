@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use agent_code_mode::{
     CellEngine, CellFailure, CellFailureKind, CellId, CellSink, ExecuteRequest, NestedTool,
-    NestedToolBinding, NestedToolDispatcher, ShutdownReport,
+    NestedToolBinding, NestedToolDispatcher, NoNestedTools, ShutdownReport,
 };
 use agent_core::sync::lock;
 
@@ -160,7 +160,14 @@ impl CellEngine for IsolateEngine {
         let limits = self.limits;
         let source = request.source.clone();
         let catalog = request.tools.clone();
-        let dispatcher = self.nested.get();
+        // A session with nothing bound refuses every nested call, and the
+        // canonical dispatcher that does so already exists. Resolving it HERE
+        // keeps the option out of the cell, where it would only be a second
+        // spelling of the same refusal.
+        let dispatcher = self
+            .nested
+            .get()
+            .unwrap_or_else(|| Arc::new(NoNestedTools) as Arc<dyn NestedToolDispatcher>);
         let worker_control = Arc::clone(&control);
         let cell_for_thread = cell.clone();
         // US-019 AC3: a cell runs on its OWN OS thread, where NEITHER the span
@@ -338,7 +345,7 @@ struct CellJob {
     cell: CellId,
     source: String,
     catalog: Vec<NestedTool>,
-    dispatcher: Option<Arc<dyn NestedToolDispatcher>>,
+    dispatcher: Arc<dyn NestedToolDispatcher>,
     sink: CellSink,
     control: Arc<CellControl>,
     limits: EngineLimits,
@@ -542,7 +549,7 @@ struct CellContext<'a> {
     sink: CellSink,
     stored: HashMap<String, serde_json::Value>,
     catalog: Vec<NestedTool>,
-    dispatcher: Option<Arc<dyn NestedToolDispatcher>>,
+    dispatcher: Arc<dyn NestedToolDispatcher>,
     in_tool: Arc<AtomicU64>,
 }
 
