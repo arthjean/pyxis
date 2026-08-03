@@ -6,6 +6,10 @@
 //! provable without one. `agent-code-mode-v8` implements `CellEngine` on a real
 //! isolate, and `agent-tools` projects the pair onto the model-visible `exec`
 //! and `wait` tools.
+//!
+//! Everything a consumer needs is re-exported HERE: the modules stay public for
+//! navigation, but the crate root is the complete facade, so no caller has to
+//! choose between two import paths for the same item.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod nested;
@@ -25,6 +29,6 @@ pub use protocol::{
 };
 pub use session::{CellEngine, CellSink, CodeModeSession, SessionLimits};
 pub use tools::{
-    EXEC_GRAMMAR, EXEC_PRAGMA_PREFIX, EXEC_TOOL_NAME, ExecInputError, ExecPragma, WAIT_TOOL_NAME,
-    exec_tool_spec, parse_exec_source, wait_tool_spec,
+    DEFAULT_MAX_OUTPUT_TOKENS, EXEC_GRAMMAR, EXEC_PRAGMA_PREFIX, EXEC_TOOL_NAME, ExecInputError,
+    ExecPragma, WAIT_TOOL_NAME, exec_tool_spec, parse_exec_source, wait_tool_spec,
 };
