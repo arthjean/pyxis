@@ -65,6 +65,28 @@ pub enum ToolErrorKind {
     Semantic,
 }
 
+impl ToolErrorKind {
+    /// Canonical textual form, identical to the `snake_case` serde
+    /// representation above. Surfaces that need the category as a plain string
+    /// (a JavaScript `Error.kind`, a log field) read it HERE rather than
+    /// hand-rolling a second projection of the same enum.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::UnknownTool => "unknown_tool",
+            Self::Parse => "parse",
+            Self::Validation => "validation",
+            Self::OutsideWorkspace => "outside_workspace",
+            Self::Io => "io",
+            Self::Rejected => "rejected",
+            Self::PermissionDenied => "permission_denied",
+            Self::SandboxDenied => "sandbox_denied",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+            Self::Semantic => "semantic",
+        }
+    }
+}
+
 /// How a tool call carries its input. Provider-neutral: a `Text` call is what
 /// the Responses API happens to call a custom tool call, but the core only
 /// knows "this input is text, not JSON arguments".

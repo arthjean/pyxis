@@ -30,6 +30,7 @@ mod response_metadata;
 pub mod sandbox;
 pub mod session;
 pub mod step;
+pub mod sync;
 mod tool_spec;
 pub mod tools;
 pub mod transition;

@@ -17,6 +17,7 @@ use agent_core::guardrail::{
 };
 use agent_core::message::{ToolCallFormat, ToolErrorKind};
 use agent_core::provider::ToolSpec;
+use agent_core::sync::lock;
 use agent_core::tools::{
     ModelToolResult, StepToolPlan, ToolDispatchEvent, ToolDispatchSnapshot, ToolEventSink,
     ToolInvocation, ToolResultStatus,
@@ -331,13 +332,6 @@ impl NestedToolDispatcher for PlanDispatcher {
     }
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
-}
-
 fn error_kind_label(kind: ToolErrorKind) -> &'static str {
     match kind {
         ToolErrorKind::UnknownTool => "unknown_tool",
@@ -388,27 +382,20 @@ impl NestedToolDispatcher for NoNestedTools {
 /// flight without threading it through the serializable `ExecuteRequest`.
 #[derive(Clone, Default)]
 pub struct NestedToolBinding {
-    inner: Arc<std::sync::Mutex<Option<Arc<dyn NestedToolDispatcher>>>>,
+    inner: Arc<Mutex<Option<Arc<dyn NestedToolDispatcher>>>>,
 }
 
 impl NestedToolBinding {
     pub fn set(&self, dispatcher: Arc<dyn NestedToolDispatcher>) {
-        *self.lock() = Some(dispatcher);
+        *lock(&self.inner) = Some(dispatcher);
     }
 
     pub fn clear(&self) {
-        *self.lock() = None;
+        *lock(&self.inner) = None;
     }
 
     pub fn get(&self) -> Option<Arc<dyn NestedToolDispatcher>> {
-        self.lock().clone()
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Arc<dyn NestedToolDispatcher>>> {
-        match self.inner.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        lock(&self.inner).clone()
     }
 }
 

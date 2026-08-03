@@ -8,7 +8,7 @@
 //! cancellation (`agent_code_mode::PlanDispatcher`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_code_mode::nested::{NestedLoopGuard, NestedToolBinding, NestedToolDispatcher};
@@ -22,6 +22,7 @@ use agent_code_mode::tools::{
     parse_exec_source, wait_tool_spec,
 };
 use agent_core::provider::{GrammarSyntax, ToolGrammar, ToolKind};
+use agent_core::sync::lock;
 use agent_core::tools::ToolImage;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -156,16 +157,6 @@ impl CodeModeHandle {
                     .into(),
             )
         })
-    }
-}
-
-/// A poisoned lock is recovered rather than propagated: losing the catalog
-/// would end the session, which is worse than reading a vector a panicking
-/// thread left consistent.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
