@@ -3,18 +3,33 @@
 //! This module is deliberately transport-neutral. It validates that a credential
 //! belongs to the selected provider, materializes only the headers needed by that
 //! provider, and exposes a non-secret fingerprint for catalog and connection scope.
+//!
+//! Header values are still plain strings here, so every struct holding one
+//! hand-writes a `Debug` that keeps the values out. Typing them is the next
+//! step; this one is about what the enum is allowed to describe.
 
 use thiserror::Error;
 use url::Url;
 
-use crate::{OAuthCredential, ProviderId, Secret};
+use crate::{ProviderId, Secret};
 
 mod bedrock;
 mod http;
 mod validation;
 
-/// Authorized HTTP request identity. Values are materialized only at the
-/// provider boundary and are always redacted from diagnostics.
+/// A URL as it may be logged: no query, no fragment. Both of those routinely
+/// carry an API key on OpenAI-compatible endpoints.
+fn redacted_url(url: &str) -> String {
+    Url::parse(url)
+        .map(|mut url| {
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        })
+        .unwrap_or_else(|_| "<invalid URL>".into())
+}
+
+/// Authorized HTTP request identity: where to send it and what to send with it.
 #[derive(Clone)]
 pub struct ProviderRequestAuth {
     pub url: String,
@@ -23,61 +38,35 @@ pub struct ProviderRequestAuth {
 
 impl std::fmt::Debug for ProviderRequestAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let redacted_url = Url::parse(&self.url)
-            .map(|mut url| {
-                url.set_query(None);
-                url.set_fragment(None);
-                url.to_string()
-            })
-            .unwrap_or_else(|_| "<invalid URL>".into());
-        let header_names = self
-            .headers
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>();
         f.debug_struct("ProviderRequestAuth")
-            .field("url", &redacted_url)
-            .field("header_names", &header_names)
+            .field("url", &redacted_url(&self.url))
+            .field(
+                "header_names",
+                &self.headers.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            )
             .field("header_values", &"Secret(***)")
             .finish()
     }
 }
 
 /// Authentication material accepted by model providers.
+///
+/// Every variant here has a caller. Five more used to exist (`ExperimentalBearer`,
+/// `ChatGptOAuth`, `PersonalAccessToken`, `PrebuiltHeaders`, `AgentIdentity`) with
+/// none: `ChatGptOAuth` in particular duplicated the ChatGPT path that
+/// `oauth::openai_chatgpt::responses_request` already serves. Add a variant back
+/// when something constructs it.
 #[derive(Clone)]
 pub enum ProviderCredential {
+    /// For an endpoint configured with `OpenAiAuthPolicy::AllowUnauthenticated`,
+    /// which is how a local OpenAI-compatible server with no key is reached.
     Unauthenticated,
     ApiKey {
         provider: ProviderId,
         key: Secret,
+        /// Names the account this key belongs to. Absent: the key itself is
+        /// hashed into the fingerprint, so rotating it reads as a new identity.
         identity: Option<String>,
-    },
-    ExperimentalBearer {
-        provider: ProviderId,
-        token: Secret,
-        identity: Option<String>,
-    },
-    ChatGptOAuth {
-        credential: OAuthCredential,
-        fedramp: bool,
-    },
-    PersonalAccessToken {
-        provider: ProviderId,
-        token: Secret,
-        account_id: String,
-        fedramp: bool,
-    },
-    PrebuiltHeaders {
-        provider: ProviderId,
-        headers: Vec<(String, Secret)>,
-        identity: String,
-    },
-    AgentIdentity {
-        provider: ProviderId,
-        authorization: Secret,
-        account_id: String,
-        fedramp: bool,
-        identity: String,
     },
     BedrockApiKey {
         token: Secret,
@@ -97,50 +86,6 @@ impl std::fmt::Debug for ProviderCredential {
                 .field("provider", provider)
                 .field("has_identity", &identity.is_some())
                 .finish_non_exhaustive(),
-            Self::ExperimentalBearer {
-                provider, identity, ..
-            } => f
-                .debug_struct("ProviderCredential::ExperimentalBearer")
-                .field("provider", provider)
-                .field("has_identity", &identity.is_some())
-                .finish_non_exhaustive(),
-            Self::ChatGptOAuth {
-                credential,
-                fedramp,
-            } => f
-                .debug_struct("ProviderCredential::ChatGptOAuth")
-                .field("provider", &credential.provider)
-                .field("account_id", &credential.account_id.as_ref().map(|_| "***"))
-                .field("fedramp", fedramp)
-                .finish_non_exhaustive(),
-            Self::PersonalAccessToken {
-                provider, fedramp, ..
-            } => f
-                .debug_struct("ProviderCredential::PersonalAccessToken")
-                .field("provider", provider)
-                .field("fedramp", fedramp)
-                .finish_non_exhaustive(),
-            Self::PrebuiltHeaders {
-                provider,
-                headers,
-                identity: _,
-            } => f
-                .debug_struct("ProviderCredential::PrebuiltHeaders")
-                .field("provider", provider)
-                .field(
-                    "header_names",
-                    &headers.iter().map(|(name, _)| name).collect::<Vec<_>>(),
-                )
-                .field("identity", &"***")
-                .finish(),
-            Self::AgentIdentity {
-                provider, fedramp, ..
-            } => f
-                .debug_struct("ProviderCredential::AgentIdentity")
-                .field("provider", provider)
-                .field("fedramp", fedramp)
-                .field("identity", &"***")
-                .finish_non_exhaustive(),
             Self::BedrockApiKey {
                 region, identity, ..
             } => f
@@ -156,37 +101,28 @@ impl std::fmt::Debug for ProviderCredential {
 pub enum ProviderAuthKind {
     Unauthenticated,
     ApiKey,
-    ExperimentalBearer,
-    ChatGptOAuth,
-    PersonalAccessToken,
-    PrebuiltHeaders,
-    AgentIdentity,
 }
 
-/// The provider boundary a credential is authorized to cross.
+/// The OpenAI-compatible boundary a credential is authorized to cross.
+///
+/// This was an enum with a single variant and a dispatcher with a single arm,
+/// while Bedrock, the second provider, went around it entirely
+/// ([`ProviderCredential::resolve_bedrock_api_key`]). A struct says the same
+/// thing without promising a dispatch that does not exist.
 #[derive(Clone)]
-pub enum ProviderAuthTarget {
-    OpenAi {
-        provider: ProviderId,
-        endpoint: Url,
-        allow_unauthenticated: bool,
-    },
+pub struct OpenAiAuthTarget {
+    pub provider: ProviderId,
+    pub endpoint: Url,
+    pub allow_unauthenticated: bool,
 }
 
-impl std::fmt::Debug for ProviderAuthTarget {
+impl std::fmt::Debug for OpenAiAuthTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OpenAi {
-                provider,
-                endpoint,
-                allow_unauthenticated,
-            } => f
-                .debug_struct("ProviderAuthTarget::OpenAi")
-                .field("provider", provider)
-                .field("endpoint_origin", &endpoint.origin().ascii_serialization())
-                .field("allow_unauthenticated", allow_unauthenticated)
-                .finish(),
-        }
+        f.debug_struct("OpenAiAuthTarget")
+            .field("provider", &self.provider)
+            .field("endpoint_origin", &self.endpoint.origin().ascii_serialization())
+            .field("allow_unauthenticated", &self.allow_unauthenticated)
+            .finish()
     }
 }
 
@@ -213,7 +149,7 @@ impl std::fmt::Debug for ResolvedBedrockAuth {
     }
 }
 
-/// Materialized provider headers. Debug output contains names, never values.
+/// Materialized provider headers.
 #[derive(Clone)]
 pub struct ResolvedProviderAuth {
     pub provider: ProviderId,
@@ -226,6 +162,22 @@ impl ResolvedProviderAuth {
     pub fn headers(&self) -> &[(String, String)] {
         &self.headers
     }
+
+    /// Turns resolved auth into a request spec for `endpoint`, appending the
+    /// headers the transport needs. Callers used to assemble this themselves,
+    /// each with its own idea of which content headers belong on it.
+    pub fn into_request(
+        self,
+        endpoint: &Url,
+        extra: impl IntoIterator<Item = (String, String)>,
+    ) -> ProviderRequestAuth {
+        let mut headers = self.headers;
+        headers.extend(extra);
+        ProviderRequestAuth {
+            url: endpoint.to_string(),
+            headers,
+        }
+    }
 }
 
 impl std::fmt::Debug for ResolvedProviderAuth {
@@ -236,11 +188,7 @@ impl std::fmt::Debug for ResolvedProviderAuth {
             .field("identity_fingerprint", &self.identity_fingerprint)
             .field(
                 "header_names",
-                &self
-                    .headers
-                    .iter()
-                    .map(|(name, _)| name)
-                    .collect::<Vec<_>>(),
+                &self.headers.iter().map(|(name, _)| name).collect::<Vec<_>>(),
             )
             .finish()
     }
@@ -258,26 +206,12 @@ pub enum ProviderAuthError {
     UnsupportedCredential,
 }
 
-impl ProviderCredential {
-    pub fn resolve(
-        &self,
-        target: &ProviderAuthTarget,
-    ) -> Result<ResolvedProviderAuth, ProviderAuthError> {
-        let ProviderAuthTarget::OpenAi {
-            provider,
-            endpoint,
-            allow_unauthenticated,
-        } = target;
-        self.resolve_openai(*provider, endpoint, *allow_unauthenticated)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn openai(provider: ProviderId) -> ProviderAuthTarget {
-        ProviderAuthTarget::OpenAi {
+    fn openai(provider: ProviderId) -> OpenAiAuthTarget {
+        OpenAiAuthTarget {
             provider,
             endpoint: Url::parse("https://example.test/v1/responses").unwrap(),
             allow_unauthenticated: false,
@@ -292,7 +226,7 @@ mod tests {
             identity: None,
         };
         let resolved = credential
-            .resolve(&openai(ProviderId::OpenAiResponses))
+            .resolve_openai(&openai(ProviderId::OpenAiResponses))
             .unwrap();
         assert_eq!(
             resolved.headers()[0],
@@ -300,46 +234,72 @@ mod tests {
         );
         let debug = format!("{credential:?} {resolved:?}");
         assert!(!debug.contains("sk-secret"));
+        assert!(debug.contains("authorization"));
         assert!(matches!(
-            credential.resolve(&openai(ProviderId::OpenAiChatGpt)),
+            credential.resolve_openai(&openai(ProviderId::OpenAiChatGpt)),
             Err(ProviderAuthError::WrongProvider)
         ));
     }
 
     #[test]
-    fn chatgpt_modes_attach_only_scoped_account_headers() {
-        let credential = ProviderCredential::PersonalAccessToken {
-            provider: ProviderId::OpenAiChatGpt,
-            token: Secret::new("pat-secret"),
-            account_id: "acct-secret".into(),
-            fedramp: true,
+    fn an_unauthenticated_credential_needs_the_policy_that_allows_it() {
+        assert!(matches!(
+            ProviderCredential::Unauthenticated.resolve_openai(&openai(ProviderId::OpenAiResponses)),
+            Err(ProviderAuthError::AuthenticationRequired)
+        ));
+        let allowed = OpenAiAuthTarget {
+            allow_unauthenticated: true,
+            ..openai(ProviderId::OpenAiResponses)
         };
-        let resolved = credential
-            .resolve(&openai(ProviderId::OpenAiChatGpt))
+        let resolved = ProviderCredential::Unauthenticated
+            .resolve_openai(&allowed)
             .unwrap();
-        assert_eq!(resolved.headers().len(), 3);
-        assert!(
-            resolved
-                .headers()
-                .iter()
-                .any(|(name, value)| { name == "x-openai-fedramp" && value == "true" })
+        assert_eq!(resolved.kind, ProviderAuthKind::Unauthenticated);
+        assert!(resolved.headers().is_empty());
+    }
+
+    /// The fallback that used to be silent: with no `identity`, the secret is
+    /// what gets hashed. Two credentials must not collide just because one of
+    /// them named an identity that happens to equal the other's key.
+    #[test]
+    fn a_named_identity_and_a_key_shaped_like_it_do_not_share_a_fingerprint() {
+        let named = ProviderCredential::ApiKey {
+            provider: ProviderId::OpenAiResponses,
+            key: Secret::new("other-key"),
+            identity: Some("sk-secret".into()),
+        };
+        let anonymous = ProviderCredential::ApiKey {
+            provider: ProviderId::OpenAiResponses,
+            key: Secret::new("sk-secret"),
+            identity: None,
+        };
+        let target = openai(ProviderId::OpenAiResponses);
+        assert_ne!(
+            named.resolve_openai(&target).unwrap().identity_fingerprint,
+            anonymous
+                .resolve_openai(&target)
+                .unwrap()
+                .identity_fingerprint
         );
-        assert!(!format!("{credential:?} {resolved:?}").contains("acct-secret"));
     }
 
     #[test]
-    fn forbidden_prebuilt_header_names_the_field_without_the_value() {
-        let credential = ProviderCredential::PrebuiltHeaders {
+    fn an_identity_that_could_not_be_logged_is_refused() {
+        let credential = ProviderCredential::ApiKey {
             provider: ProviderId::OpenAiResponses,
-            headers: vec![("host".into(), Secret::new("secret.test"))],
-            identity: "fixture".into(),
+            key: Secret::new("sk-secret"),
+            identity: Some("line\nbreak".into()),
         };
         let error = credential
-            .resolve(&openai(ProviderId::OpenAiResponses))
+            .resolve_openai(&openai(ProviderId::OpenAiResponses))
             .unwrap_err();
-        assert!(error.to_string().contains("headers"));
-        assert!(error.to_string().contains("host"));
-        assert!(!error.to_string().contains("secret.test"));
+        assert!(matches!(
+            error,
+            ProviderAuthError::InvalidField {
+                field: "identity",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -350,7 +310,7 @@ mod tests {
             identity: None,
         };
         assert!(matches!(
-            credential.resolve(&openai(ProviderId::OpenAiResponses)),
+            credential.resolve_openai(&openai(ProviderId::OpenAiResponses)),
             Err(ProviderAuthError::UnsupportedCredential)
         ));
     }
@@ -366,7 +326,6 @@ mod tests {
         assert_eq!(resolved.token().expose(), "bedrock-secret");
         let debug = format!("{credential:?} {resolved:?}");
         assert!(!debug.contains("bedrock-secret"));
-        assert!(!debug.contains("bedrock-account"));
         assert!(matches!(
             credential.resolve_bedrock_api_key("us-east-1"),
             Err(ProviderAuthError::InvalidField {
@@ -377,65 +336,21 @@ mod tests {
     }
 
     #[test]
-    fn every_openai_auth_mode_projects_only_its_scoped_headers() {
-        let target = openai(ProviderId::OpenAiChatGpt);
-        let cases = vec![
-            ProviderCredential::ExperimentalBearer {
-                provider: ProviderId::OpenAiChatGpt,
-                token: Secret::new("experimental-secret"),
-                identity: Some("experimental".into()),
-            },
-            ProviderCredential::ChatGptOAuth {
-                credential: OAuthCredential {
-                    provider: ProviderId::OpenAiChatGpt,
-                    access: Secret::new("oauth-secret"),
-                    refresh: Secret::new("refresh-secret"),
-                    expires_at: u64::MAX,
-                    account_id: Some("oauth-account".into()),
-                },
-                fedramp: true,
-            },
-            ProviderCredential::PrebuiltHeaders {
-                provider: ProviderId::OpenAiChatGpt,
-                headers: vec![("x-provider-auth".into(), Secret::new("header-secret"))],
-                identity: "prebuilt".into(),
-            },
-            ProviderCredential::AgentIdentity {
-                provider: ProviderId::OpenAiChatGpt,
-                authorization: Secret::new("Bearer agent-secret"),
-                account_id: "agent-account".into(),
-                fedramp: true,
-                identity: "agent-identity".into(),
-            },
-        ];
-        for credential in cases {
-            let resolved = credential.resolve(&target).unwrap();
-            let debug = format!("{credential:?} {resolved:?}");
-            for secret in [
-                "experimental-secret",
-                "oauth-secret",
-                "refresh-secret",
-                "oauth-account",
-                "header-secret",
-                "prebuilt",
-                "agent-secret",
-                "agent-account",
-                "agent-identity",
-            ] {
-                assert!(!debug.contains(secret));
-            }
-            assert!(
-                resolved
-                    .headers()
-                    .iter()
-                    .all(|(name, _)| !matches!(name.as_str(), "host" | "content-length"))
-            );
-        }
+    fn a_request_spec_hides_the_endpoint_query_and_fragment() {
+        let request = ProviderRequestAuth {
+            url: "https://example.test/responses?api-key=QUERY_SECRET#FRAGMENT_SECRET".into(),
+            headers: vec![("x-api-key".into(), "HEADER_SECRET".into())],
+        };
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("QUERY_SECRET"));
+        assert!(!debug.contains("FRAGMENT_SECRET"));
+        assert!(!debug.contains("HEADER_SECRET"));
+        assert!(debug.contains("x-api-key"));
     }
 
     #[test]
     fn auth_target_debug_omits_endpoint_query_and_fragment() {
-        let target = ProviderAuthTarget::OpenAi {
+        let target = OpenAiAuthTarget {
             provider: ProviderId::OpenAiResponses,
             endpoint: Url::parse(
                 "https://example.test/v1/responses?api-key=QUERY_SECRET#FRAGMENT_SECRET",

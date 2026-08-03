@@ -1,6 +1,6 @@
 use agent_auth::provider::{
-    ProviderAuthError, ProviderAuthKind, ProviderAuthTarget, ProviderCredential,
-    ProviderRequestAuth, ResolvedProviderAuth,
+    OpenAiAuthTarget, ProviderAuthError, ProviderAuthKind, ProviderCredential, ProviderRequestAuth,
+    ResolvedProviderAuth,
 };
 use agent_core::provider::{AuthError, ProviderError};
 use async_trait::async_trait;
@@ -55,7 +55,7 @@ impl ConfiguredOpenAiProvider {
     ) -> Result<(OpenAiAccountState, ResolvedProviderAuth), ProviderError> {
         let endpoint = self.config.endpoint()?;
         let auth = credential
-            .resolve(&ProviderAuthTarget::OpenAi {
+            .resolve_openai(&OpenAiAuthTarget {
                 provider: self.config.auth_provider,
                 endpoint: endpoint.clone(),
                 allow_unauthenticated: self.config.allow_unauthenticated(),
@@ -72,15 +72,15 @@ impl ConfiguredOpenAiProvider {
 
     pub(super) fn request_auth(
         endpoint: &url::Url,
-        auth: &ResolvedProviderAuth,
+        auth: ResolvedProviderAuth,
     ) -> ProviderRequestAuth {
-        let mut headers = auth.headers().to_vec();
-        headers.push(("accept".into(), "text/event-stream".into()));
-        headers.push(("content-type".into(), "application/json".into()));
-        ProviderRequestAuth {
-            url: endpoint.to_string(),
-            headers,
-        }
+        auth.into_request(
+            endpoint,
+            [
+                ("accept".into(), "text/event-stream".into()),
+                ("content-type".into(), "application/json".into()),
+            ],
+        )
     }
 
     pub(super) fn invalidate_scope(&self) {

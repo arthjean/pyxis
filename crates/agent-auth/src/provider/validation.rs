@@ -1,39 +1,15 @@
-use reqwest::header::{HeaderName, HeaderValue};
+use reqwest::header::HeaderValue;
 use sha2::{Digest, Sha256};
 
 use crate::Secret;
 
 use super::ProviderAuthError;
 
-pub(super) fn bearer_headers(token: &Secret) -> Result<Vec<(String, String)>, ProviderAuthError> {
+pub(super) fn bearer_headers(
+    token: &Secret,
+) -> Result<Vec<(String, String)>, ProviderAuthError> {
     let value = validated_header_value("token", &format!("Bearer {}", token.expose()))?;
     Ok(vec![("authorization".into(), value)])
-}
-
-pub(super) fn validate_prebuilt_headers(
-    headers: &[(String, Secret)],
-) -> Result<Vec<(String, String)>, ProviderAuthError> {
-    if headers.is_empty() {
-        return Err(invalid("headers", "must contain at least one header"));
-    }
-    headers
-        .iter()
-        .map(|(name, value)| {
-            let normalized = name.to_ascii_lowercase();
-            if matches!(
-                normalized.as_str(),
-                "host" | "content-length" | "content-encoding" | "transfer-encoding" | "connection"
-            ) {
-                return Err(invalid("headers", format!("header `{name}` is forbidden")));
-            }
-            HeaderName::from_bytes(name.as_bytes())
-                .map_err(|_| invalid("headers", format!("header name `{name}` is invalid")))?;
-            Ok((
-                normalized,
-                validated_header_value("headers", value.expose())?,
-            ))
-        })
-        .collect()
 }
 
 pub(super) fn validated_header_value(
@@ -45,29 +21,66 @@ pub(super) fn validated_header_value(
     Ok(value.to_owned())
 }
 
-pub(super) fn validate_identity(field: &'static str, value: &str) -> Result<(), ProviderAuthError> {
+/// An identity ends up in logs and in a fingerprint, so it must be something
+/// that can be printed on one line.
+pub(super) fn validate_identity(
+    field: &'static str,
+    value: Option<&str>,
+) -> Result<(), ProviderAuthError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
     if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
         return Err(invalid(field, "must be a non-empty printable value"));
     }
     Ok(())
 }
 
-pub(super) fn add_fedramp_header(headers: &mut Vec<(String, String)>, fedramp: bool) {
-    if fedramp {
-        headers.push(("x-openai-fedramp".into(), "true".into()));
+/// What a fingerprint is computed over. The fallback used to be an inline
+/// `identity.unwrap_or_else(|| key.expose())`, which made "an account named X"
+/// and "an unnamed account whose key is X" indistinguishable once hashed.
+pub(super) enum IdentitySource<'a> {
+    /// The caller named the account. Rotating the secret keeps the identity.
+    Named(&'a str),
+    /// No name available: the secret stands in for one, so a rotation reads as
+    /// a different identity and re-scopes whatever depends on it.
+    DerivedFromSecret(&'a Secret),
+    /// Nothing to identify: no credential was presented.
+    Anonymous,
+}
+
+impl<'a> IdentitySource<'a> {
+    pub(super) fn of(identity: Option<&'a str>, secret: &'a Secret) -> Self {
+        match identity {
+            Some(identity) => Self::Named(identity),
+            None => Self::DerivedFromSecret(secret),
+        }
+    }
+
+    fn tagged(&self) -> (&'static str, &str) {
+        match self {
+            Self::Named(identity) => ("named", identity),
+            Self::DerivedFromSecret(secret) => ("secret", secret.expose()),
+            Self::Anonymous => ("anonymous", ""),
+        }
     }
 }
 
-pub(super) fn fingerprint(parts: &[&str]) -> String {
+/// A stable, non-secret handle on "which account is this".
+pub(super) fn identity_fingerprint(scope: &[&str], identity: IdentitySource<'_>) -> String {
+    let (tag, value) = identity.tagged();
     let mut hash = Sha256::new();
-    for part in parts {
+    for part in scope.iter().copied().chain([tag, value]) {
         hash.update((part.len() as u64).to_be_bytes());
         hash.update(part.as_bytes());
     }
     hex::encode(hash.finalize())
 }
 
-pub(super) fn invalid(field: &'static str, reason: impl Into<String>) -> ProviderAuthError {
+pub(super) fn invalid(
+    field: &'static str,
+    reason: impl Into<String>,
+) -> ProviderAuthError {
     ProviderAuthError::InvalidField {
         field,
         reason: reason.into(),

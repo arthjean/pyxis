@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use agent_auth::provider::{ProviderAuthTarget, ProviderCredential, ProviderRequestAuth};
+use agent_auth::provider::{OpenAiAuthTarget, ProviderCredential, ProviderRequestAuth};
 use agent_core::provider::{AuthError, ProviderError, StreamEvent};
 use futures_util::stream::BoxStream;
 
@@ -98,7 +98,7 @@ pub(super) async fn configured_catalog_request(
         .ok_or(ProviderError::Credential(AuthError::RecoveryUnavailable))?;
     let endpoint = config.endpoint()?;
     let auth = credential
-        .resolve(&ProviderAuthTarget::OpenAi {
+        .resolve_openai(&OpenAiAuthTarget {
             provider: config.auth_provider,
             endpoint,
             allow_unauthenticated: config.allow_unauthenticated(),
@@ -114,6 +114,9 @@ pub(super) async fn configured_catalog_request(
             &agent_auth::oauth::openai_chatgpt::codex_client_version(),
         );
     }
+    // Configured headers first, resolved auth after: the catalog request
+    // appends rather than replaces, so a header set on both sides must reach
+    // the server in that order.
     let mut headers = config.transport.configured_endpoint_headers()?;
     headers.extend(auth.headers().iter().cloned());
     CatalogRequest::new(

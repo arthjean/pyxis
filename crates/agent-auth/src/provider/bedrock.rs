@@ -1,4 +1,6 @@
-use super::validation::{fingerprint, invalid, validate_identity, validated_header_value};
+use super::validation::{
+    IdentitySource, identity_fingerprint, invalid, validate_identity, validated_header_value,
+};
 use super::{ProviderAuthError, ProviderCredential, ResolvedBedrockAuth};
 
 impl ProviderCredential {
@@ -20,15 +22,14 @@ impl ProviderCredential {
                 "does not match the selected Bedrock region",
             ));
         }
-        validate_identity("region", region)?;
+        validate_identity("identity", identity.as_deref())?;
         validated_header_value("token", token.expose())?;
         Ok(ResolvedBedrockAuth {
             token: token.clone(),
-            identity_fingerprint: fingerprint(&[
-                "AmazonBedrock",
-                region,
-                identity.as_deref().unwrap_or_else(|| token.expose()),
-            ]),
+            identity_fingerprint: identity_fingerprint(
+                &["AmazonBedrock", region],
+                IdentitySource::of(identity.as_deref(), token),
+            ),
         })
     }
 }

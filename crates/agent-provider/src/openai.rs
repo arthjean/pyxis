@@ -2,7 +2,7 @@
 
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
-use agent_auth::provider::{ProviderAuthTarget, ProviderCredential};
+use agent_auth::provider::{OpenAiAuthTarget, ProviderCredential};
 use agent_core::model::{ModelRetryPolicy, ModelRuntimeError, ResolvedModelRuntime};
 use agent_core::provider::{
     AuthError, CanonicalRequest, Capabilities, ErrorClass, Provider, ProviderError, ProviderKind,
@@ -56,7 +56,7 @@ impl ConfiguredOpenAiProvider {
         config.validate()?;
         let endpoint = config.endpoint()?;
         credential
-            .resolve(&ProviderAuthTarget::OpenAi {
+            .resolve_openai(&OpenAiAuthTarget {
                 provider: config.auth_provider,
                 endpoint,
                 allow_unauthenticated: config.allow_unauthenticated(),
@@ -215,7 +215,7 @@ impl Provider for ConfiguredOpenAiProvider {
         let plan = self.prepare_request(request)?;
         let endpoint = self.config.endpoint()?;
         let (_, auth) = self.resolved_auth().await?;
-        let request_auth = Self::request_auth(&endpoint, &auth);
+        let request_auth = Self::request_auth(&endpoint, auth);
         let stream = responses::stream(
             responses::ResponsesExecution {
                 http: &self.http,
@@ -438,7 +438,7 @@ mod tests {
             url.query_pairs()
                 .find(|(name, _)| name == "client_version")
                 .map(|(_, value)| value.into_owned()),
-            Some(agent_auth::oauth::openai_chatgpt::codex_client_version())
+            Some(agent_auth::oauth::openai_chatgpt::codex_client_version().to_string())
         );
     }
 
