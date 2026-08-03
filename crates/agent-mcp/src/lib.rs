@@ -25,6 +25,7 @@ mod frame;
 mod http;
 mod naming;
 mod pagination;
+mod resource_tools;
 mod resources;
 mod schema;
 mod server;
@@ -41,7 +42,10 @@ pub use config::{
 };
 pub use error::McpError;
 pub use naming::{MAX_NAME_BYTES, NAME_PREFIX, qualified_name};
-pub use resources::McpResourceInfo;
+pub use resource_tools::{
+    ListMcpResourceTemplates, ListMcpResources, McpResourceCatalog, ReadMcpResource,
+};
+pub use resources::{McpResourceInfo, McpResourceTemplate};
 pub use schema::{MAX_SCHEMA_BYTES, strict_input_schema};
 pub use server::{McpRegistry, McpServer};
 pub use text::INSTRUCTIONS_CAP;

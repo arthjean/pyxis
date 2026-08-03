@@ -119,6 +119,10 @@ pub struct InteractiveConfig {
     /// exactly these names back out, and the union is what keeps a name handed out
     /// once from ever being handed out twice.
     pub mcp_tool_names: BTreeMap<String, BTreeSet<String>>,
+    /// The connected servers as the three resource tools see them (US-012).
+    /// Those tools are registered once at startup and read this at call time, so
+    /// a connect or a disconnect only has to move an entry here.
+    pub mcp_resources: agent_mcp::McpResourceCatalog,
     /// Sub-agent wiring: the spawner and the handle the six multi-agent tools
     /// address. `None` when the build has no spawner.
     pub agents: Option<crate::runtime::AgentWiring>,
@@ -1740,6 +1744,7 @@ async fn event_loop(
                                     &cfg.command_hardener,
                                     &registry,
                                     &mut mcp_tool_names,
+                                    &cfg.mcp_resources,
                                     &mut state,
                                 )
                             }
@@ -2107,6 +2112,11 @@ async fn event_loop(
                                         // only moves at a turn boundary, so a turn in
                                         // flight keeps the tools it was given.
                                         registry.stage_tools(exposed);
+                                        // US-012: the resource tools follow the
+                                        // held connection, not the staged tools:
+                                        // they were registered at startup and
+                                        // read the catalog at call time.
+                                        cfg.mcp_resources.connect(name.clone(), client);
                                         mcp_tool_names.insert(name.clone(), names);
                                         state.blocks.push(Block::Notice(format!(
                                             "MCP \"{name}\" connected ({n} tools), callable from the next turn."
@@ -2210,6 +2220,7 @@ fn handle_mcp(
     command_hardener: &agent_tools::CommandHardener,
     registry: &agent_tools::Registry,
     mcp_tool_names: &mut BTreeMap<String, BTreeSet<String>>,
+    mcp_resources: &agent_mcp::McpResourceCatalog,
     state: &mut AppState,
 ) {
     if arg == "issues" {
@@ -2272,6 +2283,11 @@ fn handle_mcp(
                     let removed = mcp_tool_names.remove(server).unwrap_or_default();
                     let count = removed.len();
                     registry.stage_removal(removed.into_iter().collect());
+                    // Withdrawn immediately, unlike the tools: a resource read
+                    // has no staged view to protect, and reaching a cancelled
+                    // peer would fail with a transport error instead of the
+                    // "not connected" the model can act on.
+                    mcp_resources.disconnect(server);
                     state.blocks.push(Block::Notice(format!(
                         "MCP \"{server}\" disconnected ({count} tools withdrawn from the next turn on)."
                     )));

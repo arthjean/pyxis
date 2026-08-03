@@ -1176,6 +1176,7 @@ pub(crate) async fn mcp_oauth_token(
 async fn connect_mcp_at_startup(
     mcp: &Arc<std::sync::Mutex<agent_mcp::McpRegistry>>,
     harden: &agent_tools::CommandHardener,
+    resources: &agent_mcp::McpResourceCatalog,
 ) -> McpStartup {
     let mut notices: Vec<String> = Vec::new();
     let mut candidates: Vec<String> = Vec::new();
@@ -1333,6 +1334,10 @@ async fn connect_mcp_at_startup(
                 exposed.iter().map(|tool| tool.name().to_string()).collect(),
             );
             startup.tools.append(&mut exposed);
+            // US-012: the resource tools reach exactly the servers held by the
+            // registry, so they are published at the same instant the tools are
+            // and never one step ahead of a connection that failed to be kept.
+            resources.connect(name.clone(), client);
         }
     }
     startup.notices = notices;
@@ -1602,10 +1607,14 @@ async fn run(
     let mcp = Arc::new(std::sync::Mutex::new(agent_mcp::McpRegistry::from_config(
         mcp_config,
     )));
+    // US-012: the connected servers, as the three resource tools see them.
+    // Created before the startup connection so a server held by the registry is
+    // published into it in the same step.
+    let mcp_resources = agent_mcp::McpResourceCatalog::new();
     let mcp_startup = if headless {
         McpStartup::default()
     } else {
-        connect_mcp_at_startup(&mcp, &mcp_harden).await
+        connect_mcp_at_startup(&mcp, &mcp_harden, &mcp_resources).await
     };
     // A server the user marked `required` did not come up: refuse to start rather
     // than open a session that silently lacks a tool declared indispensable.
@@ -1767,6 +1776,13 @@ async fn run(
         // Asking the human: a question that does not block the turn, and a
         // widening request that does.
         .register(agent_tools::RequestUserInput)
+        // US-012: the read-only half of MCP, which servers are told to model as
+        // resources rather than as tools.
+        .register(agent_mcp::ListMcpResources::new(mcp_resources.clone()))
+        .register(agent_mcp::ListMcpResourceTemplates::new(
+            mcp_resources.clone(),
+        ))
+        .register(agent_mcp::ReadMcpResource::new(mcp_resources.clone()))
         .register(agent_tools::RequestPermissions::new(Arc::new(
             CliPermissionBroker::new(
                 Arc::clone(&approver),
@@ -1915,6 +1931,7 @@ async fn run(
                 hooks: Arc::clone(&hooks),
                 hook_specs: config.hooks.clone(),
                 command_hardener: Arc::clone(&mcp_harden),
+                mcp_resources: mcp_resources.clone(),
                 mcp_notices: mcp_startup.notices,
                 mcp_tool_names: mcp_startup.names,
                 registry: Arc::clone(&registry),

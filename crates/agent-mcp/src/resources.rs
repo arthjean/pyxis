@@ -1,10 +1,19 @@
 //! MCP resources, kept whole in one place.
 //!
-//! Resources are **not** exposed to the model. They are inspected on demand
-//! through `/mcp <server> resources`, so a server cannot use them to push
-//! content into a turn nobody asked for. That is also why the same treatment is
-//! given to `initialize.instructions` (see `McpConnection::instructions`): both
-//! are server-authored prose, and neither belongs in a tool description.
+//! A server never PUSHES a resource: nothing here reaches a turn on its own,
+//! and `initialize.instructions` gets the same treatment (see
+//! `McpConnection::instructions`) because server-authored prose that lands in a
+//! tool description is injection the taint defense structurally cannot see.
+//!
+//! What the model may do is PULL one, through the three tools in
+//! `resource_tools` (US-012, ported from Codex
+//! `core/src/tools/handlers/mcp_resource.rs`). The distinction is the whole
+//! design: a pulled resource is an explicit call that goes through the same
+//! pipeline as any MCP tool, so it is confirmed by default, tainted in full,
+//! and visible in the transcript. A pushed one would be none of those things.
+//!
+//! Inspection by a human stays available and unchanged (`/mcp <server>
+//! resources`), and never goes through the model at all.
 
 use crate::call::McpClient;
 use crate::error::McpError;
@@ -15,6 +24,16 @@ use crate::text::{DESCRIPTION_CAP, cap};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpResourceInfo {
     pub uri: String,
+    pub name: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
+}
+
+/// One parameterized resource URI a server advertises.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpResourceTemplate {
+    pub uri_template: String,
     pub name: String,
     pub title: Option<String>,
     pub description: Option<String>,
@@ -45,6 +64,33 @@ impl McpClient {
                     .as_deref()
                     .map(|text| cap(text, DESCRIPTION_CAP)),
                 mime_type: resource.mime_type.clone(),
+            })
+            .collect())
+    }
+
+    /// Lists the resource TEMPLATES the server advertises: parameterized URIs a
+    /// caller fills in (`file:///{path}`). Bounded like the listing above.
+    pub async fn list_resource_templates(&self) -> Result<Vec<McpResourceTemplate>, McpError> {
+        let listing = collect_paginated("resource templates", |params| async move {
+            let page = self
+                .peer()
+                .list_resource_templates(params)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok((page.resource_templates, page.next_cursor))
+        });
+        let templates = self.bounded("resources/templates/list", listing).await?;
+        Ok(templates
+            .into_iter()
+            .map(|template| McpResourceTemplate {
+                uri_template: template.uri_template.clone(),
+                name: template.name.clone(),
+                title: template.title.clone(),
+                description: template
+                    .description
+                    .as_deref()
+                    .map(|text| cap(text, DESCRIPTION_CAP)),
+                mime_type: template.mime_type.clone(),
             })
             .collect())
     }
