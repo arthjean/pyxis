@@ -76,6 +76,10 @@ pub struct TurnSettings {
     pub permission_mode: String,
     pub sandbox: String,
     pub workspace: PathBuf,
+    /// Hosted web search requested by the user (`web_search` in the global
+    /// settings). Off by default. Whether it is actually composed also depends
+    /// on the provider and on the active model, which are read per step.
+    pub web_search: bool,
 }
 
 /// Shared, mutable settings cell. Also the runtime's [`TurnContextSource`].
@@ -117,6 +121,34 @@ impl SettingsCell {
         };
         let model = self.lock().model.clone();
         provider.tool_mode(&model)
+    }
+
+    /// Hosted web-search spec for the active model, or `None`.
+    ///
+    /// Three conditions, all required, and the order is the point: the user
+    /// asked for it, the adapter can encode it, and the catalog declares the
+    /// model able to use it. A missing provider answers `None`, like every other
+    /// per-model question here.
+    ///
+    /// Only the TEXT variant is ever composed. Image results are a second
+    /// capability (`WebSearchToolType::TextAndImage`) whose payloads reach the
+    /// transcript as images the local budget did not plan for; asking for text
+    /// keeps one contract instead of two.
+    pub fn web_search_spec(&self) -> Option<agent_core::provider::ToolSpec> {
+        let provider = self.provider.as_ref()?;
+        if !self.lock().web_search {
+            return None;
+        }
+        if !provider.capabilities().tool_calling.web_search {
+            return None;
+        }
+        let model = self.lock().model.clone();
+        let spec = agent_core::provider::ToolSpec::web_search(None, None, None);
+        provider
+            .model_tool_capabilities(&model)
+            .ensure_tools_supported(std::slice::from_ref(&spec))
+            .ok()?;
+        Some(spec)
     }
 
     /// Multi-agent protocol of the model in force. `Disabled` without a
@@ -407,9 +439,34 @@ impl CliStepSource {
                 .cloned()
                 .collect(),
         };
-        let dispatch = captured.with_specs(visible.clone());
+        // Hosted tools last: they are executed by the BACKEND, so they belong to
+        // what the model sees and to nothing the registry dispatches. Adding it
+        // to `visible` only, never to `dispatch`, is what keeps a nested Code
+        // Mode call from trying to run a tool that has no local handler.
+        let mut visible = visible;
+        if let Some(spec) = self.settings.as_ref().and_then(|s| s.web_search_spec()) {
+            visible.push(spec);
+            visible.sort_by(|left, right| left.name.cmp(&right.name));
+        }
+        let dispatch = captured.with_specs(
+            visible
+                .iter()
+                .filter(|spec| !is_hosted_tool(spec))
+                .cloned()
+                .collect(),
+        );
         (visible, Some(dispatch))
     }
+}
+
+/// Executed by the provider, not by the registry. A hosted tool has no local
+/// handler, so it must never enter a dispatch view.
+fn is_hosted_tool(spec: &ToolSpec) -> bool {
+    matches!(
+        spec.kind,
+        agent_core::provider::ToolKind::WebSearch { .. }
+            | agent_core::provider::ToolKind::ToolSearch { .. }
+    )
 }
 
 /// Model-facing Code Mode tools. A cell never calls them: one would recurse
@@ -940,6 +997,7 @@ mod tests {
             permission_mode: "ask".into(),
             sandbox: "enforced (workspace)".into(),
             workspace: workspace.to_path_buf(),
+            web_search: false,
         })
     }
 
@@ -1292,6 +1350,7 @@ mod code_mode_plan_tests {
                 permission_mode: "ask".into(),
                 sandbox: "enforced (workspace)".into(),
                 workspace: std::env::temp_dir(),
+                web_search: false,
             },
             Arc::new(ModeProvider {
                 caps: Capabilities::default(),
@@ -1455,5 +1514,61 @@ mod code_mode_plan_tests {
             shown.sort();
             assert_eq!(seen, shown, "{mode:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod web_search_tests {
+    use super::*;
+    use agent_core::provider::ToolKind;
+
+    /// The three gates on a hosted tool, and the reason each exists: the user
+    /// asked (it reaches the network from the backend, where the local
+    /// allow-list cannot see it), the adapter can encode it, and the catalog
+    /// declared the model able to use it.
+    #[test]
+    fn a_cell_without_a_provider_never_composes_a_hosted_tool() {
+        let settings = SettingsCell::new(TurnSettings {
+            model: "m".into(),
+            reasoning_effort: None,
+            tool_guidelines: Vec::new(),
+            goal: None,
+            run_config: RunConfig::default(),
+            permission_mode: "ask".into(),
+            sandbox: "workspace-write".into(),
+            workspace: std::env::temp_dir(),
+            web_search: true,
+        });
+        assert!(
+            settings.web_search_spec().is_none(),
+            "a model whose contract is unknown must not be handed a hosted tool"
+        );
+    }
+
+    /// A hosted tool is model-visible and never dispatchable: the registry has
+    /// no handler for it, so letting one into a dispatch view would turn a
+    /// backend-executed call into an "unknown tool" for any nested caller.
+    #[test]
+    fn hosted_tools_are_recognized_and_kept_out_of_dispatch() {
+        assert!(is_hosted_tool(&ToolSpec::web_search(None, None, None)));
+        assert!(is_hosted_tool(&ToolSpec::tool_search(
+            "d",
+            "client",
+            serde_json::json!({"type": "object", "properties": {}})
+        )));
+        assert!(!is_hosted_tool(&ToolSpec::function(
+            "read",
+            "d",
+            serde_json::json!({
+                "type": "object", "properties": {}, "required": [],
+                "additionalProperties": false
+            })
+        )));
+        // A namespace of local tools is dispatched locally: it is not hosted.
+        assert!(!is_hosted_tool(&ToolSpec {
+            name: "srv".into(),
+            description: "d".into(),
+            kind: ToolKind::Namespace { tools: Vec::new() },
+        }));
     }
 }

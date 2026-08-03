@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use agent_core::model::{
     InputModality, ModelDescriptor, ModelRetryPolicy, ModelRuntimeError, ModelRuntimeSource,
-    ModelToolMode, MultiAgentVersion, ResolvedModelRuntime,
+    ModelToolCapabilities, ModelToolMode, MultiAgentVersion, ResolvedModelRuntime,
 };
 use sha2::{Digest, Sha256};
 
@@ -362,6 +362,15 @@ impl ModelCatalog {
         self.descriptor(slug)
             .ok()
             .map(|(descriptor, _)| descriptor.tool_mode)
+    }
+
+    /// Tool contract of a slug, without resolving a runtime. Read at the same
+    /// step boundary as [`Self::tool_mode`]: composing a hosted tool has to know
+    /// whether the model was declared able to use it.
+    pub fn tool_capabilities(&self, slug: &str) -> Option<ModelToolCapabilities> {
+        self.descriptor(slug)
+            .ok()
+            .map(|(descriptor, _)| descriptor.tool_capabilities.clone())
     }
 
     /// Orchestration protocol of a slug, without resolving a runtime. Read at

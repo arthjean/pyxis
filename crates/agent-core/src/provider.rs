@@ -589,6 +589,14 @@ pub trait Provider: Send + Sync {
         crate::model::ModelToolMode::Direct
     }
 
+    /// Tool contract the catalog declares for `slug`, read at the same step
+    /// boundary as [`Provider::tool_mode`]. The default is the empty contract,
+    /// which supports no hosted tool: an adapter that knows nothing about a
+    /// model must not have a hosted tool composed on its behalf.
+    fn model_tool_capabilities(&self, _slug: &str) -> crate::model::ModelToolCapabilities {
+        crate::model::ModelToolCapabilities::default()
+    }
+
     /// Multi-agent protocol of `slug`, read at the same step boundary as
     /// [`Provider::tool_mode`]. `Disabled` by default: an adapter that knows
     /// nothing about orchestration must not hand a model orchestration tools.

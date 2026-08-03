@@ -1843,6 +1843,11 @@ async fn run(
             goal: goal.clone(),
             run_config,
             permission_mode: settings::permission_mode_id(initial_permission_mode).to_string(),
+            // Hosted search runs on the backend, so it reaches the network from
+            // there: the local allow-list never sees it. Off unless the user
+            // asked for it in their GLOBAL settings, which is why the key is a
+            // security key.
+            web_search: config.web_search,
             sandbox: sandbox_scope.clone(),
             workspace: workspace.clone(),
         },
