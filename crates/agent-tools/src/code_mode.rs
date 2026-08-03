@@ -29,7 +29,7 @@ use serde::Deserialize;
 
 use crate::error::{ToolError, ValidationError};
 use crate::permission::{PermCtx, PermissionDecision};
-use crate::tool::{Tool, ToolCtx, ToolOutput};
+use crate::tool::{Tool, ToolCtx, ToolOutput, terminates};
 
 /// Conversion used when a cell asks for a token budget: the workspace heuristic
 /// is ~1 token per 4 UTF-8 bytes (`agent_tokenizer::HeuristicCounter`), and the
@@ -179,6 +179,13 @@ impl Tool for ExecTool {
         EXEC_TOOL_NAME
     }
 
+    /// A cell is orchestration: the model is EXPECTED to submit the same source
+    /// again (a retry, a poll loop), so counting it as a repetition would trip
+    /// the loop guard on the protocol itself.
+    fn loop_guard_exempt(&self, _input: &serde_json::Value) -> bool {
+        true
+    }
+
     fn description(&self) -> String {
         exec_tool_spec(&self.handle.catalog(), self.handle.code_mode_only()).description
     }
@@ -283,6 +290,12 @@ impl Tool for WaitTool {
 
     fn name(&self) -> &str {
         WAIT_TOOL_NAME
+    }
+
+    /// Resuming the same cell is how `wait` makes progress. A terminating wait
+    /// is not: it happens once, and repeating it means the model is stuck.
+    fn loop_guard_exempt(&self, input: &serde_json::Value) -> bool {
+        !terminates(input)
     }
 
     fn description(&self) -> String {

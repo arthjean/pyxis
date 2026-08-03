@@ -940,6 +940,15 @@ impl ToolDispatch for Registry {
         }
     }
 
+    /// Asks the tool itself. An unknown name is NOT exempt: a call about to be
+    /// rejected must still count as a repetition, otherwise a model looping on
+    /// a misspelled tool would never trip the guard.
+    fn loop_guard_exempt(&self, call: &ToolInvocation) -> bool {
+        self.tools_read()
+            .get(&call.name)
+            .is_some_and(|tool| tool.loop_guard_exempt(&call.input))
+    }
+
     async fn dispatch(
         &self,
         calls: Vec<ToolInvocation>,

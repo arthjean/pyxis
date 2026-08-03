@@ -305,6 +305,14 @@ pub trait Tool: Send + Sync {
         agent_core::event::ToolCallKind::Other
     }
 
+    /// Is repeating this exact call how the tool makes progress? A polling read
+    /// answers `true` for the inputs that poll; the loop guard then stops
+    /// counting them as a repetition. Fail-closed by default: an unchanged call
+    /// is a loop unless the tool proves otherwise.
+    fn loop_guard_exempt(&self, _input: &serde_json::Value) -> bool {
+        false
+    }
+
     fn name(&self) -> &str;
     /// Description given to the model (capped by the Registry at exposure time).
     fn description(&self) -> String;
@@ -420,6 +428,11 @@ pub trait DynTool: Send + Sync {
     fn call_kind(&self, _raw: &serde_json::Value) -> agent_core::event::ToolCallKind {
         agent_core::event::ToolCallKind::Other
     }
+    /// Is repeating this exact call how the tool makes progress (US-014)?
+    /// Forwarded from `Tool`.
+    fn loop_guard_exempt(&self, _raw: &serde_json::Value) -> bool {
+        false
+    }
     fn is_concurrency_safe(&self) -> bool;
     fn is_read_only(&self) -> bool;
     fn is_sensitive(&self) -> bool;
@@ -461,6 +474,15 @@ pub trait DynTool: Send + Sync {
     async fn invoke(&self, raw: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError>;
 }
 
+/// Does this raw input ask the tool to END the thing it is driving (a cell, a
+/// session)? Shared by the tools that expose a `terminate` flag: a terminating
+/// call happens once, so it is never exempt from the loop guard.
+pub fn terminates(raw: &serde_json::Value) -> bool {
+    raw.get("terminate")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// Generic `Tool` -> `DynTool` adapter.
 pub struct DynToolAdapter<T: Tool> {
     inner: T,
@@ -488,6 +510,9 @@ impl<T: Tool> DynTool for DynToolAdapter<T> {
     }
     fn call_kind(&self, raw: &serde_json::Value) -> agent_core::event::ToolCallKind {
         self.inner.call_kind(raw)
+    }
+    fn loop_guard_exempt(&self, raw: &serde_json::Value) -> bool {
+        self.inner.loop_guard_exempt(raw)
     }
     fn is_concurrency_safe(&self) -> bool {
         self.inner.is_concurrency_safe()

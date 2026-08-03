@@ -1596,7 +1596,10 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     // US-014: deterministic loop guardrail (FR-05). It OVERRIDES the
                     // model's logic. At the threshold -> signal without executing;
                     // past it -> deterministic stop (iter_cap stays the last resort).
-                    let loop_decision = match guarded_batch_signature(&calls) {
+                    let loop_decision = match guarded_batch_signature(
+                        &calls,
+                        active_tool_plan.dispatcher().as_ref(),
+                    ) {
                         Some(signature) => loop_guard.observe(signature),
                         None => {
                             loop_guard.reset();

@@ -18,6 +18,9 @@ struct RecordingTools {
     seen: Mutex<Vec<(String, String, ToolCallFormat)>>,
     denied: HashSet<String>,
     emit_output: bool,
+    /// Calls this dispatcher declares repeatable by design, the way the real
+    /// registry answers for a terminal poll or a Code Mode cell.
+    repeatable: HashSet<String>,
 }
 
 impl RecordingTools {
@@ -31,6 +34,10 @@ impl RecordingTools {
 
 #[async_trait::async_trait]
 impl ToolDispatch for RecordingTools {
+    fn loop_guard_exempt(&self, call: &ToolInvocation) -> bool {
+        self.repeatable.contains(&call.name)
+    }
+
     async fn dispatch(
         &self,
         calls: Vec<ToolInvocation>,
@@ -465,7 +472,10 @@ async fn pure_cells_and_turn_boundaries_break_nested_effect_repetition() {
 
 #[tokio::test]
 async fn nested_terminal_polls_reset_the_effect_loop_guard() {
-    let tools = Arc::new(RecordingTools::default());
+    let tools = Arc::new(RecordingTools {
+        repeatable: HashSet::from(["write_stdin".to_string()]),
+        ..RecordingTools::default()
+    });
     let loop_guard = NestedLoopGuard::default();
 
     for _ in 0..4 {

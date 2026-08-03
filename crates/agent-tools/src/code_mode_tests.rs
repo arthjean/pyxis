@@ -282,3 +282,25 @@ async fn exec_without_a_session_refuses_and_names_the_missing_runtime() {
         outcomes[0].content
     );
 }
+
+/// US-014: repeating a cell IS the Code Mode protocol, so the loop guard must
+/// not count it. Terminating a cell is a one-shot and stays guarded.
+#[test]
+fn code_mode_declares_which_calls_repeat_by_design() {
+    let handle = Arc::new(CodeModeHandle::new(
+        Arc::new(ScriptedFactory {
+            engine: Arc::new(ScriptedEngine::default()),
+        }),
+        NestedToolBinding::default(),
+    ));
+
+    let exec = ExecTool::new(Arc::clone(&handle));
+    assert!(exec.loop_guard_exempt(&serde_json::Value::String("text('tick');".into())));
+
+    let wait = WaitTool::new(handle);
+    assert!(wait.loop_guard_exempt(&serde_json::json!({ "cell_id": "cell-1" })));
+    assert!(
+        !wait.loop_guard_exempt(&serde_json::json!({ "cell_id": "cell-1", "terminate": true })),
+        "terminating a cell happens once"
+    );
+}

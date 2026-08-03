@@ -13,7 +13,7 @@
 //! unit-testable.
 
 use crate::provider::TokenUsage;
-use crate::tools::ToolInvocation;
+use crate::tools::{ToolDispatch, ToolInvocation};
 use crate::transition::ExhaustReason;
 
 /// Default number of identical effectful calls accepted before the guard
@@ -81,28 +81,25 @@ impl LoopGuard {
     }
 }
 
-/// Deterministic signature of a call batch: `name\0json` per call, joined.
-/// The `Display` of `serde_json::Value` produces compact JSON with sorted keys
-/// (`serde_json::Map` without `preserve_order`) -> signature stable from one turn
-/// to the next. The order of calls in the batch does not change the signature.
-pub fn batch_signature(calls: &[ToolInvocation]) -> String {
-    signature(calls.iter()).unwrap_or_default()
-}
-
-/// Signature used by the loop guard, excluding calls whose repetition is the
-/// protocol for making progress. `exec` and `wait` are Code Mode orchestration
-/// cells; an empty `write_stdin` is a terminal poll. A non-empty stdin write is
-/// still guarded because repeating it changes process state.
-pub fn guarded_batch_signature(calls: &[ToolInvocation]) -> Option<String> {
-    signature(
-        calls
-            .iter()
-            .filter(|call| !is_repeatable_control_call(call)),
-    )
-}
-
-fn signature<'a>(calls: impl Iterator<Item = &'a ToolInvocation>) -> Option<String> {
+/// Signature used by the loop guard.
+///
+/// Deterministic: `name\0json` per call, joined. The `Display` of
+/// `serde_json::Value` produces compact JSON with sorted keys (`serde_json::Map`
+/// without `preserve_order`) -> the signature is stable from one turn to the
+/// next, and the order of the calls inside the batch does not change it.
+///
+/// Calls the dispatcher declares exempt are left out: repeating them is the
+/// protocol for making progress, not a symptom of a loop. The core asks rather
+/// than guesses, because a name and a JSON value cannot tell an orchestration
+/// cell from a tool that merely shares its name. `None` when nothing guardable
+/// remains, which is what makes a batch of pure control calls reset the run.
+pub fn guarded_batch_signature(
+    calls: &[ToolInvocation],
+    dispatch: &dyn ToolDispatch,
+) -> Option<String> {
     let mut parts: Vec<String> = calls
+        .iter()
+        .filter(|call| !dispatch.loop_guard_exempt(call))
         .map(|call| format!("{}\u{0}{}", call.name, call.input))
         .collect();
     if parts.is_empty() {
@@ -110,28 +107,6 @@ fn signature<'a>(calls: impl Iterator<Item = &'a ToolInvocation>) -> Option<Stri
     }
     parts.sort();
     Some(parts.join("\u{1}"))
-}
-
-fn is_repeatable_control_call(call: &ToolInvocation) -> bool {
-    match call.name.as_str() {
-        "exec" => true,
-        "wait" => !terminates(call),
-        "write_stdin" => {
-            !terminates(call)
-                && match call.input.get("chars") {
-                    None => true,
-                    Some(chars) => chars.as_str() == Some(""),
-                }
-        }
-        _ => false,
-    }
-}
-
-fn terminates(call: &ToolInvocation) -> bool {
-    call.input
-        .get("terminate")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
 }
 
 /// Pricing of a model, in micro-USD (1e-6 $) per thousand tokens. `u64` to
@@ -285,48 +260,41 @@ mod tests {
         assert_eq!(g.observe("b".into()), LoopDecision::Signal);
     }
 
+    /// Dispatcher that exempts whatever it was told to exempt. WHICH calls are
+    /// exempt is the tool's business (`agent-tools`); what the core owns is
+    /// that the answer is honored.
+    struct Exempting(&'static str);
+
+    #[async_trait::async_trait]
+    impl ToolDispatch for Exempting {
+        fn loop_guard_exempt(&self, call: &ToolInvocation) -> bool {
+            call.name == self.0
+        }
+
+        async fn dispatch(
+            &self,
+            _calls: Vec<ToolInvocation>,
+            _events: crate::tools::ToolEventSink,
+        ) -> Vec<crate::tools::ModelToolResult> {
+            Vec::new()
+        }
+    }
+
     #[test]
-    fn loop_guard_ignores_repeatable_orchestration_calls() {
-        let inv = |name: &str, input: serde_json::Value| ToolInvocation::json("x", name, input);
+    fn the_signature_honors_what_the_dispatcher_exempts() {
+        let inv = |name: &str| ToolInvocation::json("x", name, serde_json::json!({"a": 1}));
+        let dispatch = Exempting("control");
 
         assert_eq!(
-            guarded_batch_signature(&[inv("exec", serde_json::json!("text('tick')"))]),
-            None
+            guarded_batch_signature(&[inv("control")], &dispatch),
+            None,
+            "a batch of exempt calls is not guardable at all"
         );
+        assert!(guarded_batch_signature(&[inv("bash")], &dispatch).is_some());
         assert_eq!(
-            guarded_batch_signature(&[inv("wait", serde_json::json!({"cell_id": "cell-1"}))]),
-            None
-        );
-        assert!(
-            guarded_batch_signature(&[inv(
-                "wait",
-                serde_json::json!({"cell_id": "cell-1", "terminate": true})
-            )])
-            .is_some(),
-            "terminating a Code Mode cell changes state"
-        );
-        assert_eq!(
-            guarded_batch_signature(&[inv(
-                "write_stdin",
-                serde_json::json!({"session_id": 7, "chars": ""})
-            )]),
-            None
-        );
-        assert!(
-            guarded_batch_signature(&[inv(
-                "write_stdin",
-                serde_json::json!({"session_id": 7, "chars": "", "terminate": true})
-            )])
-            .is_some(),
-            "terminating a terminal session changes state"
-        );
-        assert!(
-            guarded_batch_signature(&[inv(
-                "write_stdin",
-                serde_json::json!({"session_id": 7, "chars": "yes\n"})
-            )])
-            .is_some(),
-            "repeated writes still need loop protection"
+            guarded_batch_signature(&[inv("bash"), inv("control")], &dispatch),
+            guarded_batch_signature(&[inv("bash")], &dispatch),
+            "an exempt call must not change the signature of the guarded ones"
         );
     }
 
@@ -345,16 +313,24 @@ mod tests {
     #[test]
     fn batch_signature_is_order_independent_and_distinct() {
         let inv = |name: &str, input: serde_json::Value| ToolInvocation::json("x", name, input);
-        let s1 = batch_signature(&[
-            inv("read", serde_json::json!({"path": "a"})),
-            inv("bash", serde_json::json!({"cmd": "ls"})),
-        ]);
-        let s2 = batch_signature(&[
-            inv("bash", serde_json::json!({"cmd": "ls"})),
-            inv("read", serde_json::json!({"path": "a"})),
-        ]);
+        let dispatch = Exempting("");
+        let s1 = guarded_batch_signature(
+            &[
+                inv("read", serde_json::json!({"path": "a"})),
+                inv("bash", serde_json::json!({"cmd": "ls"})),
+            ],
+            &dispatch,
+        );
+        let s2 = guarded_batch_signature(
+            &[
+                inv("bash", serde_json::json!({"cmd": "ls"})),
+                inv("read", serde_json::json!({"path": "a"})),
+            ],
+            &dispatch,
+        );
         assert_eq!(s1, s2, "call order should not matter");
-        let s3 = batch_signature(&[inv("bash", serde_json::json!({"cmd": "pwd"}))]);
+        let s3 =
+            guarded_batch_signature(&[inv("bash", serde_json::json!({"cmd": "pwd"}))], &dispatch);
         assert_ne!(s1, s3);
     }
 

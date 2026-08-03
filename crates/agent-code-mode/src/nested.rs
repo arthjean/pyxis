@@ -19,8 +19,8 @@ use agent_core::message::{ToolCallFormat, ToolErrorKind};
 use agent_core::provider::ToolSpec;
 use agent_core::sync::lock;
 use agent_core::tools::{
-    ModelToolResult, StepToolPlan, ToolDispatchEvent, ToolDispatchSnapshot, ToolEventSink,
-    ToolInvocation, ToolResultStatus,
+    ModelToolResult, StepToolPlan, ToolDispatch, ToolDispatchEvent, ToolDispatchSnapshot,
+    ToolEventSink, ToolInvocation, ToolResultStatus,
 };
 
 use crate::protocol::CellId;
@@ -104,9 +104,14 @@ impl Default for NestedLoopGuard {
 }
 
 impl NestedLoopGuard {
-    fn observe(&self, cell_id: &CellId, invocation: &ToolInvocation) -> (LoopDecision, u32) {
+    fn observe(
+        &self,
+        cell_id: &CellId,
+        invocation: &ToolInvocation,
+        dispatch: &dyn ToolDispatch,
+    ) -> (LoopDecision, u32) {
         let mut state = lock(&self.inner);
-        let decision = match guarded_batch_signature(std::slice::from_ref(invocation)) {
+        let decision = match guarded_batch_signature(std::slice::from_ref(invocation), dispatch) {
             Some(signature) => {
                 state.effect_cells.insert(cell_id.clone());
                 state.guard.observe(signature)
@@ -288,7 +293,10 @@ impl NestedToolDispatcher for PlanDispatcher {
             format,
         };
         let invocation_id = invocation.id.clone();
-        let (loop_decision, loop_count) = self.loop_guard.observe(&call.cell_id, &invocation);
+        let dispatch = self.plan.dispatcher();
+        let (loop_decision, loop_count) =
+            self.loop_guard
+                .observe(&call.cell_id, &invocation, dispatch.as_ref());
         if loop_decision != LoopDecision::Proceed {
             return NestedToolOutcome::error(
                 &call,
@@ -299,7 +307,7 @@ impl NestedToolDispatcher for PlanDispatcher {
                 ),
             );
         }
-        let kind = self.plan.dispatcher().call_kind(&invocation);
+        let kind = dispatch.call_kind(&invocation);
         self.events
             .emit(ToolDispatchEvent::NestedToolCall(ToolCallView {
                 id: invocation.id.clone(),

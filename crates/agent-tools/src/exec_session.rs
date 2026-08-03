@@ -40,7 +40,7 @@ use agent_core::tools::ToolExecution;
 
 use crate::error::{ToolError, ValidationError};
 use crate::permission::{PermCtx, PermissionDecision};
-use crate::tool::{MAX_COMMAND_BYTES, Tool, ToolCtx, ToolOutput};
+use crate::tool::{MAX_COMMAND_BYTES, Tool, ToolCtx, ToolOutput, terminates};
 
 /// Concurrent sessions cap. A session holds a process and its reader task;
 /// past a handful the model is juggling, not working.
@@ -677,6 +677,16 @@ impl Tool for WriteStdin {
 
     fn name(&self) -> &str {
         "write_stdin"
+    }
+
+    /// An empty write is a poll: it reads what the session produced since the
+    /// last chunk and is meant to be issued again unchanged. A real write is
+    /// guarded, because repeating it changes the state of the process.
+    fn loop_guard_exempt(&self, input: &serde_json::Value) -> bool {
+        !terminates(input)
+            && input
+                .get("chars")
+                .is_none_or(|chars| chars.as_str() == Some(""))
     }
     fn description(&self) -> String {
         "Write to the standard input of a session opened by exec_command, then \

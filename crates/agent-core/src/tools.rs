@@ -742,6 +742,16 @@ pub trait ToolDispatch: Send + Sync {
         crate::event::ToolCallKind::Other
     }
 
+    /// Is repeating this call how it makes progress, rather than a loop?
+    ///
+    /// An orchestration cell and a terminal poll are: they are MEANT to be
+    /// issued again with the same arguments. The dispatcher answers for the
+    /// same reason it answers `call_kind`, and the loop guard skips what it
+    /// declares. Default `false`: no call is exempt until a tool says so.
+    fn loop_guard_exempt(&self, _call: &ToolInvocation) -> bool {
+        false
+    }
+
     /// Runs a batch of calls and returns their results (order not guaranteed;
     /// each result is correlated by `id`).
     async fn dispatch(
