@@ -88,11 +88,6 @@ struct Args {
     help: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CliPermissionPolicy {
-    mode: PermissionMode,
-}
-
 enum CredentialBootstrap {
     Connected(OAuthCredential),
     Missing,
@@ -665,19 +660,17 @@ fn sandbox_scope_label(policy: &SandboxPolicy, enforced: bool) -> String {
     }
 }
 
-fn permission_policy(headless: bool, yes: bool, _sandbox_enforced: bool) -> CliPermissionPolicy {
-    if !headless {
-        return CliPermissionPolicy {
-            mode: PermissionMode::Default,
-        };
-    }
-    if !yes {
-        return CliPermissionPolicy {
-            mode: PermissionMode::Default,
-        };
-    }
-    CliPermissionPolicy {
-        mode: PermissionMode::AcceptEdits,
+/// Mode a run starts in when nothing declares one. Interactive always starts on
+/// `ask`, so only the headless mode has a choice to make, and `--yes` is the
+/// whole of it. Whether the kernel really confines the filesystem does NOT enter
+/// here: `--yes` states what the user accepts, and a policy that read the
+/// sandbox back would silently mean two different things on two machines. The
+/// warning belongs to `enforce_sandbox`, which is where the degradation is known.
+fn default_permission_mode(headless: bool, yes: bool) -> PermissionMode {
+    if headless && yes {
+        PermissionMode::AcceptEdits
+    } else {
+        PermissionMode::Default
     }
 }
 
@@ -688,11 +681,11 @@ fn permission_policy(headless: bool, yes: bool, _sandbox_enforced: bool) -> CliP
 /// project one.
 fn resolve_permission_mode(
     from_config: Option<PermissionMode>,
-    policy: CliPermissionPolicy,
+    default: PermissionMode,
     headless: bool,
 ) -> (PermissionMode, bool) {
-    let mode = from_config.unwrap_or(policy.mode);
-    (mode, headless && mode != policy.mode)
+    let mode = from_config.unwrap_or(default);
+    (mode, headless && mode != default)
 }
 
 /// What the confinement resolved to at startup: the policy asked for, and
@@ -1569,9 +1562,9 @@ async fn run(
 
     // 4. Tool registry + approver (TUI in interactive mode, auto in headless).
     // The channel itself was opened above, with the proxy.
-    let policy = permission_policy(headless, args.yes, sandbox.enforced);
+    let default_mode = default_permission_mode(headless, args.yes);
     let (initial_permission_mode, announce_override) =
-        resolve_permission_mode(config.permission_mode, policy, headless);
+        resolve_permission_mode(config.permission_mode, default_mode, headless);
     if announce_override {
         // US-008 AC6: the widening is announced, and it names the layer that
         // carries it: a flag and a global file do not call for the same reaction.
@@ -1583,7 +1576,7 @@ async fn run(
         eprintln!(
             "[config] permission mode from {source}: {} (default for -p would be {})",
             settings::permission_mode_id(initial_permission_mode),
-            settings::permission_mode_id(policy.mode)
+            settings::permission_mode_id(default_mode)
         );
     }
     let permission_mode = PermissionModeState::new(initial_permission_mode);
@@ -1995,7 +1988,7 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, SandboxPolicy, jsonl, parse_args_from, permission_policy, precedence_string,
+        Args, SandboxPolicy, default_permission_mode, jsonl, parse_args_from, precedence_string,
         precedence_u64, resolve_permission_mode, resolve_prompt, resolve_resume_path,
         run_config_from_args, sandbox_policy_from_args, sandbox_scope_label, settings,
         validate_ephemeral,
@@ -2046,8 +2039,8 @@ mod tests {
     /// a `-p` allows itself compared to the fail-closed default.
     #[test]
     fn configuration_replaces_the_headless_permission_default_and_says_so() {
-        let headless_default = permission_policy(true, false, true);
-        assert_eq!(headless_default.mode, PermissionMode::Default);
+        let headless_default = default_permission_mode(true, false);
+        assert_eq!(headless_default, PermissionMode::Default);
 
         let (mode, announced) = resolve_permission_mode(
             Some(PermissionMode::BypassPermissions),
@@ -2069,7 +2062,7 @@ mod tests {
 
         // In interactive mode, the substitution is the normal behavior since
         // US-012: nothing to announce.
-        let interactive = permission_policy(false, false, true);
+        let interactive = default_permission_mode(false, false);
         let (mode, announced) =
             resolve_permission_mode(Some(PermissionMode::AcceptEdits), interactive, false);
         assert_eq!(mode, PermissionMode::AcceptEdits);
@@ -2300,22 +2293,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `--yes` is the ONLY thing that moves the starting mode, and it only does
+    /// so in headless: interactive always opens on `ask`. The kernel's sandbox
+    /// verdict is deliberately not an input, so the same flags mean the same
+    /// thing on a machine where Landlock degraded.
     #[test]
-    fn headless_without_yes_is_fail_closed_default() {
-        let p = permission_policy(true, false, true);
-        assert_eq!(p.mode, agent_tools::permission::PermissionMode::Default);
-    }
+    fn only_headless_yes_moves_the_default_mode() {
+        use agent_tools::permission::PermissionMode::{AcceptEdits, Default as Ask};
 
-    #[test]
-    fn headless_yes_accepts_edits_but_not_sensitive_actions() {
-        let p = permission_policy(true, true, true);
-        assert_eq!(p.mode, agent_tools::permission::PermissionMode::AcceptEdits);
-    }
-
-    #[test]
-    fn headless_yes_accepts_edits_even_without_sandbox() {
-        let p = permission_policy(true, true, false);
-        assert_eq!(p.mode, agent_tools::permission::PermissionMode::AcceptEdits);
+        assert_eq!(default_permission_mode(true, false), Ask);
+        assert_eq!(default_permission_mode(true, true), AcceptEdits);
+        assert_eq!(default_permission_mode(false, false), Ask);
+        assert_eq!(
+            default_permission_mode(false, true),
+            Ask,
+            "`--yes` is a headless flag: it must not widen an interactive session"
+        );
     }
 
     // ───────────────────────── EP-001 ─────────────────────────
@@ -2575,7 +2568,7 @@ mod tests {
         );
         let (mode, announced) = resolve_permission_mode(
             config.permission_mode,
-            permission_policy(true, false, true),
+            default_permission_mode(true, false),
             true,
         );
         assert_eq!(mode, PermissionMode::BypassPermissions);
