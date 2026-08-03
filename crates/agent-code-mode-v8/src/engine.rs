@@ -6,10 +6,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use agent_code_mode::nested::{NestedToolBinding, NestedToolDispatcher};
-use agent_code_mode::protocol::ShutdownReport;
-use agent_code_mode::protocol::{CellFailure, CellFailureKind, CellId, ExecuteRequest, NestedTool};
-use agent_code_mode::session::{CellEngine, CellSink};
+use agent_code_mode::{
+    CellEngine, CellFailure, CellFailureKind, CellId, CellSink, ExecuteRequest, NestedTool,
+    NestedToolBinding, NestedToolDispatcher, ShutdownReport,
+};
 use agent_core::sync::lock;
 
 use crate::globals;

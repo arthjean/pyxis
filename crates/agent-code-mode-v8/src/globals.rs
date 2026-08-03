@@ -9,11 +9,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agent_code_mode::nested::{
-    NestedToolCall, NestedToolDispatcher, NestedToolInput, NestedToolOutcome,
+use agent_code_mode::{
+    CellId, CellSink, ImageDetail, NestedTool, NestedToolCall, NestedToolDispatcher,
+    NestedToolInput, NestedToolOutcome, OutputItem,
 };
-use agent_code_mode::protocol::{CellId, ImageDetail, NestedTool, OutputItem};
-use agent_code_mode::session::CellSink;
 
 /// Globals removed from every cell context. `Atomics` and `SharedArrayBuffer`
 /// exist to share memory between agents that this design does not have;

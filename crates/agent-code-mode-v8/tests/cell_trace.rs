@@ -12,8 +12,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent_code_mode::protocol::{CellState, ExecuteRequest, SessionId};
-use agent_code_mode::session::{CodeModeSession, SessionLimits};
+use agent_code_mode::{CellState, CodeModeSession, ExecuteRequest, SessionId, SessionLimits};
 use agent_code_mode_v8::{EngineLimits, IsolateEngine};
 
 struct SharedBuffer(Arc<Mutex<Vec<u8>>>);

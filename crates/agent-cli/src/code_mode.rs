@@ -7,9 +7,7 @@
 
 use std::sync::Arc;
 
-use agent_code_mode::nested::NestedToolBinding;
-use agent_code_mode::protocol::SessionId;
-use agent_code_mode::session::CodeModeSession;
+use agent_code_mode::{CodeModeSession, NestedToolBinding, SessionId};
 use agent_code_mode_v8::{EngineLimits, IsolateEngine};
 use agent_tools::{CodeModeHandle, CodeModeSessionFactory};
 

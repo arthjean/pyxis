@@ -3,10 +3,10 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use agent_code_mode::protocol::{
-    CellFailureKind, CellState, ExecuteRequest, OutputItem, RuntimeResponse, SessionId, WaitRequest,
+use agent_code_mode::{
+    CellFailureKind, CellState, CodeModeSession, ExecuteRequest, OutputItem, RuntimeResponse,
+    SessionId, SessionLimits, WaitRequest,
 };
-use agent_code_mode::session::{CodeModeSession, SessionLimits};
 
 use super::*;
 
@@ -396,10 +396,7 @@ async fn a_cell_has_no_console_no_network_and_no_shared_memory() {
 
 // --- US-008: nested tools seen from inside a cell -------------------------
 
-use agent_code_mode::nested::{
-    NestedToolCall, NestedToolDispatcher, NestedToolInput, NestedToolOutcome,
-};
-use agent_code_mode::protocol::NestedTool;
+use agent_code_mode::{NestedToolCall, NestedToolDispatcher, NestedToolInput, NestedToolOutcome};
 use agent_core::provider::ToolSpec;
 
 /// Answers nested calls without a tool pipeline, and records what it saw.
