@@ -2408,6 +2408,10 @@ pub struct SessionFacts<'a> {
     /// the runtime's last-state signal and from its v1 constants, so `/status`
     /// still answers without a single request.
     pub runtime: RuntimeFacts,
+    /// One line per tool actually called this session, most-called first. Empty
+    /// before the first call, and omitted from the report then: a heading over
+    /// nothing reads as "no tools available".
+    pub tool_activity: &'a [String],
 }
 
 /// The bounds a thread runs under, and how much of them it is using.
@@ -2528,6 +2532,12 @@ pub fn session_status_report(state: &AppState, facts: SessionFacts<'_>) -> Strin
         runtime.max_agents_per_root,
         runtime.max_agent_depth
     ));
+    if !facts.tool_activity.is_empty() {
+        report.push_str("\n  tools:");
+        for line in facts.tool_activity {
+            report.push_str(&format!("\n    {line}"));
+        }
+    }
     report
 }
 
@@ -3862,6 +3872,7 @@ mod tests {
             config_sources: &[],
             profile: None,
             runtime: RuntimeFacts::default(),
+            tool_activity: &[],
         };
 
         let status = session_status_report(&s, facts);
@@ -3908,6 +3919,7 @@ mod tests {
                 ],
                 profile: Some("review"),
                 runtime: RuntimeFacts::default(),
+                tool_activity: &[],
             },
         );
 
@@ -3960,6 +3972,7 @@ mod tests {
                     config_sources: &[],
                     profile: None,
                     runtime: RuntimeFacts::default(),
+                    tool_activity: &[],
                 }
             )
             .contains("reasoning effort: medium")

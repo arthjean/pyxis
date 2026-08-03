@@ -824,6 +824,7 @@ fn runtime_status_narrow() {
                 sandbox: "enforced (workspace)",
                 config_sources: &[],
                 profile: None,
+                tool_activity: &[],
                 runtime: agent_tui::RuntimeFacts {
                     active_agents: 0,
                     max_active_agents: 4,

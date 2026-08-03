@@ -1501,6 +1501,11 @@ async fn event_loop(
                                             sandbox: &cfg.sandbox_scope,
                                             config_sources: &sources,
                                             profile: cfg.profile.as_deref(),
+                                            // What the pipeline did, which the
+                                            // transcript does not carry: counts,
+                                            // failures and average durations per
+                                            // tool, refusals included.
+                                            tool_activity: &registry.dispatch_log().summary(),
                                             runtime: runtime_facts(),
                                         },
                                     ),

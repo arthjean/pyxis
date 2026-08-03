@@ -78,6 +78,9 @@ pub struct Registry {
     /// provider capabilities. False keeps every tool at the top level, which is
     /// what every provider understood before namespaces existed.
     namespace_tools: bool,
+    /// Bounded record of what was attempted this session. Written on every
+    /// outcome, refusals included; carries no call content.
+    log: crate::dispatch_log::DispatchLog,
     ctx: ToolCtx,
 }
 
@@ -100,6 +103,7 @@ impl Registry {
             escalator: None,
             deferred: crate::tool_search::DeferredTools::new(),
             namespace_tools: false,
+            log: crate::dispatch_log::DispatchLog::new(),
             ctx: ToolCtx::new(workspace),
         }
     }
@@ -107,6 +111,11 @@ impl Registry {
     /// Answers remembered for this session (US-009 inspection surface).
     pub fn approvals(&self) -> ApprovalMemory {
         self.approvals.clone()
+    }
+
+    /// What was attempted this session (names, statuses, durations).
+    pub fn dispatch_log(&self) -> crate::dispatch_log::DispatchLog {
+        self.log.clone()
     }
 
     pub fn mode(&self) -> PermissionMode {
@@ -364,6 +373,7 @@ impl Registry {
             escalator: self.escalator.clone(),
             deferred: self.deferred.clone(),
             namespace_tools: self.namespace_tools,
+            log: self.log.clone(),
             ctx: self.ctx.clone(),
         };
         ToolDispatchSnapshot::new(generation, specs, Arc::new(frozen))
@@ -409,11 +419,16 @@ impl Registry {
             call_id = %call.id
         );
         use tracing::Instrument as _;
+        let tool = call.name.clone();
         let outcome = self
             .run_one_inner(call, events)
             .instrument(span.clone())
             .await
             .with_duration(started.elapsed());
+        // Recorded HERE, at the one point every call comes back through:
+        // refusals, unknown tools, timeouts and panics included. Anywhere
+        // further in would miss exactly the calls a diagnosis is about.
+        self.log.record(&tool, &outcome);
         if outcome.is_error {
             // Emitted INSIDE the span, so the line already carries tool, call,
             // turn and thread. `in_scope` rather than a guard: it makes it
@@ -1149,6 +1164,7 @@ pub struct RegistryBuilder {
     escalator: Option<Arc<dyn SandboxEscalator>>,
     deferred: crate::tool_search::DeferredTools,
     namespace_tools: bool,
+    log: crate::dispatch_log::DispatchLog,
     ctx: ToolCtx,
 }
 
@@ -1240,6 +1256,12 @@ impl RegistryBuilder {
         self.namespace_tools = supported;
         self
     }
+    /// Shares the dispatch record with the frontend, so `/status` reads the same
+    /// counters the registry writes.
+    pub fn dispatch_log(mut self, log: crate::dispatch_log::DispatchLog) -> Self {
+        self.log = log;
+        self
+    }
     /// Applies an approved one-call widening (US-004). Without it no escalation
     /// is ever offered: a perimeter nobody can widen must not be advertised.
     pub fn sandbox_escalator(mut self, escalator: Arc<dyn SandboxEscalator>) -> Self {
@@ -1282,6 +1304,7 @@ impl RegistryBuilder {
             escalator: self.escalator,
             deferred: self.deferred,
             namespace_tools: self.namespace_tools,
+            log: self.log,
             ctx: self.ctx,
         };
         registry.seed_taint(self.initial_taint_recent);

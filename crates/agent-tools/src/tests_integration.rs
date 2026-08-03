@@ -3595,3 +3595,46 @@ async fn a_namespace_groups_a_server_without_renaming_its_tools() {
     assert_eq!(names, vec!["mcp__gh__create_issue".to_string()]);
 }
 
+/// The dispatch record covers what the transcript cannot: a call that was
+/// refused before running still happened, from the pipeline's point of view, and
+/// is exactly the one a "why did nothing happen?" diagnosis needs.
+#[tokio::test]
+async fn the_dispatch_record_covers_refusals_and_unknown_tools() {
+    let reg = Registry::builder("/tmp")
+        .mode(PermissionMode::Plan)
+        .approver(Arc::new(crate::AutoDeny))
+        .register(Read)
+        .register(Write)
+        .build();
+    let log = reg.dispatch_log();
+
+    let _ = reg
+        .dispatch(vec![
+            call("u", "does_not_exist", serde_json::json!({})),
+            call(
+                "w",
+                "write",
+                serde_json::json!({ "path": "a.txt", "content": "x" }),
+            ),
+        ])
+        .await;
+
+    let totals = log.totals();
+    assert_eq!(
+        totals.get("does_not_exist").map(|t| t.calls),
+        Some(1),
+        "an unknown tool was still attempted: {totals:?}"
+    );
+    assert_eq!(
+        totals.get("write").map(|t| t.failures),
+        Some(1),
+        "a call refused by the mode is a failure of that call: {totals:?}"
+    );
+    let entries = log.entries();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.error_kind == Some(ToolErrorKind::PermissionDenied)),
+        "the refusal keeps its kind: {entries:?}"
+    );
+}
