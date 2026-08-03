@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agent_code_mode::{
@@ -250,10 +250,10 @@ impl CellEngine for IsolateEngine {
     }
 }
 
+/// V8 heap ceiling of one cell, and the way back out of it.
 struct Quotas {
     heap_hit: AtomicBool,
-    heap_limit: usize,
-    handle: OnceLock<v8::IsolateHandle>,
+    handle: v8::IsolateHandle,
 }
 
 struct BudgetAllocator {
@@ -333,10 +333,17 @@ unsafe extern "C" fn near_heap_limit(
 ) -> usize {
     let quotas = unsafe { &*(data as *const Quotas) };
     quotas.heap_hit.store(true, Ordering::Release);
-    if let Some(handle) = quotas.handle.get() {
-        handle.terminate_execution();
-    }
+    quotas.handle.terminate_execution();
     current_heap_limit + HEAP_UNWIND_HEADROOM
+}
+
+/// Everything that can stop a cell from OUTSIDE its script, in one place, so
+/// `classify` reads one value instead of four.
+struct CellGuards {
+    allocator: Arc<BudgetAllocator>,
+    quotas: Arc<Quotas>,
+    control: Arc<CellControl>,
+    limits: EngineLimits,
 }
 
 /// Body of one cell thread. It always ends by publishing a terminal state on
@@ -396,11 +403,6 @@ fn run_cell(job: CellJob) {
         refused_bytes: AtomicUsize::new(0),
         refused: AtomicBool::new(false),
     });
-    let quotas = Box::new(Quotas {
-        heap_hit: AtomicBool::new(false),
-        heap_limit: limits.heap_bytes,
-        handle: OnceLock::new(),
-    });
     // SAFETY: the raw pointer is the `Arc` V8 owns from here on; the `drop`
     // entry of the vtable gives it back to Rust exactly once.
     let v8_allocator =
@@ -410,9 +412,15 @@ fn run_cell(job: CellJob) {
         .array_buffer_allocator(v8_allocator.make_shared());
     let mut isolate = v8::Isolate::new(params);
     let handle = isolate.thread_safe_handle();
-    let _ = quotas.handle.set(handle.clone());
-    let quotas_ptr: *mut Quotas = Box::into_raw(quotas);
-    isolate.add_near_heap_limit_callback(near_heap_limit, quotas_ptr.cast());
+    // Same ownership scheme as the allocator, so the two V8 callback payloads
+    // of this function are read and released the same way: a live `Arc` here,
+    // a raw one V8 holds, given back once the isolate is gone.
+    let quotas = Arc::new(Quotas {
+        heap_hit: AtomicBool::new(false),
+        handle: handle.clone(),
+    });
+    let quotas_ptr = Arc::into_raw(Arc::clone(&quotas));
+    isolate.add_near_heap_limit_callback(near_heap_limit, quotas_ptr.cast_mut().cast());
     control.publish(handle.clone());
 
     let in_tool = Arc::new(AtomicU64::new(0));
@@ -436,16 +444,13 @@ fn run_cell(job: CellJob) {
     // is what keeps the isolate healthy for its own teardown.
     isolate.cancel_terminate_execution();
 
-    let failure = classify(
-        &outcome,
-        &allocator,
-        // SAFETY: the box is alive until the end of this function, and the
-        // isolate that could call back into it is dropped below.
-        unsafe { &*quotas_ptr },
-        &control,
-        expired,
+    let guards = CellGuards {
+        allocator,
+        quotas,
+        control,
         limits,
-    );
+    };
+    let failure = classify(&outcome, &guards, expired);
     // A `store(...)` a cell already executed is committed even when the cell
     // then failed, exactly as the baseline does: the write happened, and
     // dropping it would make a partial cell silently lose work the model can
@@ -469,10 +474,11 @@ fn run_cell(job: CellJob) {
     }
     sink.finish(failure);
     // Order matters: the isolate has to go first, because a callback of its
-    // teardown could still reach the quotas box.
+    // teardown could still reach the quotas.
     drop(isolate);
-    // SAFETY: the isolate is gone, so V8 can no longer reach the box.
-    drop(unsafe { Box::from_raw(quotas_ptr) });
+    // SAFETY: the isolate is gone, so V8 can no longer reach the `Arc` it was
+    // handed, and this is the one place that gives it back.
+    drop(unsafe { Arc::from_raw(quotas_ptr) });
 }
 
 /// Terminates a cell whose CPU budget expired, from outside the isolate.
@@ -676,14 +682,8 @@ fn describe(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -
 /// order matters: V8 routes a refused array-buffer allocation through the
 /// near-heap-limit callback too, so the allocator flag has to be read first or
 /// a native breach would be reported as a heap breach (US-005 finding).
-fn classify(
-    outcome: &Evaluation,
-    allocator: &Arc<BudgetAllocator>,
-    quotas: &Quotas,
-    control: &CellControl,
-    cpu_expired: bool,
-    limits: EngineLimits,
-) -> Option<CellFailure> {
+fn classify(outcome: &Evaluation, guards: &CellGuards, cpu_expired: bool) -> Option<CellFailure> {
+    let allocator = &guards.allocator;
     let error = outcome.error.as_ref()?;
     if outcome.exited && (error.contains(globals::EXIT_MARKER) || error.is_empty()) {
         // `exit()` stops the script from the inside; that is a normal end. An
@@ -702,19 +702,22 @@ fn classify(
             ),
         ));
     }
-    if quotas.heap_hit.load(Ordering::Acquire) {
+    if guards.quotas.heap_hit.load(Ordering::Acquire) {
         return Some(CellFailure::new(
             CellFailureKind::HeapLimit,
-            format!("v8 heap limit reached: {} bytes", quotas.heap_limit),
+            format!("v8 heap limit reached: {} bytes", guards.limits.heap_bytes),
         ));
     }
-    if control.is_cancelled() {
+    if guards.control.is_cancelled() {
         return Some(CellFailure::interrupted("cell interrupted"));
     }
     if cpu_expired {
         return Some(CellFailure::new(
             CellFailureKind::CpuBudget,
-            format!("cpu budget exceeded: {} ms", limits.cpu_budget.as_millis()),
+            format!(
+                "cpu budget exceeded: {} ms",
+                guards.limits.cpu_budget.as_millis()
+            ),
         ));
     }
     let message = if error.is_empty() {
