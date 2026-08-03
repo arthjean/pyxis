@@ -431,7 +431,7 @@ mod tests {
 
     use crate::provider::ToolSpec;
     use crate::tools::{
-        ToolDispatch, ToolDispatchSnapshot, ToolEventSink, ToolInvocation, ToolOutcome,
+        ModelToolResult, ToolDispatch, ToolDispatchSnapshot, ToolEventSink, ToolInvocation,
     };
 
     use super::*;
@@ -444,7 +444,7 @@ mod tests {
             &self,
             _calls: Vec<ToolInvocation>,
             _events: ToolEventSink,
-        ) -> Vec<ToolOutcome> {
+        ) -> Vec<ModelToolResult> {
             Vec::new()
         }
     }

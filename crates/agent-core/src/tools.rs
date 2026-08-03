@@ -313,9 +313,6 @@ impl ModelToolResult {
     }
 }
 
-/// Compatibility name for callers that still use the pre-EP-003 vocabulary.
-pub type ToolOutcome = ModelToolResult;
-
 fn status_from_error(is_error: bool, error_kind: Option<ToolErrorKind>) -> ToolResultStatus {
     match error_kind {
         Some(ToolErrorKind::Timeout) => ToolResultStatus::TimedOut,
@@ -775,8 +772,11 @@ pub trait ToolDispatch: Send + Sync {
 
     /// Runs a batch of calls and returns their results (order not guaranteed;
     /// each result is correlated by `id`).
-    async fn dispatch(&self, calls: Vec<ToolInvocation>, events: ToolEventSink)
-    -> Vec<ToolOutcome>;
+    async fn dispatch(
+        &self,
+        calls: Vec<ToolInvocation>,
+        events: ToolEventSink,
+    ) -> Vec<ModelToolResult>;
 }
 
 #[cfg(test)]

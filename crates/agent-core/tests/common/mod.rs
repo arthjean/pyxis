@@ -27,7 +27,7 @@ use agent_core::provider::ToolSpec;
 use agent_core::run_agent;
 use agent_core::session::Session;
 use agent_core::session::SessionError;
-use agent_core::tools::ToolOutcome;
+use agent_core::tools::ModelToolResult;
 use agent_core::tools::ToolDispatch;
 use agent_core::tools::ToolEventSink;
 use agent_core::tools::ToolInvocation;
@@ -292,12 +292,12 @@ impl ToolDispatch for EchoTools {
         &self,
         calls: Vec<ToolInvocation>,
         _events: ToolEventSink,
-    ) -> Vec<ToolOutcome> {
+    ) -> Vec<ModelToolResult> {
         calls
             .into_iter()
-            .map(|c| ToolOutcome {
+            .map(|c| ModelToolResult {
                 images: Vec::new(),
-                ..ToolOutcome::new(c.id, format!("echo:{}", c.input), false, true, None)
+                ..ModelToolResult::new(c.id, format!("echo:{}", c.input), false, true, None)
             })
             .collect()
     }
@@ -312,7 +312,7 @@ impl ToolDispatch for StreamingTools {
         &self,
         calls: Vec<ToolInvocation>,
         events: ToolEventSink,
-    ) -> Vec<ToolOutcome> {
+    ) -> Vec<ModelToolResult> {
         calls
             .into_iter()
             .map(|c| {
@@ -321,9 +321,9 @@ impl ToolDispatch for StreamingTools {
                     stream: agent_core::event::OutputStream::Stdout,
                     chunk: b"progression...\n".to_vec(),
                 });
-                ToolOutcome {
+                ModelToolResult {
                     images: Vec::new(),
-                    ..ToolOutcome::new(c.id, format!("echo:{}", c.input), false, true, None)
+                    ..ModelToolResult::new(c.id, format!("echo:{}", c.input), false, true, None)
                 }
             })
             .collect()
@@ -338,7 +338,7 @@ impl ToolDispatch for MissingTools {
         &self,
         _calls: Vec<ToolInvocation>,
         _events: ToolEventSink,
-    ) -> Vec<ToolOutcome> {
+    ) -> Vec<ModelToolResult> {
         Vec::new()
     }
 }
@@ -353,7 +353,7 @@ impl ToolDispatch for HangingTools {
         &self,
         _calls: Vec<ToolInvocation>,
         _events: ToolEventSink,
-    ) -> Vec<ToolOutcome> {
+    ) -> Vec<ModelToolResult> {
         self.0.cancel();
         std::future::pending().await
     }
@@ -369,13 +369,13 @@ impl ToolDispatch for RacingTools {
         &self,
         calls: Vec<ToolInvocation>,
         _events: ToolEventSink,
-    ) -> Vec<ToolOutcome> {
+    ) -> Vec<ModelToolResult> {
         self.0.cancel();
         calls
             .into_iter()
-            .map(|c| ToolOutcome {
+            .map(|c| ModelToolResult {
                 images: Vec::new(),
-                ..ToolOutcome::new(c.id, "real output".into(), false, true, None)
+                ..ModelToolResult::new(c.id, "real output".into(), false, true, None)
             })
             .collect()
     }
@@ -396,7 +396,7 @@ impl ToolDispatch for DelayedCancelTools {
         &self,
         calls: Vec<ToolInvocation>,
         _events: ToolEventSink,
-    ) -> Vec<ToolOutcome> {
+    ) -> Vec<ModelToolResult> {
         for _ in 0..self.yields {
             tokio::task::yield_now().await;
         }
@@ -406,9 +406,9 @@ impl ToolDispatch for DelayedCancelTools {
         }
         calls
             .into_iter()
-            .map(|c| ToolOutcome {
+            .map(|c| ModelToolResult {
                 images: Vec::new(),
-                ..ToolOutcome::new(c.id, "real output".into(), false, true, None)
+                ..ModelToolResult::new(c.id, "real output".into(), false, true, None)
             })
             .collect()
     }
@@ -724,7 +724,7 @@ impl ToolDispatch for RichTools {
         &self,
         calls: Vec<ToolInvocation>,
         events: ToolEventSink,
-    ) -> Vec<ToolOutcome> {
+    ) -> Vec<ModelToolResult> {
         events.emit(agent_core::tools::ToolDispatchEvent::Plan(
             agent_core::PlanView {
                 explanation: None,
@@ -736,12 +736,12 @@ impl ToolDispatch for RichTools {
         ));
         calls
             .into_iter()
-            .map(|c| ToolOutcome {
+            .map(|c| ModelToolResult {
                 images: vec![agent_core::tools::ToolImage {
                     media_type: "image/png".into(),
                     data: "QUJD".into(),
                 }],
-                ..ToolOutcome::new(c.id, "read".into(), false, true, None)
+                ..ModelToolResult::new(c.id, "read".into(), false, true, None)
             })
             .collect()
     }

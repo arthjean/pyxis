@@ -26,7 +26,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use agent_core::message::ToolErrorKind;
-use agent_core::tools::{ToolOutcome, ToolResultStatus};
+use agent_core::tools::{ModelToolResult, ToolResultStatus};
 
 /// Individual calls retained. Past this the ring drops the oldest; the
 /// aggregates below keep counting.
@@ -79,7 +79,7 @@ impl DispatchLog {
     /// Records one finished call. Called by the registry for every outcome,
     /// including refusals and unknown tools: a call that never ran is exactly
     /// the one a diagnosis is looking for.
-    pub fn record(&self, tool: &str, outcome: &ToolOutcome) {
+    pub fn record(&self, tool: &str, outcome: &ModelToolResult) {
         let entry = DispatchEntry {
             tool: tool.to_string(),
             status: outcome.status,
@@ -165,8 +165,8 @@ impl DispatchLog {
 mod tests {
     use super::*;
 
-    fn outcome(id: &str, is_error: bool, ms: u64) -> ToolOutcome {
-        let mut outcome = ToolOutcome::new(
+    fn outcome(id: &str, is_error: bool, ms: u64) -> ModelToolResult {
+        let mut outcome = ModelToolResult::new(
             id.to_string(),
             "body".to_string(),
             is_error,
@@ -199,11 +199,8 @@ mod tests {
     fn a_refusal_is_recorded_like_any_other_call() {
         // The call a diagnosis is looking for is usually the one that never ran.
         let log = DispatchLog::new();
-        let refused = ToolOutcome::rejected(
-            "c1".to_string(),
-            "denied",
-            ToolErrorKind::PermissionDenied,
-        );
+        let refused =
+            ModelToolResult::rejected("c1".to_string(), "denied", ToolErrorKind::PermissionDenied);
         log.record("write", &refused);
         let entries = log.entries();
         assert_eq!(entries.len(), 1);
@@ -221,7 +218,10 @@ mod tests {
         let summary = log.summary();
         assert!(summary[0].starts_with("read: 2 call(s)"), "{summary:?}");
         assert!(summary[0].contains("5 ms average"), "{summary:?}");
-        assert!(summary[1].starts_with("bash: 1 call(s), 1 failed"), "{summary:?}");
+        assert!(
+            summary[1].starts_with("bash: 1 call(s), 1 failed"),
+            "{summary:?}"
+        );
     }
 
     #[test]

@@ -72,6 +72,6 @@ pub use session::{Session, SessionEntry, SessionError};
 pub use step::{ContextFragmentKind, StepContextSource, StepFrame};
 pub use tools::{
     MAX_MODEL_TOOL_RESULT_BYTES, ModelToolResult, StepToolPlan, ToolDispatch, ToolDispatchEvent,
-    ToolDispatchSnapshot, ToolEventSink, ToolExecution, ToolImage, ToolInvocation, ToolOutcome,
+    ToolDispatchSnapshot, ToolEventSink, ToolExecution, ToolImage, ToolInvocation,
     ToolResultStatus, ToolResultTruncation, TruncationStrategy,
 };

@@ -7,7 +7,7 @@
 //! timeout -> taint -> hooks PostToolUse -> outcome
 //! ```
 //!
-//! Invariants: one `ToolOutcome` per `ToolInvocation` (even a refusal/unknown/failed
+//! Invariants: one `ModelToolResult` per `ToolInvocation` (even a refusal/unknown/failed
 //! parse -> an error outcome, never a panic, correlation by `id`), fail-closed
 //! everywhere.
 
@@ -19,8 +19,8 @@ use agent_core::event::PermissionReq;
 use agent_core::message::ToolErrorKind;
 use agent_core::provider::ToolSpec;
 use agent_core::tools::{
-    ToolDispatch, ToolDispatchEvent, ToolDispatchSnapshot, ToolEventSink, ToolExecution,
-    ToolInvocation, ToolOutcome, ToolResultStatus,
+    ModelToolResult, ToolDispatch, ToolDispatchEvent, ToolDispatchSnapshot, ToolEventSink,
+    ToolExecution, ToolInvocation, ToolResultStatus,
 };
 use async_trait::async_trait;
 use futures_util::FutureExt;
@@ -278,10 +278,7 @@ impl Registry {
                 .and_then(|tool| tool.namespace())
                 .filter(|_| matches!(spec.kind, agent_core::provider::ToolKind::Function { .. }))
             {
-                Some(namespace) => groups
-                    .entry(namespace.to_string())
-                    .or_default()
-                    .push(spec),
+                Some(namespace) => groups.entry(namespace.to_string()).or_default().push(spec),
                 None => flat.push(spec),
             }
         }
@@ -399,13 +396,13 @@ impl Registry {
     }
 
     /// Convenience path for tests and direct calls into the registry.
-    pub async fn dispatch(&self, calls: Vec<ToolInvocation>) -> Vec<ToolOutcome> {
+    pub async fn dispatch(&self, calls: Vec<ToolInvocation>) -> Vec<ModelToolResult> {
         <Self as ToolDispatch>::dispatch(self, calls, ToolEventSink::default()).await
     }
 
     /// Strict pipeline of a single call. Never panics: always returns a
-    /// `ToolOutcome` correlated by `id`.
-    async fn run_one(&self, call: ToolInvocation, events: ToolEventSink) -> ToolOutcome {
+    /// `ModelToolResult` correlated by `id`.
+    async fn run_one(&self, call: ToolInvocation, events: ToolEventSink) -> ModelToolResult {
         let started = tokio::time::Instant::now();
         // US-019 AC3: the call span nests inside the turn span the runtime
         // opened, so anything the tool traces (including a nested Code Mode
@@ -446,7 +443,7 @@ impl Registry {
         outcome
     }
 
-    async fn run_one_inner(&self, call: ToolInvocation, events: ToolEventSink) -> ToolOutcome {
+    async fn run_one_inner(&self, call: ToolInvocation, events: ToolEventSink) -> ModelToolResult {
         let id = call.id.clone();
         // The `Arc` is cloned out of the map so no lock is held across an await:
         // a tool removed mid-call keeps running to completion on this handle.
@@ -774,10 +771,10 @@ impl Registry {
         tool: &dyn DynTool,
         denial: &SandboxDenial,
         input: serde_json::Value,
-        original: ToolOutcome,
+        original: ModelToolResult,
         ctx: &ToolCtx,
         events: &ToolEventSink,
-    ) -> ToolOutcome {
+    ) -> ModelToolResult {
         let untrusted = tool.returns_untrusted();
         let Some(escalator) = self.escalator.as_ref() else {
             return original;
@@ -915,7 +912,7 @@ impl Registry {
         &self,
         segment: Vec<(usize, ToolInvocation)>,
         events: ToolEventSink,
-    ) -> Vec<(usize, ToolOutcome)> {
+    ) -> Vec<(usize, ModelToolResult)> {
         stream::iter(segment)
             .map(|(i, call)| {
                 let events = events.clone();
@@ -947,12 +944,12 @@ impl ToolDispatch for Registry {
         &self,
         calls: Vec<ToolInvocation>,
         events: ToolEventSink,
-    ) -> Vec<ToolOutcome> {
+    ) -> Vec<ModelToolResult> {
         let started_tainted = self.taint.is_recent();
         // New dispatch cycle: shrinks the taint window.
         self.taint.begin_cycle();
 
-        let mut indexed: Vec<(usize, ToolOutcome)> = Vec::new();
+        let mut indexed: Vec<(usize, ModelToolResult)> = Vec::new();
         let mut segment: Vec<(usize, ToolInvocation)> = Vec::new();
 
         for (i, call) in calls.into_iter().enumerate() {
@@ -974,7 +971,7 @@ impl ToolDispatch for Registry {
 
         // Restores the batch order (deterministic transcripts/tests).
         indexed.sort_by_key(|(i, _)| *i);
-        let outcomes: Vec<ToolOutcome> = indexed.into_iter().map(|(_, o)| o).collect();
+        let outcomes: Vec<ModelToolResult> = indexed.into_iter().map(|(_, o)| o).collect();
         if started_tainted
             && !outcomes.is_empty()
             && outcomes.iter().all(|o| o.is_error && !o.untrusted)
@@ -989,9 +986,9 @@ fn err_outcome(
     id: agent_core::message::ToolCallId,
     msg: String,
     error_kind: ToolErrorKind,
-) -> ToolOutcome {
+) -> ModelToolResult {
     // Pipeline error (refusal/unknown/parse): in-house content, not tainted.
-    ToolOutcome::new(id, msg, true, false, Some(error_kind))
+    ModelToolResult::new(id, msg, true, false, Some(error_kind))
 }
 
 /// Outcome of a call that ran to completion, error or not.
@@ -1005,12 +1002,12 @@ fn outcome_from(
     images: Vec<agent_core::tools::ToolImage>,
     execution: Option<agent_core::tools::ToolExecution>,
     sandbox_denied: bool,
-) -> ToolOutcome {
-    let mut outcome = ToolOutcome {
+) -> ModelToolResult {
+    let mut outcome = ModelToolResult {
         structured_content,
         execution,
         images,
-        ..ToolOutcome::new(
+        ..ModelToolResult::new(
             id,
             content,
             is_error,
@@ -1039,15 +1036,15 @@ fn err_outcome_tainted(
     msg: String,
     untrusted: bool,
     error_kind: ToolErrorKind,
-) -> ToolOutcome {
-    ToolOutcome::new(id, msg, true, untrusted, Some(error_kind))
+) -> ModelToolResult {
+    ModelToolResult::new(id, msg, true, untrusted, Some(error_kind))
 }
 
 fn tool_error_outcome(
     id: agent_core::message::ToolCallId,
     error: ToolError,
     untrusted: bool,
-) -> ToolOutcome {
+) -> ModelToolResult {
     let session_closed = matches!(&error, ToolError::SessionClosed(_));
     let mut outcome = err_outcome_tainted(id, error.to_string(), untrusted, error.kind());
     if session_closed {
@@ -1299,7 +1296,9 @@ impl RegistryBuilder {
         let search: Arc<dyn DynTool> = Arc::from(into_dyn(crate::tool_search::ToolSearch::new(
             self.deferred.clone(),
         )));
-        self.tools.entry(search.name().to_string()).or_insert(search);
+        self.tools
+            .entry(search.name().to_string())
+            .or_insert(search);
         let registry = Registry {
             tools: std::sync::RwLock::new(self.tools),
             staged: std::sync::Mutex::new(Vec::new()),

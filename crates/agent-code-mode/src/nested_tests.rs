@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use agent_core::message::{ToolCallFormat, ToolErrorKind};
 use agent_core::tools::{
-    ModelToolResult, ToolDispatch, ToolDispatchEvent, ToolEventSink, ToolInvocation, ToolOutcome,
+    ModelToolResult, ToolDispatch, ToolDispatchEvent, ToolEventSink, ToolInvocation,
 };
 
 use super::*;
@@ -35,7 +35,7 @@ impl ToolDispatch for RecordingTools {
         &self,
         calls: Vec<ToolInvocation>,
         events: ToolEventSink,
-    ) -> Vec<ToolOutcome> {
+    ) -> Vec<ModelToolResult> {
         let mut outcomes = Vec::with_capacity(calls.len());
         for call in calls {
             if self.emit_output {

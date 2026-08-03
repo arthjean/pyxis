@@ -34,7 +34,7 @@ use crate::provider::{
 use crate::step::StepContextSource;
 use crate::tools::{
     MAX_MODEL_TOOL_RESULT_BYTES, ModelToolResult, StepToolPlan, ToolDispatchEvent,
-    ToolDispatchSnapshot, ToolEventSink, ToolOutcome,
+    ToolDispatchSnapshot, ToolEventSink,
 };
 use crate::transition::{
     Accumulator, ContextErrorKind, ExhaustReason, PendingError, Transition, post_stream_transition,
@@ -399,7 +399,7 @@ fn maybe_switch_to_overload_fallback(
 
 fn validate_tool_outcomes(
     expected_ids: &[ToolCallId],
-    outcomes: &[ToolOutcome],
+    outcomes: &[ModelToolResult],
 ) -> Result<(), AgentError> {
     use std::collections::HashSet;
 

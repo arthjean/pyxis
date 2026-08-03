@@ -18,7 +18,7 @@ use agent_core::provider::{
     ProviderKind, StopReason, StreamEvent, ToolSpec,
 };
 use agent_core::session::{FileSnapshot, Session, SessionError};
-use agent_core::tools::{ToolDispatch, ToolEventSink, ToolInvocation, ToolOutcome};
+use agent_core::tools::{ModelToolResult, ToolDispatch, ToolEventSink, ToolInvocation};
 use agent_core::{
     AgentContext, CancellationToken as CoreCancel, ContextTransition, Deps, RunConfig,
 };
@@ -225,11 +225,11 @@ impl ToolDispatch for EchoTools {
         &self,
         calls: Vec<ToolInvocation>,
         _events: ToolEventSink,
-    ) -> Vec<ToolOutcome> {
+    ) -> Vec<ModelToolResult> {
         calls
             .into_iter()
             .map(|call| {
-                ToolOutcome::new(
+                ModelToolResult::new(
                     call.id,
                     format!("dispatched:{}", call.name),
                     false,
@@ -263,14 +263,14 @@ impl ToolDispatch for GatedTools {
         &self,
         calls: Vec<ToolInvocation>,
         _events: ToolEventSink,
-    ) -> Vec<ToolOutcome> {
+    ) -> Vec<ModelToolResult> {
         self.started.add_permits(1);
         if let Ok(permit) = self.release.acquire().await {
             permit.forget();
         }
         calls
             .into_iter()
-            .map(|call| ToolOutcome::new(call.id, "outil terminé".into(), false, true, None))
+            .map(|call| ModelToolResult::new(call.id, "outil terminé".into(), false, true, None))
             .collect()
     }
 }
@@ -285,7 +285,7 @@ impl ToolDispatch for HangingTools {
         &self,
         _calls: Vec<ToolInvocation>,
         _events: ToolEventSink,
-    ) -> Vec<ToolOutcome> {
+    ) -> Vec<ModelToolResult> {
         std::future::pending().await
     }
 }

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use agent_core::provider::StreamEvent;
-use agent_core::tools::{ToolDispatch, ToolEventSink, ToolInvocation, ToolOutcome};
+use agent_core::tools::{ModelToolResult, ToolDispatch, ToolEventSink, ToolInvocation};
 use agent_runtime::agent::{AgentAuthority, MAX_ACTIVE_AGENTS};
 use agent_runtime::context::{FixedTurnContext, TurnContextSource};
 use agent_runtime::event::ThreadEventPayload;
@@ -270,7 +270,7 @@ impl ToolDispatch for TrackedHang {
         &self,
         _calls: Vec<ToolInvocation>,
         _events: ToolEventSink,
-    ) -> Vec<ToolOutcome> {
+    ) -> Vec<ModelToolResult> {
         let _mark = DropMark(Arc::clone(&self.dropped));
         self.started.fetch_add(1, Ordering::SeqCst);
         self.entered.add_permits(1);

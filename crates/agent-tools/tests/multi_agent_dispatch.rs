@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use agent_code_mode::nested::{NestedToolCall, NestedToolDispatcher, NestedToolInput};
 use agent_code_mode::protocol::CellId;
-use agent_core::tools::{ToolInvocation, ToolOutcome, ToolResultStatus};
+use agent_core::tools::{ModelToolResult, ToolInvocation, ToolResultStatus};
 use agent_runtime::AgentAuthority;
 use agent_runtime::supervisor::{AgentSpawner, AgentSupervisor, ChildParts, ChildRequest};
 use agent_tools::{
@@ -56,7 +56,7 @@ fn wiring() -> (Arc<Registry>, Arc<AgentHandle>) {
 }
 
 /// Runs one call through the model-facing path.
-async fn direct(registry: &Arc<Registry>, tool: &str, input: serde_json::Value) -> ToolOutcome {
+async fn direct(registry: &Arc<Registry>, tool: &str, input: serde_json::Value) -> ModelToolResult {
     registry
         .dispatch(vec![ToolInvocation::json(
             format!("direct::{tool}"),

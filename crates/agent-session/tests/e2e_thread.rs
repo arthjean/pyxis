@@ -20,7 +20,7 @@ use agent_core::provider::{
     ProviderKind, StopReason, StreamEvent,
 };
 use agent_core::session::Session;
-use agent_core::tools::{ToolDispatch, ToolEventSink, ToolInvocation, ToolOutcome};
+use agent_core::tools::{ModelToolResult, ToolDispatch, ToolEventSink, ToolInvocation};
 use agent_core::{AgentContext, CancellationToken as CoreCancel, Deps, RunConfig};
 use agent_runtime::agent::{AgentAuthority, AgentState};
 use agent_runtime::context::{FixedTurnContext, TurnContext, TurnContextSource, TurnLimits};
@@ -154,10 +154,10 @@ impl ToolDispatch for EchoTools {
         &self,
         calls: Vec<ToolInvocation>,
         _events: ToolEventSink,
-    ) -> Vec<ToolOutcome> {
+    ) -> Vec<ModelToolResult> {
         calls
             .into_iter()
-            .map(|call| ToolOutcome::new(call.id, "ok".into(), false, true, None))
+            .map(|call| ModelToolResult::new(call.id, "ok".into(), false, true, None))
             .collect()
     }
 }

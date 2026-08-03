@@ -5,7 +5,7 @@
 //! permission model and the untrusted taint defense (OWASP LLM01).
 //!
 //! Invariants held: fail-closed `Tool` trait (4), untrusted output by default
-//! (3), one `ToolOutcome` per call (never a panic, correlation by `id`).
+//! (3), one `ModelToolResult` per call (never a panic, correlation by `id`).
 //! The loop/budget guardrails (US-014) live in `agent-core` (the graph
 //! forbids `core -> tools`; stopping the loop is a core decision).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -36,8 +36,8 @@ pub mod sandbox;
 pub mod shell;
 pub mod taint;
 pub mod time;
-pub mod tool_search;
 pub mod tool;
+pub mod tool_search;
 pub mod turn_diff;
 pub mod write;
 
@@ -79,8 +79,8 @@ pub use sandbox::{
 };
 pub use shell::ShellChoice;
 pub use time::{CurrentTime, Sleep};
-pub use tool_search::{DEFER_THRESHOLD, DeferredEntry, DeferredTools, ToolSearch};
 pub use tool::{CommandHardener, DynTool, DynToolAdapter, Tool, ToolCtx, ToolOutput, into_dyn};
+pub use tool_search::{DEFER_THRESHOLD, DeferredEntry, DeferredTools, ToolSearch};
 pub use write::Write;
 
 use std::sync::Arc;

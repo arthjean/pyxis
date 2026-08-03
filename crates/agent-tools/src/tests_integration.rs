@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_core::ToolErrorKind;
 use agent_core::tools::{
-    StepToolPlan, ToolEventSink, ToolInvocation, ToolOutcome, ToolResultStatus,
+    ModelToolResult, StepToolPlan, ToolEventSink, ToolInvocation, ToolResultStatus,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -143,7 +143,7 @@ fn call(id: &str, name: &str, input: serde_json::Value) -> ToolInvocation {
     ToolInvocation::json(id, name, input)
 }
 
-fn by_id<'a>(outcomes: &'a [ToolOutcome], id: &str) -> &'a ToolOutcome {
+fn by_id<'a>(outcomes: &'a [ModelToolResult], id: &str) -> &'a ModelToolResult {
     outcomes
         .iter()
         .find(|o| o.id == id)
@@ -2816,7 +2816,10 @@ async fn a_cause_that_cannot_be_lifted_is_never_offered() {
 async fn dispatch_capturing(
     reg: &Registry,
     calls: Vec<ToolInvocation>,
-) -> (Vec<ToolOutcome>, Vec<agent_core::tools::ToolDispatchEvent>) {
+) -> (
+    Vec<ModelToolResult>,
+    Vec<agent_core::tools::ToolDispatchEvent>,
+) {
     use agent_core::tools::{ToolDispatch, ToolEventSink};
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let outcomes = ToolDispatch::dispatch(reg, calls, ToolEventSink::new(tx)).await;
@@ -3511,11 +3514,7 @@ async fn deferral_hides_the_deferrable_surface_without_making_it_unreachable() {
         fn permission(&self, _input: &Self::Input, _ctx: &PermCtx) -> PermissionDecision {
             PermissionDecision::Allow
         }
-        async fn call(
-            &self,
-            _input: Self::Input,
-            _ctx: &ToolCtx,
-        ) -> Result<ToolOutput, ToolError> {
+        async fn call(&self, _input: Self::Input, _ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::text("called"))
         }
     }
@@ -3573,7 +3572,10 @@ async fn deferral_hides_the_deferrable_surface_without_making_it_unreachable() {
     )
     .clone();
     assert!(!found.is_error, "{found:?}");
-    assert!(found.content.contains("mcp__srv__create_issue"), "{found:?}");
+    assert!(
+        found.content.contains("mcp__srv__create_issue"),
+        "{found:?}"
+    );
     let exposed: Vec<String> = reg.tool_specs().into_iter().map(|s| s.name).collect();
     assert!(
         exposed.contains(&"mcp__srv__create_issue".to_string()),
@@ -3640,7 +3642,10 @@ async fn a_namespace_groups_a_server_without_renaming_its_tools() {
 
     let specs = reg.tool_specs();
     let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
-    assert!(names.contains(&"read"), "a native tool stays flat: {names:?}");
+    assert!(
+        names.contains(&"read"),
+        "a native tool stays flat: {names:?}"
+    );
     // The server name is user-written; the namespace name obeys the same rule as
     // a tool name.
     assert!(names.contains(&"git_hub"), "{names:?}");

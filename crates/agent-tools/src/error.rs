@@ -1,6 +1,6 @@
 //! Errors of the tool system. `ValidationError` is the failure of `validate_input`
 //! (pre-execution); `ToolError` is the error surfaced to the agent (serialized into
-//! `ToolOutcome { is_error: true }`). Neither panics: the pipeline is
+//! `ModelToolResult { is_error: true }`). Neither panics: the pipeline is
 //! fail-closed (ARCHITECTURE 4.1, invariant 4).
 
 use agent_core::ToolErrorKind;
@@ -16,7 +16,7 @@ impl ValidationError {
     }
 }
 
-/// Execution error of a tool. Converted into `ToolOutcome { is_error: true }`
+/// Execution error of a tool. Converted into `ModelToolResult { is_error: true }`
 /// then returned to the agent as a `tool_result` (the model sees the failure and can
 /// react); never propagated as a panic.
 #[derive(Debug, thiserror::Error)]

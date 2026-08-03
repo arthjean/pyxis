@@ -20,7 +20,7 @@ use agent_core::provider::{
     ProviderKind, StopReason, StreamEvent, ToolSpec,
 };
 use agent_core::session::{FileSnapshot, Session, SessionError};
-use agent_core::tools::{ToolDispatch, ToolEventSink, ToolInvocation, ToolOutcome};
+use agent_core::tools::{ModelToolResult, ToolDispatch, ToolEventSink, ToolInvocation};
 use agent_core::{
     AgentContext, CancellationToken as CoreCancel, ContextTransition, Deps, RunConfig,
 };
@@ -146,11 +146,11 @@ impl ToolDispatch for EchoTools {
         &self,
         calls: Vec<ToolInvocation>,
         _events: ToolEventSink,
-    ) -> Vec<ToolOutcome> {
+    ) -> Vec<ModelToolResult> {
         calls
             .into_iter()
             .map(|call| {
-                ToolOutcome::new(
+                ModelToolResult::new(
                     call.id,
                     format!("dispatched:{}", call.name),
                     false,
