@@ -54,9 +54,109 @@ const COMMENT: &str = "the command contains a comment";
 const CONTROL: &str = "the command contains a control character";
 const EMPTY: &str = "the command is empty";
 
+/// One program a user declared side-effect free, with the same two constraints
+/// the built-in table uses. Owned, because it comes from a configuration file.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SafeCommand {
+    /// Matched EXACTLY against the first token, like a built-in entry: a path
+    /// (`/usr/local/bin/just`) never matches, because it could designate
+    /// anything.
+    pub program: String,
+    /// When non-empty, the second token must be one of these, and no global flag
+    /// may precede it.
+    pub subcommands: Vec<String>,
+    /// Flags that disqualify the call wherever they appear.
+    pub denied: Vec<String>,
+}
+
+/// User-declared additions to the side-effect-free set (`safe_commands`).
+///
+/// A project has tools the built-in table cannot know about (`just --list`,
+/// `mise ls`, an internal script), and today each of them costs a confirmation
+/// on every call. This is the smallest thing that fixes it: a list of programs,
+/// with the same two constraints an entry of the built-in table carries.
+///
+/// It is deliberately NOT a policy language. Codex has one (`codex-execpolicy`)
+/// with rules, decisions and amendments; the requirement here is "let me add
+/// `just --list`", and a language would be a second security surface to get
+/// right for a need a list already covers.
+///
+/// It can only WIDEN, and only from a file the workspace does not control
+/// (`safe_commands` is a security key). Two rules make that safe:
+/// - the built-in table wins on a program both define, so no configuration can
+///   remove a `denied` flag the built-in entry carries;
+/// - nothing here touches the tokenizer. A command with a shell construct stays
+///   opaque whatever the configuration says, because the reasoning that makes
+///   the classification sound is the absence of a shell, not the program name.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandPolicy {
+    extra: Vec<SafeCommand>,
+}
+
+impl CommandPolicy {
+    /// Empty policy: the built-in table alone. What every caller gets by default.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builds from user entries. An entry whose program is empty, carries a path
+    /// separator, or duplicates a built-in one is dropped, with the reason
+    /// returned for the caller to report: silently ignoring a line the user
+    /// wrote is how a configuration becomes untrustworthy.
+    pub fn from_entries(entries: Vec<SafeCommand>) -> (Self, Vec<String>) {
+        let mut extra = Vec::new();
+        let mut rejected = Vec::new();
+        for entry in entries {
+            let program = entry.program.trim().to_string();
+            if program.is_empty() {
+                rejected.push("safe_commands: an entry has no program".to_string());
+                continue;
+            }
+            if program.contains('/') || program.contains('\\') {
+                rejected.push(format!(
+                    "safe_commands: `{program}` looks like a path; declare the program name alone"
+                ));
+                continue;
+            }
+            if SIDE_EFFECT_FREE.iter().any(|safe| safe.program == program) {
+                // Refused rather than merged: a merge would let a configuration
+                // widen a built-in entry by omitting one of its denied flags.
+                rejected.push(format!(
+                    "safe_commands: `{program}` is already known; its built-in rule is kept"
+                ));
+                continue;
+            }
+            if extra.iter().any(|other: &SafeCommand| other.program == program) {
+                rejected.push(format!("safe_commands: `{program}` declared twice"));
+                continue;
+            }
+            extra.push(SafeCommand {
+                program,
+                subcommands: entry.subcommands,
+                denied: entry.denied,
+            });
+        }
+        (Self { extra }, rejected)
+    }
+
+    /// Programs the user added, for `/status` and diagnostics.
+    pub fn programs(&self) -> Vec<&str> {
+        self.extra.iter().map(|safe| safe.program.as_str()).collect()
+    }
+
+    fn find(&self, program: &str) -> Option<&SafeCommand> {
+        self.extra.iter().find(|safe| safe.program == program)
+    }
+}
+
+/// Classifies a raw command against the built-in table alone.
+pub fn classify(command: &str) -> CommandClass {
+    classify_with(command, &CommandPolicy::new())
+}
+
 /// Classifies a raw command. Pure and allocation-bounded: called on the
 /// permission path of every `bash` call.
-pub fn classify(command: &str) -> CommandClass {
+pub fn classify_with(command: &str, policy: &CommandPolicy) -> CommandClass {
     let tokens = match tokenize(command) {
         Ok(tokens) => tokens,
         Err(reason) => return CommandClass::Opaque(reason),
@@ -64,7 +164,7 @@ pub fn classify(command: &str) -> CommandClass {
     if tokens.is_empty() {
         return CommandClass::Opaque(EMPTY);
     }
-    if is_side_effect_free(&tokens) {
+    if is_side_effect_free(&tokens, policy) {
         CommandClass::SideEffectFree(tokens)
     } else {
         CommandClass::Argv(tokens)
@@ -231,27 +331,38 @@ const SIDE_EFFECT_FREE: &[SafeProgram] = &[
 ];
 
 /// True when the program AND every argument belong to the side-effect-free set.
-fn is_side_effect_free(tokens: &[String]) -> bool {
+///
+/// The built-in table is consulted FIRST: a program it defines keeps its
+/// built-in rule whatever a configuration says.
+fn is_side_effect_free(tokens: &[String], policy: &CommandPolicy) -> bool {
     let Some(program) = tokens.first() else {
         return false;
     };
-    let Some(safe) = SIDE_EFFECT_FREE.iter().find(|p| p.program == program) else {
-        return false;
-    };
+    let (subcommands, denied): (Vec<&str>, Vec<&str>) =
+        match SIDE_EFFECT_FREE.iter().find(|p| p.program == program) {
+            Some(safe) => (safe.subcommands.to_vec(), safe.denied.to_vec()),
+            None => match policy.find(program) {
+                Some(safe) => (
+                    safe.subcommands.iter().map(String::as_str).collect(),
+                    safe.denied.iter().map(String::as_str).collect(),
+                ),
+                None => return false,
+            },
+        };
     let mut args = &tokens[1..];
-    if !safe.subcommands.is_empty() {
+    if !subcommands.is_empty() {
         // The subcommand must come FIRST: a global flag before it (`git -C dir
         // status`) is refused rather than skipped, because skipping it would
         // require knowing which flags consume a value.
         let Some(sub) = args.first() else {
             return false;
         };
-        if !safe.subcommands.contains(&sub.as_str()) {
+        if !subcommands.contains(&sub.as_str()) {
             return false;
         }
         args = &args[1..];
     }
-    !args.iter().any(|arg| is_denied_flag(arg, safe.denied))
+    !args.iter().any(|arg| is_denied_flag(arg, &denied))
 }
 
 /// Does this token carry one of the denied flags? Covers the three spellings a
@@ -412,5 +523,120 @@ mod tests {
     #[test]
     fn empty_command_is_opaque() {
         assert_eq!(classify("   "), CommandClass::Opaque(EMPTY));
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    fn policy(entries: Vec<SafeCommand>) -> CommandPolicy {
+        CommandPolicy::from_entries(entries).0
+    }
+
+    #[test]
+    fn a_declared_program_stops_asking_for_confirmation() {
+        let just = SafeCommand {
+            program: "just".to_string(),
+            subcommands: vec!["--list".to_string()],
+            denied: Vec::new(),
+        };
+        let policy = policy(vec![just]);
+        assert!(matches!(
+            classify_with("just --list", &policy),
+            CommandClass::SideEffectFree(_)
+        ));
+        // The subcommand constraint applies to a declared entry exactly as it
+        // does to a built-in one.
+        assert!(matches!(
+            classify_with("just deploy", &policy),
+            CommandClass::Argv(_)
+        ));
+        // And the built-in table alone still asks.
+        assert!(matches!(
+            classify("just --list"),
+            CommandClass::Argv(_)
+        ));
+    }
+
+    #[test]
+    fn a_configuration_cannot_weaken_a_built_in_entry() {
+        // The attack this refuses: redeclaring `git` without its denied flags
+        // would make `git -c core.pager=sh log` run without a question.
+        let (policy, rejected) = CommandPolicy::from_entries(vec![SafeCommand {
+            program: "git".to_string(),
+            subcommands: vec!["log".to_string()],
+            denied: Vec::new(),
+        }]);
+        assert!(policy.programs().is_empty());
+        assert!(rejected[0].contains("already known"), "{rejected:?}");
+        assert!(
+            matches!(
+                classify_with("git -c core.pager=sh log", &policy),
+                CommandClass::Argv(_)
+            ),
+            "the built-in rule must keep winning"
+        );
+    }
+
+    #[test]
+    fn a_configuration_never_touches_the_tokenizer() {
+        // Whatever a user declares, a command carrying a shell construct stays
+        // opaque: what makes the classification sound is the absence of a shell,
+        // not the program name.
+        let policy = policy(vec![SafeCommand {
+            program: "just".to_string(),
+            subcommands: Vec::new(),
+            denied: Vec::new(),
+        }]);
+        for command in ["just --list | sh", "just $(id)", "just --list > /tmp/x"] {
+            assert!(
+                matches!(classify_with(command, &policy), CommandClass::Opaque(_)),
+                "{command} must stay opaque"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_entries_are_reported_rather_than_dropped_silently() {
+        let (policy, rejected) = CommandPolicy::from_entries(vec![
+            SafeCommand {
+                program: "  ".to_string(),
+                ..SafeCommand::default()
+            },
+            SafeCommand {
+                program: "/usr/local/bin/just".to_string(),
+                ..SafeCommand::default()
+            },
+            SafeCommand {
+                program: "mise".to_string(),
+                ..SafeCommand::default()
+            },
+            SafeCommand {
+                program: "mise".to_string(),
+                ..SafeCommand::default()
+            },
+        ]);
+        assert_eq!(policy.programs(), vec!["mise"]);
+        assert_eq!(rejected.len(), 3, "{rejected:?}");
+        assert!(rejected.iter().any(|r| r.contains("looks like a path")));
+        assert!(rejected.iter().any(|r| r.contains("declared twice")));
+    }
+
+    #[test]
+    fn a_declared_denied_flag_still_disqualifies() {
+        let policy = policy(vec![SafeCommand {
+            program: "mytool".to_string(),
+            subcommands: Vec::new(),
+            denied: vec!["--write".to_string()],
+        }]);
+        assert!(matches!(
+            classify_with("mytool --read", &policy),
+            CommandClass::SideEffectFree(_)
+        ));
+        assert!(matches!(
+            classify_with("mytool --write=out", &policy),
+            CommandClass::Argv(_)
+        ));
     }
 }

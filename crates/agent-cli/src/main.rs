@@ -1697,8 +1697,19 @@ async fn run(
         }) as agent_tools::UserNotice
     });
 
+    // US-007: what the user declared side-effect free, on top of the built-in
+    // table. Refusals are reported rather than swallowed: a line that does
+    // nothing must not look like a line that worked.
+    let (command_policy, policy_notices) =
+        agent_tools::command::CommandPolicy::from_entries(config.safe_commands.clone());
+    for notice in &policy_notices {
+        eprintln!("[config] {notice}");
+    }
+    let command_policy = Arc::new(command_policy);
+
     let mut builder = Registry::builder(&workspace)
         .mode_state(permission_mode.clone())
+        .command_policy(Arc::clone(&command_policy))
         .context_window(context_window.clone())
         .approver(Arc::clone(&approver))
         .approvals(approvals.clone())

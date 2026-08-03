@@ -113,8 +113,8 @@ impl Tool for Bash {
     /// side-effect-free set invoked with harmless arguments runs without a
     /// question; everything else keeps the historical `Ask`. The taint defense is
     /// orthogonal and still applies on top of this baseline (`resolve_permission`).
-    fn permission(&self, input: &Self::Input, _ctx: &PermCtx) -> PermissionDecision {
-        match crate::command::classify(&input.command) {
+    fn permission(&self, input: &Self::Input, ctx: &PermCtx) -> PermissionDecision {
+        match crate::command::classify_with(&input.command, &ctx.command_policy) {
             crate::command::CommandClass::SideEffectFree(_) => PermissionDecision::Allow,
             crate::command::CommandClass::Argv(_) | crate::command::CommandClass::Opaque(_) => {
                 PermissionDecision::Ask

@@ -500,6 +500,7 @@ impl Registry {
         let pctx = PermCtx {
             mode,
             taint_recent: self.taint.is_recent(),
+            command_policy: Arc::clone(&self.ctx.command_policy),
         };
         let baseline = tool.permission(&call.input, &pctx);
         let resolved = resolve_permission(
@@ -897,6 +898,7 @@ impl Registry {
         let pctx = PermCtx {
             mode,
             taint_recent: self.taint.is_recent(),
+            command_policy: Arc::clone(&self.ctx.command_policy),
         };
         let resolved = resolve_permission(
             mode,
@@ -1247,6 +1249,12 @@ impl RegistryBuilder {
     /// and the tool says so rather than pretending it asked.
     pub fn user_notice(mut self, notice: crate::ask::UserNotice) -> Self {
         self.ctx.user_notice = Some(notice);
+        self
+    }
+    /// Programs the user declared side-effect free (US-007), read from their
+    /// global settings by the binary.
+    pub fn command_policy(mut self, policy: Arc<crate::command::CommandPolicy>) -> Self {
+        self.ctx.command_policy = policy;
         self
     }
     /// Declares that the provider can encode `ToolKind::Namespace`. Read from

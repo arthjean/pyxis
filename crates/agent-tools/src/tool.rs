@@ -96,6 +96,9 @@ pub struct ToolCtx {
     /// model (`request_user_input`). `None` = nobody is attached, and a tool
     /// that needs one must say so rather than pretend it spoke.
     pub user_notice: Option<crate::ask::UserNotice>,
+    /// Programs the user declared side-effect free, on top of the built-in
+    /// table (US-007). Empty by default, which is the historical behavior.
+    pub command_policy: Arc<crate::command::CommandPolicy>,
 }
 
 impl std::fmt::Debug for ToolCtx {
@@ -136,6 +139,7 @@ impl ToolCtx {
             events: ToolEventSink::default(),
             context_window: agent_core::budget::ContextWindowState::new(),
             user_notice: None,
+            command_policy: Arc::new(crate::command::CommandPolicy::new()),
         }
     }
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -159,6 +163,11 @@ impl ToolCtx {
     }
     pub fn with_sandbox_observer(mut self, observer: Arc<dyn SandboxObserver>) -> Self {
         self.sandbox_observer = Some(observer);
+        self
+    }
+    /// User-declared side-effect-free programs (US-007).
+    pub fn with_command_policy(mut self, policy: Arc<crate::command::CommandPolicy>) -> Self {
+        self.command_policy = policy;
         self
     }
     /// Channel to the human (`request_user_input`).

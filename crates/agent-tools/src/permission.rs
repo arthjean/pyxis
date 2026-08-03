@@ -70,11 +70,18 @@ pub enum PermissionDecision {
 }
 
 /// Context passed to `Tool::permission` to decide the baseline.
-#[derive(Debug, Clone, Copy)]
+///
+/// No longer `Copy`: the command policy is shared state, and cloning an `Arc`
+/// per decision is cheaper than the alternative, which would be reading a
+/// configuration from inside a tool.
+#[derive(Debug, Clone, Default)]
 pub struct PermCtx {
     pub mode: PermissionMode,
     /// Was untrusted taint produced recently? (injection defense.)
     pub taint_recent: bool,
+    /// Programs the user declared side-effect free, on top of the built-in
+    /// table (US-007). Empty by default.
+    pub command_policy: std::sync::Arc<crate::command::CommandPolicy>,
 }
 
 /// Outcome of the final resolution (what the Registry applies).

