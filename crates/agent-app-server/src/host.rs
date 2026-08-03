@@ -97,7 +97,14 @@ pub trait RuntimeHost: Send + Sync + 'static {
         dynamic_tools: Vec<DynamicToolSpec>,
     ) -> Result<OpenThread, HostError>;
 
-    /// Persisted items of a thread this connection does not hold open.
+    /// Persisted items of a thread, held open by this connection or not.
+    ///
+    /// Returns the WHOLE thread: the projection has to walk every message to
+    /// number the items and to bind each result to the call it answers, so a
+    /// range would not save the walk. `thread/items/list` therefore pages over
+    /// a materialized list, and the cost of a page is the cost of the thread.
+    /// A store that can project a range on its own is what would change that,
+    /// and this signature is where it would be declared.
     async fn history(&self, thread_id: &str) -> Result<Vec<ThreadItem>, HostError>;
 
     /// Name and version published by `initialize`.
