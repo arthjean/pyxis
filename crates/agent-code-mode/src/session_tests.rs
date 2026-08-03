@@ -523,6 +523,38 @@ async fn the_result_ceiling_drops_the_rest_of_the_yield_not_just_the_big_item() 
     assert_eq!(texts(&next), vec!["fresh".to_string()]);
 }
 
+/// A closed session says so, rather than pretending the cell never existed.
+#[tokio::test]
+async fn a_closed_session_names_its_closure_on_a_cell_it_no_longer_holds() {
+    let engine = ScriptedEngine::obedient();
+    let session = session(Arc::clone(&engine));
+    let cell = session
+        .execute(quick("noop"))
+        .await
+        .unwrap()
+        .cell_id()
+        .clone();
+    session.shutdown(Duration::from_millis(50)).await;
+
+    // The forced cell is still drainable exactly once...
+    let drained = session
+        .wait(WaitRequest::new(cell.clone()).with_yield_time(Duration::from_millis(50)))
+        .await
+        .unwrap();
+    assert_eq!(drained.state(), CellState::Failed);
+    // ...and everything after that is the closure itself, not an unknown cell.
+    assert!(matches!(
+        session.wait(WaitRequest::new(cell)).await,
+        Err(CodeModeError::SessionClosed { .. })
+    ));
+    assert!(matches!(
+        session
+            .wait(WaitRequest::new(CellId::new(session.id(), 99)))
+            .await,
+        Err(CodeModeError::SessionClosed { .. })
+    ));
+}
+
 #[test]
 fn a_tool_name_becomes_a_valid_javascript_identifier() {
     assert_eq!(crate::normalize_binding("exec_command"), "exec_command");

@@ -350,6 +350,10 @@ impl CodeModeSession {
     /// Closes the session: every open cell reaches a terminal state inside
     /// `deadline`, every waiter is woken, and the engine is released.
     ///
+    /// The forced cells stay in the table on purpose. A waiter parked on one of
+    /// them must be able to read WHY it died, so a closed session still drains
+    /// each of its cells exactly once; what it refuses is a new `exec`, and a
+    /// `wait` naming anything else.
     pub async fn shutdown(&self, deadline: Duration) -> ShutdownReport {
         self.state.closed.store(true, Ordering::Release);
         let open: Vec<CellId> = {
@@ -403,14 +407,26 @@ impl CodeModeSession {
         Ok(())
     }
 
+    /// A cell this session does not hold. Once the session is closed, the
+    /// closure itself is the more precise answer: the cells it forced are
+    /// drainable once, and nothing else can ever exist again.
+    fn missing_cell(&self, cell: &CellId) -> CodeModeError {
+        if self.is_closed() {
+            return CodeModeError::SessionClosed {
+                session: self.state.id.clone(),
+            };
+        }
+        CodeModeError::UnknownCell {
+            cell_id: cell.clone(),
+        }
+    }
+
     /// Stops an owned cell: mark, interrupt, wait under the grace, close.
     async fn stop(&self, cell: &CellId) -> Result<RuntimeResponse, CodeModeError> {
         {
             let mut cells = self.state.lock();
             let Some(slot) = cells.slots.get_mut(cell) else {
-                return Err(CodeModeError::UnknownCell {
-                    cell_id: cell.clone(),
-                });
+                return Err(self.missing_cell(cell));
             };
             slot.stopped = true;
             slot.notify();
@@ -421,9 +437,7 @@ impl CodeModeSession {
 
         let mut cells = self.state.lock();
         let Some(slot) = cells.slots.get_mut(cell) else {
-            return Err(CodeModeError::UnknownCell {
-                cell_id: cell.clone(),
-            });
+            return Err(self.missing_cell(cell));
         };
         let forced = (!slot.state.is_terminal()).then(|| {
             format!(
@@ -466,9 +480,7 @@ impl CodeModeSession {
             None
         })
         .await
-        .ok_or_else(|| CodeModeError::UnknownCell {
-            cell_id: cell.clone(),
-        })
+        .ok_or_else(|| self.missing_cell(cell))
     }
 
     /// Parks until the cell is terminal or `until` passes. Never removes it.
