@@ -414,14 +414,6 @@ async fn event_loop(
     // coming back from idle. The `select!` branch is guarded by `if running` -> 0 CPU when idle.
     let mut spinner = tokio::time::interval(Duration::from_millis(100));
     spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Display pacing of the streamed answer (US-019). Separate from the spinner:
-    // it releases committed lines to the scrollback at a steady rate whatever
-    // the burstiness of the provider, and its cadence must not be tied to the
-    // speed of an animation.
-    #[cfg(feature = "codex_tui_parity")]
-    let mut commit_tick = tokio::time::interval(agent_tui::COMMIT_TICK_INTERVAL);
-    #[cfg(feature = "codex_tui_parity")]
-    commit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut screen = Screen::new();
 
     loop {
@@ -455,7 +447,12 @@ async fn event_loop(
             // agent -> 0 CPU, no 10 fps redraw of the dialog). The redraw happens
             // at the head of the loop; this only advances the animation. US-044.
             _ = spinner.tick(), if running && !awaiting_human => Wake::Spinner,
-            _ = commit_tick.tick(), if cfg!(feature = "codex_tui_parity") && running => Wake::CommitTick,
+            // Display pacing of the streamed answer (US-019). Separate from the
+            // spinner: it releases committed lines to the scrollback at a steady
+            // rate whatever the burstiness of the provider, so its cadence must
+            // not be tied to the speed of an animation. Owned by `Screen`, which
+            // is also what makes it a no-op without the parity frontend.
+            _ = screen.pace(), if running => Wake::CommitTick,
             _ = tokio::time::sleep(quit_delay), if quit_hint => Wake::QuitHintExpired,
         };
 
@@ -475,13 +472,7 @@ async fn event_loop(
                 let elapsed = session.turn_start.map(|t| t.elapsed()).unwrap_or_default();
                 session.state.tick_progress(elapsed);
             }
-            Wake::CommitTick => {
-                #[cfg(feature = "codex_tui_parity")]
-                {
-                    let width = tui.size()?.width;
-                    session.chat.surface_mut().commit_tick(width, Instant::now());
-                }
-            }
+            Wake::CommitTick => screen.commit(tui, &mut session)?,
             Wake::QuitHintExpired => session.state.clear_quit_shortcut_hint(),
         }
     }
@@ -1203,17 +1194,33 @@ struct Screen {
     reflow_width: Option<u16>,
     reflow_due: Option<Instant>,
     last_geometry: Option<String>,
+    commit_tick: tokio::time::Interval,
 }
 
 #[cfg(feature = "codex_tui_parity")]
 impl Screen {
     fn new() -> Self {
+        let mut commit_tick = tokio::time::interval(agent_tui::COMMIT_TICK_INTERVAL);
+        commit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         Self {
             inserter: HistoryInserter::new(InsertHistoryMode::InlineScrollback),
             reflow_width: None,
             reflow_due: None,
             last_geometry: None,
+            commit_tick,
         }
+    }
+
+    /// Resolves when the streamed answer should release its committed lines.
+    /// Cancel-safe: the cadence lives in the interval, not in this future.
+    async fn pace(&mut self) {
+        self.commit_tick.tick().await;
+    }
+
+    fn commit(&mut self, tui: &mut agent_tui::Tui, session: &mut Loop) -> anyhow::Result<()> {
+        let width = tui.size()?.width;
+        session.chat.surface_mut().commit_tick(width, Instant::now());
+        Ok(())
     }
 
     fn draw(&mut self, tui: &mut agent_tui::Tui, session: &mut Loop) -> anyhow::Result<()> {
@@ -1292,6 +1299,16 @@ struct Screen;
 impl Screen {
     fn new() -> Self {
         Self
+    }
+
+    /// No streaming surface to pace: the branch is kept so the `select!` stays
+    /// one expression, and it simply never fires.
+    async fn pace(&mut self) {
+        std::future::pending::<()>().await
+    }
+
+    fn commit(&mut self, _tui: &mut agent_tui::Tui, _session: &mut Loop) -> anyhow::Result<()> {
+        Ok(())
     }
 
     fn draw(&mut self, tui: &mut agent_tui::Tui, session: &mut Loop) -> anyhow::Result<()> {
