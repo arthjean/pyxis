@@ -3,13 +3,14 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use agent_code_mode::nested::{NestedToolBinding, NestedToolDispatcher};
 use agent_code_mode::protocol::ShutdownReport;
 use agent_code_mode::protocol::{CellFailure, CellFailureKind, CellId, ExecuteRequest, NestedTool};
 use agent_code_mode::session::{CellEngine, CellSink};
+use agent_core::sync::lock;
 
 use crate::globals;
 
@@ -231,16 +232,6 @@ impl CellEngine for IsolateEngine {
                 names.join(", ")
             ))
         }
-    }
-}
-
-/// A poisoned lock is recovered rather than propagated: losing the worker map
-/// would strand running isolates, which is worse than reading a map a panicking
-/// thread left consistent.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
