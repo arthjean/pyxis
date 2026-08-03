@@ -511,11 +511,15 @@ pub fn save(cred: &McpOAuthCredential) -> Result<(), crate::store::StoreError> {
 
 /// Reads the stored credential of one MCP server, `None` when absent.
 pub fn load(server: &str) -> Result<Option<McpOAuthCredential>, crate::store::StoreError> {
+    // `account_key` namespaces the entry, so nothing else can have written
+    // another credential shape under it. A mismatch is corruption, and it
+    // surfaces rather than reading as "this server was never connected".
     match crate::store::load(&account_key(server))? {
         Some(Credential::McpOauth(cred)) => Ok(Some(cred)),
-        // Another credential shape under that key: treated as absent rather than
-        // as an error, so a stale entry cannot make a server unusable forever.
-        Some(_) | None => Ok(None),
+        Some(_) => Err(crate::store::StoreError::UnexpectedCredential {
+            account: account_key(server),
+        }),
+        None => Ok(None),
     }
 }
 
