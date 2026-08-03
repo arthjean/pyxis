@@ -176,6 +176,24 @@ fn colliding_tool_names_get_distinct_bindings() {
     }
 }
 
+/// A description the catalog had to cut says so, so the visible part is not
+/// read as the whole contract of the tool.
+#[test]
+fn a_truncated_description_is_marked_as_such() {
+    let long = ToolSpec::freeform("verbose", "a\nb\nc\nd\ne\nf", None);
+    let short = ToolSpec::freeform("terse", "a\nb", None);
+    let description = exec_tool_spec(&NestedTool::catalog(&[long, short]), false).description;
+    assert!(
+        description.contains("// [description truncated]"),
+        "{description}"
+    );
+    assert_eq!(
+        description.matches("// [description truncated]").count(),
+        1,
+        "a description that fits is not marked: {description}"
+    );
+}
+
 /// The budget belongs to the `exec` that opened the cell. Advertising a second
 /// one on `wait` would be a parameter nothing reads.
 #[test]

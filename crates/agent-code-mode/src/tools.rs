@@ -17,6 +17,8 @@ pub const WAIT_TOOL_NAME: &str = "wait";
 pub const EXEC_PRAGMA_PREFIX: &str = "// @exec:";
 /// Default token budget of one direct `exec` result, from the baseline.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
+/// Description lines of a nested tool kept in the rendered catalog.
+const CATALOG_DESCRIPTION_LINES: usize = 4;
 
 /// Lark grammar of the `exec` input, adopted verbatim from the baseline so a
 /// model trained on Codex sends bytes Pyxis accepts unchanged.
@@ -54,44 +56,38 @@ pub enum ExecInputError {
 /// dropping it would run the cell under budgets the model did not ask for.
 pub fn parse_exec_source(input: &str) -> Result<(ExecPragma, &str), ExecInputError> {
     let trimmed = input.trim_start_matches(['\u{feff}']);
-    let (pragma_line, source) = match trimmed.split_once('\n') {
-        Some((first, rest)) if first.trim_start().starts_with(EXEC_PRAGMA_PREFIX) => {
-            (Some(first.trim_start()), rest)
-        }
-        _ if trimmed.trim_start().starts_with(EXEC_PRAGMA_PREFIX) => {
-            (Some(trimmed.trim_start()), "")
-        }
-        _ => (None, trimmed),
-    };
-
-    let pragma = match pragma_line {
-        None => ExecPragma::default(),
-        Some(line) => {
-            let payload = line
-                .trim_start()
-                .trim_start_matches(EXEC_PRAGMA_PREFIX)
-                .trim();
-            let value: serde_json::Value =
-                serde_json::from_str(payload).map_err(|error| ExecInputError::MalformedPragma {
-                    detail: error.to_string(),
-                })?;
-            let Some(object) = value.as_object() else {
-                return Err(ExecInputError::MalformedPragma {
-                    detail: "expected a JSON object".into(),
-                });
-            };
-            ExecPragma {
-                yield_time_ms: read_positive(object, "yield_time_ms")?,
-                max_output_tokens: read_positive(object, "max_output_tokens")?
-                    .map(|value| value as usize),
-            }
-        }
+    // A pragma is a FIRST line and nothing else, so the only question is
+    // whether the first line carries it; a source without a newline is its own
+    // first line.
+    let (first, rest) = trimmed.split_once('\n').unwrap_or((trimmed, ""));
+    let pragma_line = first.trim_start();
+    let (pragma, source) = if pragma_line.starts_with(EXEC_PRAGMA_PREFIX) {
+        (read_pragma(pragma_line)?, rest)
+    } else {
+        (ExecPragma::default(), trimmed)
     };
 
     if source.trim().is_empty() {
         return Err(ExecInputError::EmptySource);
     }
     Ok((pragma, source))
+}
+
+fn read_pragma(line: &str) -> Result<ExecPragma, ExecInputError> {
+    let payload = line.trim_start_matches(EXEC_PRAGMA_PREFIX).trim();
+    let value: serde_json::Value =
+        serde_json::from_str(payload).map_err(|error| ExecInputError::MalformedPragma {
+            detail: error.to_string(),
+        })?;
+    let Some(object) = value.as_object() else {
+        return Err(ExecInputError::MalformedPragma {
+            detail: "expected a JSON object".into(),
+        });
+    };
+    Ok(ExecPragma {
+        yield_time_ms: read_positive(object, "yield_time_ms")?,
+        max_output_tokens: read_positive(object, "max_output_tokens")?.map(|value| value as usize),
+    })
 }
 
 fn read_positive(
@@ -158,23 +154,16 @@ pub fn wait_tool_spec() -> ToolSpec {
 }
 
 fn exec_description(catalog: &[NestedTool], code_mode_only: bool) -> String {
-    let mut description = String::from(
+    let yield_time = DEFAULT_YIELD_TIME.as_millis();
+    let mut description = format!(
         "Run JavaScript to orchestrate and compose tool calls.\n\
 - Evaluates the input in a fresh V8 isolate, as the body of an async function, so `await` works at top level.\n\
 - Raw JavaScript source only: not JSON, not a quoted string, not a markdown code fence.\n\
 - No Node, no module loader, no file system, no network, no console. The only way out of the isolate is a helper below.\n\
 - Values do NOT survive a cell through the global object: use `store` and `load`, which are scoped to this thread's session.\n\
-- The first line may carry a pragma, for example `// @exec: {\"yield_time_ms\": 10000, \"max_output_tokens\": 1000}`. A malformed pragma is refused, never ignored.\n\
-- `yield_time_ms` asks `exec` to hand back what the cell produced if it is still running. Defaults to ",
-    );
-    description.push_str(&DEFAULT_YIELD_TIME.as_millis().to_string());
-    description.push_str(
-        " ms.\n\
-- `max_output_tokens` bounds the direct result of this call. Defaults to ",
-    );
-    description.push_str(&DEFAULT_MAX_OUTPUT_TOKENS.to_string());
-    description.push_str(
-        " tokens.\n\
+- The first line may carry a pragma, for example `// @exec: {{\"yield_time_ms\": 10000, \"max_output_tokens\": 1000}}`. A malformed pragma is refused, never ignored.\n\
+- `yield_time_ms` asks `exec` to hand back what the cell produced if it is still running. Defaults to {yield_time} ms.\n\
+- `max_output_tokens` bounds the direct result of this call. Defaults to {DEFAULT_MAX_OUTPUT_TOKENS} tokens.\n\
 \n\
 Helpers:\n\
 - `text(value)`: appends a text item. A non-string is stringified with `JSON.stringify`.\n\
@@ -184,7 +173,7 @@ Helpers:\n\
 - `notify(value)`: hands the accumulated output to the model right away without ending the cell.\n\
 - `yield_control()`: same, for output already produced.\n\
 - `exit()`: ends the cell successfully, like an early return.\n\
-- `ALL_TOOLS`: `{ name, description }` for every nested tool.\n",
+- `ALL_TOOLS`: `{{ name, description }}` for every nested tool.\n"
     );
 
     if code_mode_only {
@@ -206,10 +195,16 @@ fn render_catalog(catalog: &[NestedTool]) -> String {
     let mut sorted: Vec<&NestedTool> = catalog.iter().collect();
     sorted.sort_by(|left, right| left.binding.cmp(&right.binding));
     for tool in sorted {
-        for line in tool.description.lines().take(4) {
+        let mut lines = tool.description.lines();
+        for line in lines.by_ref().take(CATALOG_DESCRIPTION_LINES) {
             rendered.push_str("// ");
             rendered.push_str(line);
             rendered.push('\n');
+        }
+        // A cut description SAYS it was cut: a model must not read the visible
+        // part as the whole contract of the tool.
+        if lines.next().is_some() {
+            rendered.push_str("// [description truncated]\n");
         }
         if tool.freeform {
             // A freeform tool takes TEXT: giving it an object argument would be
@@ -283,12 +278,15 @@ fn json_type_to_typescript(property: &serde_json::Value) -> String {
     match kind {
         Some(serde_json::Value::String(name)) => one(name).to_string(),
         Some(serde_json::Value::Array(names)) => {
-            let mut parts: Vec<&str> = names
-                .iter()
-                .filter_map(|name| name.as_str())
-                .map(one)
-                .collect();
-            parts.dedup();
+            // Deduplicated in the order the schema lists them: `integer` and
+            // `number` collapse to the same TypeScript type without being
+            // adjacent, which a sort-free `dedup` would have missed.
+            let mut parts: Vec<&str> = Vec::with_capacity(names.len());
+            for part in names.iter().filter_map(|name| name.as_str()).map(one) {
+                if !parts.contains(&part) {
+                    parts.push(part);
+                }
+            }
             if parts.is_empty() {
                 "unknown".to_string()
             } else {
