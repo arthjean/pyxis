@@ -19,12 +19,36 @@ use agent_core::event::AgentEvent;
 use agent_core::message::{ContentBlock, Message, Role};
 use agent_core::tools::ToolResultStatus;
 
-use crate::protocol::{ItemStatus, ProviderErrorCategoryView, ThreadItem};
+use crate::protocol::{
+    ItemDeltaNotification, ItemNotification, ItemStatus, ProviderErrorCategoryView,
+    ProviderEventNotification, ProviderExtensionView, ResponseItemNotification, ResponseItemView,
+    ResponseMetadataView, ServerNotification, ThreadItem, TurnDeltaNotification,
+    TurnMetadataNotification,
+};
 
-/// Tools whose call is a command execution rather than a generic tool call.
-const COMMAND_TOOLS: &[&str] = &["bash", "exec_command", "write_stdin"];
-/// Tools whose call changes files.
-const FILE_CHANGE_TOOLS: &[&str] = &["write", "edit", "apply_patch"];
+/// Which family a tool call belongs to.
+///
+/// ONE table, because two surfaces read it and they must agree: the item the
+/// call is projected into, and the approval request the call raises. A call
+/// projected as a `fileChange` whose approval arrives as a generic
+/// `item/tool/requestApproval` leaves the client correlating a diff dialog to
+/// the wrong request on the same `itemId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolFamily {
+    Command,
+    FileChange,
+    Other,
+}
+
+impl ToolFamily {
+    pub fn of(tool: &str) -> Self {
+        match tool {
+            "bash" | "exec_command" | "write_stdin" => Self::Command,
+            "write" | "edit" | "apply_patch" => Self::FileChange,
+            _ => Self::Other,
+        }
+    }
+}
 
 /// What the live projection produced for one runtime event.
 #[derive(Debug, Clone, PartialEq)]
@@ -53,6 +77,75 @@ pub enum Projected {
     ProviderExtension(agent_core::provider::ProviderExtension),
 }
 
+impl Projected {
+    /// The notification this projection is published as. Lives here rather than
+    /// in the pump so the type that mints a projection is the type that names
+    /// its wire shape, and the two cannot drift apart.
+    pub fn into_notification(self, thread_id: &str, turn_id: Option<String>) -> ServerNotification {
+        let thread_id = thread_id.to_string();
+        match self {
+            Self::Started(item) => ServerNotification::ItemStarted(ItemNotification {
+                thread_id,
+                turn_id,
+                item,
+            }),
+            Self::Completed(item) => ServerNotification::ItemCompleted(ItemNotification {
+                thread_id,
+                turn_id,
+                item,
+            }),
+            Self::AssistantDelta { item_id, delta } => {
+                ServerNotification::AgentMessageDelta(ItemDeltaNotification {
+                    thread_id,
+                    turn_id,
+                    item_id,
+                    delta,
+                })
+            }
+            Self::CommandDelta { item_id, delta } => {
+                ServerNotification::CommandExecutionOutputDelta(ItemDeltaNotification {
+                    thread_id,
+                    turn_id,
+                    item_id,
+                    delta,
+                })
+            }
+            Self::ReasoningDelta { delta } => {
+                ServerNotification::TurnReasoningDelta(TurnDeltaNotification {
+                    thread_id,
+                    turn_id,
+                    delta,
+                })
+            }
+            Self::ResponseMetadata(metadata) => {
+                ServerNotification::TurnMetadata(TurnMetadataNotification {
+                    thread_id,
+                    turn_id,
+                    metadata: Box::new(ResponseMetadataView::from(metadata.as_ref())),
+                })
+            }
+            Self::ResponseItem {
+                phase,
+                output_index,
+                item,
+            } => ServerNotification::TurnResponseItem(ResponseItemNotification {
+                thread_id,
+                turn_id,
+                phase: phase.into(),
+                output_index,
+                item: Box::new(ResponseItemView::from(item.as_ref())),
+            }),
+            Self::ProviderExtension(extension) => {
+                ServerNotification::TurnProviderEvent(ProviderEventNotification {
+                    thread_id,
+                    turn_id,
+                    extension: ProviderExtensionView::from(&extension),
+                })
+            }
+        }
+    }
+}
+
 /// An item still waiting for its terminal projection.
 #[derive(Debug, Clone)]
 struct OpenItem {
@@ -62,6 +155,13 @@ struct OpenItem {
     streamed: String,
 }
 
+/// Assistant text being streamed, under the ordinal it was announced with.
+#[derive(Debug, Clone)]
+struct PendingMessage {
+    ordinal: u64,
+    text: String,
+}
+
 /// Projects one thread. Not `Sync`-shared: one projector per open thread, owned
 /// by the connection that owns the thread.
 #[derive(Debug, Default)]
@@ -69,8 +169,7 @@ pub struct Projector {
     next_ordinal: u64,
     /// Numbering of what the log will never hold, kept out of `next_ordinal`.
     next_error: u64,
-    /// Assistant text being streamed, and the id it was announced under.
-    pending_message: Option<(String, String)>,
+    pending_message: Option<PendingMessage>,
     /// Items started and not terminal yet, in start order.
     open: Vec<(String, OpenItem)>,
 }
@@ -84,15 +183,11 @@ impl Projector {
         }
     }
 
-    fn mint(&mut self) -> String {
-        let id = format!("item_{}", self.next_ordinal);
-        self.next_ordinal = self.next_ordinal.saturating_add(1);
-        id
-    }
-
-    /// Identifiers of every item still open, in start order.
-    pub fn open_item_ids(&self) -> Vec<String> {
-        self.open.iter().map(|(id, _)| id.clone()).collect()
+    /// Takes the next durable ordinal.
+    fn mint(&mut self) -> u64 {
+        let ordinal = self.next_ordinal;
+        self.next_ordinal = ordinal.saturating_add(1);
+        ordinal
     }
 
     /// The item a call opened, when it is still open. What correlates an
@@ -109,7 +204,7 @@ impl Projector {
     /// message has nothing left to happen to it.
     pub fn user_message(&mut self, text: String) -> ThreadItem {
         ThreadItem::UserMessage {
-            id: self.mint(),
+            id: item_id(self.mint()),
             text,
         }
     }
@@ -121,13 +216,17 @@ impl Projector {
             AgentEvent::Text(chunk) => {
                 let mut out = Vec::new();
                 let id = match &mut self.pending_message {
-                    Some((id, text)) => {
-                        text.push_str(chunk);
-                        id.clone()
+                    Some(pending) => {
+                        pending.text.push_str(chunk);
+                        item_id(pending.ordinal)
                     }
                     None => {
-                        let id = self.mint();
-                        self.pending_message = Some((id.clone(), chunk.clone()));
+                        let ordinal = self.mint();
+                        let id = item_id(ordinal);
+                        self.pending_message = Some(PendingMessage {
+                            ordinal,
+                            text: chunk.clone(),
+                        });
                         out.push(Projected::Started(ThreadItem::AssistantMessage {
                             id: id.clone(),
                             text: String::new(),
@@ -175,10 +274,10 @@ impl Projector {
             // rather than completed, which keeps its identifier from naming text
             // nobody will ever read again.
             AgentEvent::StreamReset => match &mut self.pending_message {
-                Some((id, text)) => {
-                    text.clear();
+                Some(pending) => {
+                    pending.text.clear();
                     vec![Projected::Started(ThreadItem::AssistantMessage {
-                        id: id.clone(),
+                        id: item_id(pending.ordinal),
                         text: String::new(),
                     })]
                 }
@@ -186,7 +285,7 @@ impl Projector {
             },
             AgentEvent::ToolCall(call) => {
                 let mut out = self.commit_message();
-                let id = self.mint();
+                let id = item_id(self.mint());
                 let item = new_tool_item(&id, call.id.as_str(), &call.name, &call.input);
                 self.open.push((
                     id,
@@ -276,21 +375,18 @@ impl Projector {
     /// empty assistant message.
     fn commit_message(&mut self) -> Vec<Projected> {
         match self.pending_message.take() {
-            Some((id, text)) if !text.is_empty() => {
+            Some(pending) if !pending.text.is_empty() => {
                 vec![Projected::Completed(ThreadItem::AssistantMessage {
-                    id,
-                    text,
+                    id: item_id(pending.ordinal),
+                    text: pending.text,
                 })]
             }
-            // The identifier is given back: nothing was committed under it, so
-            // the numbering stays the numbering of what is durable.
-            Some((id, _)) => {
-                if let Some(previous) = id
-                    .strip_prefix("item_")
-                    .and_then(|raw| raw.parse::<u64>().ok())
-                    && previous.saturating_add(1) == self.next_ordinal
-                {
-                    self.next_ordinal = previous;
+            // The ordinal is given back: nothing was committed under it, so the
+            // numbering stays the numbering of what is durable. Guarded, because
+            // giving a number back is only sound while no later item took one.
+            Some(pending) => {
+                if pending.ordinal.saturating_add(1) == self.next_ordinal {
+                    self.next_ordinal = pending.ordinal;
                 }
                 Vec::new()
             }
@@ -321,7 +417,7 @@ pub fn project_messages(messages: &[Message]) -> Vec<ThreadItem> {
                 let text = text_of(&message.content);
                 if !text.is_empty() {
                     items.push(ThreadItem::UserMessage {
-                        id: mint(&mut ordinal),
+                        id: next_id(&mut ordinal),
                         text,
                     });
                 }
@@ -331,7 +427,7 @@ pub fn project_messages(messages: &[Message]) -> Vec<ThreadItem> {
                     match block {
                         ContentBlock::Text { text } if !text.trim().is_empty() => {
                             items.push(ThreadItem::AssistantMessage {
-                                id: mint(&mut ordinal),
+                                id: next_id(&mut ordinal),
                                 text: text.clone(),
                             });
                         }
@@ -341,7 +437,7 @@ pub fn project_messages(messages: &[Message]) -> Vec<ThreadItem> {
                             input,
                             ..
                         } => {
-                            let id = mint(&mut ordinal);
+                            let id = next_id(&mut ordinal);
                             items.push(new_tool_item(&id, call_id.as_str(), name, input));
                         }
                         ContentBlock::ToolResult {
@@ -377,8 +473,13 @@ pub fn project_messages(messages: &[Message]) -> Vec<ThreadItem> {
     items
 }
 
-fn mint(ordinal: &mut u64) -> String {
-    let id = format!("item_{ordinal}");
+/// The durable name of an ordinal. The one place `item_<n>` is spelled.
+fn item_id(ordinal: u64) -> String {
+    format!("item_{ordinal}")
+}
+
+fn next_id(ordinal: &mut u64) -> String {
+    let id = item_id(*ordinal);
     *ordinal = ordinal.saturating_add(1);
     id
 }
@@ -397,33 +498,31 @@ fn text_of(blocks: &[ContentBlock]) -> String {
 }
 
 fn new_tool_item(id: &str, call_id: &str, name: &str, input: &serde_json::Value) -> ThreadItem {
-    if COMMAND_TOOLS.contains(&name) {
-        return ThreadItem::CommandExecution {
+    match ToolFamily::of(name) {
+        ToolFamily::Command => ThreadItem::CommandExecution {
             id: id.to_string(),
             call_id: call_id.to_string(),
             command: command_of(name, input),
             output: String::new(),
             exit_code: None,
             status: ItemStatus::InProgress,
-        };
-    }
-    if FILE_CHANGE_TOOLS.contains(&name) {
-        return ThreadItem::FileChange {
+        },
+        ToolFamily::FileChange => ThreadItem::FileChange {
             id: id.to_string(),
             call_id: call_id.to_string(),
-            paths: paths_of(input),
+            paths: declared_paths(input),
             output: String::new(),
             status: ItemStatus::InProgress,
-        };
-    }
-    ThreadItem::ToolCall {
-        id: id.to_string(),
-        call_id: call_id.to_string(),
-        tool: name.to_string(),
-        input: input.clone(),
-        output: String::new(),
-        status: ItemStatus::InProgress,
-        untrusted: true,
+        },
+        ToolFamily::Other => ThreadItem::ToolCall {
+            id: id.to_string(),
+            call_id: call_id.to_string(),
+            tool: name.to_string(),
+            input: input.clone(),
+            output: String::new(),
+            status: ItemStatus::InProgress,
+            untrusted: true,
+        },
     }
 }
 
@@ -452,7 +551,10 @@ fn command_of(name: &str, input: &serde_json::Value) -> String {
 /// Paths a file-changing call names. `apply_patch` carries them inside its
 /// patch text, which is not parsed here: the client gets the raw input and the
 /// tool's own result, never a guess.
-fn paths_of(input: &serde_json::Value) -> Vec<String> {
+///
+/// Read by the item projection AND by the file-change approval request, from
+/// here, so the paths a client is asked to approve are the paths its item shows.
+pub fn declared_paths(input: &serde_json::Value) -> Vec<String> {
     ["path", "file_path", "target"]
         .iter()
         .filter_map(|key| input.get(*key).and_then(serde_json::Value::as_str))
@@ -801,7 +903,13 @@ mod tests {
             Projected::Completed(item) if item.status() == ItemStatus::Failed
         )));
         assert!(projector.close_open("interrupted").is_empty());
-        assert!(projector.open_item_ids().is_empty());
+    }
+
+    #[test]
+    fn one_table_decides_the_family_of_a_call() {
+        assert_eq!(ToolFamily::of("bash"), ToolFamily::Command);
+        assert_eq!(ToolFamily::of("apply_patch"), ToolFamily::FileChange);
+        assert_eq!(ToolFamily::of("mcp__files__read"), ToolFamily::Other);
     }
 
     #[test]

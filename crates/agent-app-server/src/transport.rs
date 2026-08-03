@@ -245,15 +245,14 @@ pub async fn handle_line(connection: &Arc<Connection>, line: &str) -> Result<(),
 /// Last message of a connection the server is closing. Written straight to the
 /// queue: it is bounded, so this either fits or the client was already gone.
 fn report_overflow(connection: &Arc<Connection>, detail: &str) {
-    let notification = ServerNotification::Error(ErrorNotification {
-        thread_id: None,
-        turn_id: None,
-        message: detail.to_string(),
-    });
-    let _ = connection.outbox().send(Outbound::Notification {
-        method: notification.method_name().to_string(),
-        params: notification.params(),
-    });
+    let _ = connection
+        .outbox()
+        .send(ServerNotification::Error(ErrorNotification {
+            thread_id: None,
+            turn_id: None,
+            message: detail.to_string(),
+        })
+        .into());
     tracing::warn!(target: "pyxis::app_server", detail, "connection closed");
 }
 

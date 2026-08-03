@@ -15,7 +15,7 @@ use schemars::{JsonSchema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::jsonrpc::{ErrorObject, error_code};
+use crate::jsonrpc::{ErrorObject, Outbound, error_code};
 pub use crate::protocol_metadata::{
     ProviderErrorCategoryView, ProviderEventNotification, ProviderExtensionView,
     ReasoningMetadataView, ResponseItemKindView, ResponseItemNotification, ResponseItemPhaseView,
@@ -173,6 +173,18 @@ macro_rules! server_requests {
             ]
         }
     };
+}
+
+/// The one place a notification becomes a wire message. Three callers used to
+/// spell this out for themselves, which is three chances to disagree about what
+/// a notification looks like on the wire.
+impl From<ServerNotification> for Outbound {
+    fn from(notification: ServerNotification) -> Self {
+        Self::Notification {
+            method: notification.method_name().to_string(),
+            params: notification.params(),
+        }
+    }
 }
 
 fn decode_params<T: for<'de> Deserialize<'de>>(

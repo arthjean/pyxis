@@ -19,7 +19,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::bridge::{ClientBridge, ClientEndpoint};
 use crate::host::{HostError, OpenThread, RuntimeHost, ThreadControl};
-use crate::items::{Projected, Projector};
+use crate::items::{Projected, Projector, ToolFamily, declared_paths};
 use crate::jsonrpc::{ErrorObject, Inbound, Outbound, RequestId, error_code};
 use crate::outbound::{MAX_QUEUED_BYTES, MAX_QUEUED_EVENTS, Outbox};
 use crate::protocol::{self, *};
@@ -321,13 +321,11 @@ impl Connection {
         self.server
             .bridge
             .bind(Arc::clone(self) as Arc<dyn ClientEndpoint>);
-        let _ = self
-            .outbox
-            .send(notification(&ServerNotification::ThreadStarted(
-                ThreadStartedNotification {
-                    thread_id: thread_id.clone(),
-                },
-            )));
+        self.notify(ServerNotification::ThreadStarted(
+            ThreadStartedNotification {
+                thread_id: thread_id.clone(),
+            },
+        ));
         json(&ThreadStartedResult {
             thread_id,
             item_count,
@@ -422,13 +420,11 @@ impl Connection {
     async fn route_response(&self, id: RequestId, result: Result<Value, ErrorObject>) {
         let open = self.open.lock().await;
         let Some(state) = open.as_ref() else {
-            let _ = self.outbox.send(notification(&ServerNotification::Error(
-                ErrorNotification {
-                    thread_id: None,
-                    turn_id: None,
-                    message: format!("response {id} arrived with no thread open"),
-                },
-            )));
+            self.notify(ServerNotification::Error(ErrorNotification {
+                thread_id: None,
+                turn_id: None,
+                message: format!("response {id} arrived with no thread open"),
+            }));
             return;
         };
         let _ = state
@@ -451,14 +447,14 @@ impl Connection {
         drop(state.commands);
         let _ = state.pump.await;
         self.server.release(self.id);
-        let _ = self
-            .outbox
-            .send(notification(&ServerNotification::ThreadClosed(
-                ThreadClosedNotification {
-                    thread_id: state.thread_id,
-                    reason: reason.to_string(),
-                },
-            )));
+        self.notify(ServerNotification::ThreadClosed(ThreadClosedNotification {
+            thread_id: state.thread_id,
+            reason: reason.to_string(),
+        }));
+    }
+
+    fn notify(&self, notification: ServerNotification) {
+        let _ = self.outbox.send(notification.into());
     }
 
     pub fn outbox(&self) -> &Outbox {
@@ -675,69 +671,9 @@ impl Pump {
         }));
     }
 
-    fn publish(&mut self, projected: Vec<Projected>, turn_id: Option<String>) {
+    fn publish(&self, projected: Vec<Projected>, turn_id: Option<String>) {
         for one in projected {
-            let notification = match one {
-                Projected::Started(item) => ServerNotification::ItemStarted(ItemNotification {
-                    thread_id: self.thread_id.clone(),
-                    turn_id: turn_id.clone(),
-                    item,
-                }),
-                Projected::Completed(item) => ServerNotification::ItemCompleted(ItemNotification {
-                    thread_id: self.thread_id.clone(),
-                    turn_id: turn_id.clone(),
-                    item,
-                }),
-                Projected::AssistantDelta { item_id, delta } => {
-                    ServerNotification::AgentMessageDelta(ItemDeltaNotification {
-                        thread_id: self.thread_id.clone(),
-                        turn_id: turn_id.clone(),
-                        item_id,
-                        delta,
-                    })
-                }
-                Projected::CommandDelta { item_id, delta } => {
-                    ServerNotification::CommandExecutionOutputDelta(ItemDeltaNotification {
-                        thread_id: self.thread_id.clone(),
-                        turn_id: turn_id.clone(),
-                        item_id,
-                        delta,
-                    })
-                }
-                Projected::ReasoningDelta { delta } => {
-                    ServerNotification::TurnReasoningDelta(TurnDeltaNotification {
-                        thread_id: self.thread_id.clone(),
-                        turn_id: turn_id.clone(),
-                        delta,
-                    })
-                }
-                Projected::ResponseMetadata(metadata) => {
-                    ServerNotification::TurnMetadata(TurnMetadataNotification {
-                        thread_id: self.thread_id.clone(),
-                        turn_id: turn_id.clone(),
-                        metadata: Box::new(ResponseMetadataView::from(metadata.as_ref())),
-                    })
-                }
-                Projected::ResponseItem {
-                    phase,
-                    output_index,
-                    item,
-                } => ServerNotification::TurnResponseItem(ResponseItemNotification {
-                    thread_id: self.thread_id.clone(),
-                    turn_id: turn_id.clone(),
-                    phase: phase.into(),
-                    output_index,
-                    item: Box::new(ResponseItemView::from(item.as_ref())),
-                }),
-                Projected::ProviderExtension(extension) => {
-                    ServerNotification::TurnProviderEvent(ProviderEventNotification {
-                        thread_id: self.thread_id.clone(),
-                        turn_id: turn_id.clone(),
-                        extension: ProviderExtensionView::from(&extension),
-                    })
-                }
-            };
-            self.emit(notification);
+            self.emit(one.into_notification(&self.thread_id, turn_id.clone()));
         }
     }
 
@@ -770,7 +706,7 @@ impl Pump {
             item_id: item_id.clone(),
             call_id: call_id.clone(),
         };
-        let server_request = match classify(&request.tool) {
+        let server_request = match ToolFamily::of(&request.tool) {
             ToolFamily::Command => {
                 ServerRequest::CommandExecutionRequestApproval(CommandExecutionApprovalParams {
                     correlation,
@@ -968,10 +904,7 @@ impl Pump {
     }
 
     fn emit(&self, notification: ServerNotification) {
-        let _ = self.outbox.send(Outbound::Notification {
-            method: notification.method_name().to_string(),
-            params: notification.params(),
-        });
+        let _ = self.outbox.send(notification.into());
     }
 }
 
@@ -986,40 +919,11 @@ fn fail_pending(answer: PendingAnswer, detail: &str) {
     }
 }
 
-enum ToolFamily {
-    Command,
-    FileChange,
-    Other,
-}
-
-fn classify(tool: &str) -> ToolFamily {
-    match tool {
-        "bash" | "exec_command" | "write_stdin" => ToolFamily::Command,
-        "write" | "edit" | "apply_patch" => ToolFamily::FileChange,
-        _ => ToolFamily::Other,
-    }
-}
-
-fn declared_paths(input: &Value) -> Vec<String> {
-    ["path", "file_path", "target"]
-        .iter()
-        .filter_map(|key| input.get(*key).and_then(Value::as_str))
-        .map(str::to_string)
-        .collect()
-}
-
 fn terminal_label(state: agent_runtime::TurnState) -> &'static str {
     match state {
         agent_runtime::TurnState::Completed => "completed",
         agent_runtime::TurnState::Interrupted => "interrupted",
         _ => "failed",
-    }
-}
-
-fn notification(notification: &ServerNotification) -> Outbound {
-    Outbound::Notification {
-        method: notification.method_name().to_string(),
-        params: notification.params(),
     }
 }
 
@@ -1088,12 +992,5 @@ mod tests {
         assert!(decode_cursor(&cursor, "thr_2").is_err());
         assert!(decode_cursor("zz", "thr_1").is_err());
         assert!(decode_cursor("abc", "thr_1").is_err());
-    }
-
-    #[test]
-    fn tool_families_route_to_their_own_approval_request() {
-        assert!(matches!(classify("bash"), ToolFamily::Command));
-        assert!(matches!(classify("apply_patch"), ToolFamily::FileChange));
-        assert!(matches!(classify("mcp__files__read"), ToolFamily::Other));
     }
 }
