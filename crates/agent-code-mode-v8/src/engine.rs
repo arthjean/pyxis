@@ -198,46 +198,48 @@ impl CellEngine for IsolateEngine {
     }
 
     fn shutdown(&self, deadline: Duration) -> ShutdownReport {
-        let cells: Vec<CellId> = lock(&self.workers).keys().cloned().collect();
-        for cell in &cells {
-            if let Some(worker) = lock(&self.workers).get(cell) {
-                worker.control.cancel();
-            }
+        // Taken ONCE: a cell started after this point cannot slip between the
+        // cancellation and the wait, and nothing is joined while the table lock
+        // is held.
+        let workers: Vec<(CellId, CellWorker)> = std::mem::take(&mut *lock(&self.workers))
+            .into_iter()
+            .collect();
+        for (_, worker) in &workers {
+            worker.control.cancel();
         }
 
         let until = Instant::now() + deadline;
         let mut unjoined = Vec::new();
-        for cell in cells {
-            let worker = lock(&self.workers).remove(&cell);
-            let Some(worker) = worker else {
-                continue;
-            };
-            loop {
+        for (cell, worker) in workers {
+            let finished = loop {
                 if worker.thread.is_finished() {
-                    let _ = worker.thread.join();
-                    break;
+                    break true;
                 }
                 if Instant::now() >= until {
-                    // Deliberately NOT detached silently: the caller is told
-                    // which worker is still holding an isolate (US-007 AC4).
-                    unjoined.push(cell.clone());
-                    break;
+                    break false;
                 }
                 std::thread::sleep(Duration::from_millis(5));
+            };
+            if finished {
+                let _ = worker.thread.join();
+            } else {
+                // Deliberately NOT detached silently: the caller is told which
+                // worker is still holding an isolate (US-007 AC4).
+                unjoined.push(cell);
             }
         }
 
         if unjoined.is_empty() {
-            ShutdownReport::joined()
-        } else {
-            let names: Vec<String> = unjoined.iter().map(|cell| cell.to_string()).collect();
-            ShutdownReport::unjoined(format!(
-                "{} cell worker(s) did not join within {} ms: {}",
-                names.len(),
-                deadline.as_millis(),
-                names.join(", ")
-            ))
+            return ShutdownReport::joined();
         }
+        let mut names: Vec<String> = unjoined.iter().map(|cell| cell.to_string()).collect();
+        names.sort();
+        ShutdownReport::unjoined(format!(
+            "{} cell worker(s) did not join within {} ms: {}",
+            names.len(),
+            deadline.as_millis(),
+            names.join(", ")
+        ))
     }
 }
 
