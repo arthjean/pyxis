@@ -492,6 +492,40 @@ async fn nested_terminal_polls_reset_the_effect_loop_guard() {
     assert_eq!(tools.seen().len(), 4);
 }
 
+/// Retention exists to bridge `exec` and a later `wait`, not to buffer a whole
+/// run: an unattended dispatcher must not grow with everything the nested calls
+/// ever printed.
+#[tokio::test]
+async fn retained_nested_events_are_capped_instead_of_growing_without_bound() {
+    let tools = Arc::new(RecordingTools::default());
+    let dispatcher = dispatcher(Arc::clone(&tools), vec![function_spec("read")]);
+    // Two events per call, so this overflows the ceiling by a margin. Inputs
+    // differ so the effect loop guard has nothing to catch.
+    let rounds = super::MAX_PENDING_EVENTS;
+    let calls: Vec<NestedToolCall> = (0..rounds)
+        .map(|index| NestedToolCall {
+            cell_id: CellId::new(&SessionId::new("thread-a"), 0),
+            call_id: format!("nested-{index}"),
+            tool: "read".to_string(),
+            input: NestedToolInput::Json(serde_json::json!({ "value": index.to_string() })),
+        })
+        .collect();
+    let outcomes = dispatch_off_runtime(Arc::clone(&dispatcher), calls);
+    assert!(
+        outcomes.iter().all(|outcome| !outcome.is_error),
+        "distinct inputs must not trip the loop guard"
+    );
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    dispatcher.bind_events(ToolEventSink::new(event_tx));
+    let events: Vec<ToolDispatchEvent> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+    assert_eq!(events.len(), super::MAX_PENDING_EVENTS);
+    assert!(
+        matches!(events[0], ToolDispatchEvent::NestedToolCall(_)),
+        "the events kept are the oldest, so the pairs that survive stay whole"
+    );
+}
+
 #[tokio::test]
 async fn a_session_without_a_dispatcher_refuses_every_nested_call() {
     let outcome =

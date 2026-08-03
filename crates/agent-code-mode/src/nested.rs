@@ -25,6 +25,14 @@ use agent_core::tools::{
 
 use crate::protocol::CellId;
 
+/// Lifecycle events retained while no sink is attached.
+///
+/// Retention exists to survive the gap between `exec` and a later `wait`, not
+/// to buffer a whole run: `OutputDelta` carries the raw output of the nested
+/// tools, so an unbounded queue grows with everything a cell's calls ever
+/// printed, for a run nobody may ever come back to observe.
+const MAX_PENDING_EVENTS: usize = 1024;
+
 /// Input of a nested call, in the algebra US-002 generalized: a function tool
 /// takes JSON, a freeform tool takes text. A cell cannot turn one into the
 /// other.
@@ -136,7 +144,6 @@ pub trait NestedToolDispatcher: Send + Sync {
     fn bind_events(&self, _events: ToolEventSink) {}
 }
 
-#[derive(Default)]
 struct NestedEventBridge {
     state: Mutex<NestedEventState>,
 }
@@ -145,9 +152,21 @@ struct NestedEventBridge {
 struct NestedEventState {
     sink: ToolEventSink,
     pending: Vec<ToolDispatchEvent>,
+    /// Events the ceiling refused. Reported when a sink finally attaches, so a
+    /// truncated lifecycle is never read as a complete one.
+    dropped: usize,
 }
 
 impl NestedEventBridge {
+    fn new(sink: ToolEventSink) -> Self {
+        Self {
+            state: Mutex::new(NestedEventState {
+                sink,
+                ..NestedEventState::default()
+            }),
+        }
+    }
+
     fn bind(&self, sink: ToolEventSink) {
         let mut state = lock(&self.state);
         state.sink = sink;
@@ -157,11 +176,22 @@ impl NestedEventBridge {
                 state.pending.push(event);
             }
         }
+        let dropped = std::mem::take(&mut state.dropped);
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                "nested lifecycle events were dropped: no sink was attached for too long"
+            );
+        }
     }
 
     fn emit(&self, event: ToolDispatchEvent) {
         let mut state = lock(&self.state);
         if let Err(event) = state.sink.try_emit(event) {
+            if state.pending.len() >= MAX_PENDING_EVENTS {
+                state.dropped += 1;
+                return;
+            }
             state.pending.push(event);
         }
     }
@@ -218,11 +248,9 @@ impl PlanDispatcher {
         // Serial dispatch: one nested call at a time, so the terminal order of
         // a cell's calls is the order the cell made them.
         let plan = StepToolPlan::capture(snapshot.with_specs(specs), false);
-        let event_bridge = NestedEventBridge::default();
-        event_bridge.bind(events);
         Self {
             plan,
-            events: Arc::new(event_bridge),
+            events: Arc::new(NestedEventBridge::new(events)),
             loop_guard,
             runtime,
             callable,
