@@ -1708,6 +1708,9 @@ async fn run(
         // US-011: whether the active model reads images at all. A provider that
         // does not declare vision makes `view_image` refuse before any read.
         .vision(provider.capabilities().vision)
+        // Grouping the MCP surface per server is only exposable when the
+        // adapter can encode it; otherwise every tool stays flat.
+        .namespace_tools(provider.capabilities().tool_calling.namespace_tools)
         .exec_sessions(exec_sessions.clone())
         // US-001/US-002: the perimeter the tools evaluate BEFORE execution, and
         // whether the kernel really carries it (US-004 classification).

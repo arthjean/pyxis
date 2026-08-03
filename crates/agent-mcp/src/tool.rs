@@ -113,6 +113,22 @@ impl DynTool for McpTool {
         &[]
     }
 
+    /// MCP tools are what makes a tool list grow without bound: three servers
+    /// routinely outweigh the transcript in schemas alone. They are therefore
+    /// the deferrable set (ARCHITECTURE 4.5), found back through `tool_search`.
+    /// Nothing about dispatch changes: a deferred tool is hidden from the
+    /// request, never from the pipeline.
+    fn is_deferrable(&self) -> bool {
+        true
+    }
+
+    /// The server, as the USER named it in their MCP configuration. Grouping by
+    /// server is the one grouping that means something here: it is the trust
+    /// boundary, the disconnect unit, and what a human reasons about.
+    fn namespace(&self) -> Option<&str> {
+        Some(&self.server)
+    }
+
     fn precheck(&self, raw: &Value, _ctx: &ToolCtx) -> Result<(), ToolError> {
         let estimated = estimate_json_bytes(raw);
         if estimated > MAX_TOOL_INPUT_BYTES {

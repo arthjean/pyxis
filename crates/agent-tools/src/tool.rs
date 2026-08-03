@@ -348,6 +348,17 @@ pub trait Tool: Send + Sync {
         &[]
     }
 
+    /// May this tool be held out of the request until a `tool_search` asks for
+    /// it (ARCHITECTURE 4.5)? False by default: see [`DynTool::is_deferrable`].
+    fn is_deferrable(&self) -> bool {
+        false
+    }
+
+    /// Group this tool is exposed under. See [`DynTool::namespace`].
+    fn namespace(&self) -> Option<&str> {
+        None
+    }
+
     /// Input validation (pre-permission, pre-execution). Default: accepts. The
     /// `ToolCtx` is provided for rules that depend on the workspace: protecting
     /// deferred-execution subpaths (US-013) is one of them. Refused here, it
@@ -407,6 +418,28 @@ pub trait DynTool: Send + Sync {
     fn returns_untrusted(&self) -> bool;
     /// Behavioral invariants of the tool (US-026), forwarded from `Tool`.
     fn behavioral_guidelines(&self) -> &[&'static str];
+    /// May this tool be held out of the request until a `tool_search` asks for
+    /// it (ARCHITECTURE 4.5)? False by default: the native surface is small and
+    /// needed on most turns, and hiding it would cost a round trip to find
+    /// `read`. MCP tools override it, because they are what makes a tool list
+    /// grow without bound.
+    ///
+    /// Deferral is about prompt COST only. A deferred tool stays registered and
+    /// stays dispatchable through the same pipeline.
+    fn is_deferrable(&self) -> bool {
+        false
+    }
+    /// Group this tool is exposed under when the provider supports namespaces
+    /// (`ToolKind::Namespace`). `None` = exposed at the top level, which is what
+    /// every native tool wants: they are the surface the model uses on most
+    /// turns, and burying them one level down would only add indirection.
+    ///
+    /// Declared by the tool because it is the only thing that knows: parsing it
+    /// back out of the exposed NAME would be wrong the moment a name is
+    /// shortened to fit the 64-byte cap.
+    fn namespace(&self) -> Option<&str> {
+        None
+    }
     /// Parse + `validate_input` WITHOUT executing (fail-closed, US-010 AC3). An error
     /// means the Registry returns the failure to the agent without calling `call`.
     fn precheck(&self, raw: &serde_json::Value, ctx: &ToolCtx) -> Result<(), ToolError>;
@@ -464,6 +497,12 @@ impl<T: Tool> DynTool for DynToolAdapter<T> {
     }
     fn behavioral_guidelines(&self) -> &[&'static str] {
         self.inner.behavioral_guidelines()
+    }
+    fn is_deferrable(&self) -> bool {
+        self.inner.is_deferrable()
+    }
+    fn namespace(&self) -> Option<&str> {
+        self.inner.namespace()
     }
     fn precheck(&self, raw: &serde_json::Value, ctx: &ToolCtx) -> Result<(), ToolError> {
         let estimated = estimate_json_bytes(raw);

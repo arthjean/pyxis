@@ -70,6 +70,14 @@ pub struct Registry {
     /// Turns an approved sandbox escalation into an actual widening (US-004).
     /// `None` = no perimeter can be widened, hence no escalation is offered.
     escalator: Option<Arc<dyn SandboxEscalator>>,
+    /// What is held out of the request past the deferral threshold, and what a
+    /// `tool_search` has revealed since (ARCHITECTURE 4.5). Shared with the
+    /// `tool_search` tool, which is the only thing that reveals.
+    deferred: crate::tool_search::DeferredTools,
+    /// Can the active provider encode `ToolKind::Namespace`? Set from the
+    /// provider capabilities. False keeps every tool at the top level, which is
+    /// what every provider understood before namespaces existed.
+    namespace_tools: bool,
     ctx: ToolCtx,
 }
 
@@ -90,6 +98,8 @@ impl Registry {
             initial_taint_recent: false,
             hooks: None,
             escalator: None,
+            deferred: crate::tool_search::DeferredTools::new(),
+            namespace_tools: false,
             ctx: ToolCtx::new(workspace),
         }
     }
@@ -195,15 +205,143 @@ impl Registry {
                 }
             }
         }
+        // Dropped before republishing: `publish_deferred` takes the read lock,
+        // and holding the write lock across it would deadlock.
+        drop(tools);
         if changed {
             self.generation.fetch_add(1, Ordering::AcqRel);
+            self.publish_deferred();
         }
         changed
     }
 
     /// Specs exposed to the model (capped descriptions), for `AgentContext.tools`.
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
-        specs_from_tools(&self.tools_read())
+        let tools = self.tools_read();
+        let specs = specs_from_tools(&tools);
+        self.defer(specs, &tools)
+    }
+
+    /// Publishes the deferrable catalog `tool_search` searches. Called wherever
+    /// the exposed set moves, so a search never returns a tool the registry no
+    /// longer holds.
+    fn publish_deferred(&self) {
+        let tools = self.tools_read();
+        let entries = tools
+            .values()
+            .filter(|tool| tool.is_deferrable())
+            .map(|tool| crate::tool_search::DeferredEntry {
+                name: tool.name().to_string(),
+                description: truncate_utf8_prefix(&tool.description(), MAX_DESCRIPTION).to_string(),
+                input_schema: tool.input_schema(),
+            })
+            .collect();
+        self.deferred.publish(entries);
+    }
+
+    /// Groups the tools that declare a namespace into one `ToolKind::Namespace`
+    /// per group, when the provider can encode it.
+    ///
+    /// Member names stay the names the registry dispatches on, unchanged. The
+    /// grouping is structural, not an addressing scheme: a namespace that
+    /// renamed its members would make the name the model emits depend on a
+    /// provider capability, and the same conversation resumed against another
+    /// provider would then call tools that do not exist.
+    ///
+    /// A group whose members cannot all be expressed as functions is left flat.
+    /// The `Namespace` variant only accepts function members, and silently
+    /// dropping a freeform tool to satisfy that would remove a capability the
+    /// model was given.
+    fn group_by_namespace(
+        &self,
+        specs: Vec<ToolSpec>,
+        tools: &HashMap<String, Arc<dyn DynTool>>,
+    ) -> Vec<ToolSpec> {
+        if !self.namespace_tools {
+            return specs;
+        }
+        let mut groups: std::collections::BTreeMap<String, Vec<ToolSpec>> =
+            std::collections::BTreeMap::new();
+        let mut flat: Vec<ToolSpec> = Vec::new();
+        for spec in specs {
+            match tools
+                .get(&spec.name)
+                .and_then(|tool| tool.namespace())
+                .filter(|_| matches!(spec.kind, agent_core::provider::ToolKind::Function { .. }))
+            {
+                Some(namespace) => groups
+                    .entry(namespace.to_string())
+                    .or_default()
+                    .push(spec),
+                None => flat.push(spec),
+            }
+        }
+        for (namespace, mut members) in groups {
+            members.sort_by(|left, right| left.name.cmp(&right.name));
+            let grouped = ToolSpec::namespace(
+                sanitize_namespace(&namespace),
+                format!("Tools exposed by the MCP server \"{namespace}\"."),
+                members,
+            );
+            // Fail-closed on the SHAPE: a group the protocol would refuse is
+            // flattened back rather than exposed as something a provider will
+            // reject at request time, which would cost the whole turn.
+            match grouped.validate() {
+                Ok(()) => flat.push(grouped),
+                Err(error) => {
+                    tracing::debug!(
+                        target: "pyxis::tools",
+                        namespace = %namespace,
+                        %error,
+                        "namespace not exposable; its tools stay at the top level"
+                    );
+                    if let agent_core::provider::ToolKind::Namespace { tools } = grouped.kind {
+                        flat.extend(tools);
+                    }
+                }
+            }
+        }
+        flat.sort_by(|left, right| left.name.cmp(&right.name));
+        flat
+    }
+
+    /// Applies the deferral (ARCHITECTURE 4.5) to a composed spec list.
+    ///
+    /// `tool_search` itself is exposed exactly when something is actually
+    /// hidden: advertising a search over an empty catalog wastes a tool slot,
+    /// and hiding tools without it would make them unreachable.
+    fn defer(
+        &self,
+        specs: Vec<ToolSpec>,
+        tools: &HashMap<String, Arc<dyn DynTool>>,
+    ) -> Vec<ToolSpec> {
+        let deferrable: std::collections::BTreeSet<String> = tools
+            .values()
+            .filter(|tool| tool.is_deferrable())
+            .map(|tool| tool.name().to_string())
+            .collect();
+        // Deferral FIRST, grouping second: deferral reasons about flat names,
+        // and a tool already folded into a namespace would escape the filter
+        // and be exposed by a group the threshold was meant to hide.
+        let exposed = crate::tool_search::apply_deferral(specs, &deferrable, &self.deferred);
+        let hid_something = exposed
+            .iter()
+            .filter(|spec| deferrable.contains(&spec.name))
+            .count()
+            < deferrable.len();
+        let exposed = if hid_something {
+            exposed
+        } else {
+            // Nothing is hidden, so the search has nothing to find: its spec
+            // leaves the request. The TOOL stays registered either way, because
+            // a model that calls it on a stale plan must get an answer, not
+            // "unknown tool".
+            exposed
+                .into_iter()
+                .filter(|spec| spec.name != crate::tool_search::TOOL_SEARCH_NAME)
+                .collect()
+        };
+        self.group_by_namespace(exposed, tools)
     }
 
     /// Captures specs and an immutable restricted dispatcher under the same
@@ -212,7 +350,7 @@ impl Registry {
         let tools_guard = self.tools_read();
         let generation = self.generation.load(Ordering::Acquire);
         let tools = tools_guard.clone();
-        let specs = specs_from_tools(&tools);
+        let specs = self.defer(specs_from_tools(&tools), &tools);
         drop(tools_guard);
         let frozen = Registry {
             tools: std::sync::RwLock::new(tools),
@@ -224,6 +362,8 @@ impl Registry {
             taint: Arc::clone(&self.taint),
             hooks: Arc::clone(&self.hooks),
             escalator: self.escalator.clone(),
+            deferred: self.deferred.clone(),
+            namespace_tools: self.namespace_tools,
             ctx: self.ctx.clone(),
         };
         ToolDispatchSnapshot::new(generation, specs, Arc::new(frozen))
@@ -954,6 +1094,32 @@ fn truncate_utf8_prefix(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// A server name is user-written and can carry anything; a namespace name is
+/// bound by the same `^[A-Za-z0-9_-]{1,64}$` rule as a tool name. Same
+/// substitution as `agent_mcp::naming`, applied here so this crate keeps no
+/// dependency on that one.
+fn sanitize_namespace(name: &str) -> String {
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(MAX_NAMESPACE_BYTES)
+        .collect();
+    if sanitized.is_empty() {
+        "server".to_string()
+    } else {
+        sanitized
+    }
+}
+
+/// Same cap as a tool name (`ToolSpec::validate`).
+const MAX_NAMESPACE_BYTES: usize = 64;
+
 fn specs_from_tools(tools: &HashMap<String, Arc<dyn DynTool>>) -> Vec<ToolSpec> {
     let mut specs: Vec<ToolSpec> = tools
         .values()
@@ -981,6 +1147,8 @@ pub struct RegistryBuilder {
     initial_taint_recent: bool,
     hooks: Option<Arc<dyn Hooks>>,
     escalator: Option<Arc<dyn SandboxEscalator>>,
+    deferred: crate::tool_search::DeferredTools,
+    namespace_tools: bool,
     ctx: ToolCtx,
 }
 
@@ -1065,6 +1233,13 @@ impl RegistryBuilder {
         self.ctx.user_notice = Some(notice);
         self
     }
+    /// Declares that the provider can encode `ToolKind::Namespace`. Read from
+    /// the provider capabilities by the binary; false leaves every tool at the
+    /// top level.
+    pub fn namespace_tools(mut self, supported: bool) -> Self {
+        self.namespace_tools = supported;
+        self
+    }
     /// Applies an approved one-call widening (US-004). Without it no escalation
     /// is ever offered: a perimeter nobody can widen must not be advertised.
     pub fn sandbox_escalator(mut self, escalator: Arc<dyn SandboxEscalator>) -> Self {
@@ -1086,7 +1261,15 @@ impl RegistryBuilder {
         self.tools.entry(tool.name().to_string()).or_insert(tool);
         self
     }
-    pub fn build(self) -> Registry {
+    pub fn build(mut self) -> Registry {
+        // ARCHITECTURE 4.5: registered unconditionally, exposed only when
+        // something is actually deferred. Registering it here rather than at a
+        // call site is what keeps the search and the catalog it reads from ever
+        // being wired to two different handles.
+        let search: Arc<dyn DynTool> = Arc::from(into_dyn(crate::tool_search::ToolSearch::new(
+            self.deferred.clone(),
+        )));
+        self.tools.entry(search.name().to_string()).or_insert(search);
         let registry = Registry {
             tools: std::sync::RwLock::new(self.tools),
             staged: std::sync::Mutex::new(Vec::new()),
@@ -1097,9 +1280,15 @@ impl RegistryBuilder {
             taint: Arc::new(TaintTracker::new(self.taint_window)),
             hooks: self.hooks.unwrap_or_else(|| Arc::new(NoHooks)),
             escalator: self.escalator,
+            deferred: self.deferred,
+            namespace_tools: self.namespace_tools,
             ctx: self.ctx,
         };
         registry.seed_taint(self.initial_taint_recent);
+        // The deferrable catalog has to exist before the first spec is composed,
+        // otherwise the first turn exposes everything and the deferral starts
+        // one turn late.
+        registry.publish_deferred();
         registry
     }
 }

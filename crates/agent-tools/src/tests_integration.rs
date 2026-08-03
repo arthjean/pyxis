@@ -22,6 +22,7 @@ use crate::registry::Registry;
 use crate::tool::{
     MAX_COMMAND_BYTES, MAX_EDIT_FILE_BYTES, MAX_WRITE_BYTES, Tool, ToolCtx, ToolOutput,
 };
+use crate::tool_search::DEFER_THRESHOLD;
 use crate::{Bash, Edit, Glob, Grep, Read, Write};
 
 // ───────────────────────── helpers ─────────────────────────
@@ -3383,3 +3384,214 @@ async fn a_hook_refusal_stops_a_session_before_the_process_exists() {
         "a refusal must not leave a session, hence no process, behind"
     );
 }
+/// ARCHITECTURE 4.5: past the threshold, deferrable tools leave the request and
+/// `tool_search` takes their place; a search puts back exactly what it matched.
+///
+/// The three properties asserted here are the ones a regression would break
+/// silently: the native surface never leaves, a hidden tool is still
+/// DISPATCHABLE (deferral is a prompt-cost decision, not a permission one), and
+/// `tool_search` disappears again once nothing is hidden.
+#[tokio::test]
+async fn deferral_hides_the_deferrable_surface_without_making_it_unreachable() {
+    /// A deferrable tool, standing in for an MCP one.
+    struct Deferrable(&'static str, &'static str);
+
+    #[async_trait]
+    impl Tool for Deferrable {
+        type Input = serde_json::Value;
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> String {
+            self.1.to_string()
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object", "properties": {}, "required": [],
+                "additionalProperties": false
+            })
+        }
+        fn is_deferrable(&self) -> bool {
+            true
+        }
+        fn is_read_only(&self) -> bool {
+            true
+        }
+        fn is_sensitive(&self) -> bool {
+            false
+        }
+        fn permission(&self, _input: &Self::Input, _ctx: &PermCtx) -> PermissionDecision {
+            PermissionDecision::Allow
+        }
+        async fn call(
+            &self,
+            _input: Self::Input,
+            _ctx: &ToolCtx,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("called"))
+        }
+    }
+
+    let mut builder = Registry::builder("/tmp")
+        .mode(PermissionMode::BypassPermissions)
+        .approver(allow_approver())
+        .register(Read)
+        .register(Glob)
+        .register(Grep);
+    // Enough deferrable tools to cross the threshold with the natives above.
+    for index in 0..DEFER_THRESHOLD {
+        let name: &'static str = Box::leak(format!("mcp__srv__tool_{index}").into_boxed_str());
+        builder = builder.register(Deferrable(name, "does something remote"));
+    }
+    builder = builder.register(Deferrable("mcp__srv__create_issue", "Open an issue."));
+    let reg = builder.build();
+
+    let exposed: Vec<String> = reg.tool_specs().into_iter().map(|s| s.name).collect();
+    assert!(exposed.contains(&"read".to_string()), "{exposed:?}");
+    assert!(
+        exposed.contains(&"tool_search".to_string()),
+        "the search must be exposed while something is hidden: {exposed:?}"
+    );
+    assert!(
+        !exposed.contains(&"mcp__srv__create_issue".to_string()),
+        "a deferrable tool must leave the request: {exposed:?}"
+    );
+
+    // Hidden from the prompt, still reachable through the pipeline.
+    let direct = by_id(
+        &reg.dispatch(vec![call(
+            "d",
+            "mcp__srv__create_issue",
+            serde_json::json!({}),
+        )])
+        .await,
+        "d",
+    )
+    .clone();
+    assert!(
+        !direct.is_error,
+        "deferral is a prompt-cost decision, not a permission one: {direct:?}"
+    );
+
+    // A search reveals it, and the next composition exposes it.
+    let found = by_id(
+        &reg.dispatch(vec![call(
+            "s",
+            "tool_search",
+            serde_json::json!({ "query": "create issue", "limit": null }),
+        )])
+        .await,
+        "s",
+    )
+    .clone();
+    assert!(!found.is_error, "{found:?}");
+    assert!(found.content.contains("mcp__srv__create_issue"), "{found:?}");
+    let exposed: Vec<String> = reg.tool_specs().into_iter().map(|s| s.name).collect();
+    assert!(
+        exposed.contains(&"mcp__srv__create_issue".to_string()),
+        "a revealed tool comes back into the request: {exposed:?}"
+    );
+
+    // With nothing deferrable at all, the search is not advertised.
+    let plain = Registry::builder("/tmp").register(Read).build();
+    let exposed: Vec<String> = plain.tool_specs().into_iter().map(|s| s.name).collect();
+    assert_eq!(exposed, vec!["read".to_string()]);
+}
+
+/// Namespaces group the MCP surface per server WITHOUT changing what the model
+/// has to write to call a tool.
+///
+/// That last point is the whole risk: if a namespace renamed its members, the
+/// name the model emits would depend on a provider capability, and the same
+/// conversation resumed against another provider would call tools that do not
+/// exist. The test pins the member names to the dispatch names.
+#[tokio::test]
+async fn a_namespace_groups_a_server_without_renaming_its_tools() {
+    struct Server(&'static str, &'static str);
+
+    #[async_trait]
+    impl Tool for Server {
+        type Input = serde_json::Value;
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> String {
+            "remote".to_string()
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object", "properties": {}, "required": [],
+                "additionalProperties": false
+            })
+        }
+        fn namespace(&self) -> Option<&str> {
+            Some(self.1)
+        }
+        fn is_read_only(&self) -> bool {
+            true
+        }
+        fn is_sensitive(&self) -> bool {
+            false
+        }
+        fn permission(&self, _input: &Self::Input, _ctx: &PermCtx) -> PermissionDecision {
+            PermissionDecision::Allow
+        }
+        async fn call(&self, _i: Self::Input, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("called"))
+        }
+    }
+
+    let reg = Registry::builder("/tmp")
+        .mode(PermissionMode::BypassPermissions)
+        .approver(allow_approver())
+        .namespace_tools(true)
+        .register(Read)
+        .register(Server("mcp__gh__create_issue", "git hub"))
+        .register(Server("mcp__gh__list_pulls", "git hub"))
+        .build();
+
+    let specs = reg.tool_specs();
+    let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
+    assert!(names.contains(&"read"), "a native tool stays flat: {names:?}");
+    // The server name is user-written; the namespace name obeys the same rule as
+    // a tool name.
+    assert!(names.contains(&"git_hub"), "{names:?}");
+
+    let namespace = specs
+        .iter()
+        .find(|spec| spec.name == "git_hub")
+        .expect("the group must exist");
+    let members: Vec<&str> = match &namespace.kind {
+        agent_core::provider::ToolKind::Namespace { tools } => {
+            tools.iter().map(|spec| spec.name.as_str()).collect()
+        }
+        other => unreachable!("the group must be a namespace, got {other:?}"),
+    };
+    assert_eq!(
+        members,
+        vec!["mcp__gh__create_issue", "mcp__gh__list_pulls"],
+        "members keep the names the registry dispatches on"
+    );
+    assert!(namespace.validate().is_ok(), "the group must be exposable");
+
+    // And the dispatch name is unchanged.
+    let out = by_id(
+        &reg.dispatch(vec![call(
+            "n",
+            "mcp__gh__create_issue",
+            serde_json::json!({}),
+        )])
+        .await,
+        "n",
+    )
+    .clone();
+    assert!(!out.is_error, "{out:?}");
+
+    // A provider that cannot encode namespaces sees the flat set it always saw.
+    let flat = Registry::builder("/tmp")
+        .register(Server("mcp__gh__create_issue", "git hub"))
+        .build();
+    let names: Vec<String> = flat.tool_specs().into_iter().map(|s| s.name).collect();
+    assert_eq!(names, vec!["mcp__gh__create_issue".to_string()]);
+}
+

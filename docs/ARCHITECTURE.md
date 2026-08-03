@@ -405,6 +405,13 @@ serde parse
 
 Les outils peuvent être **chargés à la demande** via `ToolSearch` : le modèle découvre un outil quand il en a besoin plutôt que de le porter en permanence dans le prompt. **Seuil : ne pas déférer si moins de 15 outils.** En dessous, le coût de prompt est négligeable et le defer ajoute de la latence pour rien.
 
+Ce que le `Registry` applique (`tool_search.rs`) :
+
+- **Le déferrable est déclaré par l'outil** (`DynTool::is_deferrable`), pas déduit d'un nom. En pratique ce sont les outils MCP : la surface native est courte, stable et utile à presque chaque tour, alors que trois serveurs MCP pèsent plus que le transcript en schémas.
+- **Le deferral est LOCAL**, pas délégué au backend. Le flag `defer_loading` du wire continue de voyager quand une spec le porte, mais la décision de masquer est prise ici, ce qui la rend valable sur tout provider.
+- **`tool_search` est enregistré en permanence et exposé seulement quand quelque chose est réellement masqué.** Un outil masqué reste **dispatchable** : masquer une spec est une décision de coût de prompt, jamais de permission.
+- L'ordre est **deferral puis regroupement en namespace** : un outil déjà plié dans un namespace échapperait au filtre.
+
 ### 4.6 Taint untrusted (OWASP LLM01 — prompt injection)
 
 Tout output d'outil (`Bash`, `Read`, MCP, etc.) est **untrusted par défaut** (`returns_untrusted() == true`). Le taint se **propage** dans le contexte. Règle de défense : si un tour contient du taint récent et que le modèle demande une **action destructive ou réseau**, on **force `Ask`** quel que soit le mode de permission courant (hors `BypassPermissions`). C'est la mitigation directe de l'injection de prompt via contenu lu.
