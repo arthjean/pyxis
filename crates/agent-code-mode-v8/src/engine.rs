@@ -259,57 +259,90 @@ struct Quotas {
 struct BudgetAllocator {
     budget: usize,
     live: AtomicUsize,
+    /// Size of the refused request, and what was already live when it landed.
+    /// Both are needed to say why a request smaller than the budget failed.
     refused_bytes: AtomicUsize,
+    refused_live: AtomicUsize,
     refused: AtomicBool,
 }
 
 impl BudgetAllocator {
+    fn new(budget: usize) -> Self {
+        Self {
+            budget,
+            live: AtomicUsize::new(0),
+            refused_bytes: AtomicUsize::new(0),
+            refused_live: AtomicUsize::new(0),
+            refused: AtomicBool::new(false),
+        }
+    }
+
     fn take(&self, len: usize) -> bool {
         let mut current = self.live.load(Ordering::Acquire);
         loop {
-            let Some(next) = current.checked_add(len) else {
-                return false;
-            };
-            if next > self.budget {
-                self.refused.store(true, Ordering::Release);
-                self.refused_bytes.store(next, Ordering::Release);
-                return false;
-            }
-            match self.live.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(observed) => current = observed,
+            match current.checked_add(len) {
+                Some(next) if next <= self.budget => {
+                    match self.live.compare_exchange_weak(
+                        current,
+                        next,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return true,
+                        Err(observed) => current = observed,
+                    }
+                }
+                _ => {
+                    // The two sizes are published BEFORE the flag, so a reader
+                    // that sees the refusal reads the numbers that caused it.
+                    self.refused_bytes.store(len, Ordering::Relaxed);
+                    self.refused_live.store(current, Ordering::Relaxed);
+                    self.refused.store(true, Ordering::Release);
+                    return false;
+                }
             }
         }
     }
+
+    fn give_back(&self, len: usize) {
+        self.live.fetch_sub(len, Ordering::AcqRel);
+    }
+}
+
+/// Body of both allocator entries: reserve the budget FIRST, and give it back
+/// on every path that ends without memory, or a cell would pay for allocations
+/// it never received.
+unsafe fn allocate(handle: &BudgetAllocator, len: usize, zeroed: bool) -> *mut c_void {
+    if !handle.take(len) {
+        return std::ptr::null_mut();
+    }
+    let Ok(layout) = std::alloc::Layout::from_size_align(len.max(1), 8) else {
+        handle.give_back(len);
+        return std::ptr::null_mut();
+    };
+    let data = unsafe {
+        if zeroed {
+            std::alloc::alloc_zeroed(layout)
+        } else {
+            std::alloc::alloc(layout)
+        }
+    };
+    if data.is_null() {
+        handle.give_back(len);
+    }
+    data.cast()
 }
 
 unsafe extern "C" fn alloc_zeroed(handle: &BudgetAllocator, len: usize) -> *mut c_void {
-    if !handle.take(len) {
-        return std::ptr::null_mut();
-    }
-    match std::alloc::Layout::from_size_align(len.max(1), 8) {
-        Ok(layout) => unsafe { std::alloc::alloc_zeroed(layout).cast() },
-        Err(_) => std::ptr::null_mut(),
-    }
+    unsafe { allocate(handle, len, true) }
 }
 
 unsafe extern "C" fn alloc_uninit(handle: &BudgetAllocator, len: usize) -> *mut c_void {
-    if !handle.take(len) {
-        return std::ptr::null_mut();
-    }
-    match std::alloc::Layout::from_size_align(len.max(1), 8) {
-        Ok(layout) => unsafe { std::alloc::alloc(layout).cast() },
-        Err(_) => std::ptr::null_mut(),
-    }
+    unsafe { allocate(handle, len, false) }
 }
 
 unsafe extern "C" fn alloc_free(handle: &BudgetAllocator, data: *mut c_void, len: usize) {
-    handle.live.fetch_sub(len, Ordering::AcqRel);
+    handle.give_back(len);
     if let Ok(layout) = std::alloc::Layout::from_size_align(len.max(1), 8) {
         unsafe { std::alloc::dealloc(data.cast(), layout) };
     }
@@ -397,12 +430,7 @@ fn run_cell(job: CellJob) {
         return;
     }
 
-    let allocator = Arc::new(BudgetAllocator {
-        budget: limits.native_bytes,
-        live: AtomicUsize::new(0),
-        refused_bytes: AtomicUsize::new(0),
-        refused: AtomicBool::new(false),
-    });
+    let allocator = Arc::new(BudgetAllocator::new(limits.native_bytes));
     // SAFETY: the raw pointer is the `Arc` V8 owns from here on; the `drop`
     // entry of the vtable gives it back to Rust exactly once.
     let v8_allocator =
@@ -696,8 +724,9 @@ fn classify(outcome: &Evaluation, guards: &CellGuards, cpu_expired: bool) -> Opt
         return Some(CellFailure::new(
             CellFailureKind::NativeMemory,
             format!(
-                "native memory budget exceeded: {} bytes requested, {} bytes allowed",
-                allocator.refused_bytes.load(Ordering::Acquire),
+                "native memory budget exceeded: {} bytes requested with {} bytes live, {} bytes allowed",
+                allocator.refused_bytes.load(Ordering::Relaxed),
+                allocator.refused_live.load(Ordering::Relaxed),
                 allocator.budget
             ),
         ));
