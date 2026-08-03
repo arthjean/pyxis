@@ -70,11 +70,17 @@ impl CellControl {
 
     /// Publishes the isolate handle, and stops the cell straight away when an
     /// interruption arrived while the isolate was still being created.
+    ///
+    /// The check runs UNDER the handle lock, which is what makes the two orders
+    /// equivalent: either `cancel` set the flag before the check and this
+    /// terminates, or it takes the lock afterwards and finds the handle. Taking
+    /// the lock second would leave a window where neither side terminates.
     fn publish(&self, handle: v8::IsolateHandle) {
+        let mut slot = lock(&self.handle);
         if self.is_cancelled() {
             handle.terminate_execution();
         }
-        *lock(&self.handle) = Some(handle);
+        *slot = Some(handle);
     }
 }
 
