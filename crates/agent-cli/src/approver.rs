@@ -38,6 +38,72 @@ impl Approver for TuiApprover {
     }
 }
 
+/// Tool name carried by a network approval request. Not a registered tool: it
+/// is the name the dialog and the transcript show for a question the PROXY
+/// asked, and keeping it distinct is what stops it from ever matching a
+/// remembered answer keyed on a real tool.
+pub const NETWORK_APPROVAL_TOOL: &str = "network";
+
+/// Asks the user, at the moment the proxy blocks a host, whether to let it
+/// through (US-004). Rides the same channel as a tool confirmation, so the TUI
+/// renders it with the dialog it already has and the same fail-closed rules
+/// apply: a closed channel or a lost answer refuses.
+///
+/// The two "allow" answers map onto the two grants the proxy knows: a one-shot
+/// answer opens this connection only, a session answer opens the host and its
+/// subdomains until the process ends. Nothing here writes the user's configured
+/// allow-list: a grant is not a policy change.
+pub struct TuiNetworkApprover {
+    tx: mpsc::Sender<PermissionMsg>,
+}
+
+impl TuiNetworkApprover {
+    pub fn new(tx: mpsc::Sender<PermissionMsg>) -> Self {
+        Self { tx }
+    }
+}
+
+#[async_trait]
+impl agent_sandbox::NetworkApprover for TuiNetworkApprover {
+    async fn approve(&self, host: &str, allowed: &str) -> agent_sandbox::NetworkDecision {
+        let input = serde_json::json!({ "host": host, "allowed": allowed });
+        let req = PermissionRequest {
+            // Not a tool call: the identifier only has to be unique enough for a
+            // client to correlate the dialog with its answer.
+            call_id: format!("network:{host}"),
+            tool: NETWORK_APPROVAL_TOOL.to_string(),
+            reason: format!(
+                "{host} is outside the network allow-list (allowed: {allowed})"
+            ),
+            // A blocked host is reached BY a command, whose output may itself
+            // have been shaped by untrusted content. Marking the question as
+            // taint-forced is what keeps the dialog from looking routine.
+            taint_forced: false,
+            mode: agent_tools::PermissionMode::Default,
+            input_summary: format!("connect to {host}"),
+            input,
+            // The session option here means "for the rest of this run", applied
+            // by the proxy itself, not by the approval memory.
+            memoizable: true,
+            memo_refused: None,
+        };
+        let (resp_tx, resp_rx) = oneshot::channel();
+        if self.tx.send((req, resp_tx)).await.is_err() {
+            return agent_sandbox::NetworkDecision::Deny;
+        }
+        match resp_rx.await {
+            Ok(ApprovalResponse::Approved { remember: true }) => {
+                agent_sandbox::NetworkDecision::AllowSession
+            }
+            Ok(ApprovalResponse::Approved { remember: false }) => {
+                agent_sandbox::NetworkDecision::AllowOnce
+            }
+            // A refusal, an abort, a timeout and a lost answer are the same
+            // outcome for a socket: it does not open.
+            _ => agent_sandbox::NetworkDecision::Deny,
+        }
+    }
+}
 
 /// Tool name carried by a `request_permissions` confirmation. Same reasoning as
 /// [`NETWORK_APPROVAL_TOOL`]: it names who is asking, and never collides with a
@@ -189,6 +255,12 @@ pub fn to_prompt(req: &PermissionRequest) -> PermissionPrompt {
         "bash" => (
             "bash".to_string(),
             diff::note([str_field("command").to_string()]),
+        ),
+        // The proxy asked, not a tool: the dialog names the host and the list it
+        // failed, because that is the whole decision.
+        NETWORK_APPROVAL_TOOL => (
+            format!("network {}", str_field("host")),
+            diff::note([format!("allowed so far: {}", str_field("allowed"))]),
         ),
         // `note` expects one line per item: we split (a multi-line summary must
         // not end up in a single `Row::Context` with embedded `\n`).

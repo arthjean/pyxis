@@ -18,8 +18,9 @@ pub use fs::{
     enforce_process, resolve_writable_roots,
 };
 pub use proxy::{
-    NetworkGrant, NetworkGrants, ProxyHandle, ProxyNotice, ProxyPolicy, describe_allowed,
-    spawn as spawn_proxy,
+    NetworkApprover, NetworkDecision, NetworkGrant, NetworkGrants, ProxyHandle, ProxyNotice,
+    ProxyPolicy, describe_allowed, spawn as spawn_proxy,
+    spawn_with_approver as spawn_proxy_with_approver,
 };
 
 const SAFE_ENV_KEYS: &[&str] = &[

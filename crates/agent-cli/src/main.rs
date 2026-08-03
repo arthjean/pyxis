@@ -40,7 +40,7 @@ use agent_tools::{
     UpdatePlan, ViewImage, Write, WriteStdin,
 };
 
-use crate::approver::{CliPermissionBroker, TuiApprover};
+use crate::approver::{CliPermissionBroker, TuiApprover, TuiNetworkApprover};
 use crate::interactive::InteractiveConfig;
 
 const RESUME_TAINT_SCAN_MESSAGES: usize = 8;
@@ -1489,6 +1489,11 @@ async fn run(
     // mode already go (stdout stays byte-for-byte identical).
     let (notice_tx, hook_notice_rx) = tokio::sync::mpsc::channel::<String>(16);
 
+    // Confirmation channel, opened before the proxy because the proxy asks on it
+    // too (US-004): a host blocked at connect time is a question, not only a
+    // refusal, and the answer has to reach the socket still waiting for it.
+    let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
+
     // 2. Network allow-list proxy (fail-closed). Hardens the Bash commands.
     // US-003 AC1: whether the network is reachable at all is a property of the
     // sandbox policy; the allow-list only narrows it further.
@@ -1507,7 +1512,16 @@ async fn run(
             let _ = tx.try_send(format!("sandbox: {message}"));
         })
     };
-    let proxy = agent_sandbox::spawn_proxy(proxy_policy, Some(proxy_notice)).await?;
+    // US-004: only an interactive run has someone to ask. Headless and
+    // app-server keep the historical behavior (immediate 403), because a
+    // question nobody can answer is a socket held open for the bound and then
+    // refused anyway.
+    let network_approver: Option<Arc<dyn agent_sandbox::NetworkApprover>> =
+        (!headless && !args.app_server)
+            .then(|| Arc::new(TuiNetworkApprover::new(perm_tx.clone())) as Arc<_>);
+    let proxy =
+        agent_sandbox::spawn_proxy_with_approver(proxy_policy, Some(proxy_notice), network_approver)
+            .await?;
     let proxy_addr = proxy.addr.clone();
     let harden: agent_tools::CommandHardener =
         Arc::new(move |cmd: &mut tokio::process::Command| set_proxy_env(cmd, &proxy_addr));
@@ -1543,7 +1557,7 @@ async fn run(
     };
 
     // 4. Tool registry + approver (TUI in interactive mode, auto in headless).
-    let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
+    // The channel itself was opened above, with the proxy.
     let policy = permission_policy(headless, args.yes, sandbox.enforced);
     let (initial_permission_mode, announce_override) =
         resolve_permission_mode(config.permission_mode, policy, headless);

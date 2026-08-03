@@ -111,11 +111,17 @@ fn is_suffix_match(host: &str, allowed: &str) -> bool {
         && host.as_bytes()[host.len() - allowed.len() - 1] == b'.'
 }
 
-/// Hosts granted for the duration of ONE tool call (US-004). Kept apart from
-/// the policy on purpose: an escalation must never look like a policy change.
+/// Hosts granted outside the policy: for the duration of ONE tool call (US-004)
+/// or, once a human said so at the moment of the block, for the rest of the
+/// session. Kept apart from the policy on purpose: neither must ever look like a
+/// policy change, and both disappear with the process.
 #[derive(Clone, Default)]
 pub struct NetworkGrants {
     inner: Arc<Mutex<HashMap<String, usize>>>,
+    /// Hosts a human allowed for the session, at a block, through
+    /// [`NetworkApprover`]. Separate from the counted map because these have no
+    /// guard: they are released by the process ending, and by nothing else.
+    session: Arc<Mutex<Vec<String>>>,
 }
 
 impl NetworkGrants {
@@ -133,11 +139,48 @@ impl NetworkGrants {
         }
     }
 
+    /// Records a host a human allowed for the whole session. Stored as a
+    /// suffix rule, exactly like the policy's own entries: allowing
+    /// `github.com` at a block covers `api.github.com` afterwards, on a label
+    /// boundary, and covers nothing that merely ends with the same characters.
+    pub fn grant_for_session(&self, host: &str) {
+        let host = normalize_host(host);
+        if host.is_empty() {
+            return;
+        }
+        let mut session = match self.session.lock() {
+            Ok(session) => session,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !session.iter().any(|granted| granted == &host) {
+            session.push(host);
+        }
+    }
+
+    /// Hosts allowed for the session so far, for display (`/sandbox`).
+    pub fn session_grants(&self) -> Vec<String> {
+        match self.session.lock() {
+            Ok(session) => session.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
     fn allows(&self, host: &str) -> bool {
-        match self.inner.lock() {
+        let once = match self.inner.lock() {
             Ok(map) => map.contains_key(host),
             Err(poisoned) => poisoned.into_inner().contains_key(host),
-        }
+        };
+        once || self.session_allows(host)
+    }
+
+    fn session_allows(&self, host: &str) -> bool {
+        let session = match self.session.lock() {
+            Ok(session) => session,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        session
+            .iter()
+            .any(|granted| is_suffix_match(host, granted))
     }
 
     fn release(&self, host: &str) {
@@ -152,6 +195,39 @@ impl NetworkGrants {
         }
     }
 }
+
+/// What a human answers when the proxy blocks a host and asks (US-004, ported
+/// from Codex `core/src/tools/network_approval.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkDecision {
+    /// Let this connection through, and nothing else.
+    AllowOnce,
+    /// Allow this host, and its subdomains, for the rest of the session.
+    AllowSession,
+    /// Keep the refusal.
+    Deny,
+}
+
+/// Asked, at the moment of a block, whether to let a host through.
+///
+/// Deliberately consulted INSIDE the proxy rather than after a failed tool call:
+/// a command that reaches the network usually fails in a way its own output does
+/// not explain, and by the time the tool returns, the connection the user would
+/// have allowed is already gone. Asking here means the answer can still save the
+/// call in flight.
+///
+/// Fail-closed by construction: an absent approver, an approver that errors, and
+/// an approver that does not answer within [`APPROVAL_TIMEOUT`] all keep the
+/// refusal.
+#[async_trait::async_trait]
+pub trait NetworkApprover: Send + Sync {
+    async fn approve(&self, host: &str, allowed: &str) -> NetworkDecision;
+}
+
+/// Longest a blocked connection waits for a human. Past it the refusal stands:
+/// a TCP client that gets no answer at all is a worse failure mode than one that
+/// gets a 403, and an unattended run must not hang on a question nobody reads.
+pub const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// RAII token of a one-call network grant. Revokes on drop.
 pub struct NetworkGrant {
@@ -207,6 +283,17 @@ pub async fn spawn(
     policy: ProxyPolicy,
     notice: Option<ProxyNotice>,
 ) -> std::io::Result<ProxyHandle> {
+    spawn_with_approver(policy, notice, None).await
+}
+
+/// Same, with a human consulted at each block (US-004). Without an approver the
+/// behavior is byte-for-byte the historical one: a blocked host is logged,
+/// restituted and refused, and nothing waits.
+pub async fn spawn_with_approver(
+    policy: ProxyPolicy,
+    notice: Option<ProxyNotice>,
+    approver: Option<Arc<dyn NetworkApprover>>,
+) -> std::io::Result<ProxyHandle> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?.to_string();
     let blocked = Arc::new(Mutex::new(Vec::new()));
@@ -222,8 +309,9 @@ pub async fn spawn(
             let blocked = Arc::clone(&blocked_bg);
             let grants = grants_bg.clone();
             let notice = notice.clone();
+            let approver = approver.clone();
             tokio::spawn(async move {
-                let _ = handle_conn(sock, policy, grants, blocked, notice).await;
+                let _ = handle_conn(sock, policy, grants, blocked, notice, approver).await;
             });
         }
     });
@@ -242,6 +330,7 @@ async fn handle_conn(
     grants: NetworkGrants,
     blocked: Arc<Mutex<Vec<String>>>,
     notice: Option<ProxyNotice>,
+    approver: Option<Arc<dyn NetworkApprover>>,
 ) -> std::io::Result<()> {
     // Read the headers up to CRLFCRLF.
     let mut buf = Vec::new();
@@ -276,21 +365,46 @@ async fn handle_conn(
     // A one-call grant (US-004) is checked alongside the policy, never merged
     // into it: the policy of the session stays what the user configured.
     if !policy.is_allowed(&host) && !grants.allows(&normalize_host(&host)) {
-        if let Ok(mut log) = blocked.lock() {
-            log.push(host.clone());
-        }
-        // US-003 AC6: the refusal names the host AND the active allow-list, on
-        // both channels -> the body reaches the model through the tool output,
-        // the notice reaches the user.
         let allowed = describe_allowed(policy.allowed());
-        if let Some(notice) = notice {
-            notice(format!("network blocked: {host} (allowed: {allowed})"));
+        // US-004: ask BEFORE recording the block. A host a human just allowed
+        // was never blocked, so logging it would make the tool output claim a
+        // refusal that did not happen, and would offer a retry for a connection
+        // that already went through.
+        let decision = match &approver {
+            Some(approver) => decide(approver.as_ref(), &host, &allowed).await,
+            None => NetworkDecision::Deny,
+        };
+        match decision {
+            NetworkDecision::AllowSession => {
+                grants.grant_for_session(&host);
+                if let Some(notice) = &notice {
+                    notice(format!(
+                        "network allowed for this session: {host} (and its subdomains)"
+                    ));
+                }
+            }
+            NetworkDecision::AllowOnce => {
+                if let Some(notice) = &notice {
+                    notice(format!("network allowed once: {host}"));
+                }
+            }
+            NetworkDecision::Deny => {
+                if let Ok(mut log) = blocked.lock() {
+                    log.push(host.clone());
+                }
+                // US-003 AC6: the refusal names the host AND the active
+                // allow-list, on both channels -> the body reaches the model
+                // through the tool output, the notice reaches the user.
+                if let Some(notice) = notice {
+                    notice(format!("network blocked: {host} (allowed: {allowed})"));
+                }
+                let body = format!(
+                    "HTTP/1.1 403 Forbidden\r\n\r\nblocked by pyxis network allow-list: {host} (allowed: {allowed})"
+                );
+                let _ = client.write_all(body.as_bytes()).await;
+                return Ok(());
+            }
         }
-        let body = format!(
-            "HTTP/1.1 403 Forbidden\r\n\r\nblocked by pyxis network allow-list: {host} (allowed: {allowed})"
-        );
-        let _ = client.write_all(body.as_bytes()).await;
-        return Ok(());
     }
 
     // Allowed: real DNS resolution + bidirectional tunnel.
@@ -306,6 +420,20 @@ async fn handle_conn(
         .await?;
     let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
     Ok(())
+}
+
+/// Consults the approver under a bound. A question that never comes back is a
+/// refusal, so an unattended run degrades to the historical behavior instead of
+/// holding a socket open forever.
+async fn decide(
+    approver: &dyn NetworkApprover,
+    host: &str,
+    allowed: &str,
+) -> NetworkDecision {
+    match tokio::time::timeout(APPROVAL_TIMEOUT, approver.approve(host, allowed)).await {
+        Ok(decision) => decision,
+        Err(_) => NetworkDecision::Deny,
+    }
 }
 
 /// Renders the allow-list for a refusal message. An empty list is stated, not
@@ -366,6 +494,73 @@ mod tests {
         let p = ProxyPolicy::new(vec!["GitHub.com.".to_string()]);
         assert!(p.is_allowed("api.GITHUB.com"));
         assert!(p.is_allowed("github.com."));
+    }
+
+    #[test]
+    fn a_session_grant_covers_subdomains_but_not_lookalikes() {
+        // US-004: a host allowed at a block is a suffix rule, exactly like a
+        // policy entry. Anything else would let `evil-github.com` through on the
+        // strength of a `github.com` the user allowed.
+        let grants = NetworkGrants::default();
+        grants.grant_for_session("GitHub.com.");
+        assert!(grants.allows("github.com"));
+        assert!(grants.allows("api.github.com"));
+        for refused in ["evil-github.com", "github.com.evil.test", "notgithub.com"] {
+            assert!(!grants.allows(refused), "{refused} must stay blocked");
+        }
+    }
+
+    #[test]
+    fn a_one_call_grant_still_dies_with_its_guard_while_session_grants_persist() {
+        let grants = NetworkGrants::default();
+        {
+            let _guard = grants.grant("once.test");
+            assert!(grants.allows("once.test"));
+        }
+        assert!(
+            !grants.allows("once.test"),
+            "a one-call grant must not survive its guard"
+        );
+        grants.grant_for_session("kept.test");
+        assert_eq!(grants.session_grants(), vec!["kept.test".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn an_approver_that_never_answers_keeps_the_refusal() {
+        // Fail-closed: the bound is what stops an unattended run from hanging on
+        // a question nobody is there to read.
+        struct Silent;
+        #[async_trait::async_trait]
+        impl NetworkApprover for Silent {
+            async fn approve(&self, _host: &str, _allowed: &str) -> NetworkDecision {
+                std::future::pending::<NetworkDecision>().await
+            }
+        }
+        tokio::time::pause();
+        let decision = decide(&Silent, "slow.test", "none");
+        tokio::pin!(decision);
+        // Nothing is decided before the bound elapses.
+        assert!(
+            futures_poll(&mut decision).is_none(),
+            "the decision must wait for the approver"
+        );
+        tokio::time::advance(APPROVAL_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        assert_eq!(decision.await, NetworkDecision::Deny);
+    }
+
+    /// Polls a pinned future once without blocking, to assert it is still
+    /// pending. `tokio::time::pause` makes the advance deterministic.
+    fn futures_poll<F: std::future::Future>(
+        future: &mut std::pin::Pin<&mut F>,
+    ) -> Option<F::Output> {
+        use std::task::{Context, Poll, Waker};
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(value) => Some(value),
+            Poll::Pending => None,
+        }
     }
 
     #[test]

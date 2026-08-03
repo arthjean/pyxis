@@ -15,12 +15,17 @@ workspace = true
 # The confinement POLICY is pure data owned by `agent-core` (ADR-3): this crate
 # applies it, `agent-tools` evaluates it. Neither one owns it.
 agent-core.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "process", "rt"] }
+tokio = { workspace = true, features = ["io-util", "net", "process", "rt", "time"] }
 thiserror.workspace = true
+# US-004: the network approver is consulted from inside the proxy, hence behind
+# an `Arc<dyn ...>`. Already in the workspace graph, no new dependency.
+async-trait.workspace = true
 
 # Landlock = Linux only. Outside Linux, the FS sandbox degrades to disabled.
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+# `test-util` drives the virtual clock: the approval bound is asserted without
+# a real 60-second wait.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
