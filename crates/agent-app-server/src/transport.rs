@@ -6,13 +6,19 @@
 //! WebSocket transport does not have that property, so it is loopback-only and
 //! bearer-authorized, and it carries the SAME contract and the same identifiers
 //! as stdio.
+//!
+//! A transport owns exactly two things: where its lines come from, and where
+//! they go. The connection lifecycle itself is [`serve_connection`], written
+//! once, so the two transports cannot drift apart on when a thread closes or on
+//! what a malformed message does.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use futures_util::{SinkExt, StreamExt};
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use futures_util::{SinkExt, Stream, StreamExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::handshake::server::{
     ErrorResponse, Request as HandshakeRequest, Response as HandshakeResponse,
 };
@@ -33,24 +39,21 @@ pub enum ServeError {
     WebSocket(String),
 }
 
+/// Whether the connection survives the message that was just handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    Continue,
+    Close,
+}
+
 /// Serves one client over standard input/output.
 pub async fn serve_stdio(server: Arc<AppServer>) -> Result<(), ServeError> {
-    let (outbox, receiver) = Outbox::new();
-    let connection = Connection::new(server, outbox);
-    let writer = tokio::spawn(write_lines(receiver, tokio::io::stdout()));
-
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if handle_line(&connection, &line).await.is_err() {
-            break;
-        }
-    }
-    connection.close_thread("the client disconnected").await;
-    drop(connection);
-    let _ = writer.await;
+    serve_connection(
+        server,
+        read_lines(BufReader::new(tokio::io::stdin())),
+        |rx| tokio::spawn(write_lines(rx, tokio::io::stdout())),
+    )
+    .await;
     Ok(())
 }
 
@@ -94,6 +97,35 @@ pub async fn serve_websocket(
     }
 }
 
+/// Drives one connection from end to end: the queue, the writer task, the read
+/// loop and the teardown.
+///
+/// The line source ending is the client leaving, whatever ended it: a closed
+/// pipe, a close frame, or a read error the transport already logged.
+async fn serve_connection(
+    server: Arc<AppServer>,
+    lines: impl Stream<Item = String>,
+    spawn_writer: impl FnOnce(OutboxReceiver) -> JoinHandle<()>,
+) {
+    let (outbox, receiver) = Outbox::new();
+    let connection = Connection::new(server, outbox);
+    let writer = spawn_writer(receiver);
+
+    let mut lines = std::pin::pin!(lines);
+    while let Some(line) = lines.next().await {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if handle_line(&connection, &line).await == Disposition::Close {
+            break;
+        }
+    }
+
+    connection.close_thread("the client disconnected").await;
+    drop(connection);
+    let _ = writer.await;
+}
+
 fn is_loopback(addr: &SocketAddr) -> bool {
     match addr.ip() {
         IpAddr::V4(ip) => ip.is_loopback(),
@@ -106,10 +138,7 @@ pub fn mint_token() -> String {
     use rand::RngCore;
     let mut bytes = [0_u8; 32];
     rand::rng().fill_bytes(&mut bytes);
-    bytes.iter().fold(String::new(), |mut out, byte| {
-        out.push_str(&format!("{byte:02x}"));
-        out
-    })
+    hex::encode(bytes)
 }
 
 async fn serve_websocket_connection(
@@ -139,48 +168,59 @@ async fn serve_websocket_connection(
     .await
     .map_err(|err| ServeError::WebSocket(err.to_string()))?;
 
-    let (mut sink, mut source) = socket.split();
-    let (outbox, receiver) = Outbox::new();
-    let connection = Connection::new(server, outbox);
-    let writer = tokio::spawn(async move {
-        while let Some(message) = receiver.recv().await {
-            if sink
-                .send(Message::Text(message.to_line().into()))
-                .await
-                .is_err()
-            {
-                break;
+    let (mut sink, source) = socket.split();
+    serve_connection(server, websocket_lines(source), |receiver| {
+        tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                if sink
+                    .send(Message::Text(message.to_line().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
-        }
-        let _ = sink.close().await;
-    });
-
-    while let Some(message) = source.next().await {
-        let message = match message {
-            Ok(message) => message,
-            Err(err) => {
-                tracing::debug!(target: "pyxis::app_server", error = %err, "websocket read");
-                break;
-            }
-        };
-        let line = match message {
-            Message::Text(text) => text,
-            // A binary frame is legal WebSocket and is not this protocol.
-            Message::Binary(_) => continue,
-            Message::Close(_) => break,
-            _ => continue,
-        };
-        if line.trim().is_empty() {
-            continue;
-        }
-        if handle_line(&connection, &line).await.is_err() {
-            break;
-        }
-    }
-    connection.close_thread("the client disconnected").await;
-    drop(connection);
-    let _ = writer.await;
+            let _ = sink.close().await;
+        })
+    })
+    .await;
     Ok(())
+}
+
+/// Protocol lines carried by a WebSocket. A binary frame is legal WebSocket and
+/// is not this protocol, so it is skipped rather than ending the connection.
+fn websocket_lines<S>(source: S) -> impl Stream<Item = String>
+where
+    S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    futures_util::stream::unfold(source, |mut source| async move {
+        loop {
+            match source.next().await {
+                Some(Ok(Message::Text(text))) => return Some((text.to_string(), source)),
+                Some(Ok(Message::Close(_))) | None => return None,
+                Some(Ok(_)) => continue,
+                Some(Err(err)) => {
+                    tracing::debug!(target: "pyxis::app_server", error = %err, "websocket read");
+                    return None;
+                }
+            }
+        }
+    })
+}
+
+/// Protocol lines read from a byte stream. A read error ends the source the
+/// same way an end of file does: there is nobody left to answer.
+fn read_lines<R: AsyncBufRead + Unpin>(reader: R) -> impl Stream<Item = String> {
+    futures_util::stream::unfold(reader.lines(), |mut lines| async move {
+        match lines.next_line().await {
+            Ok(Some(line)) => Some((line, lines)),
+            Ok(None) => None,
+            Err(err) => {
+                tracing::warn!(target: "pyxis::app_server", error = %err, "stdin read");
+                None
+            }
+        }
+    })
 }
 
 fn authorized(request: &HandshakeRequest, expected: &str) -> bool {
@@ -221,7 +261,7 @@ fn constant_time_eq(candidate: &str, expected: &str) -> bool {
 /// The only fatal outcome is a closed outbound queue: everything a client can
 /// write, however broken, produces an answer and leaves the connection usable
 /// (US-016 AC4).
-pub async fn handle_line(connection: &Arc<Connection>, line: &str) -> Result<(), ()> {
+pub async fn handle_line(connection: &Arc<Connection>, line: &str) -> Disposition {
     let answer = match jsonrpc::decode(line) {
         Ok(inbound) => connection.handle(inbound).await,
         Err((id, error)) => Some(Outbound::Error {
@@ -233,26 +273,28 @@ pub async fn handle_line(connection: &Arc<Connection>, line: &str) -> Result<(),
         && let Err(overflow) = connection.outbox().send(answer)
     {
         report_overflow(connection, &overflow.detail);
-        return Err(());
+        return Disposition::Close;
     }
+    // Checked again even when this line queued nothing: the pump publishes into
+    // the same queue, so a client can fall behind on events it never asked for.
     if let Some(overflow) = connection.outbox().overflow() {
         report_overflow(connection, &overflow.detail);
-        return Err(());
+        return Disposition::Close;
     }
-    Ok(())
+    Disposition::Continue
 }
 
 /// Last message of a connection the server is closing. Written straight to the
 /// queue: it is bounded, so this either fits or the client was already gone.
 fn report_overflow(connection: &Arc<Connection>, detail: &str) {
-    let _ = connection
-        .outbox()
-        .send(ServerNotification::Error(ErrorNotification {
+    let _ = connection.outbox().send(
+        ServerNotification::Error(ErrorNotification {
             thread_id: None,
             turn_id: None,
             message: detail.to_string(),
         })
-        .into());
+        .into(),
+    );
     tracing::warn!(target: "pyxis::app_server", detail, "connection closed");
 }
 
@@ -293,5 +335,13 @@ mod tests {
         let first = mint_token();
         assert_eq!(first.len(), 64);
         assert_ne!(first, mint_token());
+    }
+
+    /// Both transports read their lines through the same helper, so an empty
+    /// line and a line break are handled identically on either one.
+    #[tokio::test]
+    async fn a_byte_stream_becomes_protocol_lines() {
+        let lines: Vec<String> = read_lines(&b"first\n\nsecond\n"[..]).collect().await;
+        assert_eq!(lines, vec!["first", "", "second"]);
     }
 }

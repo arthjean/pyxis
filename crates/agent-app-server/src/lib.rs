@@ -37,4 +37,4 @@ pub use protocol::{
     ThreadItem,
 };
 pub use server::{AppServer, Connection};
-pub use transport::{ServeError, mint_token, serve_stdio, serve_websocket};
+pub use transport::{Disposition, ServeError, mint_token, serve_stdio, serve_websocket};

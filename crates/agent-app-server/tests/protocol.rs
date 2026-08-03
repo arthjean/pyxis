@@ -16,7 +16,7 @@ use agent_app_server::items::project_messages;
 use agent_app_server::outbound::{Outbox, OutboxReceiver};
 use agent_app_server::protocol::{DynamicToolSpec, ThreadItem};
 use agent_app_server::server::{AppServer, Connection};
-use agent_app_server::transport::handle_line;
+use agent_app_server::transport::{Disposition, handle_line};
 use agent_core::event::{AgentEvent, ToolCallView, ToolResultView};
 use agent_core::message::{Message, ToolCallId};
 use agent_core::tools::ToolResultStatus;
@@ -189,9 +189,11 @@ impl Harness {
     }
 
     async fn send(&self, line: &str) {
-        handle_line(&self.connection, line)
-            .await
-            .expect("the connection survives every client message");
+        assert_eq!(
+            handle_line(&self.connection, line).await,
+            Disposition::Continue,
+            "the connection survives every client message"
+        );
     }
 
     /// Next outbound message, or a failure: a test that waits forever tells
