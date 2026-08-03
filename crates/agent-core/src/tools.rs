@@ -301,7 +301,9 @@ impl ModelToolResult {
             // above, so even the smallest valid profile retains completion.
             terminal
         } else {
-            truncate_plain(&rendered, strategy, counter, token_limit, byte_limit)
+            largest_fitting(&rendered, strategy, |kept| {
+                feedback_fits(kept, counter, token_limit, byte_limit)
+            })
         };
         self.truncation = Some(ToolResultTruncation {
             original_bytes,
@@ -378,29 +380,9 @@ fn render_execution(
     if feedback_fits(&full, counter, token_limit, byte_limit) {
         return full;
     }
-    let boundaries = char_boundaries(stderr);
-    let mut low = 0usize;
-    let mut high = boundaries.len().saturating_sub(1);
-    while low < high {
-        let mid = (low + high).div_ceil(2);
-        let candidate = render(slice_chars(
-            stderr,
-            &boundaries,
-            mid,
-            TruncationStrategy::Tail,
-        ));
-        if feedback_fits(&candidate, counter, token_limit, byte_limit) {
-            low = mid;
-        } else {
-            high = mid.saturating_sub(1);
-        }
-    }
-    let bounded = render(slice_chars(
-        stderr,
-        &boundaries,
-        low,
-        TruncationStrategy::Tail,
-    ));
+    let bounded = render(&largest_fitting(stderr, TruncationStrategy::Tail, |kept| {
+        feedback_fits(&render(kept), counter, token_limit, byte_limit)
+    }));
     if feedback_fits(&bounded, counter, token_limit, byte_limit) {
         bounded
     } else {
@@ -442,36 +424,30 @@ fn truncate_feedback_text(
     token_limit: usize,
     byte_limit: usize,
 ) -> String {
-    let boundaries = char_boundaries(text);
-    let mut low = 0usize;
-    let mut high = boundaries.len().saturating_sub(1);
-    while low < high {
-        let mid = (low + high).div_ceil(2);
-        let candidate = slice_chars(text, &boundaries, mid, strategy);
-        let rendered = render_feedback(&format!("{candidate}\n{marker}"), structured, execution);
-        if feedback_fits(&rendered, counter, token_limit, byte_limit) {
-            low = mid;
-        } else {
-            high = mid.saturating_sub(1);
-        }
-    }
-    slice_chars(text, &boundaries, low, strategy).to_string()
+    largest_fitting(text, strategy, |kept| {
+        let rendered = render_feedback(&format!("{kept}\n{marker}"), structured, execution);
+        feedback_fits(&rendered, counter, token_limit, byte_limit)
+    })
 }
 
-fn truncate_plain(
+/// Longest prefix (or suffix) of `text`, cut on a character boundary, whose
+/// RENDERING still fits. `fits` is what varies between callers: the same slice
+/// is measured bare, beside a truncation marker, or inside an execution
+/// envelope, and only the caller knows which.
+///
+/// Binary search rather than a byte cut, because a token count is not a byte
+/// count: the caller's own predicate is the only thing that can answer.
+fn largest_fitting(
     text: &str,
     strategy: TruncationStrategy,
-    counter: &dyn TokenCounter,
-    token_limit: usize,
-    byte_limit: usize,
+    fits: impl Fn(&str) -> bool,
 ) -> String {
     let boundaries = char_boundaries(text);
     let mut low = 0usize;
     let mut high = boundaries.len().saturating_sub(1);
     while low < high {
         let mid = (low + high).div_ceil(2);
-        let candidate = slice_chars(text, &boundaries, mid, strategy);
-        if feedback_fits(candidate, counter, token_limit, byte_limit) {
+        if fits(slice_chars(text, &boundaries, mid, strategy)) {
             low = mid;
         } else {
             high = mid.saturating_sub(1);
