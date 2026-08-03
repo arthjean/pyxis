@@ -1,49 +1,90 @@
 //! The protocol actor (US-016, US-017, US-018).
 //!
-//! One connection = one read loop and one pump. The read loop decodes, checks
-//! ownership and drives the runtime; the pump owns everything that must be
-//! ordered against the event stream: the item projection, the pending server
-//! requests and the current turn. That split is what makes the correlation of
-//! an approval deterministic rather than lucky: the pump polls the runtime
-//! events BEFORE its own command queue, so the item a call opens is always
-//! projected before the approval that call raises is sent out.
+//! One connection = one read loop and one pump. This module owns the read loop:
+//! it decodes, checks ownership and drives the runtime. Everything that must be
+//! ordered against the event stream lives in [`crate::pump`].
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use agent_runtime::thread::{RuntimeEvent, RuntimeEventPayload};
 use agent_tools::permission::{ApprovalResponse, PermissionRequest};
 use serde_json::Value;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::bridge::{ClientBridge, ClientEndpoint};
+use crate::cursor;
 use crate::host::{HostError, OpenThread, RuntimeHost, ThreadControl};
-use crate::items::{Projected, Projector, ToolFamily, declared_paths};
+use crate::items::Projector;
 use crate::jsonrpc::{ErrorObject, Inbound, Outbound, RequestId, error_code};
 use crate::outbound::{MAX_QUEUED_BYTES, MAX_QUEUED_EVENTS, Outbox};
-use crate::protocol::{self, *};
+use crate::protocol::*;
+use crate::pump::{Pump, PumpCommand};
 
 /// Default page size of `thread/items/list`, and its ceiling.
 pub const DEFAULT_PAGE_SIZE: usize = 50;
 pub const MAX_PAGE_SIZE: usize = 500;
 
-/// Shared state of every connection of one process.
+/// Who holds the single thread this process hosts.
 ///
 /// This build hosts ONE thread at a time: the tool registry, the Code Mode
 /// session and the sub-agent handle of the process each belong to the open
 /// thread, so a second live thread would silently rebind them. A second client
 /// therefore gets a typed conflict rather than a thread whose tools point
 /// elsewhere (edge case #8).
-#[derive(Default)]
-struct Ownership {
-    held: Option<(String, u64)>,
+enum Ownership {
+    Free,
+    /// A connection is opening a thread whose identifier is not known yet.
+    Reserved {
+        owner: u64,
+    },
+    Bound {
+        thread_id: String,
+        owner: u64,
+    },
+}
+
+impl Ownership {
+    fn owner(&self) -> Option<u64> {
+        match self {
+            Self::Free => None,
+            Self::Reserved { owner } | Self::Bound { owner, .. } => Some(*owner),
+        }
+    }
+
+    /// What to tell a client that cannot have the thread, and `None` when it
+    /// can. The refusal names WHICH thread is held, so a client knows whether
+    /// to wait or to resume; `threadId` is null while the holder is still
+    /// opening one, because at that point it has no name to give.
+    fn conflict(&self, connection: u64) -> Option<ErrorObject> {
+        let (message, thread_id) = match self {
+            Self::Free => return None,
+            Self::Reserved { owner } if *owner == connection => {
+                ("this connection is already opening a thread", Value::Null)
+            }
+            Self::Reserved { .. } => (
+                "this server is already opening a thread for another client",
+                Value::Null,
+            ),
+            Self::Bound { thread_id, owner } if *owner == connection => (
+                "this connection already holds a thread; unsubscribe from it first",
+                Value::String(thread_id.clone()),
+            ),
+            Self::Bound { thread_id, .. } => (
+                "this server is already driving a thread for another client",
+                Value::String(thread_id.clone()),
+            ),
+        };
+        Some(
+            ErrorObject::new(error_code::THREAD_CONFLICT, message)
+                .with_data(serde_json::json!({ "threadId": thread_id })),
+        )
+    }
 }
 
 pub struct AppServer {
     host: Arc<dyn RuntimeHost>,
-    bridge: Arc<ClientBridge>,
     ownership: std::sync::Mutex<Ownership>,
+    bridge: Arc<ClientBridge>,
     next_connection: AtomicU64,
 }
 
@@ -52,7 +93,7 @@ impl AppServer {
         Arc::new(Self {
             host,
             bridge,
-            ownership: std::sync::Mutex::new(Ownership::default()),
+            ownership: std::sync::Mutex::new(Ownership::Free),
             next_connection: AtomicU64::new(1),
         })
     }
@@ -67,41 +108,59 @@ impl AppServer {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Claims the write ownership. The refusal names WHICH thread is held, so a
-    /// client knows whether to wait or to resume.
-    fn claim(&self, thread_id: Option<&str>, connection: u64) -> Result<(), ErrorObject> {
+    /// Reserves the write ownership for `connection`.
+    ///
+    /// The reservation releases itself unless it is confirmed, so no failure
+    /// path between here and a live thread can leak the slot.
+    fn reserve(self: &Arc<Self>, connection: u64) -> Result<Reservation, ErrorObject> {
         let mut held = self.ownership();
-        match &held.held {
-            Some((owned, owner)) if *owner != connection => Err(ErrorObject::new(
-                error_code::THREAD_CONFLICT,
-                "this server is already driving a thread for another client",
-            )
-            .with_data(serde_json::json!({ "threadId": owned }))),
-            Some((owned, _)) => Err(ErrorObject::new(
-                error_code::THREAD_CONFLICT,
-                "this connection already holds a thread; unsubscribe from it first",
-            )
-            .with_data(serde_json::json!({ "threadId": owned }))),
-            None => {
-                held.held = Some((thread_id.unwrap_or_default().to_string(), connection));
-                Ok(())
-            }
+        if let Some(conflict) = held.conflict(connection) {
+            return Err(conflict);
         }
-    }
-
-    /// Names the thread a reservation was taken for, once its identifier is
-    /// known. A failed open releases instead.
-    fn confirm(&self, thread_id: &str, connection: u64) {
-        let mut held = self.ownership();
-        if matches!(&held.held, Some((_, owner)) if *owner == connection) {
-            held.held = Some((thread_id.to_string(), connection));
-        }
+        *held = Ownership::Reserved { owner: connection };
+        drop(held);
+        Ok(Reservation {
+            server: Arc::clone(self),
+            connection,
+            confirmed: false,
+        })
     }
 
     fn release(&self, connection: u64) {
         let mut held = self.ownership();
-        if matches!(&held.held, Some((_, owner)) if *owner == connection) {
-            held.held = None;
+        if held.owner() == Some(connection) {
+            *held = Ownership::Free;
+        }
+    }
+}
+
+/// A claim on the single thread slot, released on drop until it is confirmed.
+struct Reservation {
+    server: Arc<AppServer>,
+    connection: u64,
+    confirmed: bool,
+}
+
+impl Reservation {
+    /// Names the thread the reservation was taken for, once it exists.
+    fn confirm(mut self, thread_id: &str) {
+        let mut held = self.server.ownership();
+        if held.owner() == Some(self.connection) {
+            *held = Ownership::Bound {
+                thread_id: thread_id.to_string(),
+                owner: self.connection,
+            };
+        }
+        self.confirmed = true;
+        // Released before `self` drops, which would take the same lock.
+        drop(held);
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.confirmed {
+            self.server.release(self.connection);
         }
     }
 }
@@ -114,30 +173,12 @@ struct OpenState {
     pump: tokio::task::JoinHandle<()>,
 }
 
-/// What the pump must serialize against the event stream.
-enum PumpCommand {
-    Approve {
-        request: Box<PermissionRequest>,
-        reply: oneshot::Sender<ApprovalResponse>,
-    },
-    DynamicTool {
-        tool: String,
-        call_id: String,
-        arguments: Value,
-        reply: oneshot::Sender<Result<DynamicToolCallResponse, String>>,
-    },
-    ClientResponse {
-        id: RequestId,
-        result: Result<Value, ErrorObject>,
-    },
-}
-
 /// One client connection.
 pub struct Connection {
     id: u64,
     server: Arc<AppServer>,
     outbox: Outbox,
-    initialized: std::sync::atomic::AtomicBool,
+    initialized: AtomicBool,
     open: tokio::sync::Mutex<Option<OpenState>>,
 }
 
@@ -147,7 +188,7 @@ impl Connection {
             id: server.connection_id(),
             server,
             outbox,
-            initialized: std::sync::atomic::AtomicBool::new(false),
+            initialized: AtomicBool::new(false),
             open: tokio::sync::Mutex::new(None),
         })
     }
@@ -256,58 +297,51 @@ impl Connection {
         self: &Arc<Self>,
         params: ThreadStartParams,
     ) -> Result<Value, ErrorObject> {
-        self.server.claim(None, self.id)?;
-        let opened = match self.server.host.start_thread(params.dynamic_tools).await {
-            Ok(opened) => opened,
-            Err(err) => {
-                self.server.release(self.id);
-                return Err(err.into_error_object());
-            }
-        };
-        self.adopt(opened).await
+        let reservation = self.server.reserve(self.id)?;
+        let opened = self
+            .server
+            .host
+            .start_thread(params.dynamic_tools)
+            .await
+            .map_err(HostError::into_error_object)?;
+        self.adopt(opened, reservation).await
     }
 
     async fn thread_resume(
         self: &Arc<Self>,
         params: ThreadResumeParams,
     ) -> Result<Value, ErrorObject> {
-        self.server.claim(Some(&params.thread_id), self.id)?;
-        let opened = match self
+        let reservation = self.server.reserve(self.id)?;
+        let opened = self
             .server
             .host
             .resume_thread(&params.thread_id, params.dynamic_tools)
             .await
-        {
-            Ok(opened) => opened,
-            Err(err) => {
-                self.server.release(self.id);
-                return Err(err.into_error_object());
-            }
-        };
-        self.adopt(opened).await
+            .map_err(HostError::into_error_object)?;
+        self.adopt(opened, reservation).await
     }
 
     /// Binds an opened thread to this connection: the pump starts, the tool
     /// pipeline is pointed at this client, and the thread is announced.
-    async fn adopt(self: &Arc<Self>, opened: OpenThread) -> Result<Value, ErrorObject> {
+    async fn adopt(
+        self: &Arc<Self>,
+        opened: OpenThread,
+        reservation: Reservation,
+    ) -> Result<Value, ErrorObject> {
         let OpenThread {
             thread_id,
             items,
             events,
             control,
         } = opened;
-        self.server.confirm(&thread_id, self.id);
+        reservation.confirm(&thread_id);
         let item_count = items.len() as u64;
+        let pump = Pump::new(
+            thread_id.clone(),
+            self.outbox.clone(),
+            Projector::resumed(item_count),
+        );
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
-        let pump = Pump {
-            thread_id: thread_id.clone(),
-            outbox: self.outbox.clone(),
-            projector: Projector::resumed(item_count),
-            pending: HashMap::new(),
-            next_request_id: AtomicI64::new(1),
-            current_turn: None,
-            queued_inputs: HashMap::new(),
-        };
         let handle = tokio::spawn(pump.run(events, commands_rx));
         *self.open.lock().await = Some(OpenState {
             thread_id: thread_id.clone(),
@@ -335,10 +369,8 @@ impl Connection {
     async fn thread_unsubscribe(self: &Arc<Self>, params: ThreadRef) -> Result<Value, ErrorObject> {
         {
             let open = self.open.lock().await;
-            let Some(state) = open.as_ref() else {
-                return Err(unknown_thread(&params.thread_id));
-            };
-            if state.thread_id != params.thread_id {
+            let held = open.as_ref().map(|state| state.thread_id.as_str());
+            if held != Some(params.thread_id.as_str()) {
                 return Err(unknown_thread(&params.thread_id));
             }
         }
@@ -349,7 +381,7 @@ impl Connection {
     async fn items_list(&self, params: ThreadItemsListParams) -> Result<Value, ErrorObject> {
         let start = match params.cursor.as_deref() {
             None => 0,
-            Some(cursor) => decode_cursor(cursor, &params.thread_id)?,
+            Some(cursor) => cursor::decode(cursor, &params.thread_id)?,
         };
         let page_size = params
             .page_size
@@ -363,7 +395,7 @@ impl Connection {
             .map_err(HostError::into_error_object)?;
         let end = start.saturating_add(page_size).min(items.len());
         let page: Vec<ThreadItem> = items.get(start..end).unwrap_or_default().to_vec();
-        let next_cursor = (end < items.len()).then(|| encode_cursor(&params.thread_id, end));
+        let next_cursor = (end < items.len()).then(|| cursor::encode(&params.thread_id, end));
         json(&ThreadItemsListResult {
             items: page,
             next_cursor,
@@ -417,9 +449,14 @@ impl Connection {
         }
     }
 
-    async fn route_response(&self, id: RequestId, result: Result<Value, ErrorObject>) {
+    /// The pump queue of the open thread, when there is one.
+    async fn commands(&self) -> Option<mpsc::UnboundedSender<PumpCommand>> {
         let open = self.open.lock().await;
-        let Some(state) = open.as_ref() else {
+        open.as_ref().map(|state| state.commands.clone())
+    }
+
+    async fn route_response(&self, id: RequestId, result: Result<Value, ErrorObject>) {
+        let Some(commands) = self.commands().await else {
             self.notify(ServerNotification::Error(ErrorNotification {
                 thread_id: None,
                 turn_id: None,
@@ -427,9 +464,7 @@ impl Connection {
             }));
             return;
         };
-        let _ = state
-            .commands
-            .send(PumpCommand::ClientResponse { id, result });
+        let _ = commands.send(PumpCommand::ClientResponse { id, result });
     }
 
     /// Ends the thread this connection holds: the pump stops, the runtime
@@ -465,10 +500,7 @@ impl Connection {
 #[async_trait::async_trait]
 impl ClientEndpoint for Connection {
     async fn approve(&self, request: &PermissionRequest) -> Option<ApprovalResponse> {
-        let commands = {
-            let open = self.open.lock().await;
-            open.as_ref().map(|state| state.commands.clone())
-        }?;
+        let commands = self.commands().await?;
         let (reply, answer) = oneshot::channel();
         commands
             .send(PumpCommand::Approve {
@@ -485,11 +517,10 @@ impl ClientEndpoint for Connection {
         call_id: &str,
         arguments: Value,
     ) -> Result<DynamicToolCallResponse, String> {
-        let commands = {
-            let open = self.open.lock().await;
-            open.as_ref().map(|state| state.commands.clone())
-        }
-        .ok_or_else(|| "no thread is open on this connection".to_string())?;
+        let commands = self
+            .commands()
+            .await
+            .ok_or_else(|| "no thread is open on this connection".to_string())?;
         let (reply, answer) = oneshot::channel();
         commands
             .send(PumpCommand::DynamicTool {
@@ -505,428 +536,6 @@ impl ClientEndpoint for Connection {
     }
 }
 
-/// A server request waiting for its answer.
-struct PendingRequest {
-    method: &'static str,
-    turn_id: Option<String>,
-    item_id: String,
-    answer: PendingAnswer,
-}
-
-enum PendingAnswer {
-    Approval(oneshot::Sender<ApprovalResponse>),
-    DynamicTool(oneshot::Sender<Result<DynamicToolCallResponse, String>>),
-}
-
-/// Everything ordered against the runtime event stream.
-struct Pump {
-    thread_id: String,
-    outbox: Outbox,
-    projector: Projector,
-    pending: HashMap<RequestId, PendingRequest>,
-    next_request_id: AtomicI64,
-    current_turn: Option<String>,
-    /// Inputs accepted for a turn that has not started yet.
-    queued_inputs: HashMap<String, Vec<String>>,
-}
-
-impl Pump {
-    async fn run(
-        mut self,
-        mut events: broadcast::Receiver<RuntimeEvent>,
-        mut commands: mpsc::UnboundedReceiver<PumpCommand>,
-    ) {
-        loop {
-            tokio::select! {
-                // Runtime events FIRST: the item a call opens must be projected
-                // before the approval that call raises is sent to the client.
-                biased;
-                received = events.recv() => match received {
-                    Ok(event) => self.on_event(&event),
-                    Err(broadcast::error::RecvError::Lagged(dropped)) => {
-                        self.emit(ServerNotification::Error(ErrorNotification {
-                            thread_id: Some(self.thread_id.clone()),
-                            turn_id: self.current_turn.clone(),
-                            message: format!(
-                                "{dropped} runtime event(s) dropped from the live stream; \
-                                 re-read the thread with `thread/items/list`"
-                            ),
-                        }));
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                },
-                command = commands.recv() => match command {
-                    Some(command) => self.on_command(command),
-                    None => break,
-                },
-            }
-        }
-        self.cancel_pending(None);
-    }
-
-    fn on_event(&mut self, event: &RuntimeEvent) {
-        let turn_id = event.turn_id.map(|id| id.to_string());
-        match &event.payload {
-            RuntimeEventPayload::InputAccepted { text } => {
-                let Some(turn) = turn_id else {
-                    return;
-                };
-                if self.current_turn.as_deref() == Some(turn.as_str()) {
-                    self.emit_input(&turn, text);
-                } else {
-                    self.queued_inputs
-                        .entry(turn)
-                        .or_default()
-                        .push(text.clone());
-                }
-            }
-            RuntimeEventPayload::TurnStateChanged { to, cause, .. } => {
-                let Some(turn) = turn_id else {
-                    return;
-                };
-                match to {
-                    agent_runtime::TurnState::Running => {
-                        // A turn that came back from `needs_input` is the same
-                        // turn: it is announced once, not once per resumption.
-                        let already = self.current_turn.as_deref() == Some(turn.as_str());
-                        self.current_turn = Some(turn.clone());
-                        if !already {
-                            self.emit(ServerNotification::TurnStarted(TurnStartedNotification {
-                                thread_id: self.thread_id.clone(),
-                                turn_id: turn.clone(),
-                            }));
-                        }
-                        for text in self.queued_inputs.remove(&turn).unwrap_or_default() {
-                            self.emit_input(&turn, &text);
-                        }
-                    }
-                    state if state.is_terminal() => {
-                        let cause_text = cause
-                            .clone()
-                            .unwrap_or_else(|| format!("turn {}", terminal_label(*state)));
-                        // US-019 AC1: read once, by the classifier the TUI, the
-                        // headless summary and the durable log all share.
-                        let failure =
-                            agent_runtime::TurnFailure::classify(*state, cause.as_deref());
-                        // Exactly one terminal projection per open item, before
-                        // the turn is declared over (US-017 AC3).
-                        let closed = self.projector.close_open(&cause_text);
-                        self.publish(closed, Some(turn.clone()));
-                        self.cancel_pending(Some(&turn));
-                        self.queued_inputs.remove(&turn);
-                        self.emit(ServerNotification::TurnCompleted(
-                            TurnCompletedNotification {
-                                thread_id: self.thread_id.clone(),
-                                turn_id: turn.clone(),
-                                status: match state {
-                                    agent_runtime::TurnState::Completed => TurnStatus::Completed,
-                                    agent_runtime::TurnState::Interrupted => {
-                                        TurnStatus::Interrupted
-                                    }
-                                    _ => TurnStatus::Failed,
-                                },
-                                cause: cause.clone(),
-                                cause_category: failure
-                                    .as_ref()
-                                    .map(|failure| failure.category.into()),
-                                cause_guidance: failure
-                                    .as_ref()
-                                    .map(|failure| failure.category.guidance().to_string()),
-                            },
-                        ));
-                        if self.current_turn.as_deref() == Some(turn.as_str()) {
-                            self.current_turn = None;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            RuntimeEventPayload::Engine(engine) => {
-                let projected = self.projector.engine(engine);
-                self.publish(projected, turn_id);
-            }
-            RuntimeEventPayload::StoreFailed { operation, detail } => {
-                self.emit(ServerNotification::Error(ErrorNotification {
-                    thread_id: Some(self.thread_id.clone()),
-                    turn_id,
-                    message: format!("thread store failed during {operation}: {detail}"),
-                }));
-            }
-            RuntimeEventPayload::ShuttingDown => {
-                self.emit(ServerNotification::ThreadClosed(ThreadClosedNotification {
-                    thread_id: self.thread_id.clone(),
-                    reason: "the runtime is shutting down".to_string(),
-                }));
-            }
-            RuntimeEventPayload::Forked { .. } => {}
-        }
-    }
-
-    fn emit_input(&mut self, turn: &str, text: &str) {
-        let item = self.projector.user_message(text.to_string());
-        self.emit(ServerNotification::ItemCompleted(ItemNotification {
-            thread_id: self.thread_id.clone(),
-            turn_id: Some(turn.to_string()),
-            item,
-        }));
-    }
-
-    fn publish(&self, projected: Vec<Projected>, turn_id: Option<String>) {
-        for one in projected {
-            self.emit(one.into_notification(&self.thread_id, turn_id.clone()));
-        }
-    }
-
-    fn on_command(&mut self, command: PumpCommand) {
-        match command {
-            PumpCommand::Approve { request, reply } => self.ask_approval(*request, reply),
-            PumpCommand::DynamicTool {
-                tool,
-                call_id,
-                arguments,
-                reply,
-            } => self.ask_dynamic_tool(tool, call_id, arguments, reply),
-            PumpCommand::ClientResponse { id, result } => self.answer(id, result),
-        }
-    }
-
-    fn ask_approval(
-        &mut self,
-        request: PermissionRequest,
-        reply: oneshot::Sender<ApprovalResponse>,
-    ) {
-        let call_id = request.call_id.as_str().to_string();
-        let item_id = self
-            .projector
-            .item_for_call(&call_id)
-            .unwrap_or_else(|| call_id.clone());
-        let correlation = RequestCorrelation {
-            thread_id: self.thread_id.clone(),
-            turn_id: self.current_turn.clone(),
-            item_id: item_id.clone(),
-            call_id: call_id.clone(),
-        };
-        let server_request = match ToolFamily::of(&request.tool) {
-            ToolFamily::Command => {
-                ServerRequest::CommandExecutionRequestApproval(CommandExecutionApprovalParams {
-                    correlation,
-                    command: request.input_summary.clone(),
-                    reason: request.reason.clone(),
-                    taint_forced: request.taint_forced,
-                    mode: request.mode.to_string(),
-                    memoizable: request.memoizable,
-                    memo_refused: request.memo_refused.clone(),
-                })
-            }
-            ToolFamily::FileChange => {
-                ServerRequest::FileChangeRequestApproval(FileChangeApprovalParams {
-                    correlation,
-                    tool: request.tool.clone(),
-                    paths: declared_paths(&request.input),
-                    input: request.input.clone(),
-                    reason: request.reason.clone(),
-                    taint_forced: request.taint_forced,
-                    mode: request.mode.to_string(),
-                    memoizable: request.memoizable,
-                    memo_refused: request.memo_refused.clone(),
-                })
-            }
-            ToolFamily::Other => ServerRequest::ToolRequestApproval(ToolApprovalParams {
-                correlation,
-                tool: request.tool.clone(),
-                input: request.input.clone(),
-                summary: request.input_summary.clone(),
-                reason: request.reason.clone(),
-                taint_forced: request.taint_forced,
-                mode: request.mode.to_string(),
-                memoizable: request.memoizable,
-                memo_refused: request.memo_refused.clone(),
-            }),
-        };
-        self.send_request(server_request, item_id, PendingAnswer::Approval(reply));
-    }
-
-    fn ask_dynamic_tool(
-        &mut self,
-        tool: String,
-        call_id: String,
-        arguments: Value,
-        reply: oneshot::Sender<Result<DynamicToolCallResponse, String>>,
-    ) {
-        let item_id = self
-            .projector
-            .item_for_call(&call_id)
-            .unwrap_or_else(|| call_id.clone());
-        let request = ServerRequest::DynamicToolCall(DynamicToolCallParams {
-            correlation: RequestCorrelation {
-                thread_id: self.thread_id.clone(),
-                turn_id: self.current_turn.clone(),
-                item_id: item_id.clone(),
-                call_id,
-            },
-            tool,
-            arguments,
-        });
-        self.send_request(request, item_id, PendingAnswer::DynamicTool(reply));
-    }
-
-    fn send_request(&mut self, request: ServerRequest, item_id: String, answer: PendingAnswer) {
-        let id = RequestId::Number(self.next_request_id.fetch_add(1, Ordering::Relaxed));
-        let method = request.method_name();
-        let sent = self.outbox.send(Outbound::Request {
-            id: id.clone(),
-            method: method.to_string(),
-            params: request.params(),
-        });
-        if sent.is_err() {
-            // The queue is closed: nothing will ever answer, so the caller is
-            // released now rather than after a timeout it does not have.
-            fail_pending(answer, "the client connection is closed");
-            return;
-        }
-        self.pending.insert(
-            id,
-            PendingRequest {
-                method,
-                turn_id: self.current_turn.clone(),
-                item_id,
-                answer,
-            },
-        );
-    }
-
-    /// Routes a client answer. A late, duplicated or unknown answer is REFUSED
-    /// and reported: it reopens no item and runs no tool (US-017 AC4).
-    fn answer(&mut self, id: RequestId, result: Result<Value, ErrorObject>) {
-        let Some(pending) = self.pending.remove(&id) else {
-            self.emit(ServerNotification::Error(ErrorNotification {
-                thread_id: Some(self.thread_id.clone()),
-                turn_id: self.current_turn.clone(),
-                message: format!(
-                    "response to request {id} refused: it is unknown, already \
-                     answered, or belongs to a turn that ended"
-                ),
-            }));
-            return;
-        };
-        let item_id = pending.item_id.clone();
-        let turn_id = pending.turn_id.clone();
-        match (pending.answer, result) {
-            (PendingAnswer::Approval(reply), Ok(value)) => {
-                match serde_json::from_value::<ApprovalDecisionResponse>(value) {
-                    Ok(decision) => {
-                        let _ = reply.send(match decision.decision {
-                            ApprovalDecision::Approved => ApprovalResponse::ALLOW_ONCE,
-                            ApprovalDecision::ApprovedForSession => ApprovalResponse::ALLOW_SESSION,
-                            ApprovalDecision::Declined => ApprovalResponse::DENY_ONCE,
-                            ApprovalDecision::DeclinedForSession => ApprovalResponse::DENY_SESSION,
-                        });
-                    }
-                    // An unreadable decision denies: the fail-closed rule of the
-                    // whole permission pipeline does not stop at the wire.
-                    Err(err) => {
-                        let _ = reply.send(ApprovalResponse::DENY_ONCE);
-                        self.emit(ServerNotification::Error(ErrorNotification {
-                            thread_id: Some(self.thread_id.clone()),
-                            turn_id: turn_id.clone(),
-                            message: format!("unreadable approval answer, denied: {err}"),
-                        }));
-                    }
-                }
-            }
-            (PendingAnswer::Approval(reply), Err(error)) => {
-                let _ = reply.send(ApprovalResponse::DENY_ONCE);
-                self.emit(ServerNotification::Error(ErrorNotification {
-                    thread_id: Some(self.thread_id.clone()),
-                    turn_id: turn_id.clone(),
-                    message: format!("client refused the approval request: {}", error.message),
-                }));
-            }
-            (PendingAnswer::DynamicTool(reply), Ok(value)) => {
-                let _ = reply.send(
-                    serde_json::from_value::<DynamicToolCallResponse>(value)
-                        .map_err(|err| format!("unreadable tool answer: {err}")),
-                );
-            }
-            (PendingAnswer::DynamicTool(reply), Err(error)) => {
-                let _ = reply.send(Err(error.message));
-            }
-        }
-        self.emit(ServerNotification::ServerRequestResolved(
-            ServerRequestResolvedNotification {
-                request_id: id.to_string(),
-                thread_id: Some(self.thread_id.clone()),
-                turn_id,
-                item_id: Some(item_id),
-                resolution: ServerRequestResolution::Answered,
-            },
-        ));
-    }
-
-    /// Releases every request bound to `turn` (all of them when `None`).
-    ///
-    /// Releasing means DENYING: a request nobody will answer must not leave a
-    /// tool waiting, and a permission nobody granted is a permission refused.
-    fn cancel_pending(&mut self, turn: Option<&str>) {
-        let doomed: Vec<RequestId> = self
-            .pending
-            .iter()
-            .filter(|(_, pending)| match turn {
-                None => true,
-                Some(turn) => pending.turn_id.as_deref() == Some(turn),
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in doomed {
-            let Some(pending) = self.pending.remove(&id) else {
-                continue;
-            };
-            let item_id = pending.item_id.clone();
-            let turn_id = pending.turn_id.clone();
-            let method = pending.method;
-            fail_pending(pending.answer, "the turn ended before the client answered");
-            tracing::debug!(
-                target: "pyxis::app_server",
-                request_id = %id,
-                method,
-                "server request cancelled"
-            );
-            self.emit(ServerNotification::ServerRequestResolved(
-                ServerRequestResolvedNotification {
-                    request_id: id.to_string(),
-                    thread_id: Some(self.thread_id.clone()),
-                    turn_id,
-                    item_id: Some(item_id),
-                    resolution: ServerRequestResolution::Cancelled,
-                },
-            ));
-        }
-    }
-
-    fn emit(&self, notification: ServerNotification) {
-        let _ = self.outbox.send(notification.into());
-    }
-}
-
-fn fail_pending(answer: PendingAnswer, detail: &str) {
-    match answer {
-        PendingAnswer::Approval(reply) => {
-            let _ = reply.send(ApprovalResponse::DENY_ONCE);
-        }
-        PendingAnswer::DynamicTool(reply) => {
-            let _ = reply.send(Err(detail.to_string()));
-        }
-    }
-}
-
-fn terminal_label(state: agent_runtime::TurnState) -> &'static str {
-    match state {
-        agent_runtime::TurnState::Completed => "completed",
-        agent_runtime::TurnState::Interrupted => "interrupted",
-        _ => "failed",
-    }
-}
-
 fn unknown_thread(thread_id: &str) -> ErrorObject {
     ErrorObject::new(
         error_code::UNKNOWN_THREAD,
@@ -937,60 +546,4 @@ fn unknown_thread(thread_id: &str) -> ErrorObject {
 fn json<T: serde::Serialize>(value: &T) -> Result<Value, ErrorObject> {
     serde_json::to_value(value)
         .map_err(|err| ErrorObject::new(error_code::INTERNAL_ERROR, err.to_string()))
-}
-
-/// Cursors are opaque and bound to their thread: one taken from another thread
-/// is refused rather than applied to an unrelated list (FR-17).
-fn encode_cursor(thread_id: &str, index: usize) -> String {
-    let raw = format!("{thread_id}:{index}");
-    raw.bytes().fold(String::new(), |mut out, byte| {
-        out.push_str(&format!("{byte:02x}"));
-        out
-    })
-}
-
-fn decode_cursor(cursor: &str, thread_id: &str) -> Result<usize, ErrorObject> {
-    let invalid = || {
-        ErrorObject::new(
-            error_code::INVALID_PARAMS,
-            "cursor is not a cursor this thread handed out",
-        )
-    };
-    if !cursor.len().is_multiple_of(2) {
-        return Err(invalid());
-    }
-    let bytes: Option<Vec<u8>> = cursor
-        .as_bytes()
-        .chunks(2)
-        .map(|pair| {
-            std::str::from_utf8(pair)
-                .ok()
-                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-        })
-        .collect();
-    let decoded = String::from_utf8(bytes.ok_or_else(invalid)?).map_err(|_| invalid())?;
-    let (owner, index) = decoded.rsplit_once(':').ok_or_else(invalid)?;
-    if owner != thread_id {
-        return Err(invalid());
-    }
-    index.parse::<usize>().map_err(|_| invalid())
-}
-
-/// Re-exported so a transport can name the whole protocol from one module.
-pub use protocol::PROTOCOL_VERSION as SERVED_PROTOCOL_VERSION;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_cursor_is_opaque_and_bound_to_its_thread() {
-        let cursor = encode_cursor("thr_1", 50);
-        assert!(!cursor.contains("thr_1"), "{cursor}");
-        assert!(!cursor.contains("50"), "{cursor}");
-        assert_eq!(decode_cursor(&cursor, "thr_1"), Ok(50));
-        assert!(decode_cursor(&cursor, "thr_2").is_err());
-        assert!(decode_cursor("zz", "thr_1").is_err());
-        assert!(decode_cursor("abc", "thr_1").is_err());
-    }
 }

@@ -17,12 +17,14 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod bridge;
+mod cursor;
 pub mod host;
 pub mod items;
 pub mod jsonrpc;
 pub mod outbound;
 pub mod protocol;
 mod protocol_metadata;
+mod pump;
 pub mod schema;
 pub mod server;
 pub mod transport;

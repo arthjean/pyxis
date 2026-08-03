@@ -30,6 +30,9 @@ async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 rand.workspace = true
+# The canonical hex codec of the workspace: bearer tokens and pagination
+# cursors, rather than a second implementation per call site.
+hex.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-std", "io-util", "test-util"] }
