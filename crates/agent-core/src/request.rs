@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::message::Message;
+use crate::message::{Message, is_false};
 use crate::model::ResolvedModelRuntime;
 use crate::provider::{ToolSpec, ToolSpecValidationError};
 use crate::redaction::{is_sensitive_key, looks_like_signed_url};
@@ -248,10 +248,6 @@ fn validate_client_metadata(
         }
     }
     Ok(())
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 #[cfg(test)]

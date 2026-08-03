@@ -4,6 +4,8 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::message::is_false;
+
 /// Grammar syntax accepted by a freeform tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -510,10 +512,6 @@ fn default_true() -> bool {
 
 fn is_true(value: &bool) -> bool {
     *value
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

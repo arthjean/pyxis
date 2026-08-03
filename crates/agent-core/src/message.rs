@@ -23,6 +23,12 @@ pub const INTERRUPTED_TOOL_RESULT: &str = "Interrupted by the user before this t
      completed. No result is available: the tool may have partially executed and any process \
      it started may still be running.";
 
+/// Prefix marking a summary produced by a compaction. It lives here, with the
+/// content blocks, because two places read it: the compaction that writes
+/// summaries and the trust rule that has to recognize a legacy one. A second
+/// literal would be a second definition of the same format.
+pub const SUMMARY_PREFIX: &str = "[Previous conversation summary]\n";
+
 /// Transcript tool calls left WITHOUT a result, in order of appearance.
 ///
 /// This is the single definition of the `tool_use` <-> `tool_result` pairing:
@@ -106,6 +112,13 @@ impl ToolCallFormat {
     pub const fn is_text(&self) -> bool {
         matches!(self, Self::Text)
     }
+}
+
+/// `skip_serializing_if` predicate for the many additive boolean fields of the
+/// canonical types. One definition: four copies of `!*value` was four chances
+/// for one of them to stop matching its `#[serde(default)]`.
+pub(crate) fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 const fn default_untrusted() -> bool {
@@ -332,13 +345,23 @@ impl Message {
 
     /// Does the message carry content that must stay treated as untrusted
     /// by the next tool or compaction decisions?
+    ///
+    /// A legacy text summary counts: it was produced from tool output whose
+    /// trust level the older format never recorded, so it is read fail-closed.
     pub fn carries_untrusted_content(&self) -> bool {
-        self.content.iter().any(ContentBlock::carries_untrusted_content)
-            || (self.role == Role::User
-                && self
-                    .content
-                    .iter()
-                    .any(|b| matches!(b, ContentBlock::Text { text } if text.starts_with("[Previous conversation summary]\n"))))
+        self.content
+            .iter()
+            .any(ContentBlock::carries_untrusted_content)
+            || self.is_legacy_text_summary()
+    }
+
+    /// Summary written before the typed `Summary` block existed: a user message
+    /// whose text opens with the compaction prefix.
+    pub(crate) fn is_legacy_text_summary(&self) -> bool {
+        self.role == Role::User
+            && self.content.iter().any(
+                |block| matches!(block, ContentBlock::Text { text } if text.starts_with(SUMMARY_PREFIX)),
+            )
     }
 
     pub fn validate(&self) -> Result<(), MessageValidationError> {

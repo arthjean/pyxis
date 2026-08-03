@@ -3,6 +3,7 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+use crate::message::is_false;
 use crate::redaction::{redact_json_value, redact_string};
 
 /// Maximum serialized provider payload allowed across the public event seam.
@@ -132,10 +133,6 @@ impl<'de> Deserialize<'de> for ProviderExtension {
         extension.redacted |= wire.redacted;
         Ok(extension)
     }
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 #[cfg(test)]

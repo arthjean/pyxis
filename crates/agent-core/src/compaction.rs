@@ -26,7 +26,7 @@ const PRUNED_PLACEHOLDER: &str = "[tool result pruned to save context]";
 /// Prefix marking a summary message (US-030). Acts as the "summary of a summary"
 /// guard: a message carrying this prefix is EXCLUDED from the re-summary prompt then
 /// kept verbatim, so that re-summarizing it does not degrade the summary.
-pub const SUMMARY_PREFIX: &str = "[Previous conversation summary]\n";
+pub use crate::message::SUMMARY_PREFIX;
 
 /// Output cap of the summarizer (US-030: raised from 1024 to 4096, then bounded
 /// by the active model geometry at call time).
@@ -39,10 +39,11 @@ const SUMMARY_COMBINED_MAX: usize = 32_000;
 /// True if `msg` is a summary message (produced by an earlier compaction).
 pub fn is_summary_message(msg: &Message) -> bool {
     msg.role == Role::User
-        && msg.content.iter().any(|b| {
-            matches!(b, ContentBlock::Summary { .. })
-                || matches!(b, ContentBlock::Text { text } if text.starts_with(SUMMARY_PREFIX))
-        })
+        && (msg
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Summary { .. }))
+            || msg.is_legacy_text_summary())
 }
 
 const SUMMARY_SYSTEM: &str = "You summarize a conversation between a user and a coding agent. \

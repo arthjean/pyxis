@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::event::{PermissionReq, PlanView};
-use crate::message::{ToolCallFormat, ToolCallId, ToolErrorKind};
+use crate::message::{ToolCallFormat, ToolCallId, ToolErrorKind, is_false};
 use crate::provider::ToolSpec;
 
 /// Absolute ceiling for one model-visible tool result, independently of the
@@ -406,10 +406,6 @@ fn render_execution(
     } else {
         core
     }
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 fn render_feedback(text: &str, structured: Option<&str>, execution: Option<&str>) -> String {
