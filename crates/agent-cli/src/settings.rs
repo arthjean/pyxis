@@ -863,34 +863,60 @@ pub fn ensure_file(path: &Path) -> io::Result<()> {
         .map(|_| ())
 }
 
-/// Upsert of a scalar key, line by line. Deliberately not `toml_edit`: the
-/// only thing written here is `key = "value"`, and a line replacement
-/// preserves the comments and the order of the user's file. The continuation
-/// lines of a multi-line array have no `=` and are therefore
+/// Upsert of a scalar key of the ROOT table, line by line. Deliberately not
+/// `toml_edit`: the only thing written here is `key = "value"`, and a line
+/// replacement preserves the comments and the order of the user's file. The
+/// continuation lines of a multi-line array have no `=` and are therefore
 /// copied as is.
+///
+/// The scan stops at the first table header. `model`, `reasoning_effort` and
+/// `permission_mode` are exactly the keys a `[profiles.<name>]` table declares
+/// too (US-006), and a line-oriented rewrite that ignored the header would
+/// either hijack a profile's value or drop it: the same key seen twice used to
+/// be treated as a duplicate of the first. A profile is a setting the user
+/// wrote for ANOTHER session, so `/models` has no business editing it.
 fn save_string_key(path: &Path, key: &str, value: Option<&str>) -> io::Result<()> {
     let new_line = value.map(|value| format!("{key} = \"{value}\""));
-    let mut replaced = false;
-    let mut lines = match std::fs::read_to_string(path) {
-        Ok(contents) => contents
-            .lines()
-            .filter_map(|line| {
-                if is_key_line(line, key) {
-                    if replaced {
-                        return None;
-                    }
-                    replaced = true;
-                    return new_line.clone();
-                }
-                Some(line.to_string())
-            })
-            .collect::<Vec<_>>(),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(err),
     };
 
+    let mut lines: Vec<String> = Vec::new();
+    let mut replaced = false;
+    // Index the first table header will occupy, hence the end of the root table.
+    let mut header_at: Option<usize> = None;
+    for line in contents.lines() {
+        if header_at.is_none() && is_table_header(line) {
+            header_at = Some(lines.len());
+        }
+        if header_at.is_none() && is_key_line(line, key) {
+            // A second declaration at the root is invalid TOML anyway: dropped,
+            // so the file this writes back stays readable by the parser.
+            if replaced {
+                continue;
+            }
+            replaced = true;
+            if let Some(new_line) = &new_line {
+                lines.push(new_line.clone());
+            }
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+
     if !replaced && let Some(new_line) = new_line {
-        lines.push(new_line);
+        // Appended INSIDE the root table, after its last non-blank line: a key
+        // written past a header would silently join that table instead.
+        let at = match header_at {
+            Some(header) => lines[..header]
+                .iter()
+                .rposition(|line| !line.trim().is_empty())
+                .map_or(header, |last| last + 1),
+            None => lines.len(),
+        };
+        lines.insert(at, new_line);
     }
     let mut contents = lines.join("\n");
     contents.push('\n');
@@ -906,6 +932,12 @@ fn is_key_line(line: &str, expected_key: &str) -> bool {
         return false;
     };
     key.trim() == expected_key
+}
+
+/// Opening line of a table (`[profiles.review]`, `[[x]]`). Everything after the
+/// first one belongs to that table and never to the root.
+fn is_table_header(line: &str) -> bool {
+    line.trim_start().starts_with('[')
 }
 
 pub fn home_dir() -> Option<PathBuf> {
@@ -1076,6 +1108,78 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "permission_mode = \"ask\"\n"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// US-006: a profile declares the SAME keys as the root, so an interactive
+    /// `/models` or `/effort` must not reach into it. The line rewrite used to
+    /// treat the profile's line as a duplicate of the root one and delete it,
+    /// silently emptying a table the user wrote for another session.
+    #[test]
+    fn saving_a_root_key_never_touches_a_profile_table() {
+        let path = temp_path("profiles-preserved");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "# mes reglages\nmodel = \"gpt-5.5\"\nreasoning_effort = \"high\"\n\n\
+             [profiles.review]\nmodel = \"gpt-5.6-sol\"\nreasoning_effort = \"xhigh\"\n\
+             permission_mode = \"read-only\"\n",
+        )
+        .unwrap();
+
+        save_model(&path, "gpt-5.7").unwrap();
+        save_reasoning_effort(&path, Some("low")).unwrap();
+        save_permission_mode(&path, PermissionMode::AcceptEdits).unwrap();
+
+        let config = resolve(Request {
+            global: Some(&path),
+            profile: Some("review"),
+            ..Request::default()
+        })
+        .expect("le profil existe toujours");
+
+        // The profile still carries everything it declared, and it still wins
+        // over the root values the session just wrote.
+        assert_eq!(config.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(config.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(config.permission_mode, Some(PermissionMode::Plan));
+
+        // And without the profile, the root keys are the ones that moved.
+        let root = load(Some(&path), None);
+        assert_eq!(root.model.as_deref(), Some("gpt-5.7"));
+        assert_eq!(root.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(root.permission_mode, Some(PermissionMode::AcceptEdits));
+        assert!(root.warnings.is_empty(), "{:?}", root.warnings);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A key that exists ONLY inside a profile is not the root key: writing the
+    /// root one creates it, above the header, instead of hijacking the line
+    /// that was already there.
+    #[test]
+    fn a_key_declared_only_in_a_profile_is_not_hijacked() {
+        let path = temp_path("profile-only");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "# entete\ntoken_budget = 42\n\n[profiles.review]\nmodel = \"gpt-5.6-sol\"\n",
+        )
+        .unwrap();
+
+        save_model(&path, "gpt-5.7").unwrap();
+
+        let root = load(Some(&path), None);
+        assert_eq!(root.model.as_deref(), Some("gpt-5.7"));
+        assert_eq!(root.token_budget, Some(42));
+        assert!(root.warnings.is_empty(), "{:?}", root.warnings);
+
+        let profiled = resolve(Request {
+            global: Some(&path),
+            profile: Some("review"),
+            ..Request::default()
+        })
+        .expect("le profil existe toujours");
+        assert_eq!(profiled.model.as_deref(), Some("gpt-5.6-sol"));
         let _ = std::fs::remove_file(path);
     }
 
