@@ -577,6 +577,40 @@ async fn a_denied_tool_rejects_with_its_kind_and_the_cell_keeps_control() {
     );
 }
 
+/// A freeform tool takes TEXT, never a JSON object the cell invented for it.
+#[tokio::test]
+async fn a_freeform_tool_receives_text_not_json() {
+    let engine = engine(EngineLimits::default());
+    let specs = vec![ToolSpec::freeform("apply_patch", "takes a patch", None)];
+    let tools = FakeTools::new(specs.clone());
+    engine.nested_tools().set(Arc::clone(&tools) as Arc<_>);
+    let session = session("freeform", Arc::clone(&engine));
+
+    let response = session
+        .execute(nested_request(
+            "const out = await tools.apply_patch('*** Begin Patch');\n\
+             const empty = await tools.apply_patch();\n\
+             text(out + '|' + empty.length);",
+            &specs,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.state(),
+        CellState::Completed,
+        "{:?}",
+        response.failure()
+    );
+    assert_eq!(texts(&response), vec!["*** Begin Patch|0".to_string()]);
+    assert_eq!(
+        tools.seen(),
+        vec![
+            "apply_patch:*** Begin Patch".to_string(),
+            "apply_patch:".to_string()
+        ]
+    );
+}
+
 /// A session whose binding holds nothing refuses every nested call through the
 /// canonical `NoNestedTools`, with the category it publishes.
 #[tokio::test]

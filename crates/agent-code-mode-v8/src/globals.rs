@@ -343,6 +343,67 @@ fn notify_callback(
     }
 }
 
+/// One nested call, read out of the cell state in a single borrow.
+struct NestedCall {
+    tool: String,
+    freeform: bool,
+    cell: CellId,
+    dispatcher: Arc<dyn NestedToolDispatcher>,
+    in_tool: Arc<AtomicU64>,
+    call_id: String,
+}
+
+/// Resolves the binding at `index` and consumes the next correlation id. Both
+/// happen under ONE borrow of the state, so there is no second path to invent a
+/// fallback identifier for.
+fn take_call(scope: &mut v8::PinScope<'_, '_>, index: usize) -> Option<NestedCall> {
+    let state = scope.get_slot_mut::<CellRuntimeState>()?;
+    let entry = state.catalog.get(index)?;
+    let (tool, freeform) = (entry.name.clone(), entry.freeform);
+    state.next_call += 1;
+    Some(NestedCall {
+        tool,
+        freeform,
+        cell: state.cell.clone(),
+        dispatcher: Arc::clone(&state.dispatcher),
+        in_tool: Arc::clone(&state.in_tool),
+        call_id: format!("nested-{}", state.next_call),
+    })
+}
+
+/// Argument of a nested call, in the algebra a cell cannot bend. `None` means
+/// the input was refused and the exception is already thrown.
+fn read_input(
+    scope: &mut v8::PinScope<'_, '_>,
+    raw: v8::Local<'_, v8::Value>,
+    freeform: bool,
+) -> Option<NestedToolInput> {
+    if freeform {
+        // A freeform tool takes TEXT. Handing it a JSON object would be the
+        // invented schema the tool algebra forbids.
+        return Some(NestedToolInput::Text(if raw.is_undefined() {
+            String::new()
+        } else {
+            to_text(scope, raw)
+        }));
+    }
+    if raw.is_undefined() || raw.is_null() {
+        return Some(NestedToolInput::Json(serde_json::json!({})));
+    }
+    if raw.is_string() {
+        return Some(NestedToolInput::Json(serde_json::Value::String(
+            raw.to_rust_string_lossy(scope),
+        )));
+    }
+    match to_json(scope, raw) {
+        Some(value) => Some(NestedToolInput::Json(value)),
+        None => {
+            throw(scope, "a nested tool input must be JSON-serializable");
+            None
+        }
+    }
+}
+
 /// `tools.<name>(input)`.
 ///
 /// The call is dispatched SYNCHRONOUSLY on the cell thread and the answer comes
@@ -356,66 +417,33 @@ fn nested_tool_callback(
     mut return_value: v8::ReturnValue<'_, v8::Value>,
 ) {
     let index = args.data().number_value(scope).unwrap_or(-1.0);
-    let Some(index) = (index >= 0.0).then_some(index as usize) else {
-        throw(scope, "this nested tool binding is not usable");
-        return;
-    };
-
-    let Some((tool, freeform, cell, dispatcher, in_tool)) =
-        scope.get_slot::<CellRuntimeState>().and_then(|state| {
-            let entry = state.catalog.get(index)?;
-            Some((
-                entry.name.clone(),
-                entry.freeform,
-                state.cell.clone(),
-                Arc::clone(&state.dispatcher),
-                Arc::clone(&state.in_tool),
-            ))
-        })
+    let call = (index >= 0.0)
+        .then_some(index as usize)
+        .and_then(|index| take_call(scope, index));
+    let Some(NestedCall {
+        tool,
+        freeform,
+        cell,
+        dispatcher,
+        in_tool,
+        call_id,
+    }) = call
     else {
         throw(scope, "this nested tool binding is not usable");
         return;
     };
 
-    let call_id = match scope.get_slot_mut::<CellRuntimeState>() {
-        Some(state) => {
-            state.next_call += 1;
-            format!("nested-{}", state.next_call)
-        }
-        None => "nested-0".to_string(),
+    let Some(input) = read_input(scope, args.get(0), freeform) else {
+        return;
     };
 
-    let raw = args.get(0);
-    let input = if freeform {
-        // A freeform tool takes TEXT. Handing it a JSON object would be the
-        // invented schema the tool algebra forbids.
-        NestedToolInput::Text(if raw.is_undefined() {
-            String::new()
-        } else {
-            to_text(scope, raw)
-        })
-    } else if raw.is_undefined() || raw.is_null() {
-        NestedToolInput::Json(serde_json::json!({}))
-    } else if raw.is_string() {
-        NestedToolInput::Json(serde_json::Value::String(raw.to_rust_string_lossy(scope)))
-    } else {
-        match to_json(scope, raw) {
-            Some(value) => NestedToolInput::Json(value),
-            None => {
-                throw(scope, "a nested tool input must be JSON-serializable");
-                return;
-            }
-        }
-    };
-
-    let call = NestedToolCall {
+    in_tool.fetch_add(1, Ordering::AcqRel);
+    let outcome = dispatcher.dispatch(NestedToolCall {
         cell_id: cell,
         call_id,
         tool,
         input,
-    };
-    in_tool.fetch_add(1, Ordering::AcqRel);
-    let outcome = dispatcher.dispatch(call);
+    });
     in_tool.fetch_sub(1, Ordering::AcqRel);
 
     let Some(resolver) = v8::PromiseResolver::new(scope) else {
