@@ -274,8 +274,6 @@ pub struct WaitInput {
     #[serde(default)]
     pub yield_time_ms: Option<u64>,
     #[serde(default)]
-    pub max_output_bytes: Option<usize>,
-    #[serde(default)]
     pub terminate: Option<bool>,
 }
 

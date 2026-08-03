@@ -175,3 +175,21 @@ fn colliding_tool_names_get_distinct_bindings() {
         );
     }
 }
+
+/// The budget belongs to the `exec` that opened the cell. Advertising a second
+/// one on `wait` would be a parameter nothing reads.
+#[test]
+fn wait_advertises_no_output_budget_it_does_not_apply() {
+    let schema = wait_tool_spec()
+        .input_schema()
+        .expect("wait takes JSON")
+        .clone();
+    assert_eq!(
+        schema["required"],
+        serde_json::json!(["cell_id", "yield_time_ms", "terminate"])
+    );
+    assert!(
+        schema["properties"].get("max_output_bytes").is_none(),
+        "{schema}"
+    );
+}

@@ -127,6 +127,10 @@ pub fn exec_tool_spec(catalog: &[NestedTool], code_mode_only: bool) -> ToolSpec 
 /// Every property is `required` with a nullable type rather than optional:
 /// `ToolSpec::validate` demands a strict schema, and a strict schema says
 /// "absent" with `null`, never by leaving a key out.
+///
+/// The output budget is deliberately NOT a parameter here. It is set once, by
+/// the `exec` that opened the cell, and the session restores it at every yield;
+/// a second knob on `wait` would be a promise this crate does not keep.
 pub fn wait_tool_spec() -> ToolSpec {
     ToolSpec::function(
         WAIT_TOOL_NAME,
@@ -134,7 +138,7 @@ pub fn wait_tool_spec() -> ToolSpec {
         serde_json::json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["cell_id", "yield_time_ms", "max_output_bytes", "terminate"],
+            "required": ["cell_id", "yield_time_ms", "terminate"],
             "properties": {
                 "cell_id": {
                     "type": "string",
@@ -143,10 +147,6 @@ pub fn wait_tool_spec() -> ToolSpec {
                 "yield_time_ms": {
                     "type": ["integer", "null"],
                     "description": "Wait this long for more output before yielding again. Defaults to 10000 ms."
-                },
-                "max_output_bytes": {
-                    "type": ["integer", "null"],
-                    "description": "Output budget for this wait call, in bytes. Defaults to the cell budget."
                 },
                 "terminate": {
                     "type": ["boolean", "null"],
