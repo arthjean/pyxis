@@ -64,26 +64,31 @@ static PLATFORM: OnceLock<Result<Platform, String>> = OnceLock::new();
 /// refused here, before a session exists: silently running under the first mode
 /// would make the JIT policy of a session unknowable (US-007 AC2).
 pub fn initialize_v8(jit: V8JitMode) -> Result<(), V8Error> {
-    match PLATFORM.get_or_init(|| initialize_once(jit)) {
-        Ok(platform) if platform.jit == jit => Ok(()),
-        Ok(platform) => Err(V8Error::JitModeLocked {
-            active: platform.jit.label(),
-            asked: jit.label(),
-        }),
-        Err(detail) => Err(V8Error::Initialization {
-            detail: detail.clone(),
-        }),
+    let platform = platform(jit)?;
+    if platform.jit == jit {
+        return Ok(());
     }
+    Err(V8Error::JitModeLocked {
+        active: platform.jit.label(),
+        asked: jit.label(),
+    })
 }
 
 /// Initializes V8 with the default JIT policy if nothing has done so yet.
 pub(crate) fn ensure_initialized() -> Result<(), V8Error> {
-    match PLATFORM.get_or_init(|| initialize_once(V8JitMode::default())) {
-        Ok(_) => Ok(()),
-        Err(detail) => Err(V8Error::Initialization {
+    platform(V8JitMode::default()).map(|_| ())
+}
+
+/// The process-wide platform, initializing it in `jit` mode on the first call.
+/// The mode a later caller asked for is NOT compared here: only `initialize_v8`
+/// owns that policy, and it is the one that can refuse.
+fn platform(jit: V8JitMode) -> Result<&'static Platform, V8Error> {
+    PLATFORM
+        .get_or_init(|| initialize_once(jit))
+        .as_ref()
+        .map_err(|detail| V8Error::Initialization {
             detail: detail.clone(),
-        }),
-    }
+        })
 }
 
 /// JIT mode actually in force, or `None` when V8 has not been initialized.
