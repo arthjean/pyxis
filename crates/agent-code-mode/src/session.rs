@@ -76,7 +76,13 @@ impl CellSink {
     pub fn push(&self, item: OutputItem) {
         self.with_slot(|slot| {
             let weight = item.weight();
-            if slot.pending_bytes.saturating_add(weight) > slot.max_output_bytes {
+            // Once the ceiling is reached, the REST of this yield is dropped
+            // too. Letting a later, smaller item slip in would leave a hole in
+            // the middle of the stream the model reads, with nothing saying
+            // where it is; `omitted_bytes` only says how much is missing. The
+            // budget is restored by the next yield, with `take_items`.
+            let overflows = slot.pending_bytes.saturating_add(weight) > slot.max_output_bytes;
+            if slot.omitted_bytes > 0 || overflows {
                 slot.omitted_bytes = slot.omitted_bytes.saturating_add(weight);
             } else {
                 slot.pending_bytes += weight;

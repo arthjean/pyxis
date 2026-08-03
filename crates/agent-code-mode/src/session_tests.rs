@@ -479,6 +479,50 @@ async fn a_late_terminal_cannot_reopen_a_cell_nor_rewrite_its_cause() {
     assert_eq!(texts(&response), vec!["after the end".to_string()]);
 }
 
+/// A cell whose ceiling is reached stops accepting output until the next
+/// yield: a smaller item slipping in behind a dropped one would leave a hole
+/// in the middle of the stream, and `omitted_bytes` says how much is missing,
+/// never where.
+#[tokio::test]
+async fn the_result_ceiling_drops_the_rest_of_the_yield_not_just_the_big_item() {
+    let engine = ScriptedEngine::deaf();
+    let session = session(Arc::clone(&engine));
+    let cell = session
+        .execute(quick("noop"))
+        .await
+        .unwrap()
+        .cell_id()
+        .clone();
+
+    engine.sink(&cell).push_text("x".repeat(60));
+    engine.sink(&cell).push_text("y".repeat(30));
+    engine.sink(&cell).push_text("z");
+    engine.sink(&cell).request_yield();
+
+    let response = session
+        .wait(WaitRequest::new(cell.clone()).with_yield_time(Duration::from_millis(200)))
+        .await
+        .unwrap();
+    assert_eq!(
+        texts(&response),
+        vec!["x".repeat(60)],
+        "nothing may follow the first dropped item"
+    );
+    let RuntimeResponse::Yielded { omitted_bytes, .. } = response else {
+        unreachable!("expected a yielded cell");
+    };
+    assert_eq!(omitted_bytes, 31);
+
+    // The budget is restored by the yield: the next chunk goes through.
+    engine.sink(&cell).push_text("fresh");
+    engine.sink(&cell).finish(None);
+    let next = session
+        .wait(WaitRequest::new(cell).with_yield_time(Duration::from_millis(200)))
+        .await
+        .unwrap();
+    assert_eq!(texts(&next), vec!["fresh".to_string()]);
+}
+
 #[test]
 fn a_tool_name_becomes_a_valid_javascript_identifier() {
     assert_eq!(crate::normalize_binding("exec_command"), "exec_command");
