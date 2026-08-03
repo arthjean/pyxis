@@ -85,6 +85,66 @@ pub trait SandboxEscalator: Send + Sync {
     fn lift(&self, denial: &SandboxDenial) -> Option<EscalationGuard>;
 }
 
+/// Attributes a failed call to the confinement, for ANY tool.
+///
+/// Lives here rather than in `bash` because the question is the same wherever a
+/// call can fail: did the perimeter refuse this, or did the work itself fail? A
+/// `bash` that names the cause while an `apply_patch` reports a bare
+/// "Permission denied" teaches the model that the two failures are different
+/// kinds of thing, and they are not.
+///
+/// `mark` is the position taken in the proxy's block log BEFORE the call, when
+/// the tool can reach the network; `None` for a tool that cannot, which leaves
+/// only the filesystem classification. Fail-closed on the CLAIM: an ambiguous
+/// failure returns `None` and nothing is attributed.
+pub fn attribute(ctx: &crate::tool::ToolCtx, mark: Option<usize>, body: &str) -> Option<SandboxDenial> {
+    let blocked = match (ctx.sandbox_observer.as_ref(), mark) {
+        (Some(observer), Some(mark)) => observer.blocked_since(mark),
+        _ => Vec::new(),
+    };
+    let allowed = ctx
+        .sandbox_observer
+        .as_ref()
+        .map(|observer| observer.allowed())
+        .unwrap_or_else(|| "none".to_string());
+    classify_failure(ctx.sandbox_enforced, &blocked, &allowed, body)
+}
+
+/// Turns a failed call into a result the model can act on: the cause is appended
+/// to the body it reads, and carried structurally so the Registry can offer an
+/// escalation where one exists.
+pub fn attributed_failure(
+    ctx: &crate::tool::ToolCtx,
+    mark: Option<usize>,
+    mut body: String,
+) -> crate::tool::ToolOutput {
+    let Some(denial) = attribute(ctx, mark, &body) else {
+        return crate::tool::ToolOutput::error(body);
+    };
+    body.push('\n');
+    body.push_str(&denial.explain());
+    crate::tool::ToolOutput::error(body).with_denial(denial)
+}
+
+/// Same, for a tool whose failure surfaces as a `ToolError` rather than as a
+/// non-zero exit code. An unattributable error is returned UNCHANGED: turning
+/// every I/O failure into a sandbox story is exactly the over-claim
+/// `classify_failure` refuses to make.
+pub fn attribute_error(
+    ctx: &crate::tool::ToolCtx,
+    mark: Option<usize>,
+    error: crate::error::ToolError,
+) -> Result<crate::tool::ToolOutput, crate::error::ToolError> {
+    let body = error.to_string();
+    match attribute(ctx, mark, &body) {
+        Some(denial) => {
+            let explained = format!("{body}\n{}", denial.explain());
+            Ok(crate::tool::ToolOutput::error(explained).with_denial(denial))
+        }
+        None => Err(error),
+    }
+}
+
 /// Signals a shell failure caused by the kernel FS confinement. Deliberately
 /// narrow: each pattern is a message the kernel or libc produces for a denied
 /// access, and a broader net would classify ordinary permission problems as

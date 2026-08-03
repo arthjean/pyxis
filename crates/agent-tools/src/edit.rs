@@ -141,12 +141,17 @@ impl Tool for Edit {
             }
         };
 
-        replace_file_confined(&ctx.workspace, &path, &input.path, updated.as_bytes()).await?;
-        Ok(ToolOutput::text(format!(
-            "Edited: {} ({})",
-            input.path,
-            level.label()
-        )))
+        // US-004: same attribution as `write` and `bash`. The anchor work above
+        // succeeded; if the write fails, the perimeter is a candidate cause and
+        // the model is told so rather than left to guess.
+        match replace_file_confined(&ctx.workspace, &path, &input.path, updated.as_bytes()).await {
+            Ok(()) => Ok(ToolOutput::text(format!(
+                "Edited: {} ({})",
+                input.path,
+                level.label()
+            ))),
+            Err(error) => crate::sandbox::attribute_error(ctx, None, error),
+        }
     }
 }
 

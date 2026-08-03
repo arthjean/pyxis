@@ -3384,6 +3384,94 @@ async fn a_hook_refusal_stops_a_session_before_the_process_exists() {
         "a refusal must not leave a session, hence no process, behind"
     );
 }
+
+/// US-004: the attribution of a confinement refusal is a property of the
+/// PIPELINE, not of `bash`. A write refused by the kernel must name the cause in
+/// the result the model reads, exactly like a refused command does, otherwise
+/// the model reads "Permission denied" and retries the same write elsewhere.
+///
+/// The regression this guards against is silent: adding a fourth writing tool
+/// that forgets the attribution costs nothing at compile time and is invisible
+/// until a model loops on a refused write.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_write_refused_by_the_confinement_names_the_cause_like_bash_does() {
+    // A read-only directory reproduces what Landlock does to a write, without
+    // needing a kernel domain in a test process.
+    let dir = std::env::temp_dir().join(format!("pyxis-denied-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("test dir");
+    let mut perms = std::fs::metadata(&dir).expect("metadata").permissions();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(0o500);
+    }
+    std::fs::set_permissions(&dir, perms).expect("read-only dir");
+
+    let reg = Registry::builder(&dir)
+        .mode(PermissionMode::BypassPermissions)
+        .approver(allow_approver())
+        // The claim is only made when the confinement is really in force
+        // (AC6), so the test has to declare it.
+        .sandbox(
+            agent_core::sandbox::SandboxPolicy::workspace_write(
+                dir.clone(),
+                Vec::new(),
+                Vec::<PathBuf>::new(),
+            ),
+            true,
+        )
+        .register(Write)
+        .register(crate::ApplyPatch)
+        .build();
+
+    let write = by_id(
+        &reg.dispatch(vec![call(
+            "w",
+            "write",
+            serde_json::json!({ "path": "denied.txt", "content": "x" }),
+        )])
+        .await,
+        "w",
+    )
+    .clone();
+    let patch = by_id(
+        &reg.dispatch(vec![call(
+            "p",
+            "apply_patch",
+            serde_json::json!({
+                "input": "*** Begin Patch\n*** Add File: denied2.txt\n+x\n*** End Patch\n"
+            }),
+        )])
+        .await,
+        "p",
+    )
+    .clone();
+
+    // Cleanup before the assertions, so a failure does not leave an
+    // unremovable directory behind.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&dir).expect("metadata").permissions();
+        perms.set_mode(0o700);
+        let _ = std::fs::set_permissions(&dir, perms);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    for outcome in [&write, &patch] {
+        assert!(outcome.is_error, "{outcome:?}");
+        assert!(
+            outcome.content.contains("[sandbox]"),
+            "the refusal must name the confinement: {outcome:?}"
+        );
+        assert_eq!(
+            outcome.error_kind,
+            Some(ToolErrorKind::SandboxDenied),
+            "an attributed refusal is a sandbox denial, not a generic io error: {outcome:?}"
+        );
+    }
+}
+
 /// ARCHITECTURE 4.5: past the threshold, deferrable tools leave the request and
 /// `tool_search` takes their place; a search puts back exactly what it matched.
 ///

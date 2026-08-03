@@ -613,6 +613,9 @@ impl Tool for ExecCommand {
         let workdir = resolve_workdir(input.workdir.as_deref(), ctx)?;
         let shell = resolve_shell(input.shell.as_deref())?;
         let tty = input.tty.unwrap_or(false);
+        // US-004: taken before the process exists, so what the proxy logs after
+        // it is this call's doing and nobody else's.
+        let sandbox_mark = ctx.sandbox_observer.as_ref().map(|observer| observer.mark());
         let id = sessions.reserve()?;
 
         let session = match spawn_session(&shell, &input.cmd, &workdir, tty, ctx) {
@@ -634,6 +637,8 @@ impl Tool for ExecCommand {
             started,
             input.max_output_tokens,
             false,
+            ctx,
+            sandbox_mark,
         ))
     }
 }
@@ -755,6 +760,9 @@ impl Tool for WriteStdin {
         let sessions = ctx.sessions.clone();
         let id = input.session_id;
         let terminating = input.terminates();
+        // Same mark as `exec_command`: what the session reaches while this write
+        // is being consumed is attributable to this call.
+        let sandbox_mark = ctx.sandbox_observer.as_ref().map(|observer| observer.mark());
 
         if !input.chars.is_empty() {
             write_to_session(&sessions, id, input.chars.as_bytes()).await?;
@@ -786,6 +794,8 @@ impl Tool for WriteStdin {
             started,
             input.max_output_tokens,
             terminating,
+            ctx,
+            sandbox_mark,
         ))
     }
 }
@@ -1109,6 +1119,11 @@ fn emit(ctx: &ToolCtx, chunk: &OutputBuffer, accumulated: &mut OutputBuffer) {
 
 /// Shapes the baseline result and closes the session when its process is gone:
 /// an exited session must not stay in the store waiting for the watchdog.
+/// `mark` is the proxy block-log position taken BEFORE the process ran, so a
+/// non-zero exit caused by the network allow-list is attributed to it (US-004)
+/// exactly like a `bash` failure. `None` when nothing could have been blocked
+/// since the previous call.
+#[allow(clippy::too_many_arguments)]
 fn finish(
     sessions: &ExecSessions,
     id: u64,
@@ -1116,6 +1131,8 @@ fn finish(
     started: Instant,
     max_output_tokens: Option<u64>,
     terminated: bool,
+    ctx: &ToolCtx,
+    mark: Option<usize>,
 ) -> ToolOutput {
     let Collected {
         mut buffer,
@@ -1203,7 +1220,15 @@ fn finish(
     // A terminated session ended on request: that is an outcome, not a failure.
     let failed = !terminated && (exit_code.is_some_and(|c| c != 0) || signal.is_some());
     let output = if failed {
-        ToolOutput::error(text)
+        // The BODY is what the classification reads, not the framing sections:
+        // "Process exited with code 1" says nothing about a cause, and the
+        // proxy's own record outranks the text anyway.
+        let attributed = crate::sandbox::attributed_failure(ctx, mark, body.clone());
+        match attributed.denial {
+            Some(denial) => ToolOutput::error(format!("{text}\n{}", denial.explain()))
+                .with_denial(denial),
+            None => ToolOutput::error(text),
+        }
     } else {
         ToolOutput::text(text)
     };

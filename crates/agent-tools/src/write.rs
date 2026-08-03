@@ -76,10 +76,17 @@ impl Tool for Write {
         // may have appeared in the workspace (US-013).
         ensure_policy_allows_write(&ctx.sandbox, &ctx.workspace, &path, &input.path)?;
         let bytes = input.content.len();
-        replace_file_confined(&ctx.workspace, &path, &input.path, input.content.as_bytes()).await?;
-        Ok(ToolOutput::text(format!(
-            "Wrote file: {} ({bytes} bytes)",
-            input.path
-        )))
+        // US-004: a write the kernel confinement refused says so, exactly like a
+        // refused shell command does. Without it the model reads "Permission
+        // denied" and retries the same write under another name.
+        match replace_file_confined(&ctx.workspace, &path, &input.path, input.content.as_bytes())
+            .await
+        {
+            Ok(()) => Ok(ToolOutput::text(format!(
+                "Wrote file: {} ({bytes} bytes)",
+                input.path
+            ))),
+            Err(error) => crate::sandbox::attribute_error(ctx, None, error),
+        }
     }
 }

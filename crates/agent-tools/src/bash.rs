@@ -309,27 +309,11 @@ fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
 }
 
 /// Attributes a failed command to the confinement when the sandbox actually
-/// refused something (US-004 AC1). The cause is named IN the result the model
-/// reads, which is what stops it from retrying variants of the same command,
-/// and is carried structurally so the Registry can offer an escalation.
-fn finish_failure(mut body: String, ctx: &ToolCtx, mark: Option<usize>) -> ToolOutput {
-    let blocked = match (ctx.sandbox_observer.as_ref(), mark) {
-        (Some(observer), Some(mark)) => observer.blocked_since(mark),
-        _ => Vec::new(),
-    };
-    let allowed = ctx
-        .sandbox_observer
-        .as_ref()
-        .map(|o| o.allowed())
-        .unwrap_or_else(|| "none".to_string());
-    let Some(denial) =
-        crate::sandbox::classify_failure(ctx.sandbox_enforced, &blocked, &allowed, &body)
-    else {
-        return ToolOutput::error(body);
-    };
-    body.push('\n');
-    body.push_str(&denial.explain());
-    ToolOutput::error(body).with_denial(denial)
+/// refused something (US-004 AC1). The rule itself lives in `sandbox` and is
+/// shared with every other tool that can be refused by the perimeter; what stays
+/// here is only the call site.
+fn finish_failure(body: String, ctx: &ToolCtx, mark: Option<usize>) -> ToolOutput {
+    crate::sandbox::attributed_failure(ctx, mark, body)
 }
 
 /// Builds the shell command (same options as before US-014, only the executed

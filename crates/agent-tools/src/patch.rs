@@ -215,11 +215,23 @@ impl Tool for ApplyPatch {
 
         // Phase 2: the disk. Everything above is resolved, so a partial file
         // state can no longer come from a stale context (AC2).
+        //
+        // US-004: a refusal here is attributed like any other. It is also the
+        // one place where the attribution matters most: a patch that stops
+        // half-applied leaves the workspace in a state the model has to reason
+        // about, and it cannot do that without knowing whether the perimeter or
+        // the patch itself was the problem.
         for (abs, display, contents) in &writes {
-            replace_file_confined(&ctx.workspace, abs, display, contents.as_bytes()).await?;
+            if let Err(error) =
+                replace_file_confined(&ctx.workspace, abs, display, contents.as_bytes()).await
+            {
+                return crate::sandbox::attribute_error(ctx, None, error);
+            }
         }
         for (abs, display) in &removals {
-            remove_file_confined(&ctx.workspace, abs, display).await?;
+            if let Err(error) = remove_file_confined(&ctx.workspace, abs, display).await {
+                return crate::sandbox::attribute_error(ctx, None, error);
+            }
         }
         Ok(ToolOutput::text(format!(
             "Patch applied ({} file(s)):\n{}",
