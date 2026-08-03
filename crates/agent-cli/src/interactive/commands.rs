@@ -25,6 +25,41 @@ use agent_tui::{
 use super::{Loop, Switch, new_session_path, sign_out};
 use crate::settings::{permission_mode_from_arg, permission_mode_id};
 
+/// Commands the dispatcher below answers. Checked against `agent_tui::COMMANDS`
+/// by a test: the picker lives in the frontend crate and the handling here, so
+/// a command offered by one and unknown to the other would silently fall
+/// through to "Unknown command".
+///
+/// Deliberately not a runtime lookup (the `match` below is the dispatch): it is
+/// the list a reader updates next to the arm they just added, and the test is
+/// what makes forgetting it fail.
+#[cfg_attr(not(test), allow(dead_code))]
+const HANDLED_COMMANDS: &[&str] = &[
+    "/help",
+    "/models",
+    "/effort",
+    "/permissions",
+    "/skills",
+    "/goal",
+    "/providers",
+    "/mcp",
+    "/resume",
+    "/fork",
+    "/rewind",
+    "/approvals",
+    "/status",
+    "/usage",
+    "/hooks",
+    "/diff",
+    "/copy",
+    "/init",
+    "/compact",
+    "/new",
+    "/clear",
+    "/logout",
+    "/quit",
+];
+
 /// Commands that need a TERMINAL turn boundary. A branch is cut at one, a
 /// compaction rewrites the transcript, and `/goal` and `/init` open a turn of
 /// their own: all four would otherwise work on a conversation that is still
@@ -876,6 +911,54 @@ fn count_encrypted_reasoning(messages: &[Message]) -> usize {
 mod tests {
     use super::*;
     use agent_tui::AppState;
+
+    /// The picker lives in `agent-tui`, the handling here. Nothing links them at
+    /// compile time, so a command added to one and not the other would reach the
+    /// user as "Unknown command" from a menu that offered it.
+    #[test]
+    fn every_offered_command_has_a_handler() {
+        let missing: Vec<&str> = COMMANDS
+            .iter()
+            .map(|(name, _, _)| *name)
+            .filter(|name| !HANDLED_COMMANDS.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "offered by the picker with no arm in the dispatcher: {missing:?}"
+        );
+        let orphan: Vec<&&str> = HANDLED_COMMANDS
+            .iter()
+            .filter(|name| !COMMANDS.iter().any(|(offered, _, _)| offered == *name))
+            .collect();
+        assert!(
+            orphan.is_empty(),
+            "handled but never offered, hence undiscoverable: {orphan:?}"
+        );
+    }
+
+    /// The guard used to be repeated at the head of four arms. It is now one
+    /// table, and it must still cover exactly the commands that need a terminal
+    /// turn boundary.
+    #[test]
+    fn the_idle_guard_covers_every_command_that_moves_the_conversation() {
+        for command in ["/fork", "/rewind", "/resume", "/new", "/clear", "/compact"] {
+            assert!(
+                NEEDS_IDLE.contains(&command),
+                "`{command}` works on the transcript: it needs a terminal boundary"
+            );
+        }
+        // `/goal` and `/init` submit a turn of their own.
+        assert!(NEEDS_IDLE.contains(&"/goal"));
+        assert!(NEEDS_IDLE.contains(&"/init"));
+        // Read-only surfaces never wait.
+        for command in ["/status", "/usage", "/diff", "/copy", "/hooks", "/approvals"] {
+            assert!(!NEEDS_IDLE.contains(&command), "`{command}` reads only");
+        }
+        // Every entry is a command someone can actually type.
+        for command in NEEDS_IDLE {
+            assert!(HANDLED_COMMANDS.contains(command), "{command}");
+        }
+    }
 
     /// US-019 AC1/AC2: with nothing to protect the bootstrap turn starts; with an
     /// instruction file already there it does NOT, and the file is named.
