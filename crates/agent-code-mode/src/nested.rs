@@ -214,24 +214,13 @@ impl PlanDispatcher {
     /// calling them would either recurse into itself or drive the session it
     /// runs in, so they are removed from the nested catalog rather than left
     /// callable and failing late.
+    ///
+    /// `loop_guard` is a REQUIRED argument rather than a default: it belongs to
+    /// the Code Mode session, and a dispatcher that built its own would let a
+    /// repeated nested effect evade detection simply by starting a fresh outer
+    /// `exec` cell. A caller that genuinely wants no history across cells says
+    /// so with `NestedLoopGuard::default()`, in the open.
     pub fn new(
-        snapshot: &ToolDispatchSnapshot,
-        hidden: &[&str],
-        events: ToolEventSink,
-        runtime: tokio::runtime::Handle,
-    ) -> Self {
-        Self::new_with_loop_guard(
-            snapshot,
-            hidden,
-            NestedLoopGuard::default(),
-            events,
-            runtime,
-        )
-    }
-
-    /// Uses loop state owned by the Code Mode session so a repeated nested
-    /// effect cannot evade detection by starting a fresh outer `exec` cell.
-    pub fn new_with_loop_guard(
         snapshot: &ToolDispatchSnapshot,
         hidden: &[&str],
         loop_guard: NestedLoopGuard,

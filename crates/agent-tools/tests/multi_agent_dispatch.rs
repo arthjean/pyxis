@@ -78,6 +78,7 @@ fn nested(
     let dispatcher = agent_code_mode::PlanDispatcher::new(
         &registry.step_snapshot(),
         &["exec", "wait"],
+        agent_code_mode::NestedLoopGuard::default(),
         agent_core::tools::ToolEventSink::default(),
         runtime,
     );
@@ -162,6 +163,7 @@ async fn a_listing_names_the_owning_thread_on_both_paths() {
     let dispatcher = agent_code_mode::PlanDispatcher::new(
         &registry.step_snapshot(),
         &["exec", "wait"],
+        agent_code_mode::NestedLoopGuard::default(),
         agent_core::tools::ToolEventSink::default(),
         tokio::runtime::Handle::current(),
     );

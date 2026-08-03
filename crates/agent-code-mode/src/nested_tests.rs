@@ -124,12 +124,7 @@ fn call_in_cell(ordinal: u64, tool: &str, input: NestedToolInput) -> NestedToolC
 }
 
 fn dispatcher(tools: Arc<RecordingTools>, specs: Vec<ToolSpec>) -> Arc<PlanDispatcher> {
-    Arc::new(PlanDispatcher::new(
-        &snapshot(tools, specs),
-        &[crate::tools::EXEC_TOOL_NAME, crate::tools::WAIT_TOOL_NAME],
-        ToolEventSink::default(),
-        tokio::runtime::Handle::current(),
-    ))
+    dispatcher_with_guard(tools, specs, NestedLoopGuard::default())
 }
 
 fn dispatcher_with_guard(
@@ -137,7 +132,7 @@ fn dispatcher_with_guard(
     specs: Vec<ToolSpec>,
     loop_guard: NestedLoopGuard,
 ) -> Arc<PlanDispatcher> {
-    Arc::new(PlanDispatcher::new_with_loop_guard(
+    Arc::new(PlanDispatcher::new(
         &snapshot(tools, specs),
         &[crate::tools::EXEC_TOOL_NAME, crate::tools::WAIT_TOOL_NAME],
         loop_guard,

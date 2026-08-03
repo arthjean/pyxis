@@ -414,7 +414,7 @@ impl CliStepSource {
             (Some(handle), true) => {
                 if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                     handle.bind_step(
-                        Arc::new(agent_code_mode::PlanDispatcher::new_with_loop_guard(
+                        Arc::new(agent_code_mode::PlanDispatcher::new(
                             &captured,
                             &CODE_MODE_TOOLS,
                             handle.loop_guard(),
@@ -1474,6 +1474,7 @@ mod code_mode_plan_tests {
         let nested = agent_code_mode::PlanDispatcher::new(
             &source.registry.step_snapshot(),
             &super::CODE_MODE_TOOLS,
+            agent_code_mode::NestedLoopGuard::default(),
             agent_core::tools::ToolEventSink::default(),
             runtime,
         );
