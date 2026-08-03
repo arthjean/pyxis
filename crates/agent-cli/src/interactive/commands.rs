@@ -181,6 +181,28 @@ impl Loop {
             ));
             return;
         }
+        // The slug is checked against the catalog BEFORE anything is changed or
+        // written. An unknown one only fails at the next turn, inside the turn
+        // context capture, and it has reached the global settings file by then:
+        // the session is then stuck on a model no start can resolve.
+        let Some(meta) = agent_tui::model_meta(arg) else {
+            let known = agent_tui::models()
+                .iter()
+                .map(|meta| meta.slug)
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.state.blocks.push(Block::Error(format!(
+                "Unknown model: {arg}. Available: {known}"
+            )));
+            return;
+        };
+        if let Some(reason) = meta.incompatibility_reason {
+            self.state.blocks.push(Block::Error(format!(
+                "Model {arg} unusable in this build: {reason}"
+            )));
+            return;
+        }
+
         let removed = count_encrypted_reasoning(&self.runtime.messages());
         if removed > 0 {
             if let Err(err) = self.runtime.session().redact_encrypted_reasoning().await {
