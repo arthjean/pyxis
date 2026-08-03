@@ -1720,6 +1720,8 @@ async fn run(
         .register(WriteStdin)
         // Clock and context-window surface: what the model cannot observe from
         // inside a turn, and therefore invents when it is not exposed.
+        .register(agent_tools::CurrentTime)
+        .register(agent_tools::Sleep)
         .register(agent_tools::GetContextRemaining)
         .register(agent_tools::NewContextWindow)
     if let Some(handle) = &code_mode {

@@ -40,7 +40,16 @@ use crate::session::SharedSession;
 /// Tools a child may run whatever its authority: they mutate nothing. Sorted,
 /// because that is how a registry lists them.
 #[cfg(test)]
-const CHILD_READ_ONLY_TOOLS: [&str; 5] = ["glob", "grep", "read", "update_plan", "view_image"];
+const CHILD_READ_ONLY_TOOLS: [&str; 8] = [
+    "current_time",
+    "get_context_remaining",
+    "glob",
+    "grep",
+    "read",
+    "sleep",
+    "update_plan",
+    "view_image",
+];
 
 /// What a sub-agent is told about its own situation. Appended to the model's
 /// own instructions so a child knows it reports back instead of asking.
@@ -162,6 +171,8 @@ impl SubAgentSpawner {
             .register(agent_tools::Grep)
             .register(agent_tools::ViewImage)
             .register(agent_tools::UpdatePlan)
+            .register(agent_tools::CurrentTime)
+            .register(agent_tools::Sleep)
             .register(agent_tools::GetContextRemaining);
         // One check, one source of truth: the authority decides, tool by tool.
         if authority.allows("write", false) {
