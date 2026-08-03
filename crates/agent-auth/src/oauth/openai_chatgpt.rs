@@ -784,8 +784,8 @@ mod tests {
         assert_eq!(cred.provider, ProviderId::OpenAiChatGpt);
         assert_eq!(cred.account_id.as_deref(), Some("acct_9"));
         assert_eq!(cred.expires_at, 1_000 + 3_600_000);
-        assert!(!cred.is_expired(cred.expires_at - 1));
-        assert!(cred.is_expired(cred.expires_at));
+        assert!(!cred.needs_refresh(cred.expires_at - 1, 0));
+        assert!(cred.needs_refresh(cred.expires_at, 0));
     }
 
     #[test]

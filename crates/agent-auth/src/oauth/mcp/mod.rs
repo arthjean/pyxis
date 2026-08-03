@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::oauth::openai_chatgpt::AuthError;
 use crate::oauth::pkce::Pkce;
-use crate::{Credential, Secret};
+use crate::{Credential, REFRESH_MARGIN_MS, Secret};
 
 /// Bound of one discovery or token request.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -53,8 +53,6 @@ pub const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Path of the local callback. Fixed; only the port is ephemeral.
 const CALLBACK_PATH: &str = "/pyxis/mcp/callback";
-/// Refresh margin: a token about to expire is refreshed rather than used.
-const REFRESH_MARGIN_MS: u64 = 60_000;
 /// Bound of a discovery document: metadata is small, a multi-megabyte answer is
 /// an attack, not a document.
 const MAX_METADATA_BYTES: usize = 128 * 1024;

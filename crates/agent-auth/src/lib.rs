@@ -65,6 +65,13 @@ pub enum Credential {
     McpOauth(oauth::mcp::McpOAuthCredential),
 }
 
+/// How far ahead of an expiry a token is refreshed rather than raced.
+///
+/// One definition for every OAuth credential in the workspace. It used to exist
+/// three times: exact-edge here, with a margin on the MCP side, and a third copy
+/// inlined in the provider crate that consumes this one.
+pub const REFRESH_MARGIN_MS: u64 = 60_000;
+
 /// OAuth credential (sliding refresh). `account_id` carries the `chatgpt_account_id`
 /// for the ChatGPT subscription (required for routing); `None` for Anthropic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,9 +85,10 @@ pub struct OAuthCredential {
 }
 
 impl OAuthCredential {
-    /// Expired at `now_ms`? Exact edge, without a margin (like Pi on the OpenAI side).
-    pub fn is_expired(&self, now_ms: u64) -> bool {
-        now_ms >= self.expires_at
+    /// Is this credential expired at `now_ms`, or close enough that a call would
+    /// race the expiry? Pass `0` for the exact edge.
+    pub fn needs_refresh(&self, now_ms: u64, margin_ms: u64) -> bool {
+        now_ms.saturating_add(margin_ms) >= self.expires_at
     }
 }
 
@@ -113,7 +121,9 @@ mod tests {
             unreachable!("expected oauth variant")
         };
         assert_eq!(o.account_id.as_deref(), Some("acct_1"));
-        assert!(o.is_expired(1_000));
-        assert!(!o.is_expired(999));
+        assert!(o.needs_refresh(1_000, 0));
+        assert!(!o.needs_refresh(999, 0));
+        // The margin is what turns "expired" into "about to expire".
+        assert!(o.needs_refresh(999, 1));
     }
 }

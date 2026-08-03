@@ -10,10 +10,6 @@ use agent_auth::provider::ProviderRequestAuth;
 use agent_auth::{Credential, OAuthCredential};
 use agent_core::provider::{AuthError, ProviderError};
 
-/// Refresh margin: we refresh 60 s BEFORE expiry to avoid an
-/// expiry/request race (Pi aims at the exact edge; the margin is more robust).
-const REFRESH_MARGIN_MS: u64 = 60_000;
-
 pub struct CredentialManager {
     state: tokio::sync::Mutex<CredentialState>,
     http: reqwest::Client,
@@ -70,7 +66,10 @@ impl CredentialManager {
             state.persist_dirty = false;
         }
         let cred = state.cred.as_mut().ok_or_else(disconnected_error)?;
-        if now.saturating_add(REFRESH_MARGIN_MS) >= cred.expires_at {
+        // The margin lives with the credential type: refreshing 60 s early
+        // rather than racing the exact edge is a property of the credential,
+        // not of this manager.
+        if cred.needs_refresh(now, agent_auth::REFRESH_MARGIN_MS) {
             if !refresh_expiring {
                 return Err(ProviderError::Credential(AuthError::Expired));
             }
