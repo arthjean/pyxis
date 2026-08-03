@@ -13,6 +13,7 @@ use crate::budget::{estimate_input, estimate_static_input};
 use crate::message::Message;
 use crate::model::{ReasoningReplaySupport, ResolvedModelRuntime};
 use crate::provider::CanonicalRequest;
+use crate::model::is_sha256;
 use crate::step::ContextFragmentKind;
 use crate::tools::StepToolPlan;
 
@@ -411,10 +412,6 @@ fn serialized_len<T: Serialize + ?Sized>(value: &T) -> usize {
 fn fingerprint<T: Serialize>(value: &T) -> String {
     let bytes = serde_json::to_vec(value).unwrap_or_default();
     format!("{:x}", Sha256::digest(bytes))
-}
-
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

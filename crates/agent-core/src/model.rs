@@ -11,6 +11,13 @@ use crate::tool_spec::{ToolKind, ToolSpec};
 
 pub const MAX_MODEL_INSTRUCTIONS_BYTES: usize = 64 * 1024;
 
+/// Is this the hexadecimal SHA-256 every fingerprint in the system is? One
+/// definition, because a model runtime and a context baseline must agree on
+/// what a valid fingerprint looks like.
+pub fn is_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModelRuntimeSource {
@@ -253,23 +260,33 @@ pub struct ModelDescriptor {
     pub comp_hash: Option<String>,
 }
 
-impl ModelDescriptor {
-    pub fn validate(&self) -> Result<(), ModelRuntimeError> {
+/// The rules a model contract must satisfy, whichever side it comes from: a
+/// catalog entry or the runtime resolved for one turn.
+///
+/// Borrowed rather than owned. The runtime used to validate itself by BUILDING
+/// a `ModelDescriptor`, which meant inventing a `display_name` and a list of
+/// supported efforts it does not have; every field added to the descriptor was
+/// one more value to fabricate here.
+struct ModelContract<'a> {
+    slug: &'a str,
+    instructions: &'a str,
+    context_window: u32,
+    auto_compact_token_limit: u32,
+    input_modalities: &'a [InputModality],
+    supports_verbosity: bool,
+    verbosity: Option<&'a str>,
+    tool_capabilities: &'a ModelToolCapabilities,
+    service_tiers: &'a [String],
+    truncation: TruncationPolicy,
+    comp_hash: Option<&'a str>,
+}
+
+impl ModelContract<'_> {
+    fn validate(&self) -> Result<(), ModelRuntimeError> {
         if self.slug.trim().is_empty() {
             return Err(ModelRuntimeError::EmptySlug);
         }
-        if self.slug.len() > 256 || self.slug.chars().any(char::is_control) {
-            return Err(ModelRuntimeError::InvalidField {
-                field: "slug",
-                detail: "must not exceed 256 bytes or contain control characters".into(),
-            });
-        }
-        if self.display_name.len() > 512 || self.display_name.chars().any(char::is_control) {
-            return Err(ModelRuntimeError::InvalidField {
-                field: "display_name",
-                detail: "must not exceed 512 bytes or contain control characters".into(),
-            });
-        }
+        bounded("slug", self.slug, 256)?;
         if self.instructions.trim().is_empty() {
             return Err(ModelRuntimeError::InvalidField {
                 field: "instructions",
@@ -307,24 +324,105 @@ impl ModelDescriptor {
                 detail: "must not contain more than 8 entries".into(),
             });
         }
+        if !self.supports_verbosity && self.verbosity.is_some() {
+            return Err(ModelRuntimeError::InvalidField {
+                field: "default_verbosity",
+                detail: "requires verbosity support".into(),
+            });
+        }
+        if let Some(verbosity) = self.verbosity {
+            bounded("default_verbosity", verbosity, 64)?;
+        }
+        unique_bounded(
+            "tool_capabilities.experimental_supported_tools",
+            &self.tool_capabilities.experimental_supported_tools,
+            64,
+            128,
+        )?;
+        unique_bounded("service_tiers", self.service_tiers, 32, 64)?;
+        let minimum_feedback = match self.truncation.mode {
+            TruncationMode::Bytes => crate::tools::MIN_MODEL_TOOL_RESULT_BYTES,
+            TruncationMode::Tokens => crate::tools::MIN_MODEL_TOOL_RESULT_TOKENS,
+        };
+        if usize::try_from(self.truncation.limit).unwrap_or(usize::MAX) < minimum_feedback {
+            return Err(ModelRuntimeError::InvalidField {
+                field: "truncation.limit",
+                detail: format!("must be at least {minimum_feedback} for terminal tool feedback"),
+            });
+        }
+        if let Some(hash) = self.comp_hash {
+            bounded("comp_hash", hash, 256)?;
+        }
+        Ok(())
+    }
+}
+
+/// Non-empty, at most `max` bytes, no control characters. The shape every
+/// short text field of a model contract has to have.
+fn bounded(field: &'static str, value: &str, max: usize) -> Result<(), ModelRuntimeError> {
+    if value.trim().is_empty() || value.len() > max || value.chars().any(char::is_control) {
+        return Err(ModelRuntimeError::InvalidField {
+            field,
+            detail: format!("must contain 1 to {max} bytes and no control characters"),
+        });
+    }
+    Ok(())
+}
+
+/// Same, for a list whose entries must also be distinct (case-insensitively).
+fn unique_bounded(
+    field: &'static str,
+    values: &[String],
+    max_count: usize,
+    max_len: usize,
+) -> Result<(), ModelRuntimeError> {
+    let unique: HashSet<String> = values
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect();
+    if values.len() > max_count || unique.len() != values.len() {
+        return Err(ModelRuntimeError::InvalidField {
+            field,
+            detail: format!("must contain at most {max_count} unique values"),
+        });
+    }
+    for value in values {
+        bounded(field, value, max_len)?;
+    }
+    Ok(())
+}
+
+impl ModelDescriptor {
+    fn contract(&self) -> ModelContract<'_> {
+        ModelContract {
+            slug: &self.slug,
+            instructions: &self.instructions,
+            context_window: self.context_window,
+            auto_compact_token_limit: self.auto_compact_token_limit,
+            input_modalities: &self.input_modalities,
+            supports_verbosity: self.supports_verbosity,
+            verbosity: self.default_verbosity.as_deref(),
+            tool_capabilities: &self.tool_capabilities,
+            service_tiers: &self.service_tiers,
+            truncation: self.truncation,
+            comp_hash: self.comp_hash.as_deref(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ModelRuntimeError> {
+        self.contract().validate()?;
+        if self.display_name.len() > 512 || self.display_name.chars().any(char::is_control) {
+            return Err(ModelRuntimeError::InvalidField {
+                field: "display_name",
+                detail: "must not exceed 512 bytes or contain control characters".into(),
+            });
+        }
+        // Catalog-only: an entry declares the WHOLE menu of efforts, where a
+        // resolved runtime carries the single one that was selected.
         if self.supports_reasoning && self.supported_reasoning_efforts.is_empty() {
             return Err(ModelRuntimeError::InvalidField {
                 field: "supported_reasoning_efforts",
                 detail: "must not be empty when reasoning is supported".into(),
-            });
-        }
-        if self.supported_reasoning_efforts.iter().any(|effort| {
-            effort.trim().is_empty() || effort.len() > 64 || effort.chars().any(char::is_control)
-        }) {
-            return Err(ModelRuntimeError::InvalidField {
-                field: "supported_reasoning_efforts",
-                detail: "must contain non-empty efforts of at most 64 bytes".into(),
-            });
-        }
-        if self.supported_reasoning_efforts.len() > 32 {
-            return Err(ModelRuntimeError::InvalidField {
-                field: "supported_reasoning_efforts",
-                detail: "must not contain more than 32 efforts".into(),
             });
         }
         if !self.supports_reasoning
@@ -336,6 +434,15 @@ impl ModelDescriptor {
                 detail: "contradicts the declared reasoning efforts".into(),
             });
         }
+        if self.supported_reasoning_efforts.len() > 32 {
+            return Err(ModelRuntimeError::InvalidField {
+                field: "supported_reasoning_efforts",
+                detail: "must not contain more than 32 efforts".into(),
+            });
+        }
+        for effort in &self.supported_reasoning_efforts {
+            bounded("supported_reasoning_efforts", effort, 64)?;
+        }
         if let Some(default) = self.default_reasoning_effort.as_deref()
             && !self
                 .supported_reasoning_efforts
@@ -345,78 +452,6 @@ impl ModelDescriptor {
             return Err(ModelRuntimeError::InvalidField {
                 field: "default_reasoning_effort",
                 detail: "must be one of the supported efforts".into(),
-            });
-        }
-        if !self.supports_verbosity && self.default_verbosity.is_some() {
-            return Err(ModelRuntimeError::InvalidField {
-                field: "default_verbosity",
-                detail: "requires verbosity support".into(),
-            });
-        }
-        let unique_experimental_tools = self
-            .tool_capabilities
-            .experimental_supported_tools
-            .iter()
-            .map(|tool| tool.to_ascii_lowercase())
-            .collect::<HashSet<_>>();
-        if self.tool_capabilities.experimental_supported_tools.len() > 64
-            || self
-                .tool_capabilities
-                .experimental_supported_tools
-                .iter()
-                .any(|tool| {
-                    tool.trim().is_empty() || tool.len() > 128 || tool.chars().any(char::is_control)
-                })
-            || unique_experimental_tools.len()
-                != self.tool_capabilities.experimental_supported_tools.len()
-        {
-            return Err(ModelRuntimeError::InvalidField {
-                field: "tool_capabilities.experimental_supported_tools",
-                detail: "must contain at most 64 unique non-empty names of at most 128 bytes"
-                    .into(),
-            });
-        }
-        if self.default_verbosity.as_ref().is_some_and(|verbosity| {
-            verbosity.is_empty() || verbosity.len() > 64 || verbosity.chars().any(char::is_control)
-        }) {
-            return Err(ModelRuntimeError::InvalidField {
-                field: "default_verbosity",
-                detail: "must contain at most 64 bytes".into(),
-            });
-        }
-        let unique_service_tiers = self
-            .service_tiers
-            .iter()
-            .map(|tier| tier.to_ascii_lowercase())
-            .collect::<HashSet<_>>();
-        if self.service_tiers.len() > 32
-            || self.service_tiers.iter().any(|tier| {
-                tier.trim().is_empty() || tier.len() > 64 || tier.chars().any(char::is_control)
-            })
-            || unique_service_tiers.len() != self.service_tiers.len()
-        {
-            return Err(ModelRuntimeError::InvalidField {
-                field: "service_tiers",
-                detail: "must contain at most 32 unique non-empty values of at most 64 bytes"
-                    .into(),
-            });
-        }
-        let minimum_feedback = match self.truncation.mode {
-            TruncationMode::Bytes => crate::tools::MIN_MODEL_TOOL_RESULT_BYTES,
-            TruncationMode::Tokens => crate::tools::MIN_MODEL_TOOL_RESULT_TOKENS,
-        };
-        if usize::try_from(self.truncation.limit).unwrap_or(usize::MAX) < minimum_feedback {
-            return Err(ModelRuntimeError::InvalidField {
-                field: "truncation.limit",
-                detail: format!("must be at least {minimum_feedback} for terminal tool feedback"),
-            });
-        }
-        if self.comp_hash.as_ref().is_some_and(|hash| {
-            hash.is_empty() || hash.len() > 256 || hash.chars().any(char::is_control)
-        }) {
-            return Err(ModelRuntimeError::InvalidField {
-                field: "comp_hash",
-                detail: "must contain at most 256 bytes".into(),
             });
         }
         Ok(())
@@ -455,35 +490,25 @@ pub struct ResolvedModelRuntime {
 
 impl ResolvedModelRuntime {
     pub fn validate(&self) -> Result<(), ModelRuntimeError> {
-        ModelDescriptor {
-            slug: self.slug.clone(),
-            display_name: self.slug.clone(),
-            instructions: self.instructions.clone(),
+        ModelContract {
+            slug: &self.slug,
+            instructions: &self.instructions,
             context_window: self.context_window,
             auto_compact_token_limit: self.auto_compact_token_limit,
-            input_modalities: self.input_modalities.clone(),
-            supports_reasoning: self.reasoning_effort.is_some(),
-            default_reasoning_effort: self.reasoning_effort.clone(),
-            supported_reasoning_efforts: self.reasoning_effort.clone().into_iter().collect(),
+            input_modalities: &self.input_modalities,
             supports_verbosity: self.supports_verbosity,
-            default_verbosity: self.verbosity.clone(),
-            supports_parallel_tool_calls: self.supports_parallel_tool_calls,
-            tool_capabilities: self.tool_capabilities.clone(),
-            service_tiers: self.service_tiers.clone(),
-            reasoning_replay: self.reasoning_replay,
-            responses_dialect: self.responses_dialect,
-            tool_mode: self.tool_mode,
-            multi_agent_version: self.multi_agent_version,
+            verbosity: self.verbosity.as_deref(),
+            tool_capabilities: &self.tool_capabilities,
+            service_tiers: &self.service_tiers,
             truncation: self.truncation,
-            comp_hash: self.comp_hash.clone(),
+            comp_hash: self.comp_hash.as_deref(),
         }
         .validate()?;
-        if self.fingerprint.len() != 64
-            || !self
-                .fingerprint
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
+        // The turn carries ONE effort, already selected from the catalog menu.
+        if let Some(effort) = self.reasoning_effort.as_deref() {
+            bounded("reasoning_effort", effort, 64)?;
+        }
+        if !is_sha256(&self.fingerprint) {
             return Err(ModelRuntimeError::InvalidField {
                 field: "fingerprint",
                 detail: "must be a 64-character hexadecimal SHA-256".into(),
