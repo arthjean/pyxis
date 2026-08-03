@@ -318,6 +318,7 @@ pub fn deps(
         // Overridden per turn by `RunAgentRunner`; a root here would be an orphan
         // branch, which is exactly what US-008 AC1 forbids.
         cancel: CoreCancel::new(),
+        context_window: Default::default(),
     }
 }
 

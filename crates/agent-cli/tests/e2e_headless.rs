@@ -297,6 +297,7 @@ fn harness_with_hooks(
             clock: Arc::new(SystemClock),
             tools: Arc::new(registry),
             cancel: CancellationToken::new(),
+            context_window: Default::default(),
         },
         provider,
         session_path,

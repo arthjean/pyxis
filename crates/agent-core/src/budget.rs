@@ -160,6 +160,98 @@ fn pct(v: u32, p: u32) -> u32 {
     ((u64::from(v) * u64::from(p)) / 100) as u32
 }
 
+/// Read-only projection of the budget, shared with whoever is outside the loop
+/// and needs to know how much room is left: the `get_context_remaining` tool,
+/// and any client that would rather display the pressure than recompute it.
+///
+/// The budget itself stays owned by the loop (invariant 5: one source of truth
+/// per model). This is a snapshot the loop PUBLISHES, never a second budget:
+/// nothing here decides a compaction, and a reader that lags by one turn reads
+/// a number that was true, not one that is wrong.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContextWindow {
+    pub max_context: u32,
+    pub output_reserve: u32,
+    /// Input tokens the last turn actually carried (real usage when the stream
+    /// reported one, local estimate otherwise).
+    pub current_input: u32,
+    /// Growth past which the loop compacts on its own.
+    pub auto_threshold: u32,
+    /// Post-compaction incompressible baseline. Thresholds measure the growth
+    /// above it, so a remaining count that ignored it would be pessimistic by
+    /// the whole fixed overhead.
+    pub prefill_input: u32,
+    /// Has a real backend `usage` been seen for the current turn? A `false`
+    /// makes every figure an estimate, and a caller that shows it must say so.
+    pub usage_seen: bool,
+}
+
+impl ContextWindow {
+    /// Tokens that may still be added before the loop compacts. Saturating: past
+    /// the threshold the answer is zero, never a wrapped huge number.
+    pub fn remaining_before_compaction(&self) -> u32 {
+        self.auto_threshold
+            .saturating_sub(self.current_input.saturating_sub(self.prefill_input))
+    }
+
+    /// Share of the compaction budget already consumed, in percent, capped at
+    /// 100. Zero when the threshold itself is zero (unusable window).
+    pub fn used_percent(&self) -> u32 {
+        if self.auto_threshold == 0 {
+            return 0;
+        }
+        let used = self.current_input.saturating_sub(self.prefill_input);
+        ((u64::from(used) * 100) / u64::from(self.auto_threshold)).min(100) as u32
+    }
+}
+
+impl From<&ContextBudget> for ContextWindow {
+    fn from(budget: &ContextBudget) -> Self {
+        Self {
+            max_context: budget.max_context(),
+            output_reserve: budget.output_reserve(),
+            current_input: budget.current_input(),
+            auto_threshold: budget.auto_threshold(),
+            prefill_input: budget.prefill_input(),
+            usage_seen: budget.usage_seen(),
+        }
+    }
+}
+
+/// Shared handle on the latest published [`ContextWindow`]. Cloned into the tool
+/// context so a tool reads the same figures the loop just computed, without the
+/// tools crate ever owning a budget of its own.
+///
+/// `&self` everywhere: the loop publishes while concurrent read-only tools read.
+#[derive(Debug, Clone, Default)]
+pub struct ContextWindowState {
+    inner: std::sync::Arc<std::sync::RwLock<Option<ContextWindow>>>,
+}
+
+impl ContextWindowState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publishes the current state of the budget. Called by the loop at the
+    /// points where the budget itself moves.
+    pub fn publish(&self, window: ContextWindow) {
+        match self.inner.write() {
+            Ok(mut slot) => *slot = Some(window),
+            Err(poisoned) => *poisoned.into_inner() = Some(window),
+        }
+    }
+
+    /// Last published window. `None` before the first turn: a caller must then
+    /// say it does not know rather than invent a full window.
+    pub fn get(&self) -> Option<ContextWindow> {
+        match self.inner.read() {
+            Ok(slot) => *slot,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+}
+
 /// Cost charged to an image block in the local estimate (US-011). Zero was
 /// correct as long as no tool ever produced an image; now that `view_image`
 /// does, an image billed at nothing would be a transcript the projection can

@@ -180,6 +180,7 @@ fn deps(provider: Arc<FakeProvider>, store: Arc<FakeStore>) -> Deps {
         clock: Arc::new(InstantClock),
         tools: Arc::new(EchoTools),
         cancel: CoreCancel::new(),
+        context_window: Default::default(),
     }
 }
 

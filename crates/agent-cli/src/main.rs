@@ -1680,9 +1680,15 @@ async fn run(
         authority: agent_runtime::AgentAuthority::unrestricted(),
     };
 
+    // Published by the loop, read by `get_context_remaining`. Created here
+    // because the registry and the engine are assembled from the same scope and
+    // must share ONE handle.
+    let context_window = agent_core::budget::ContextWindowState::new();
+
     let mut builder = Registry::builder(&workspace)
         .mode_state(permission_mode.clone())
         .approver(approver)
+        .context_window(context_window.clone())
         .approvals(approvals.clone())
         .initial_taint_recent(initial_taint_recent)
         .hooks(Arc::clone(&hooks))
@@ -1711,7 +1717,11 @@ async fn run(
         .register(ApplyPatch)
         .register(ViewImage)
         .register(ExecCommand)
-        .register(WriteStdin);
+        .register(WriteStdin)
+        // Clock and context-window surface: what the model cannot observe from
+        // inside a turn, and therefore invents when it is not exposed.
+        .register(agent_tools::GetContextRemaining)
+        .register(agent_tools::NewContextWindow)
     if let Some(handle) = &code_mode {
         builder = builder
             .register(agent_tools::ExecTool::new(Arc::clone(handle)))
@@ -1746,6 +1756,10 @@ async fn run(
         tokenizer: Arc::new(HeuristicCounter),
         clock: Arc::new(SystemClock),
         tools: Arc::clone(&registry) as Arc<dyn agent_core::tools::ToolDispatch>,
+        // Same handle on both sides: the loop publishes its budget into it, the
+        // registry hands it to `get_context_remaining`. Two handles here would
+        // make the tool report a window that never moves.
+        context_window: context_window.clone(),
     };
     let sandbox_scope = sandbox_scope_label(&sandbox.policy, sandbox.enforced);
     // What every turn is captured from, and what the model sees at each step.

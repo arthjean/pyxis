@@ -121,6 +121,11 @@ pub struct ModelToolResult {
     /// loop stops instead of sampling the model again. Mirrors Codex
     /// `ReviewDecision::Abort` (`codex-rs/protocol/src/protocol.rs:4138`).
     pub aborts_turn: bool,
+    /// The tool asked for a fresh context window (`new_context_window`). It is a
+    /// REQUEST, not an order: it arms the same mid-turn compaction a long
+    /// `tool_result` arms (US-030), so the loop keeps deciding when and how to
+    /// compact, and a model cannot use it to wipe a transcript on demand.
+    pub requests_compaction: bool,
 }
 
 impl ModelToolResult {
@@ -145,6 +150,7 @@ impl ModelToolResult {
             execution: None,
             images: Vec::new(),
             aborts_turn: false,
+            requests_compaction: false,
         }
     }
 

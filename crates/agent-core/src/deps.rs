@@ -26,4 +26,9 @@ pub struct Deps {
     /// pass the child token of the turn they are running, never a fresh root:
     /// a fresh root is an orphan branch that no interruption reaches.
     pub cancel: CancellationToken,
+    /// Where the loop publishes the state of its context budget, for readers
+    /// outside it (the `get_context_remaining` tool, a client that displays the
+    /// pressure). Publishing into a handle nobody kept is a no-op, so the
+    /// default costs a write to an `Arc` per turn and changes no behavior.
+    pub context_window: crate::budget::ContextWindowState,
 }

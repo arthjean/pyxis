@@ -14,6 +14,7 @@ pub mod agent;
 pub mod bash;
 pub mod code_mode;
 pub mod command;
+pub mod context_window;
 pub mod edit;
 pub mod error;
 pub mod exec_session;
@@ -46,6 +47,7 @@ pub use agent::{
 pub use bash::Bash;
 pub use code_mode::{CodeModeHandle, CodeModeSessionFactory, ExecTool, WaitTool};
 pub use command::{CommandClass, classify};
+pub use context_window::{GetContextRemaining, NewContextWindow};
 pub use edit::Edit;
 pub use error::{ToolError, ValidationError};
 pub use exec_session::{ExecCommand, ExecSessions, WriteStdin};

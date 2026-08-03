@@ -492,6 +492,10 @@ pub struct EngineDeps {
     pub tokenizer: Arc<dyn agent_tokenizer::TokenCounter>,
     pub clock: Arc<dyn Clock>,
     pub tools: Arc<dyn agent_core::tools::ToolDispatch>,
+    /// Shared with the tool registry: the loop publishes its context budget
+    /// here, `get_context_remaining` reads it. Default = a handle nobody else
+    /// holds, which makes publishing a no-op.
+    pub context_window: agent_core::budget::ContextWindowState,
 }
 
 /// A branch the runtime materialized, named on the client's side.
@@ -635,6 +639,7 @@ impl SessionRuntime {
             // token never signalled leaves the loop behavior unchanged until
             // then, and no branch of the tree is orphaned.
             cancel: CancellationToken::new(),
+            context_window: engine.context_window,
         };
         let step_source: Arc<dyn StepContextSource> = Arc::new(StepContexts::new(
             Arc::clone(&steps) as Arc<dyn StepSource>,
@@ -917,6 +922,7 @@ mod tests {
             tokenizer: Arc::new(agent_tokenizer::HeuristicCounter),
             clock: Arc::new(SystemClock),
             tools: Arc::clone(registry) as Arc<dyn agent_core::tools::ToolDispatch>,
+            context_window: Default::default(),
         }
     }
 

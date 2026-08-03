@@ -296,6 +296,7 @@ async fn open(
         clock: Arc::new(InstantClock),
         tools: Arc::new(EchoTools),
         cancel: CoreCancel::new(),
+        context_window: Default::default(),
     };
     let handle = ThreadHandle::start(ThreadOptions {
         thread_id,
@@ -640,6 +641,7 @@ impl AgentSpawner for FileSpawner {
             clock: Arc::new(InstantClock),
             tools: Arc::new(EchoTools),
             cancel: CoreCancel::new(),
+            context_window: Default::default(),
         };
         Ok(ChildParts {
             store: store as Arc<dyn ThreadStore>,

@@ -878,6 +878,12 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         }
                     }
                     budget.begin_turn();
+                    // The figures a reader outside the loop can act on: the
+                    // request about to leave carries exactly this much context.
+                    // Published here rather than at each budget mutation, so a
+                    // tool called during the turn reads the state that turn was
+                    // built from instead of a mid-flight intermediate.
+                    deps.context_window.publish((&budget).into());
                     active_tool_plan = snapshot.tool_plan().clone();
                     let next_baseline = snapshot.baseline().clone();
                     if let Some(context_transition) = transition_between(
@@ -1186,6 +1192,11 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     );
                                 }
                                 budget.observe_usage(usage);
+                                // Real backend usage supersedes the pre-turn
+                                // estimate: republished so the tools of THIS
+                                // turn stop reading an estimate once the
+                                // authoritative count is known.
+                                deps.context_window.publish((&budget).into());
                                 run_usage.add_assign(&usage);
                                 last_usage = Some(usage);
                             }
@@ -1737,6 +1748,13 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             // force compaction on the next turn, before the model.
                             let projected = estimate_current_input(&messages, static_input_tokens, &deps);
                             if budget.would_autocompact(projected) {
+                                force_compact = true;
+                            }
+                            // A tool that asked for a fresh window rides the SAME
+                            // arming: the request is granted as a compaction at the
+                            // next safe point, never as an immediate transcript
+                            // rewrite between a `tool_use` and its result.
+                            if outcomes.iter().any(|o| o.requests_compaction) {
                                 force_compact = true;
                             }
                             // loop back: the model sees the results.

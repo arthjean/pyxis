@@ -549,7 +549,7 @@ impl Registry {
                 if let Some(plan) = out.plan {
                     events.emit(ToolDispatchEvent::Plan(plan));
                 }
-                outcome_from(
+                let mut outcome = outcome_from(
                     id.clone(),
                     out.content,
                     out.structured_content,
@@ -558,7 +558,9 @@ impl Registry {
                     out.images,
                     out.execution,
                     sandbox_denied,
-                )
+                );
+                outcome.requests_compaction = out.requests_compaction;
+                outcome
             }
         };
 
@@ -705,7 +707,7 @@ impl Registry {
                 if let Some(plan) = out.plan {
                     events.emit(ToolDispatchEvent::Plan(plan));
                 }
-                outcome_from(
+                let mut outcome = outcome_from(
                     id,
                     out.content,
                     out.structured_content,
@@ -714,7 +716,9 @@ impl Registry {
                     out.images,
                     out.execution,
                     sandbox_denied,
-                )
+                );
+                outcome.requests_compaction = out.requests_compaction;
+                outcome
             }
         }
     }
@@ -1046,6 +1050,13 @@ impl RegistryBuilder {
     /// agent-cli over the network proxy.
     pub fn sandbox_observer(mut self, observer: Arc<dyn crate::sandbox::SandboxObserver>) -> Self {
         self.ctx.sandbox_observer = Some(observer);
+        self
+    }
+    /// Handle the loop publishes its context budget into, read by
+    /// `get_context_remaining`. One handle per LOOP: a sub-agent gets its own,
+    /// otherwise a child would report its parent's window.
+    pub fn context_window(mut self, window: agent_core::budget::ContextWindowState) -> Self {
+        self.ctx.context_window = window;
         self
     }
     /// Applies an approved one-call widening (US-004). Without it no escalation

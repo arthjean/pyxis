@@ -144,6 +144,7 @@ impl SubAgentSpawner {
     fn child_registry(
         &self,
         authority: &agent_runtime::AgentAuthority,
+        context_window: agent_core::budget::ContextWindowState,
     ) -> Arc<agent_tools::Registry> {
         let mut builder = agent_tools::Registry::builder(&self.workspace)
             .mode(agent_tools::PermissionMode::Default)
@@ -153,11 +154,15 @@ impl SubAgentSpawner {
             .command_hardener(Arc::clone(&self.harden))
             .vision(self.provider.capabilities().vision)
             .sandbox(self.sandbox.clone(), self.sandbox_enforced)
+            // A child runs its own loop, hence its own budget: sharing the
+            // parent's handle would make each side report the other's window.
+            .context_window(context_window)
             .register(agent_tools::Read)
             .register(agent_tools::Glob)
             .register(agent_tools::Grep)
             .register(agent_tools::ViewImage)
-            .register(agent_tools::UpdatePlan);
+            .register(agent_tools::UpdatePlan)
+            .register(agent_tools::GetContextRemaining);
         // One check, one source of truth: the authority decides, tool by tool.
         if authority.allows("write", false) {
             builder = builder.register(agent_tools::Write);
@@ -179,7 +184,9 @@ impl SubAgentSpawner {
 impl AgentSpawner for SubAgentSpawner {
     async fn spawn(&self, request: &ChildRequest) -> Result<ChildParts, String> {
         let ids: Arc<dyn IdGenerator> = Arc::new(RandomIds);
-        let registry = self.child_registry(&request.authority);
+        // One handle per child loop, shared with the child's registry below.
+        let context_window = agent_core::budget::ContextWindowState::new();
+        let registry = self.child_registry(&request.authority, context_window.clone());
 
         // The child's file sits next to its parent's, named by its own thread
         // identifier. Reopening the SAME path is what makes a restored child
@@ -220,6 +227,7 @@ impl AgentSpawner for SubAgentSpawner {
             tools: Arc::clone(&registry) as Arc<dyn agent_core::tools::ToolDispatch>,
             // Replaced by the turn's own child token in `RunAgentRunner`.
             cancel: CancellationToken::new(),
+            context_window,
         };
         let runner = {
             let registry = Arc::clone(&registry);
@@ -351,7 +359,7 @@ mod tests {
 
     fn tools_of(authority: &AgentAuthority) -> Vec<String> {
         let mut names: Vec<String> = spawner()
-            .child_registry(authority)
+            .child_registry(authority, agent_core::budget::ContextWindowState::new())
             .tool_specs()
             .into_iter()
             .map(|spec| spec.name)

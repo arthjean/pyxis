@@ -88,6 +88,10 @@ pub struct ToolCtx {
     /// Client event channel of the current dispatch. Code Mode forwards it to
     /// nested calls so clients see their native lifecycle.
     pub events: ToolEventSink,
+    /// What the loop published about its context budget. Empty by default: a
+    /// tool that reads it must handle "not published yet" rather than assume a
+    /// full window, since nothing guarantees a turn has run.
+    pub context_window: agent_core::budget::ContextWindowState,
 }
 
 impl std::fmt::Debug for ToolCtx {
@@ -126,6 +130,7 @@ impl ToolCtx {
             output: None,
             call_id: None,
             events: ToolEventSink::default(),
+            context_window: agent_core::budget::ContextWindowState::new(),
         }
     }
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -149,6 +154,14 @@ impl ToolCtx {
     }
     pub fn with_sandbox_observer(mut self, observer: Arc<dyn SandboxObserver>) -> Self {
         self.sandbox_observer = Some(observer);
+        self
+    }
+    /// Shares the handle the loop publishes its context budget into.
+    pub fn with_context_window(
+        mut self,
+        window: agent_core::budget::ContextWindowState,
+    ) -> Self {
+        self.context_window = window;
         self
     }
     /// Context derived for ONE call: its identifier, output emitter and event
@@ -198,6 +211,9 @@ pub struct ToolOutput {
     /// Terminal shell facts, kept outside display text so later truncation can
     /// preserve them.
     pub execution: Option<ToolExecution>,
+    /// The call asked the loop for a fresh context window. Forwarded by the
+    /// Registry into the outcome; the loop decides what to do with it.
+    pub requests_compaction: bool,
 }
 
 impl ToolOutput {
@@ -211,6 +227,7 @@ impl ToolOutput {
             plan: None,
             images: Vec::new(),
             execution: None,
+            requests_compaction: false,
         }
     }
     /// Output marked as a semantic error (the content is kept for the model).
@@ -223,7 +240,13 @@ impl ToolOutput {
             plan: None,
             images: Vec::new(),
             execution: None,
+            requests_compaction: false,
         }
+    }
+    /// Asks the loop for a fresh context window at its next safe point.
+    pub fn requesting_compaction(mut self) -> Self {
+        self.requests_compaction = true;
+        self
     }
     /// Attributes the failure to the confinement (US-004 AC1).
     pub fn with_denial(mut self, denial: SandboxDenial) -> Self {

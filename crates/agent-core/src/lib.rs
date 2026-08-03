@@ -546,6 +546,7 @@ mod loop_tests {
             clock: Arc::new(NoopClock),
             tools: Arc::new(EchoTools),
             cancel: crate::CancellationToken::new(),
+            context_window: Default::default(),
         };
         Harness {
             log,
