@@ -88,7 +88,7 @@ fn wait_is_a_strict_function_tool() {
 
 #[test]
 fn the_catalog_projects_function_and_freeform_tools_differently() {
-    let function = NestedTool::from_spec(&ToolSpec::function_with_options(
+    let function = ToolSpec::function_with_options(
         "read-file",
         "Reads a file.",
         serde_json::json!({
@@ -111,11 +111,11 @@ fn the_catalog_projects_function_and_freeform_tools_differently() {
                 "exit_code": { "type": ["integer", "null"] }
             }
         })),
-    ));
-    let freeform =
-        NestedTool::from_spec(&ToolSpec::freeform("apply_patch", "Applies a patch.", None));
+    );
+    let freeform = ToolSpec::freeform("apply_patch", "Applies a patch.", None);
 
-    let description = exec_tool_spec(&[function, freeform], true).description;
+    let catalog = NestedTool::catalog(&[function, freeform]);
+    let description = exec_tool_spec(&catalog, true).description;
     assert!(
         description.contains(
             "declare function read_file(input: { limit: number | null; path: string }): Promise<{ exit_code: number | null; output: string }>;"
@@ -132,4 +132,46 @@ fn the_catalog_projects_function_and_freeform_tools_differently() {
 fn an_empty_catalog_says_so_instead_of_pretending() {
     let description = exec_tool_spec(&[], false).description;
     assert!(description.contains("No nested tool is available in this cell."));
+}
+
+/// Two names that normalize to the same JavaScript identifier are BOTH
+/// callable: without this, the second binding overwrites the first on the
+/// `tools` object and the model calls one tool believing it called the other.
+/// `mcp__server__list-files` next to `mcp__server__list_files` is the real
+/// shape of it, since `agent-mcp` keeps the dash it was given.
+#[test]
+fn colliding_tool_names_get_distinct_bindings() {
+    let catalog = NestedTool::catalog(&[
+        ToolSpec::freeform("mcp__srv__list-files", "Dashed.", None),
+        ToolSpec::freeform("mcp__srv__list_files", "Underscored.", None),
+        ToolSpec::freeform("mcp__srv__list_files_1", "Already taken.", None),
+    ]);
+    let bindings: Vec<&str> = catalog.iter().map(|tool| tool.binding.as_str()).collect();
+    assert_eq!(
+        bindings,
+        vec![
+            "mcp__srv__list_files",
+            "mcp__srv__list_files_1",
+            "mcp__srv__list_files_1_1"
+        ],
+        "a taken fallback is skipped rather than colliding in turn"
+    );
+    // The names themselves are untouched: only the JavaScript identifier moves.
+    let names: Vec<&str> = catalog.iter().map(|tool| tool.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "mcp__srv__list-files",
+            "mcp__srv__list_files",
+            "mcp__srv__list_files_1"
+        ]
+    );
+
+    let description = exec_tool_spec(&catalog, false).description;
+    for binding in bindings {
+        assert!(
+            description.contains(&format!("declare function {binding}(")),
+            "each tool must be reachable under its own binding: {description}"
+        );
+    }
 }

@@ -479,7 +479,7 @@ fn echo_spec(name: &str) -> ToolSpec {
 
 fn nested_request(source: &str, catalog: &[ToolSpec]) -> ExecuteRequest {
     ExecuteRequest::new("call-1", source)
-        .with_tools(catalog.iter().map(NestedTool::from_spec).collect())
+        .with_tools(NestedTool::catalog(catalog))
         .with_yield_time(Duration::from_secs(10))
 }
 

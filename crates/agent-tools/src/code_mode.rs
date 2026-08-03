@@ -105,12 +105,10 @@ impl CodeModeHandle {
     /// Binds the tool plan of the step in flight and refreshes what the model
     /// is told it can call from JavaScript.
     pub fn bind_step(&self, dispatcher: Arc<dyn NestedToolDispatcher>, code_mode_only: bool) {
-        let catalog = dispatcher
-            .catalog()
-            .iter()
-            .map(NestedTool::from_spec)
-            .collect();
-        *lock(&self.catalog) = catalog;
+        // Projected as a WHOLE set: `catalog` is what allocates a unique
+        // JavaScript binding per tool, which a name-by-name projection cannot
+        // promise.
+        *lock(&self.catalog) = NestedTool::catalog(&dispatcher.catalog());
         self.code_mode_only.store(code_mode_only, Ordering::Release);
         self.binding.set(dispatcher);
     }

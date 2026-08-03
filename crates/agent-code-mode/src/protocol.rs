@@ -3,6 +3,7 @@
 //! Responses wire; the engine (`CellEngine`) and the tools (`agent-tools`) are
 //! the two sides that project it.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::time::Duration;
 
@@ -229,7 +230,41 @@ pub struct NestedTool {
 }
 
 impl NestedTool {
-    pub fn from_spec(spec: &ToolSpec) -> Self {
+    /// Projects a whole tool set, allocating a UNIQUE binding to each tool.
+    ///
+    /// Uniqueness is a property of the SET, not of one name: `ToolSpec` accepts
+    /// both `-` and `_`, and `agent-mcp` keeps the dash when it composes
+    /// `mcp__server__tool`, so two legitimately distinct names can normalize to
+    /// the same JavaScript identifier. Left unresolved, the second binding
+    /// silently overwrites the first on the `tools` object and the model calls
+    /// one tool believing it called the other. Same shape as
+    /// `agent_mcp::naming::qualified_name`, which already carries a `taken` set
+    /// for exactly this reason.
+    pub fn catalog(specs: &[ToolSpec]) -> Vec<Self> {
+        let mut taken: HashSet<String> = HashSet::with_capacity(specs.len());
+        specs
+            .iter()
+            .map(|spec| {
+                let mut tool = Self::from_spec(spec);
+                let base = std::mem::take(&mut tool.binding);
+                let mut candidate = base.clone();
+                // Bounded: `taken` is finite, so a free name is reached in at
+                // most `taken.len() + 1` attempts.
+                let mut attempt = 1_usize;
+                while !taken.insert(candidate.clone()) {
+                    candidate = format!("{base}_{attempt}");
+                    attempt += 1;
+                }
+                tool.binding = candidate;
+                tool
+            })
+            .collect()
+    }
+
+    /// One tool in isolation. Its binding is NOT unique on its own: only
+    /// `catalog` can promise that. Kept private so no caller can build half a
+    /// catalog by hand.
+    fn from_spec(spec: &ToolSpec) -> Self {
         Self {
             name: spec.name.clone(),
             binding: normalize_binding(&spec.name),
@@ -243,15 +278,15 @@ impl NestedTool {
 
 /// Turns a tool name into a JavaScript identifier. A name is already limited to
 /// `[A-Za-z0-9_-]` by `ToolSpec::validate`, so only `-` and a leading digit can
-/// make it invalid.
+/// make it invalid: a `-` becomes `_` in place, and only a leading digit needs
+/// a prefix, since a substituted character is already a valid first character.
 pub fn normalize_binding(name: &str) -> String {
     let mut binding = String::with_capacity(name.len() + 1);
     for (index, character) in name.chars().enumerate() {
-        let valid = character.is_ascii_alphanumeric() || character == '_';
-        let leading_digit = index == 0 && character.is_ascii_digit();
-        if index == 0 && (leading_digit || !valid) {
+        if index == 0 && character.is_ascii_digit() {
             binding.push('_');
         }
+        let valid = character.is_ascii_alphanumeric() || character == '_';
         binding.push(if valid { character } else { '_' });
     }
     if binding.is_empty() {

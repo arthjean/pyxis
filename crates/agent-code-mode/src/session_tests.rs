@@ -488,5 +488,8 @@ fn a_tool_name_becomes_a_valid_javascript_identifier() {
         "mcp__ologs__get_profile"
     );
     assert_eq!(crate::normalize_binding("2fast"), "_2fast");
+    // A substituted character is already a valid first character: only a
+    // leading digit needs a prefix.
+    assert_eq!(crate::normalize_binding("-lead"), "_lead");
     assert_eq!(crate::normalize_binding(""), "_");
 }
