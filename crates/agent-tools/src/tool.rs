@@ -92,6 +92,10 @@ pub struct ToolCtx {
     /// tool that reads it must handle "not published yet" rather than assume a
     /// full window, since nothing guarantees a turn has run.
     pub context_window: agent_core::budget::ContextWindowState,
+    /// Channel to the human, for what is addressed to them rather than to the
+    /// model (`request_user_input`). `None` = nobody is attached, and a tool
+    /// that needs one must say so rather than pretend it spoke.
+    pub user_notice: Option<crate::ask::UserNotice>,
 }
 
 impl std::fmt::Debug for ToolCtx {
@@ -131,6 +135,7 @@ impl ToolCtx {
             call_id: None,
             events: ToolEventSink::default(),
             context_window: agent_core::budget::ContextWindowState::new(),
+            user_notice: None,
         }
     }
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -154,6 +159,11 @@ impl ToolCtx {
     }
     pub fn with_sandbox_observer(mut self, observer: Arc<dyn SandboxObserver>) -> Self {
         self.sandbox_observer = Some(observer);
+        self
+    }
+    /// Channel to the human (`request_user_input`).
+    pub fn with_user_notice(mut self, notice: crate::ask::UserNotice) -> Self {
+        self.user_notice = Some(notice);
         self
     }
     /// Shares the handle the loop publishes its context budget into.

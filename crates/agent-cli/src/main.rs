@@ -40,7 +40,7 @@ use agent_tools::{
     UpdatePlan, ViewImage, Write, WriteStdin,
 };
 
-use crate::approver::TuiApprover;
+use crate::approver::{CliPermissionBroker, TuiApprover};
 use crate::interactive::InteractiveConfig;
 
 const RESUME_TAINT_SCAN_MESSAGES: usize = 8;
@@ -1685,10 +1685,22 @@ async fn run(
     // must share ONE handle.
     let context_window = agent_core::budget::ContextWindowState::new();
 
+    // Question addressed to the human (`request_user_input`), on the same
+    // channel the sandbox and the hooks already use. Headless has no one to ask,
+    // so no channel is installed and the tool says the question was not asked.
+    let user_notice: Option<agent_tools::UserNotice> = (!headless).then(|| {
+        let tx = notice_tx.clone();
+        Arc::new(move |message: String| {
+            if let Err(err) = tx.try_send(message) {
+                eprintln!("[ask] {}", err.into_inner());
+            }
+        }) as agent_tools::UserNotice
+    });
+
     let mut builder = Registry::builder(&workspace)
         .mode_state(permission_mode.clone())
-        .approver(approver)
         .context_window(context_window.clone())
+        .approver(Arc::clone(&approver))
         .approvals(approvals.clone())
         .initial_taint_recent(initial_taint_recent)
         .hooks(Arc::clone(&hooks))
@@ -1724,6 +1736,19 @@ async fn run(
         .register(agent_tools::Sleep)
         .register(agent_tools::GetContextRemaining)
         .register(agent_tools::NewContextWindow)
+        // Asking the human: a question that does not block the turn, and a
+        // widening request that does.
+        .register(agent_tools::RequestUserInput)
+        .register(agent_tools::RequestPermissions::new(Arc::new(
+            CliPermissionBroker::new(
+                Arc::clone(&approver),
+                proxy.grants.clone(),
+                permission_mode.clone(),
+            ),
+        )));
+    if let Some(notice) = user_notice {
+        builder = builder.user_notice(notice);
+    }
     if let Some(handle) = &code_mode {
         builder = builder
             .register(agent_tools::ExecTool::new(Arc::clone(handle)))

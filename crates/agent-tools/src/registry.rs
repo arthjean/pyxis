@@ -1059,6 +1059,12 @@ impl RegistryBuilder {
         self.ctx.context_window = window;
         self
     }
+    /// Channel to the human (`request_user_input`). Absent = nobody is attached,
+    /// and the tool says so rather than pretending it asked.
+    pub fn user_notice(mut self, notice: crate::ask::UserNotice) -> Self {
+        self.ctx.user_notice = Some(notice);
+        self
+    }
     /// Applies an approved one-call widening (US-004). Without it no escalation
     /// is ever offered: a perimeter nobody can widen must not be advertised.
     pub fn sandbox_escalator(mut self, escalator: Arc<dyn SandboxEscalator>) -> Self {

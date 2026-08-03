@@ -6,6 +6,8 @@
 //! Fail-closed: when the channel is closed (TUI gone) or the answer lost, we
 //! **refuse** by default.
 
+use std::sync::Arc;
+
 use agent_tools::permission::{ApprovalResponse, Approver, PermissionRequest};
 use agent_tui::{PermissionPrompt, diff};
 use async_trait::async_trait;
@@ -34,6 +36,138 @@ impl Approver for TuiApprover {
         // Answer lost -> fail-closed, and nothing remembered.
         resp_rx.await.unwrap_or(ApprovalResponse::DENY_ONCE)
     }
+}
+
+
+/// Tool name carried by a `request_permissions` confirmation. Same reasoning as
+/// [`NETWORK_APPROVAL_TOOL`]: it names who is asking, and never collides with a
+/// remembered answer keyed on a registered tool.
+pub const PERMISSION_GRANT_TOOL: &str = "permission-grant";
+
+/// Grants what `request_permissions` asks for, once a human agrees (US-004).
+///
+/// Holds the two perimeters that can actually move while a session runs: the
+/// proxy's session grants and the permission mode. The filesystem is absent on
+/// purpose, and the tool refuses that scope before reaching here: a Landlock
+/// domain is inherited and irreversible, so no broker can widen it.
+///
+/// Every grant is confirmed by the SAME approver the tool pipeline uses. The
+/// confirmation is asked twice on purpose: once by the pipeline for the call
+/// itself, once here for the widening. They are different questions, and
+/// answering the first is not answering the second.
+pub struct CliPermissionBroker {
+    approver: Arc<dyn Approver>,
+    grants: agent_sandbox::NetworkGrants,
+    mode: agent_tools::PermissionModeState,
+}
+
+impl CliPermissionBroker {
+    pub fn new(
+        approver: Arc<dyn Approver>,
+        grants: agent_sandbox::NetworkGrants,
+        mode: agent_tools::PermissionModeState,
+    ) -> Self {
+        Self {
+            approver,
+            grants,
+            mode,
+        }
+    }
+
+    async fn confirm(&self, summary: &str, reason: &str, input: serde_json::Value) -> bool {
+        let req = PermissionRequest {
+            call_id: format!("grant:{summary}"),
+            tool: PERMISSION_GRANT_TOOL.to_string(),
+            reason: format!("the model asks to {summary}: {reason}"),
+            taint_forced: false,
+            mode: self.mode.get(),
+            input_summary: summary.to_string(),
+            input,
+            // A widening is never remembered: the next request asks again. Same
+            // rule as a sandbox escalation, for the same reason.
+            memoizable: false,
+            memo_refused: Some("a widening is granted once, never remembered".to_string()),
+        };
+        self.approver.approve(&req).await.allows()
+    }
+}
+
+#[async_trait]
+impl agent_tools::PermissionBroker for CliPermissionBroker {
+    async fn request(
+        &self,
+        ask: &agent_tools::PermissionAsk,
+        reason: &str,
+    ) -> agent_tools::GrantOutcome {
+        use agent_tools::{GrantOutcome, PermissionAsk};
+        match ask {
+            PermissionAsk::Network { host } => {
+                let host = host.trim();
+                let summary = format!("reach {host} for the rest of the session");
+                if !self
+                    .confirm(&summary, reason, serde_json::json!({ "host": host }))
+                    .await
+                {
+                    return GrantOutcome::Refused(format!(
+                        "the user refused network access to {host}. Do not retry \
+                         it; work without that host or say what it blocks."
+                    ));
+                }
+                self.grants.grant_for_session(host);
+                GrantOutcome::Granted(format!(
+                    "{host} and its subdomains are now reachable for the rest of \
+                     this session."
+                ))
+            }
+            PermissionAsk::Mode { mode } => {
+                let current = self.mode.get();
+                // A request that would not widen anything is answered without
+                // bothering the user: asking a human to confirm a no-op teaches
+                // them to confirm without reading.
+                if !widens(current, *mode) {
+                    return GrantOutcome::Refused(format!(
+                        "the session is already in `{}`, which is not more \
+                         restrictive than `{}`; nothing to grant.",
+                        current.id(),
+                        mode.id()
+                    ));
+                }
+                let summary = format!("switch the session to `{}`", mode.id());
+                if !self
+                    .confirm(&summary, reason, serde_json::json!({ "mode": mode.id() }))
+                    .await
+                {
+                    return GrantOutcome::Refused(format!(
+                        "the user kept the session in `{}`. Keep asking for \
+                         confirmations rather than working around them.",
+                        current.id()
+                    ));
+                }
+                self.mode.set(*mode);
+                GrantOutcome::Granted(format!(
+                    "the session is now in `{}`.",
+                    mode.id()
+                ))
+            }
+        }
+    }
+}
+
+/// Does moving from `current` to `requested` actually widen anything? Ranked by
+/// how much they ask of the user, which is the only ordering that matters here:
+/// `read-only` < `ask` < `accept-edits` < `auto` < `full-access`.
+fn widens(current: agent_tools::PermissionMode, requested: agent_tools::PermissionMode) -> bool {
+    fn rank(mode: agent_tools::PermissionMode) -> u8 {
+        use agent_tools::PermissionMode as Mode;
+        match mode {
+            Mode::Plan => 0,
+            Mode::Default => 1,
+            Mode::AcceptEdits => 2,
+            Mode::DontAsk => 3,
+            Mode::BypassPermissions => 4,
+        }
+    }
+    rank(requested) > rank(current)
 }
 
 /// Builds the visual prompt from the request: title adapted to the tool + preview

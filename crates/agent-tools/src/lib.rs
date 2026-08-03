@@ -11,6 +11,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod agent;
+pub mod ask;
 pub mod bash;
 pub mod code_mode;
 pub mod command;
@@ -44,6 +45,9 @@ mod tests_integration;
 pub use agent::{
     AgentHandle, FollowupTask, InterruptAgent, ListAgents, MULTI_AGENT_V2_TOOLS, SendMessage,
     SpawnAgent, WaitAgent,
+};
+pub use ask::{
+    GrantOutcome, PermissionAsk, PermissionBroker, RequestPermissions, RequestUserInput, UserNotice,
 };
 pub use bash::Bash;
 pub use code_mode::{CodeModeHandle, CodeModeSessionFactory, ExecTool, WaitTool};
