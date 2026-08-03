@@ -174,6 +174,20 @@ fn property(
     Some(value.to_rust_string_lossy(scope))
 }
 
+/// The one argument shape `image()` and `audio()` both take: a data URL, or an
+/// object carrying it under `field`.
+fn source_url(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+    field: &str,
+) -> Option<String> {
+    if value.is_string() {
+        return Some(value.to_rust_string_lossy(scope));
+    }
+    let object = v8::Local::<v8::Object>::try_from(value).ok()?;
+    property(scope, object, field)
+}
+
 fn parse_detail(value: &str) -> Option<ImageDetail> {
     match value {
         "auto" => Some(ImageDetail::Auto),
@@ -199,22 +213,7 @@ fn image_callback(
     _return_value: v8::ReturnValue<'_, v8::Value>,
 ) {
     let first = args.get(0);
-    let (image_url, embedded_detail) = if first.is_string() {
-        (first.to_rust_string_lossy(scope), None)
-    } else if let Ok(object) = v8::Local::<v8::Object>::try_from(first) {
-        let url = property(scope, object, "image_url");
-        let detail = property(scope, object, "detail");
-        match url {
-            Some(url) => (url, detail),
-            None => {
-                throw(
-                    scope,
-                    "image() needs a data URL or an object with image_url",
-                );
-                return;
-            }
-        }
-    } else {
+    let Some(image_url) = source_url(scope, first, "image_url") else {
         throw(
             scope,
             "image() needs a data URL or an object with image_url",
@@ -222,9 +221,13 @@ fn image_callback(
         return;
     };
 
+    // A second argument wins over the one the object carries; a data URL has
+    // no object to carry one at all.
     let explicit = args.get(1);
     let detail = if explicit.is_undefined() || explicit.is_null() {
-        embedded_detail
+        v8::Local::<v8::Object>::try_from(first)
+            .ok()
+            .and_then(|object| property(scope, object, "detail"))
     } else {
         Some(explicit.to_rust_string_lossy(scope))
     };
@@ -242,21 +245,7 @@ fn audio_callback(
     args: v8::FunctionCallbackArguments<'_>,
     _return_value: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let first = args.get(0);
-    let audio_url = if first.is_string() {
-        first.to_rust_string_lossy(scope)
-    } else if let Ok(object) = v8::Local::<v8::Object>::try_from(first) {
-        match property(scope, object, "audio_url") {
-            Some(url) => url,
-            None => {
-                throw(
-                    scope,
-                    "audio() needs a data URL or an object with audio_url",
-                );
-                return;
-            }
-        }
-    } else {
+    let Some(audio_url) = source_url(scope, args.get(0), "audio_url") else {
         throw(
             scope,
             "audio() needs a data URL or an object with audio_url",

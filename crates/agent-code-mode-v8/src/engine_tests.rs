@@ -4,8 +4,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use agent_code_mode::{
-    CellFailureKind, CellState, CodeModeSession, ExecuteRequest, OutputItem, RuntimeResponse,
-    SessionId, SessionLimits, WaitRequest,
+    CellFailureKind, CellState, CodeModeSession, ExecuteRequest, ImageDetail, OutputItem,
+    RuntimeResponse, SessionId, SessionLimits, WaitRequest,
 };
 
 use super::*;
@@ -377,6 +377,97 @@ async fn a_contradictory_jit_mode_is_refused_before_a_session_exists() {
     );
     // Asking again for the mode in force is still fine.
     assert!(crate::initialize_v8(active).is_ok());
+}
+
+/// `image()` takes a data URL or an object, and the second argument wins over
+/// the detail the object carries.
+#[tokio::test]
+async fn image_accepts_both_argument_shapes() {
+    let session = session("image", engine(EngineLimits::default()));
+    let response = session
+        .execute(cell(
+            "image('data:image/png;base64,AAA');\n\
+             image({ image_url: 'data:image/png;base64,BBB', detail: 'low' });\n\
+             image({ image_url: 'data:image/png;base64,CCC', detail: 'low' }, 'high');",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.state(),
+        CellState::Completed,
+        "{:?}",
+        response.failure()
+    );
+    let images: Vec<(String, Option<ImageDetail>)> = response
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            OutputItem::Image { image_url, detail } => Some((image_url.clone(), *detail)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        images,
+        vec![
+            ("data:image/png;base64,AAA".to_string(), None),
+            (
+                "data:image/png;base64,BBB".to_string(),
+                Some(ImageDetail::Low)
+            ),
+            (
+                "data:image/png;base64,CCC".to_string(),
+                Some(ImageDetail::High)
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn image_without_a_url_throws_instead_of_emitting_an_item() {
+    let session = session("image-bad", engine(EngineLimits::default()));
+    let response = session
+        .execute(cell("image({ detail: 'low' });"))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.failure().map(|failure| failure.kind),
+        Some(CellFailureKind::Script),
+        "{:?}",
+        response.failure()
+    );
+    assert!(
+        response
+            .items()
+            .iter()
+            .all(|item| !matches!(item, OutputItem::Image { .. }))
+    );
+}
+
+#[tokio::test]
+async fn audio_accepts_both_argument_shapes() {
+    let session = session("audio", engine(EngineLimits::default()));
+    let response = session
+        .execute(cell(
+            "audio('data:audio/wav;base64,AAA');\n\
+             audio({ audio_url: 'data:audio/wav;base64,BBB' });",
+        ))
+        .await
+        .unwrap();
+    let urls: Vec<String> = response
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            OutputItem::Audio { audio_url } => Some(audio_url.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        urls,
+        vec![
+            "data:audio/wav;base64,AAA".to_string(),
+            "data:audio/wav;base64,BBB".to_string()
+        ]
+    );
 }
 
 #[tokio::test]
