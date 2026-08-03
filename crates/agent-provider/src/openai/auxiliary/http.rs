@@ -162,7 +162,7 @@ impl ConfiguredOpenAiProvider {
             let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
                 AuxiliaryError::invalid(operation, "headers", "invalid header name")
             })?;
-            let value = HeaderValue::from_str(&value).map_err(|_| {
+            let value = HeaderValue::from_str(value.expose()).map_err(|_| {
                 AuxiliaryError::invalid(operation, "headers", "invalid header value")
             })?;
             request = request.header(name, value);

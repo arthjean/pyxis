@@ -5,9 +5,7 @@ use crate::Secret;
 
 use super::ProviderAuthError;
 
-pub(super) fn bearer_headers(
-    token: &Secret,
-) -> Result<Vec<(String, String)>, ProviderAuthError> {
+pub(super) fn bearer_headers(token: &Secret) -> Result<Vec<(String, Secret)>, ProviderAuthError> {
     let value = validated_header_value("token", &format!("Bearer {}", token.expose()))?;
     Ok(vec![("authorization".into(), value)])
 }
@@ -15,10 +13,10 @@ pub(super) fn bearer_headers(
 pub(super) fn validated_header_value(
     field: &'static str,
     value: &str,
-) -> Result<String, ProviderAuthError> {
+) -> Result<Secret, ProviderAuthError> {
     HeaderValue::from_str(value)
         .map_err(|_| invalid(field, "contains an invalid HTTP header value"))?;
-    Ok(value.to_owned())
+    Ok(Secret::new(value))
 }
 
 /// An identity ends up in logs and in a fingerprint, so it must be something

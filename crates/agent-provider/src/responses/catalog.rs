@@ -119,7 +119,7 @@ impl RemoteCatalogManager {
             .timeout(MODELS_TIMEOUT)
             .header(reqwest::header::ACCEPT, "application/json");
         for (name, value) in &request.auth.headers {
-            builder = builder.header(name, value);
+            builder = builder.header(name, value.expose());
         }
         if cache == CatalogCacheMode::Revalidate
             && let Some(etag) = cached_etag.as_deref()

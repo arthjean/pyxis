@@ -375,7 +375,7 @@ async fn chatgpt_catalog_request(
         .headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("chatgpt-account-id"))
-        .map(|(_, value)| value.as_str())
+        .map(|(_, value)| value.expose())
         .ok_or(ProviderError::Credential(
             agent_core::provider::AuthError::ReconnectRequired,
         ))?;

@@ -137,14 +137,14 @@ struct TokenResponse {
 /// Builds the authorization URL (browser flow). Includes the
 /// non-standard parameters required by the Codex backend (`id_token_add_organizations`,
 /// `codex_cli_simplified_flow`).
-pub fn build_authorize_url(challenge: &str, state: &str) -> Result<String, AuthError> {
+pub fn build_authorize_url(challenge: &Secret, state: &str) -> Result<String, AuthError> {
     let mut url = url::Url::parse(AUTHORIZE_URL).map_err(|e| AuthError::Callback(e.to_string()))?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", CLIENT_ID)
         .append_pair("redirect_uri", REDIRECT_URI)
         .append_pair("scope", SCOPE)
-        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge", challenge.expose())
         .append_pair("code_challenge_method", "S256")
         .append_pair("state", state)
         .append_pair("id_token_add_organizations", "true")
@@ -190,19 +190,10 @@ fn token_to_credential(token: TokenResponse, now_ms: u64) -> Result<OAuthCredent
 }
 
 /// Result of a browser callback.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct CallbackResult {
-    pub code: String,
-    pub state: String,
-}
-
-impl std::fmt::Debug for CallbackResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CallbackResult")
-            .field("code", &"Secret(***)")
-            .field("state", &"Secret(***)")
-            .finish()
-    }
+    pub code: Secret,
+    pub state: Secret,
 }
 
 /// Parses the HTTP request line of the callback (`GET /auth/callback?code=...&state=... HTTP/1.1`)
@@ -235,32 +226,21 @@ pub fn parse_callback_request_line(
         return Err(AuthError::StateMismatch);
     }
     let code = code.ok_or_else(|| AuthError::Callback("missing code".to_string()))?;
-    Ok(CallbackResult { code, state })
+    Ok(CallbackResult {
+        code: Secret::new(code),
+        state: Secret::new(state),
+    })
 }
 
 /// Outcome of a device-code poll.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum PollOutcome {
     Pending,
     SlowDown,
     Done {
-        authorization_code: String,
-        code_verifier: String,
+        authorization_code: Secret,
+        code_verifier: Secret,
     },
-}
-
-impl std::fmt::Debug for PollOutcome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Pending => f.write_str("Pending"),
-            Self::SlowDown => f.write_str("SlowDown"),
-            Self::Done { .. } => f
-                .debug_struct("Done")
-                .field("authorization_code", &"Secret(***)")
-                .field("code_verifier", &"Secret(***)")
-                .finish(),
-        }
-    }
 }
 
 fn device_error_code(body: &serde_json::Value) -> Option<&str> {
@@ -279,9 +259,9 @@ pub fn classify_device_poll(
         let verifier = body.get("code_verifier").and_then(|v| v.as_str());
         return match (code, verifier) {
             (Some(c), Some(v)) => Ok(PollOutcome::Done {
-                authorization_code: c.to_string(),
+                authorization_code: Secret::new(c),
                 // in device flow, the code_verifier comes from the SERVER, not locally.
-                code_verifier: v.to_string(),
+                code_verifier: Secret::new(v),
             }),
             _ => Err(AuthError::TokenResponse(
                 "device 200 without authorization_code/code_verifier".to_string(),
@@ -304,9 +284,9 @@ pub fn classify_device_poll(
 /// `chatgpt-account-id` (derived from the JWT) is required to route to the account.
 pub fn responses_request(cred: &OAuthCredential) -> Result<ProviderRequestAuth, AuthError> {
     let mut headers = auth_headers(cred)?;
-    headers.push(("OpenAI-Beta".to_string(), OPENAI_BETA_SSE.to_string()));
-    headers.push(("accept".to_string(), "text/event-stream".to_string()));
-    headers.push(("content-type".to_string(), "application/json".to_string()));
+    headers.push(("OpenAI-Beta".to_string(), Secret::new(OPENAI_BETA_SSE)));
+    headers.push(("accept".to_string(), Secret::new("text/event-stream")));
+    headers.push(("content-type".to_string(), Secret::new("application/json")));
     Ok(ProviderRequestAuth {
         url: format!("{CHATGPT_BASE_URL}{RESPONSES_PATH}"),
         headers,
@@ -318,7 +298,7 @@ pub fn responses_request(cred: &OAuthCredential) -> Result<ProviderRequestAuth, 
 /// already applied), filtered by the current build's `client_version`.
 pub fn models_request(cred: &OAuthCredential) -> Result<ProviderRequestAuth, AuthError> {
     let mut headers = auth_headers(cred)?;
-    headers.push(("accept".to_string(), "application/json".to_string()));
+    headers.push(("accept".to_string(), Secret::new("application/json")));
     let mut url = url::Url::parse(&format!("{CHATGPT_BASE_URL}{MODELS_PATH}"))
         .map_err(|e| AuthError::Callback(e.to_string()))?;
     url.query_pairs_mut()
@@ -330,7 +310,7 @@ pub fn models_request(cred: &OAuthCredential) -> Result<ProviderRequestAuth, Aut
 }
 
 /// Identification headers common to every Codex backend request.
-fn auth_headers(cred: &OAuthCredential) -> Result<Vec<(String, String)>, AuthError> {
+fn auth_headers(cred: &OAuthCredential) -> Result<Vec<(String, Secret)>, AuthError> {
     if cred.provider != ProviderId::OpenAiChatGpt {
         return Err(AuthError::WrongProvider(cred.provider));
     }
@@ -341,10 +321,10 @@ fn auth_headers(cred: &OAuthCredential) -> Result<Vec<(String, String)>, AuthErr
     Ok(vec![
         (
             "Authorization".to_string(),
-            format!("Bearer {}", cred.access.expose()),
+            Secret::new(format!("Bearer {}", cred.access.expose())),
         ),
-        ("chatgpt-account-id".to_string(), account_id.to_string()),
-        ("originator".to_string(), originator()),
+        ("chatgpt-account-id".to_string(), Secret::new(account_id)),
+        ("originator".to_string(), Secret::new(originator())),
     ])
 }
 
@@ -354,8 +334,8 @@ fn auth_headers(cred: &OAuthCredential) -> Result<Vec<(String, String)>, AuthErr
 /// between browser (`REDIRECT_URI`) and device (`DEVICE_REDIRECT_URI`).
 pub async fn exchange_code(
     client: &reqwest::Client,
-    code: &str,
-    verifier: &str,
+    code: &Secret,
+    verifier: &Secret,
     redirect_uri: &str,
     now_ms: u64,
 ) -> Result<OAuthCredential, AuthError> {
@@ -364,8 +344,8 @@ pub async fn exchange_code(
         .form(&[
             ("grant_type", "authorization_code"),
             ("client_id", CLIENT_ID),
-            ("code", code),
-            ("code_verifier", verifier),
+            ("code", code.expose()),
+            ("code_verifier", verifier.expose()),
             ("redirect_uri", redirect_uri),
         ])
         .send()
@@ -494,37 +474,18 @@ async fn accept_callback_with_read_timeout(
 // ──────────────────────────── Device-code flow (headless) ────────────────────────────
 
 /// Information to present to the user for the device flow.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct DeviceAuth {
-    pub user_code: String,
+    pub user_code: Secret,
     pub verification_uri: String,
 }
 
-impl std::fmt::Debug for DeviceAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeviceAuth")
-            .field("user_code", &"Secret(***)")
-            .field("verification_uri", &self.verification_uri)
-            .finish()
-    }
-}
-
 /// Internal poll state (separate from the user-facing display).
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct DeviceAuthState {
-    device_auth_id: String,
-    user_code: String,
+    device_auth_id: Secret,
+    user_code: Secret,
     interval: u64,
-}
-
-impl std::fmt::Debug for DeviceAuthState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeviceAuthState")
-            .field("device_auth_id", &"Secret(***)")
-            .field("user_code", &"Secret(***)")
-            .field("interval", &self.interval)
-            .finish()
-    }
 }
 
 /// Starts the device flow: returns the state to poll + the info to display.
@@ -540,16 +501,14 @@ pub async fn start_device(
         .json()
         .await?;
 
-    let device_auth_id = v
-        .get("device_auth_id")
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| AuthError::TokenResponse("missing device_auth_id".to_string()))?
-        .to_string();
-    let user_code = v
-        .get("user_code")
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| AuthError::TokenResponse("user_code absent".to_string()))?
-        .to_string();
+    let field = |name: &str| {
+        v.get(name)
+            .and_then(|x| x.as_str())
+            .map(Secret::new)
+            .ok_or_else(|| AuthError::TokenResponse(format!("missing {name}")))
+    };
+    let device_auth_id = field("device_auth_id")?;
+    let user_code = field("user_code")?;
     let interval = v
         .get("interval")
         .and_then(|x| x.as_u64())
@@ -588,8 +547,8 @@ pub async fn poll_device(
         let resp = client
             .post(DEVICE_TOKEN_URL)
             .json(&serde_json::json!({
-                "device_auth_id": st.device_auth_id,
-                "user_code": st.user_code,
+                "device_auth_id": st.device_auth_id.expose(),
+                "user_code": st.user_code.expose(),
             }))
             .send()
             .await?;
@@ -658,7 +617,7 @@ mod tests {
 
     #[test]
     fn authorize_url_contains_required_params() {
-        let url = build_authorize_url("CHAL", "STATE123").unwrap();
+        let url = build_authorize_url(&Secret::new("CHAL"), "STATE123").unwrap();
         for needle in [
             "client_id=app_EMoamEEZ73f0CkXaXp7hrann",
             "code_challenge=CHAL",
@@ -687,7 +646,7 @@ mod tests {
     fn callback_parses_code_and_validates_state() {
         let line = "GET /auth/callback?code=abc123&state=s1 HTTP/1.1";
         let cb = parse_callback_request_line(line, "s1").unwrap();
-        assert_eq!(cb.code, "abc123");
+        assert_eq!(cb.code.expose(), "abc123");
 
         assert!(matches!(
             parse_callback_request_line("GET /auth/callback2?code=abc123&state=s1 HTTP/1.1", "s1"),
@@ -715,31 +674,24 @@ mod tests {
     #[test]
     fn device_poll_classification() {
         let null = serde_json::Value::Null;
-        assert_eq!(
-            classify_device_poll(403, &null).unwrap(),
-            PollOutcome::Pending
-        );
-        assert_eq!(
-            classify_device_poll(404, &null).unwrap(),
-            PollOutcome::Pending
-        );
-        assert_eq!(
-            classify_device_poll(
+        for (status, body) in [
+            (403, null.clone()),
+            (404, null),
+            (
                 400,
-                &serde_json::json!({"errorCode":"deviceauth_authorization_pending"})
-            )
-            .unwrap(),
-            PollOutcome::Pending
-        );
-        assert_eq!(
-            classify_device_poll(400, &serde_json::json!({"errorCode":"slow_down"})).unwrap(),
-            PollOutcome::SlowDown
-        );
-        assert_eq!(
-            classify_device_poll(400, &serde_json::json!({"error":"authorization_pending"}))
-                .unwrap(),
-            PollOutcome::Pending
-        );
+                serde_json::json!({"errorCode":"deviceauth_authorization_pending"}),
+            ),
+            (400, serde_json::json!({"error":"authorization_pending"})),
+        ] {
+            assert!(matches!(
+                classify_device_poll(status, &body),
+                Ok(PollOutcome::Pending)
+            ));
+        }
+        assert!(matches!(
+            classify_device_poll(400, &serde_json::json!({"errorCode":"slow_down"})),
+            Ok(PollOutcome::SlowDown)
+        ));
         assert!(matches!(
             classify_device_poll(403, &serde_json::json!({"errorCode":"access_denied"})),
             Err(AuthError::DeviceDenied(e)) if e == "access_denied"
@@ -748,26 +700,25 @@ mod tests {
             classify_device_poll(404, &serde_json::json!({"error":"expired_token"})),
             Err(AuthError::DeviceTimeout)
         ));
+        assert!(matches!(
+            classify_device_poll(200, &serde_json::json!({"authorization_code":"C"})),
+            Err(AuthError::TokenResponse(_))
+        ));
+
         let done = classify_device_poll(
             200,
             &serde_json::json!({"authorization_code":"C","code_verifier":"V"}),
         )
         .unwrap();
-        assert_eq!(
-            done,
-            PollOutcome::Done {
-                authorization_code: "C".into(),
-                code_verifier: "V".into()
-            }
-        );
-        assert!(matches!(
-            classify_device_poll(400, &serde_json::json!({"errorCode":"access_denied"})),
-            Err(AuthError::DeviceDenied(_))
-        ));
-        assert!(matches!(
-            classify_device_poll(200, &serde_json::json!({"authorization_code":"C"})),
-            Err(AuthError::TokenResponse(_))
-        ));
+        let PollOutcome::Done {
+            authorization_code,
+            code_verifier,
+        } = done
+        else {
+            unreachable!("a complete 200 is a Done")
+        };
+        assert_eq!(authorization_code.expose(), "C");
+        assert_eq!(code_verifier.expose(), "V");
     }
 
     #[test]
@@ -799,7 +750,10 @@ mod tests {
         };
         let spec = responses_request(&cred).unwrap();
         assert_eq!(spec.url, "https://chatgpt.com/backend-api/codex/responses");
-        let h: std::collections::HashMap<_, _> = spec.headers.into_iter().collect();
+        let h: std::collections::HashMap<_, _> = spec
+            .header_pairs()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
         assert_eq!(h["Authorization"], "Bearer AT");
         assert_eq!(h["chatgpt-account-id"], "acct_7");
         assert_eq!(h["originator"], "pyxis");
@@ -838,7 +792,7 @@ mod tests {
 
         let configured = ProviderRequestAuth {
             url: "https://example.test/responses?api-key=QUERY_SECRET#FRAGMENT_SECRET".into(),
-            headers: vec![("x-api-key".into(), "HEADER_SECRET".into())],
+            headers: vec![("x-api-key".into(), Secret::new("HEADER_SECRET"))],
         };
         let configured_dbg = format!("{configured:?}");
         assert!(!configured_dbg.contains("QUERY_SECRET"));
@@ -847,24 +801,24 @@ mod tests {
         assert!(configured_dbg.contains("x-api-key"));
 
         let cb = CallbackResult {
-            code: "CODE_SECRET".into(),
-            state: "STATE_SECRET".into(),
+            code: Secret::new("CODE_SECRET"),
+            state: Secret::new("STATE_SECRET"),
         };
         let cb_dbg = format!("{cb:?}");
         assert!(!cb_dbg.contains("CODE_SECRET"));
         assert!(!cb_dbg.contains("STATE_SECRET"));
 
         let done = PollOutcome::Done {
-            authorization_code: "AUTH_CODE_SECRET".into(),
-            code_verifier: "VERIFIER_SECRET".into(),
+            authorization_code: Secret::new("AUTH_CODE_SECRET"),
+            code_verifier: Secret::new("VERIFIER_SECRET"),
         };
         let done_dbg = format!("{done:?}");
         assert!(!done_dbg.contains("AUTH_CODE_SECRET"));
         assert!(!done_dbg.contains("VERIFIER_SECRET"));
 
         let st = DeviceAuthState {
-            device_auth_id: "DEVICE_SECRET".into(),
-            user_code: "USER_SECRET".into(),
+            device_auth_id: Secret::new("DEVICE_SECRET"),
+            user_code: Secret::new("USER_SECRET"),
             interval: 5,
         };
         let st_dbg = format!("{st:?}");
@@ -872,7 +826,7 @@ mod tests {
         assert!(!st_dbg.contains("USER_SECRET"));
 
         let display = DeviceAuth {
-            user_code: "DISPLAY_CODE_SECRET".into(),
+            user_code: Secret::new("DISPLAY_CODE_SECRET"),
             verification_uri: DEVICE_VERIFICATION_URI.into(),
         };
         let display_dbg = format!("{display:?}");
@@ -904,7 +858,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(cb.code, "abc123");
+        assert_eq!(cb.code.expose(), "abc123");
     }
 
     // US-021 AC2: selection of the `originator` fallback. `pyxis` by default;

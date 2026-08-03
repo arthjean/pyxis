@@ -194,7 +194,7 @@ fn build_authorize_url(
     metadata: &AuthServerMetadata,
     client_id: &str,
     redirect_uri: &str,
-    challenge: &str,
+    challenge: &Secret,
     state: &str,
     scopes: &[String],
     resource: Option<&str>,
@@ -207,7 +207,7 @@ fn build_authorize_url(
             .append_pair("response_type", "code")
             .append_pair("client_id", client_id)
             .append_pair("redirect_uri", redirect_uri)
-            .append_pair("code_challenge", challenge)
+            .append_pair("code_challenge", challenge.expose())
             .append_pair("code_challenge_method", "S256")
             .append_pair("state", state);
         if !scopes.is_empty() {
@@ -311,16 +311,16 @@ async fn exchange_code(
     client: &reqwest::Client,
     token_endpoint: &str,
     client_id: &str,
-    code: &str,
-    verifier: &str,
+    code: &Secret,
+    verifier: &Secret,
     redirect_uri: &str,
     resource: Option<&str>,
 ) -> Result<TokenResponse, AuthError> {
     let mut form = vec![
         ("grant_type", "authorization_code"),
         ("client_id", client_id),
-        ("code", code),
-        ("code_verifier", verifier),
+        ("code", code.expose()),
+        ("code_verifier", verifier.expose()),
         ("redirect_uri", redirect_uri),
     ];
     if let Some(resource) = resource {
@@ -413,7 +413,10 @@ fn credential_from_token(
 
 /// Extracts the authorization code from a callback request line, after checking
 /// the anti-CSRF `state`. `Err(Callback)` = not our callback, keep listening.
-pub fn parse_callback_request_line(line: &str, expected_state: &str) -> Result<String, AuthError> {
+pub fn parse_callback_request_line(
+    line: &str,
+    expected_state: &str,
+) -> Result<Secret, AuthError> {
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or_default();
@@ -445,13 +448,14 @@ pub fn parse_callback_request_line(line: &str, expected_state: &str) -> Result<S
     if state.as_deref() != Some(expected_state) {
         return Err(AuthError::StateMismatch);
     }
-    code.ok_or_else(|| AuthError::Callback("callback carries no code".to_string()))
+    code.map(Secret::new)
+        .ok_or_else(|| AuthError::Callback("callback carries no code".to_string()))
 }
 
 async fn accept_callback(
     listener: &tokio::net::TcpListener,
     expected_state: &str,
-) -> Result<String, AuthError> {
+) -> Result<Secret, AuthError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     loop {
@@ -535,7 +539,7 @@ pub async fn access_token(
     client: &reqwest::Client,
     server: &str,
     now_ms: u64,
-) -> Result<Option<String>, AuthError> {
+) -> Result<Option<Secret>, AuthError> {
     let owned = server.to_string();
     let stored = tokio::task::spawn_blocking(move || load(&owned))
         .await
@@ -545,10 +549,10 @@ pub async fn access_token(
         return Ok(None);
     };
     if !cred.needs_refresh(now_ms) {
-        return Ok(Some(cred.access.expose().to_string()));
+        return Ok(Some(cred.access.clone()));
     }
     let refreshed = refresh(client, &cred, now_ms).await?;
-    let token = refreshed.access.expose().to_string();
+    let token = refreshed.access.clone();
     // A write failure is not fatal: the fresh token is still usable for this run.
     let _ = tokio::task::spawn_blocking(move || save(&refreshed)).await;
     Ok(Some(token))
@@ -582,7 +586,7 @@ mod tests {
             &metadata(),
             "client-123",
             "http://127.0.0.1:5000/pyxis/mcp/callback",
-            "CHALLENGE",
+            &Secret::new("CHALLENGE"),
             "STATE",
             &["mcp".to_string(), "read".to_string()],
             Some("https://api.example.com/mcp"),
@@ -603,7 +607,10 @@ mod tests {
     #[test]
     fn the_callback_checks_the_state_before_reading_the_code() {
         let line = "GET /pyxis/mcp/callback?code=SECRET&state=good HTTP/1.1";
-        assert_eq!(parse_callback_request_line(line, "good").unwrap(), "SECRET");
+        assert_eq!(
+            parse_callback_request_line(line, "good").unwrap().expose(),
+            "SECRET"
+        );
         // Wrong state: rejected as a state mismatch, and the code is not returned.
         let err = parse_callback_request_line(line, "other").unwrap_err();
         assert!(matches!(err, AuthError::StateMismatch));

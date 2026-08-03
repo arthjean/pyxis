@@ -177,7 +177,7 @@ async fn connect_socket(
         {
             let name = http::HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| AuxiliaryError::invalid(operation, "headers", "invalid name"))?;
-            let value = http::HeaderValue::from_str(&value)
+            let value = http::HeaderValue::from_str(value.expose())
                 .map_err(|_| AuxiliaryError::invalid(operation, "headers", "invalid value"))?;
             request.headers_mut().insert(name, value);
         }

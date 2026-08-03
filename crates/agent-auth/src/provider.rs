@@ -4,9 +4,10 @@
 //! belongs to the selected provider, materializes only the headers needed by that
 //! provider, and exposes a non-secret fingerprint for catalog and connection scope.
 //!
-//! Header values are still plain strings here, so every struct holding one
-//! hand-writes a `Debug` that keeps the values out. Typing them is the next
-//! step; this one is about what the enum is allowed to describe.
+//! Header values are `Secret`, so a rendering redacts them because of what they
+//! are rather than because every struct here remembered to hand-write a `Debug`.
+//! The one hand-written `Debug` left is for an endpoint URL, whose query string
+//! can carry a key that no field type can see.
 
 use thiserror::Error;
 use url::Url;
@@ -33,18 +34,24 @@ fn redacted_url(url: &str) -> String {
 #[derive(Clone)]
 pub struct ProviderRequestAuth {
     pub url: String,
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<(String, Secret)>,
+}
+
+impl ProviderRequestAuth {
+    /// Header names and values, for the transport that is about to send them.
+    /// This is the point of use: past here the values are plain strings.
+    pub fn header_pairs(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.expose()))
+    }
 }
 
 impl std::fmt::Debug for ProviderRequestAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProviderRequestAuth")
             .field("url", &redacted_url(&self.url))
-            .field(
-                "header_names",
-                &self.headers.iter().map(|(name, _)| name).collect::<Vec<_>>(),
-            )
-            .field("header_values", &"Secret(***)")
+            .field("headers", &self.headers)
             .finish()
     }
 }
@@ -56,7 +63,7 @@ impl std::fmt::Debug for ProviderRequestAuth {
 /// none: `ChatGptOAuth` in particular duplicated the ChatGPT path that
 /// `oauth::openai_chatgpt::responses_request` already serves. Add a variant back
 /// when something constructs it.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum ProviderCredential {
     /// For an endpoint configured with `OpenAiAuthPolicy::AllowUnauthenticated`,
     /// which is how a local OpenAI-compatible server with no key is reached.
@@ -73,28 +80,6 @@ pub enum ProviderCredential {
         region: String,
         identity: Option<String>,
     },
-}
-
-impl std::fmt::Debug for ProviderCredential {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unauthenticated => f.write_str("ProviderCredential::Unauthenticated"),
-            Self::ApiKey {
-                provider, identity, ..
-            } => f
-                .debug_struct("ProviderCredential::ApiKey")
-                .field("provider", provider)
-                .field("has_identity", &identity.is_some())
-                .finish_non_exhaustive(),
-            Self::BedrockApiKey {
-                region, identity, ..
-            } => f
-                .debug_struct("ProviderCredential::BedrockApiKey")
-                .field("region", region)
-                .field("has_identity", &identity.is_some())
-                .finish_non_exhaustive(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +113,7 @@ impl std::fmt::Debug for OpenAiAuthTarget {
 
 /// Region-scoped Bedrock API-key material for the AWS SDK bearer provider.
 /// The token never passes through an HTTP-header representation.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ResolvedBedrockAuth {
     token: Secret,
     pub identity_fingerprint: String,
@@ -140,26 +125,17 @@ impl ResolvedBedrockAuth {
     }
 }
 
-impl std::fmt::Debug for ResolvedBedrockAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResolvedBedrockAuth")
-            .field("token", &"Secret(***)")
-            .field("identity_fingerprint", &self.identity_fingerprint)
-            .finish()
-    }
-}
-
 /// Materialized provider headers.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ResolvedProviderAuth {
     pub provider: ProviderId,
     pub kind: ProviderAuthKind,
     pub identity_fingerprint: String,
-    headers: Vec<(String, String)>,
+    headers: Vec<(String, Secret)>,
 }
 
 impl ResolvedProviderAuth {
-    pub fn headers(&self) -> &[(String, String)] {
+    pub fn headers(&self) -> &[(String, Secret)] {
         &self.headers
     }
 
@@ -169,7 +145,7 @@ impl ResolvedProviderAuth {
     pub fn into_request(
         self,
         endpoint: &Url,
-        extra: impl IntoIterator<Item = (String, String)>,
+        extra: impl IntoIterator<Item = (String, Secret)>,
     ) -> ProviderRequestAuth {
         let mut headers = self.headers;
         headers.extend(extra);
@@ -177,20 +153,6 @@ impl ResolvedProviderAuth {
             url: endpoint.to_string(),
             headers,
         }
-    }
-}
-
-impl std::fmt::Debug for ResolvedProviderAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResolvedProviderAuth")
-            .field("provider", &self.provider)
-            .field("kind", &self.kind)
-            .field("identity_fingerprint", &self.identity_fingerprint)
-            .field(
-                "header_names",
-                &self.headers.iter().map(|(name, _)| name).collect::<Vec<_>>(),
-            )
-            .finish()
     }
 }
 
@@ -228,10 +190,9 @@ mod tests {
         let resolved = credential
             .resolve_openai(&openai(ProviderId::OpenAiResponses))
             .unwrap();
-        assert_eq!(
-            resolved.headers()[0],
-            ("authorization".into(), "Bearer sk-secret".into())
-        );
+        let (name, value) = &resolved.headers()[0];
+        assert_eq!(name, "authorization");
+        assert_eq!(value.expose(), "Bearer sk-secret");
         let debug = format!("{credential:?} {resolved:?}");
         assert!(!debug.contains("sk-secret"));
         assert!(debug.contains("authorization"));
@@ -339,13 +300,17 @@ mod tests {
     fn a_request_spec_hides_the_endpoint_query_and_fragment() {
         let request = ProviderRequestAuth {
             url: "https://example.test/responses?api-key=QUERY_SECRET#FRAGMENT_SECRET".into(),
-            headers: vec![("x-api-key".into(), "HEADER_SECRET".into())],
+            headers: vec![("x-api-key".into(), Secret::new("HEADER_SECRET"))],
         };
         let debug = format!("{request:?}");
         assert!(!debug.contains("QUERY_SECRET"));
         assert!(!debug.contains("FRAGMENT_SECRET"));
         assert!(!debug.contains("HEADER_SECRET"));
         assert!(debug.contains("x-api-key"));
+        assert_eq!(
+            request.header_pairs().collect::<Vec<_>>(),
+            vec![("x-api-key", "HEADER_SECRET")]
+        );
     }
 
     #[test]

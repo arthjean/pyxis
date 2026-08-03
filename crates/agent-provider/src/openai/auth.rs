@@ -1,3 +1,4 @@
+use agent_auth::Secret;
 use agent_auth::provider::{
     OpenAiAuthTarget, ProviderAuthError, ProviderAuthKind, ProviderCredential, ProviderRequestAuth,
     ResolvedProviderAuth,
@@ -77,8 +78,8 @@ impl ConfiguredOpenAiProvider {
         auth.into_request(
             endpoint,
             [
-                ("accept".into(), "text/event-stream".into()),
-                ("content-type".into(), "application/json".into()),
+                ("accept".into(), Secret::new("text/event-stream")),
+                ("content-type".into(), Secret::new("application/json")),
             ],
         )
     }

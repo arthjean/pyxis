@@ -1147,7 +1147,9 @@ pub(crate) async fn mcp_oauth_token(
     match agent_auth::oauth::mcp::access_token(&client, name, agent_auth::oauth::mcp::now_ms())
         .await
     {
-        Ok(token) => token,
+        // Point of use: the token stops being a `Secret` exactly where it is
+        // handed to the transport that puts it on the wire.
+        Ok(token) => token.map(|token| token.expose().to_string()),
         Err(err) => {
             // Not fatal: a stale or unreadable credential must not make an
             // anonymous-capable server unreachable. It is traced rather than

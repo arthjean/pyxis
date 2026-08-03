@@ -8,6 +8,7 @@ use std::io::Cursor;
 use std::time::Duration;
 
 use agent_auth::oauth::openai_chatgpt::CHATGPT_BASE_URL;
+use agent_auth::Secret;
 use agent_auth::provider::ProviderRequestAuth;
 use agent_core::model::{ModelRetryPolicy, ResponsesDialect};
 use agent_core::provider::{CanonicalRequest, ProviderError};
@@ -88,7 +89,7 @@ impl PreparedResponsesRequest {
         auth: &ProviderRequestAuth,
     ) -> Result<reqwest::Request, ProviderError> {
         validate_authority(&self.endpoint, &auth.url)?;
-        for (name, value) in &auth.headers {
+        for (name, value) in auth.header_pairs() {
             if name.eq_ignore_ascii_case("content-length")
                 || name.eq_ignore_ascii_case("content-encoding")
             {
@@ -299,16 +300,19 @@ impl ResponsesTransportConfig {
         self.endpoint().map(|_| ())
     }
 
+    /// Headers the user configured on this endpoint. `Secret` because one of
+    /// them is routinely the API key of an OpenAI-compatible gateway, and they
+    /// get concatenated with resolved auth headers before being sent.
     pub(crate) fn configured_endpoint_headers(
         &self,
-    ) -> Result<Vec<(String, String)>, ProviderError> {
+    ) -> Result<Vec<(String, Secret)>, ProviderError> {
         self.default_headers
             .iter()
             .map(|(name, value)| {
                 let value = value
                     .to_str()
                     .map_err(|_| invalid("invalid responses default header value"))?;
-                Ok((name.as_str().to_string(), value.to_string()))
+                Ok((name.as_str().to_string(), Secret::new(value)))
             })
             .collect()
     }
@@ -467,7 +471,7 @@ impl ResponsesTransportConfig {
             .set_scheme(websocket_scheme)
             .map_err(|_| invalid("invalid responses websocket URL"))?;
 
-        for (name, value) in &auth.headers {
+        for (name, value) in auth.header_pairs() {
             if name.eq_ignore_ascii_case("accept")
                 || name.eq_ignore_ascii_case("content-type")
                 || name.eq_ignore_ascii_case("content-length")

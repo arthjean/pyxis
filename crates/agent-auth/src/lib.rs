@@ -44,6 +44,12 @@ impl Secret {
     }
 }
 
+impl<T: Into<String>> From<T> for Secret {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
 impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Secret(***)")
