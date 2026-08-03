@@ -449,8 +449,6 @@ pub enum CodeModeError {
     UnknownCell { cell_id: CellId },
     #[error("cell {cell_id} does not belong to session {session}")]
     ForeignCell { cell_id: CellId, session: SessionId },
-    #[error("cell {cell_id} already exists in session {session}")]
-    DuplicateCell { cell_id: CellId, session: SessionId },
     #[error("code mode session {session} is shut down")]
     SessionClosed { session: SessionId },
     #[error("session {session} already runs {active} cells (limit {limit})")]

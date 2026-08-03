@@ -345,9 +345,7 @@ impl Tool for WaitTool {
 /// becomes a generic failure whose cause the model has to guess.
 fn session_error(error: CodeModeError) -> ToolError {
     match error {
-        CodeModeError::UnknownCell { .. }
-        | CodeModeError::ForeignCell { .. }
-        | CodeModeError::DuplicateCell { .. } => {
+        CodeModeError::UnknownCell { .. } | CodeModeError::ForeignCell { .. } => {
             ToolError::Validation(ValidationError::new(error.to_string()))
         }
         other => ToolError::Rejected(other.to_string()),
