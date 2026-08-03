@@ -1576,8 +1576,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 // US-011: images ride INSIDE the result now. They
                                 // used to enter as a user message right after it,
                                 // which put a turn the user never took between two
-                                // tool turns. The full compaction still strips them
-                                // (`Message::strip_images`).
+                                // tool turns. The full compaction still drops them
+                                // (`compaction::strip_for_summary`): vision is not
+                                // paid for twice.
                                 messages.push(Message::tool_result_from_model(o));
                             }
                             // US-030 MidTurn: the tool_results we just added are NOT

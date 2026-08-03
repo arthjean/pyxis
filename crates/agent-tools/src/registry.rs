@@ -278,7 +278,10 @@ impl Registry {
                 .and_then(|tool| tool.namespace())
                 .filter(|_| matches!(spec.kind, agent_core::provider::ToolKind::Function { .. }))
             {
-                Some(namespace) => groups.entry(namespace.to_string()).or_default().push(spec),
+                Some(namespace) => groups
+                    .entry(namespace.to_string())
+                    .or_default()
+                    .push(spec),
                 None => flat.push(spec),
             }
         }
@@ -1305,9 +1308,7 @@ impl RegistryBuilder {
         let search: Arc<dyn DynTool> = Arc::from(into_dyn(crate::tool_search::ToolSearch::new(
             self.deferred.clone(),
         )));
-        self.tools
-            .entry(search.name().to_string())
-            .or_insert(search);
+        self.tools.entry(search.name().to_string()).or_insert(search);
         let registry = Registry {
             tools: std::sync::RwLock::new(self.tools),
             staged: std::sync::Mutex::new(Vec::new()),

@@ -325,24 +325,6 @@ impl Message {
         })
     }
 
-    /// Removes every image (full compaction: we do not pay for vision twice).
-    /// Returns how many were removed, counting those carried by a tool result:
-    /// leaving those behind would keep the exact cost this compaction exists to
-    /// drop.
-    pub fn strip_images(&mut self) -> usize {
-        let before = self.content.len();
-        self.content
-            .retain(|b| !matches!(b, ContentBlock::Image { .. }));
-        let mut removed = before - self.content.len();
-        for block in &mut self.content {
-            if let ContentBlock::ToolResult { images, .. } = block {
-                removed += images.len();
-                images.clear();
-            }
-        }
-        removed
-    }
-
     /// Does the message carry content that must stay treated as untrusted
     /// by the next tool or compaction decisions?
     ///
@@ -502,24 +484,6 @@ mod tests {
         assert!(json.contains("\"type\":\"encrypted_reasoning\""));
         let back: ContentBlock = serde_json::from_str(&json).unwrap();
         assert_eq!(b, back);
-    }
-
-    #[test]
-    fn strip_images_removes_image_blocks() {
-        let mut m = Message {
-            role: Role::User,
-            content: vec![
-                ContentBlock::Text { text: "hi".into() },
-                ContentBlock::Image {
-                    media_type: "image/png".into(),
-                    data: "xxxx".into(),
-                },
-            ],
-        };
-        assert!(m.has_images());
-        assert_eq!(m.strip_images(), 1);
-        assert!(!m.has_images());
-        assert_eq!(m.content.len(), 1);
     }
 
     #[test]

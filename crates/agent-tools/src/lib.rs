@@ -36,8 +36,8 @@ pub mod sandbox;
 pub mod shell;
 pub mod taint;
 pub mod time;
-pub mod tool;
 pub mod tool_search;
+pub mod tool;
 pub mod turn_diff;
 pub mod write;
 
@@ -79,8 +79,8 @@ pub use sandbox::{
 };
 pub use shell::ShellChoice;
 pub use time::{CurrentTime, Sleep};
-pub use tool::{CommandHardener, DynTool, DynToolAdapter, Tool, ToolCtx, ToolOutput, into_dyn};
 pub use tool_search::{DEFER_THRESHOLD, DeferredEntry, DeferredTools, ToolSearch};
+pub use tool::{CommandHardener, DynTool, DynToolAdapter, Tool, ToolCtx, ToolOutput, into_dyn};
 pub use write::Write;
 
 use std::sync::Arc;
