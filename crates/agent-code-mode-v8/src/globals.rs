@@ -462,7 +462,12 @@ fn build_tool_error<'s>(
     if let Ok(object) = v8::Local::<v8::Object>::try_from(error) {
         let _ = set_string(scope, object, "name", "ToolError");
         let _ = set_string(scope, object, "tool", &outcome.tool);
-        let _ = set_string(scope, object, "kind", outcome.error_kind.unwrap_or("error"));
+        // Every failed outcome carries its category, so nothing is invented
+        // here: a missing one stays missing rather than being papered over
+        // with a second default the dispatcher already applied.
+        if let Some(kind) = outcome.error_kind {
+            let _ = set_string(scope, object, "kind", kind);
+        }
     }
     error
 }

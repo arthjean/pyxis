@@ -155,6 +155,10 @@ async fn a_nested_call_reaches_the_same_pipeline_a_direct_call_would() {
     );
     assert_eq!(outcomes.len(), 1);
     assert!(!outcomes[0].is_error, "{:?}", outcomes[0]);
+    assert_eq!(
+        outcomes[0].error_kind, None,
+        "a category on a success would contradict `is_error`"
+    );
     assert!(outcomes[0].content.contains("ran read"));
 
     let seen = tools.seen();

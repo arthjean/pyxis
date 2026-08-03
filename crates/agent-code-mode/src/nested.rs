@@ -59,8 +59,10 @@ pub struct NestedToolOutcome {
     pub content: String,
     pub structured: Option<serde_json::Value>,
     pub is_error: bool,
-    /// Machine-readable category, present on every error so the cell can branch
-    /// on it instead of matching a message.
+    /// Machine-readable category, so the cell can branch on it instead of
+    /// matching a message. `Some` if and ONLY if `is_error`: a failure without
+    /// a category would force the cell back to parsing text, and a category on
+    /// a success would be a contradiction the JavaScript side cannot express.
     pub error_kind: Option<&'static str>,
 }
 
@@ -267,7 +269,7 @@ impl NestedToolDispatcher for PlanDispatcher {
             // effect, and the cell learns why.
             return NestedToolOutcome::error(
                 &call,
-                "unknown_tool",
+                ToolErrorKind::UnknownTool.label(),
                 format!("tool `{}` is not available in this cell", call.tool),
             );
         }
@@ -290,7 +292,7 @@ impl NestedToolDispatcher for PlanDispatcher {
         if loop_decision != LoopDecision::Proceed {
             return NestedToolOutcome::error(
                 &call,
-                "semantic",
+                ToolErrorKind::Semantic.label(),
                 format!(
                     "Loop detected on {} (x{loop_count}). Stopping nested dispatch. Reframe the approach.",
                     invocation.name
@@ -333,10 +335,11 @@ impl NestedToolDispatcher for PlanDispatcher {
             content: outcome.content,
             structured: outcome.structured_content,
             is_error: outcome.is_error,
-            error_kind: outcome
-                .error_kind
-                .map(error_kind_label)
-                .or_else(|| status_label(outcome.status)),
+            error_kind: outcome.is_error.then(|| {
+                outcome
+                    .error_kind
+                    .map_or_else(|| status_label(outcome.status), ToolErrorKind::label)
+            }),
         }
     }
 
@@ -349,32 +352,16 @@ impl NestedToolDispatcher for PlanDispatcher {
     }
 }
 
-fn error_kind_label(kind: ToolErrorKind) -> &'static str {
-    match kind {
-        ToolErrorKind::UnknownTool => "unknown_tool",
-        ToolErrorKind::Parse => "parse",
-        ToolErrorKind::Validation => "validation",
-        ToolErrorKind::OutsideWorkspace => "outside_workspace",
-        ToolErrorKind::Io => "io",
-        ToolErrorKind::Rejected => "rejected",
-        ToolErrorKind::PermissionDenied => "permission_denied",
-        ToolErrorKind::SandboxDenied => "sandbox_denied",
-        ToolErrorKind::Timeout => "timeout",
-        ToolErrorKind::Cancelled => "cancelled",
-        ToolErrorKind::Semantic => "semantic",
-    }
-}
-
-/// A refusal that carries no `error_kind` still has a status; the cell must
-/// never see an error without a category.
-fn status_label(status: ToolResultStatus) -> Option<&'static str> {
+/// Category of a refusal that carries no `ToolErrorKind` of its own. `Success`
+/// cannot reach here: `ModelToolResult` never pairs it with `is_error`, and
+/// only a failed outcome is labelled.
+fn status_label(status: ToolResultStatus) -> &'static str {
     match status {
-        ToolResultStatus::Success => None,
-        ToolResultStatus::Error => Some("error"),
-        ToolResultStatus::Rejected => Some("rejected"),
-        ToolResultStatus::Cancelled => Some("cancelled"),
-        ToolResultStatus::TimedOut => Some("timeout"),
-        ToolResultStatus::SandboxDenied => Some("sandbox_denied"),
+        ToolResultStatus::Success | ToolResultStatus::Error => "error",
+        ToolResultStatus::Rejected => "rejected",
+        ToolResultStatus::Cancelled => "cancelled",
+        ToolResultStatus::TimedOut => "timeout",
+        ToolResultStatus::SandboxDenied => "sandbox_denied",
     }
 }
 
@@ -385,7 +372,7 @@ impl NestedToolDispatcher for NoNestedTools {
     fn dispatch(&self, call: NestedToolCall) -> NestedToolOutcome {
         NestedToolOutcome::error(
             &call,
-            "unknown_tool",
+            ToolErrorKind::UnknownTool.label(),
             "no nested tool is available in this cell",
         )
     }
