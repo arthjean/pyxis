@@ -570,9 +570,24 @@ impl Watchdog {
     }
 }
 
+/// Why the JavaScript side stopped, before quotas are taken into account.
+///
+/// The three cases are kept apart because they are answered by three different
+/// parties: the model wrote the script, V8 answers for a termination, and the
+/// host answers for a cell it could not even set up. Collapsing them into one
+/// string is how a host failure ends up reported to the model as its own bug.
+enum CellStop {
+    /// The script threw or failed to compile. The text is what the model reads.
+    Script(String),
+    /// V8 stopped the script from outside. The cause is in the quota flags.
+    Terminated,
+    /// The host could not build the cell. Never the model's fault.
+    Host(String),
+}
+
 /// What the JavaScript side produced, before quotas are taken into account.
 struct Evaluation {
-    error: Option<String>,
+    stop: Option<CellStop>,
     exited: bool,
     writes: HashMap<String, serde_json::Value>,
 }
@@ -606,19 +621,19 @@ fn evaluate(isolate: &mut v8::OwnedIsolate, context_data: CellContext<'_>) -> Ev
 
     if let Err(detail) = globals::install(scope) {
         return Evaluation {
-            error: Some(detail),
+            stop: Some(CellStop::Host(detail)),
             exited: false,
             writes: HashMap::new(),
         };
     }
 
-    let error = run_wrapped(scope, source);
+    let stop = run_wrapped(scope, source);
     let (exited, writes) = scope
-        .get_slot::<globals::CellRuntimeState>()
-        .map(|state| (state.exit_requested, state.writes.clone()))
+        .get_slot_mut::<globals::CellRuntimeState>()
+        .map(|state| (state.exit_requested, std::mem::take(&mut state.writes)))
         .unwrap_or_default();
     Evaluation {
-        error,
+        stop,
         exited,
         writes,
     }
@@ -629,20 +644,17 @@ fn evaluate(isolate: &mut v8::OwnedIsolate, context_data: CellContext<'_>) -> Ev
 ///
 /// The wrapper prefix stays on the FIRST line so a reported line number still
 /// matches the source the model wrote for every line but that one.
-fn run_wrapped(scope: &mut v8::PinScope<'_, '_>, source: &str) -> Option<String> {
-    /// A termination leaves NO exception behind, so the empty string is what
-    /// tells `classify` to read the quota flags instead of inventing a script
-    /// error. Written as a macro because the concrete scope type of a
-    /// `TryCatch` is not nameable without pinning down every lifetime.
+fn run_wrapped(scope: &mut v8::PinScope<'_, '_>, source: &str) -> Option<CellStop> {
+    /// A termination leaves NO exception behind, which is `Terminated`. Written
+    /// as a macro because the concrete scope type of a `TryCatch` is not
+    /// nameable without pinning down every lifetime.
     macro_rules! caught {
         ($try_catch:expr) => {{
-            if $try_catch.has_terminated() {
-                Some(String::new())
-            } else {
-                match $try_catch.exception() {
-                    Some(exception) => Some(describe($try_catch, exception)),
-                    None => Some(String::new()),
+            match $try_catch.exception() {
+                Some(exception) if !$try_catch.has_terminated() => {
+                    CellStop::Script(describe($try_catch, exception))
                 }
+                _ => CellStop::Terminated,
             }
         }};
     }
@@ -651,13 +663,15 @@ fn run_wrapped(scope: &mut v8::PinScope<'_, '_>, source: &str) -> Option<String>
     v8::tc_scope!(let try_catch, scope);
 
     let Some(code) = v8::String::new(try_catch, &wrapped) else {
-        return Some("cell source is not representable in v8".to_string());
+        return Some(CellStop::Host(
+            "cell source is not representable in v8".to_string(),
+        ));
     };
     let Some(script) = v8::Script::compile(try_catch, code, None) else {
-        return caught!(try_catch);
+        return Some(caught!(try_catch));
     };
     let Some(value) = script.run(try_catch) else {
-        return caught!(try_catch);
+        return Some(caught!(try_catch));
     };
     let Ok(promise) = v8::Local::<v8::Promise>::try_from(value) else {
         // Cannot happen with the wrapper above, but a non-promise completion
@@ -672,11 +686,11 @@ fn run_wrapped(scope: &mut v8::PinScope<'_, '_>, source: &str) -> Option<String>
             v8::PromiseState::Fulfilled => return None,
             v8::PromiseState::Rejected => {
                 let rejection = promise.result(try_catch);
-                return Some(describe(try_catch, rejection));
+                return Some(CellStop::Script(describe(try_catch, rejection)));
             }
         }
         if try_catch.has_terminated() {
-            return caught!(try_catch);
+            return Some(caught!(try_catch));
         }
     }
     // Still pending with nothing left to run: unawaited promises are
@@ -711,15 +725,28 @@ fn describe(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -
 /// near-heap-limit callback too, so the allocator flag has to be read first or
 /// a native breach would be reported as a heap breach (US-005 finding).
 fn classify(outcome: &Evaluation, guards: &CellGuards, cpu_expired: bool) -> Option<CellFailure> {
-    let allocator = &guards.allocator;
-    let error = outcome.error.as_ref()?;
-    if outcome.exited && (error.contains(globals::EXIT_MARKER) || error.is_empty()) {
-        // `exit()` stops the script from the inside; that is a normal end. An
-        // error the model raised AFTER catching the exit does not carry the
-        // marker, so it is still reported as the failure it is.
+    let stop = outcome.stop.as_ref()?;
+    // A cell the host could not build says so with the kind that means it, so
+    // the model is never blamed for a failure it had no part in.
+    if let CellStop::Host(detail) = stop {
+        return Some(CellFailure::new(
+            CellFailureKind::EngineLost,
+            detail.clone(),
+        ));
+    }
+    // `exit()` stops the script from the inside; that is a normal end. An error
+    // the model raised AFTER catching the exit does not carry the marker, so it
+    // is still reported as the failure it is.
+    let exiting = match stop {
+        CellStop::Script(text) => text.contains(globals::EXIT_MARKER),
+        CellStop::Terminated => true,
+        CellStop::Host(_) => false,
+    };
+    if outcome.exited && exiting {
         return None;
     }
 
+    let allocator = &guards.allocator;
     if allocator.refused.load(Ordering::Acquire) {
         return Some(CellFailure::new(
             CellFailureKind::NativeMemory,
@@ -749,12 +776,15 @@ fn classify(outcome: &Evaluation, guards: &CellGuards, cpu_expired: bool) -> Opt
             ),
         ));
     }
-    let message = if error.is_empty() {
-        "cell stopped without a reportable cause".to_string()
-    } else {
-        error.clone()
-    };
-    Some(CellFailure::new(CellFailureKind::Script, message))
+    match stop {
+        CellStop::Script(text) => Some(CellFailure::new(CellFailureKind::Script, text.clone())),
+        // Terminated, but no guard claims it: the engine stopped the cell and
+        // cannot say why, which is exactly what `EngineLost` names.
+        _ => Some(CellFailure::new(
+            CellFailureKind::EngineLost,
+            "cell stopped without a reportable cause",
+        )),
+    }
 }
 
 #[cfg(test)]
