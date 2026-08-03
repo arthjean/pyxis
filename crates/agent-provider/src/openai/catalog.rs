@@ -111,7 +111,7 @@ pub(super) async fn configured_catalog_request(
     {
         models_endpoint.query_pairs_mut().append_pair(
             "client_version",
-            &agent_auth::oauth::openai_chatgpt::codex_client_version(),
+            agent_auth::oauth::openai_chatgpt::codex_client_version(),
         );
     }
     // Configured headers first, resolved auth after: the catalog request

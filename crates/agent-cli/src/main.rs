@@ -1144,9 +1144,7 @@ pub(crate) async fn mcp_oauth_token(
         .connect_timeout(MCP_OAUTH_TIMEOUT)
         .build()
         .ok()?;
-    match agent_auth::oauth::mcp::access_token(&client, name, agent_auth::oauth::mcp::now_ms())
-        .await
-    {
+    match agent_auth::oauth::mcp::access_token(&client, name, agent_auth::oauth::now_ms()).await {
         // Point of use: the token stops being a `Secret` exactly where it is
         // handed to the transport that puts it on the wire.
         Ok(token) => token.map(|token| token.expose().to_string()),

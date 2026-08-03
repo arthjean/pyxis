@@ -18,7 +18,7 @@
 //!    after.
 
 use super::{AuthServerMetadata, HTTP_TIMEOUT, MAX_METADATA_BYTES};
-use crate::oauth::openai_chatgpt::AuthError;
+use crate::oauth::AuthError;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -104,7 +104,7 @@ fn auth_server_urls(issuer: &url::Url) -> Vec<String> {
 /// loopback host only, which is where every local MCP server in development lives.
 pub(super) fn require_secure(url: &str, what: &str) -> Result<url::Url, AuthError> {
     let parsed = url::Url::parse(url)
-        .map_err(|e| AuthError::Callback(format!("{what}: invalid url \"{url}\": {e}")))?;
+        .map_err(|e| AuthError::discovery(format!("{what}: invalid url \"{url}\": {e}")))?;
     let secure = match parsed.scheme() {
         "https" => true,
         "http" => parsed.host_str().is_some_and(is_loopback_host),
@@ -113,9 +113,10 @@ pub(super) fn require_secure(url: &str, what: &str) -> Result<url::Url, AuthErro
     if secure {
         Ok(parsed)
     } else {
-        Err(AuthError::Callback(format!(
-            "{what}: refused, {url} is not https (only a loopback host may be plain http)"
-        )))
+        Err(AuthError::InsecureEndpoint {
+            what: what.to_string(),
+            url: url.to_string(),
+        })
     }
 }
 
@@ -132,7 +133,7 @@ fn is_loopback_host(host: &str) -> bool {
 /// is only an early exit: the cap is enforced on what actually arrives, so a
 /// chunked or lying response is bounded all the same.
 async fn read_bounded(mut response: reqwest::Response, max: usize) -> Result<Vec<u8>, AuthError> {
-    let too_large = || AuthError::Callback(format!("response larger than {max} bytes"));
+    let too_large = || AuthError::ResponseTooLarge { max };
     if response
         .content_length()
         .is_some_and(|len| len > max as u64)
@@ -156,7 +157,7 @@ pub(super) async fn read_json<T: serde::de::DeserializeOwned>(
 ) -> Result<T, AuthError> {
     let body = tokio::time::timeout(HTTP_TIMEOUT, read_bounded(response, max))
         .await
-        .map_err(|_| AuthError::Callback("response body timed out".to_string()))??;
+        .map_err(|_| AuthError::timeout("response body"))??;
     serde_json::from_slice(&body)
         .map_err(|e| AuthError::TokenResponse(format!("malformed response: {e}")))
 }
@@ -214,7 +215,7 @@ pub async fn discover(
         if let Some(declared) = metadata.resource.as_deref() {
             let declared_url = require_secure(declared, "protected resource")?;
             if !covers_resource(&declared_url, &parsed) {
-                return Err(AuthError::Callback(format!(
+                return Err(AuthError::discovery(format!(
                     "protected-resource metadata at {candidate} declares resource {declared}, which does not cover {mcp_url}"
                 )));
             }
@@ -264,7 +265,7 @@ pub async fn discover(
     }
 
     Err(refusal.unwrap_or_else(|| {
-        AuthError::Callback(format!("no OAuth authorization server found for {mcp_url}"))
+        AuthError::discovery(format!("no OAuth authorization server found for {mcp_url}"))
     }))
 }
 
@@ -309,7 +310,7 @@ fn validate_auth_server(
             .iter()
             .any(|method| method == "S256")
     {
-        return Err(AuthError::Callback(format!(
+        return Err(AuthError::discovery(format!(
             "authorization server {issuer} does not support PKCE S256"
         )));
     }

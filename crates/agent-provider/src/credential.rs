@@ -5,7 +5,7 @@
 //! `Provider::stream` takes `&self` -> the credential lives behind a
 //! `tokio::sync::Mutex` (interior mutability; a network refresh can happen under the lock).
 
-use agent_auth::oauth::openai_chatgpt::{self, AuthError as OAuthError};
+use agent_auth::oauth::{AuthError as OAuthError, now_ms, openai_chatgpt};
 use agent_auth::provider::ProviderRequestAuth;
 use agent_auth::{Credential, OAuthCredential};
 use agent_core::provider::{AuthError, ProviderError};
@@ -56,7 +56,7 @@ impl CredentialManager {
         refresh_expiring: bool,
     ) -> Result<ProviderRequestAuth, ProviderError> {
         let mut state = self.state.lock().await;
-        let now = openai_chatgpt::now_ms();
+        let now = now_ms();
         if state.cred.is_none() {
             return Err(disconnected_error());
         }
@@ -85,7 +85,7 @@ impl CredentialManager {
         if state.cred.is_none() {
             return Err(disconnected_error());
         }
-        self.refresh_locked(&mut state, openai_chatgpt::now_ms())
+        self.refresh_locked(&mut state, now_ms())
             .await
     }
 
@@ -179,15 +179,25 @@ fn convert_refresh_err(error: OAuthError) -> ProviderError {
             Some(_) => AuthError::RecoveryPermanent,
             None => AuthError::RecoveryTransient,
         },
-        OAuthError::Io(_) => AuthError::RecoveryTransient,
+        // A timeout, an unreadable socket or an unavailable keyring say nothing
+        // about the credential: the same refresh can succeed on the next try.
+        OAuthError::Io(_) | OAuthError::Timeout { .. } | OAuthError::Store(_) => {
+            AuthError::RecoveryTransient
+        }
+        // Everything else means this credential will not come back on its own.
         OAuthError::TokenResponse(_)
         | OAuthError::Jwt(_)
         | OAuthError::MissingAccountId
+        | OAuthError::MissingRefreshToken { .. }
         | OAuthError::WrongProvider(_)
         | OAuthError::Callback(_)
         | OAuthError::StateMismatch
+        | OAuthError::AuthorizationDenied(_)
         | OAuthError::DeviceTimeout
-        | OAuthError::DeviceDenied(_) => AuthError::RecoveryPermanent,
+        | OAuthError::DeviceDenied(_)
+        | OAuthError::InsecureEndpoint { .. }
+        | OAuthError::Discovery(_)
+        | OAuthError::ResponseTooLarge { .. } => AuthError::RecoveryPermanent,
     };
     ProviderError::Credential(outcome)
 }

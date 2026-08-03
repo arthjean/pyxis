@@ -2488,7 +2488,7 @@ async fn run_mcp_login(
     let outcome = agent_auth::oauth::mcp::login(
         &client,
         &request,
-        agent_auth::oauth::mcp::now_ms(),
+        agent_auth::oauth::now_ms(),
         move |url, opened| {
             // `try_send` rather than an await: the callback is synchronous, and a
             // full channel is not a reason to abort a login already in flight.

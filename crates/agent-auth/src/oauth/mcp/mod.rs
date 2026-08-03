@@ -33,24 +33,25 @@
 //! 4. **The redirect URI is loopback with an ephemeral port** (RFC 8252 §7.3),
 //!    bound before the browser opens so nothing else can claim it.
 //! 5. **`state` is verified** on the callback, and the code never leaves the
-//!    process except toward the discovered token endpoint.
+//!    process except toward the discovered token endpoint. That check, and the
+//!    listener enforcing it, live in `oauth::callback`, shared with every other
+//!    authorization-code flow in this crate.
 //! 6. **Every body is read under a cap**, before it is allocated rather than
 //!    after: discovery talks to a party that has not authenticated yet.
 
 use std::time::Duration;
 
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-use crate::oauth::openai_chatgpt::AuthError;
+use crate::oauth::callback::Callback;
 use crate::oauth::pkce::Pkce;
+use crate::oauth::{AuthError, random_state};
 use crate::{Credential, REFRESH_MARGIN_MS, Secret};
 
 /// Bound of one discovery or token request.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bound of the whole browser round trip.
 pub const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
-const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Path of the local callback. Fixed; only the port is ephemeral.
 const CALLBACK_PATH: &str = "/pyxis/mcp/callback";
 /// Bound of a discovery document: metadata is small, a multi-megabyte answer is
@@ -59,8 +60,6 @@ const MAX_METADATA_BYTES: usize = 128 * 1024;
 /// Bound of a registration or token response. Tighter than a metadata document:
 /// it carries a handful of strings.
 const MAX_TOKEN_BYTES: usize = 64 * 1024;
-
-const SUCCESS_BODY: &str = "<!doctype html><meta charset=utf-8><body style=\"font-family:system-ui;background:#0b0b0b;color:#eaeaea;display:grid;place-items:center;height:100vh\"><div><h2>MCP server connected</h2><p>You can close this tab.</p></div></body>";
 
 /// Keyring account of one MCP server's credential. Namespaced so it can never
 /// collide with a provider credential.
@@ -148,6 +147,25 @@ struct TokenResponse {
     scope: Option<String>,
 }
 
+/// Sends one bounded POST and reads its answer under a cap. Both token-issuing
+/// endpoints go through here, so a timeout and a non-2xx read the same way
+/// whichever one answered.
+async fn post_json<T: serde::de::DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+    operation: &'static str,
+) -> Result<T, AuthError> {
+    let response = tokio::time::timeout(HTTP_TIMEOUT, request.send())
+        .await
+        .map_err(|_| AuthError::timeout(operation))??;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(AuthError::TokenResponse(format!(
+            "{operation}: HTTP {status}"
+        )));
+    }
+    read_json(response, MAX_TOKEN_BYTES).await
+}
+
 // ───────────────────────────── Registration (RFC 7591) ─────────────────────────────
 
 /// Registers this CLI as a public OAuth client. Returns the issued client id.
@@ -164,29 +182,15 @@ pub async fn register_client(
         // Public client: there is no secret a CLI could keep.
         "token_endpoint_auth_method": "none",
     });
-    let response = tokio::time::timeout(
-        HTTP_TIMEOUT,
-        client.post(registration_endpoint).json(&body).send(),
+    let registered: RegistrationResponse = post_json(
+        client.post(registration_endpoint).json(&body),
+        "client registration",
     )
-    .await
-    .map_err(|_| AuthError::Callback("client registration timed out".to_string()))??;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(AuthError::Callback(format!(
-            "client registration refused: HTTP {status}"
-        )));
-    }
-    let registered: RegistrationResponse = read_json(response, MAX_TOKEN_BYTES).await?;
+    .await?;
     Ok(registered.client_id)
 }
 
 // ───────────────────────────── Login ─────────────────────────────
-
-fn random_state() -> String {
-    let mut bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
-}
 
 /// Builds the authorization URL. `resource` implements RFC 8707: the token the
 /// user is about to grant is bound to this MCP server and to no other.
@@ -200,7 +204,7 @@ fn build_authorize_url(
     resource: Option<&str>,
 ) -> Result<String, AuthError> {
     let mut url = url::Url::parse(&metadata.authorization_endpoint)
-        .map_err(|e| AuthError::Callback(format!("authorization endpoint: {e}")))?;
+        .map_err(|e| AuthError::discovery(format!("authorization endpoint: {e}")))?;
     {
         let mut query = url.query_pairs_mut();
         query
@@ -244,7 +248,7 @@ where
         Some(client_id) => client_id.clone(),
         None => {
             let Some(registration) = metadata.registration_endpoint.as_deref() else {
-                return Err(AuthError::Callback(format!(
+                return Err(AuthError::discovery(format!(
                     "MCP server \"{}\" needs an OAuth client id: its authorization server offers no dynamic registration",
                     request.server
                 )));
@@ -279,9 +283,14 @@ where
     let opened = open::that(&url).is_ok();
     on_auth_url(&url, opened);
 
-    let code = tokio::time::timeout(CALLBACK_TIMEOUT, accept_callback(&listener, &state))
+    let callback = Callback {
+        path: CALLBACK_PATH,
+        headline: "MCP server connected",
+        expected_state: &state,
+    };
+    let code = tokio::time::timeout(CALLBACK_TIMEOUT, callback.accept(&listener))
         .await
-        .map_err(|_| AuthError::Callback("OAuth callback expired".to_string()))??;
+        .map_err(|_| AuthError::timeout("OAuth callback"))??;
 
     let token = exchange_code(
         client,
@@ -326,15 +335,7 @@ async fn exchange_code(
     if let Some(resource) = resource {
         form.push(("resource", resource));
     }
-    let response =
-        tokio::time::timeout(HTTP_TIMEOUT, client.post(token_endpoint).form(&form).send())
-            .await
-            .map_err(|_| AuthError::Callback("token exchange timed out".to_string()))??;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(AuthError::TokenResponse(format!("HTTP {status}")));
-    }
-    read_json(response, MAX_TOKEN_BYTES).await
+    post_json(client.post(token_endpoint).form(&form), "token exchange").await
 }
 
 /// Refreshes a credential. The refresh token may rotate, so the returned
@@ -345,10 +346,9 @@ pub async fn refresh(
     now_ms: u64,
 ) -> Result<McpOAuthCredential, AuthError> {
     let Some(refresh_token) = cred.refresh.as_ref() else {
-        return Err(AuthError::TokenResponse(format!(
-            "MCP server \"{}\" has no refresh token: log in again",
-            cred.server
-        )));
+        return Err(AuthError::MissingRefreshToken {
+            server: cred.server.clone(),
+        });
     };
     let mut form = vec![
         ("grant_type", "refresh_token"),
@@ -358,17 +358,8 @@ pub async fn refresh(
     if let Some(resource) = cred.resource.as_deref() {
         form.push(("resource", resource));
     }
-    let response = tokio::time::timeout(
-        HTTP_TIMEOUT,
-        client.post(&cred.token_endpoint).form(&form).send(),
-    )
-    .await
-    .map_err(|_| AuthError::Callback("token refresh timed out".to_string()))??;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(AuthError::TokenResponse(format!("HTTP {status}")));
-    }
-    let token: TokenResponse = read_json(response, MAX_TOKEN_BYTES).await?;
+    let token: TokenResponse =
+        post_json(client.post(&cred.token_endpoint).form(&form), "token refresh").await?;
     let mut refreshed = credential_from_token(
         token,
         cred.server.clone(),
@@ -406,98 +397,6 @@ fn credential_from_token(
         token_endpoint,
         resource,
         scopes: token.scope,
-    }
-}
-
-// ───────────────────────────── Local callback ─────────────────────────────
-
-/// Extracts the authorization code from a callback request line, after checking
-/// the anti-CSRF `state`. `Err(Callback)` = not our callback, keep listening.
-pub fn parse_callback_request_line(
-    line: &str,
-    expected_state: &str,
-) -> Result<Secret, AuthError> {
-    let mut parts = line.split_whitespace();
-    let method = parts.next().unwrap_or_default();
-    let target = parts.next().unwrap_or_default();
-    if method != "GET" {
-        return Err(AuthError::Callback("not a GET".to_string()));
-    }
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    if path != CALLBACK_PATH {
-        return Err(AuthError::Callback(format!("unexpected path {path}")));
-    }
-    let mut code = None;
-    let mut state = None;
-    let mut error = None;
-    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-        match key.as_ref() {
-            "code" => code = Some(value.into_owned()),
-            "state" => state = Some(value.into_owned()),
-            "error" => error = Some(value.into_owned()),
-            _ => {}
-        }
-    }
-    if let Some(error) = error {
-        return Err(AuthError::TokenResponse(format!(
-            "authorization refused: {error}"
-        )));
-    }
-    // The state is checked BEFORE the code is looked at: a callback that does not
-    // belong to this flow must not get its code read, logged or exchanged.
-    if state.as_deref() != Some(expected_state) {
-        return Err(AuthError::StateMismatch);
-    }
-    code.map(Secret::new)
-        .ok_or_else(|| AuthError::Callback("callback carries no code".to_string()))
-}
-
-async fn accept_callback(
-    listener: &tokio::net::TcpListener,
-    expected_state: &str,
-) -> Result<Secret, AuthError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    loop {
-        let (mut sock, _) = listener.accept().await?;
-        let mut buf = [0u8; 4096];
-        let n = match tokio::time::timeout(CALLBACK_READ_TIMEOUT, sock.read(&mut buf)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => {
-                let _ = sock
-                    .write_all(b"HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n")
-                    .await;
-                continue;
-            }
-        };
-        let request = String::from_utf8_lossy(&buf[..n]);
-        let line = request.lines().next().unwrap_or_default();
-        match parse_callback_request_line(line, expected_state) {
-            Ok(code) => {
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
-                    SUCCESS_BODY.len(),
-                    SUCCESS_BODY
-                );
-                let _ = sock.write_all(response.as_bytes()).await;
-                let _ = sock.flush().await;
-                return Ok(code);
-            }
-            // A mismatched state or an explicit refusal ends the flow; anything
-            // else (favicon, probe) gets a 404 and the loop goes on.
-            Err(err @ (AuthError::StateMismatch | AuthError::TokenResponse(_))) => {
-                let _ = sock
-                    .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-                    .await;
-                return Err(err);
-            }
-            Err(_) => {
-                let _ = sock
-                    .write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
-                    .await;
-            }
-        }
     }
 }
 
@@ -541,10 +440,7 @@ pub async fn access_token(
     now_ms: u64,
 ) -> Result<Option<Secret>, AuthError> {
     let owned = server.to_string();
-    let stored = tokio::task::spawn_blocking(move || load(&owned))
-        .await
-        .map_err(|e| AuthError::Callback(format!("keyring task: {e}")))?
-        .map_err(|e| AuthError::Callback(e.to_string()))?;
+    let stored = keyring_task("load", move || load(&owned)).await??;
     let Some(cred) = stored else {
         return Ok(None);
     };
@@ -553,17 +449,28 @@ pub async fn access_token(
     }
     let refreshed = refresh(client, &cred, now_ms).await?;
     let token = refreshed.access.clone();
-    // A write failure is not fatal: the fresh token is still usable for this run.
-    let _ = tokio::task::spawn_blocking(move || save(&refreshed)).await;
+    // A write failure is not fatal: the fresh token is still usable for this
+    // run. It is still worth saying, or the next run silently refreshes again.
+    if let Err(error) = keyring_task("save", move || save(&refreshed)).await {
+        tracing::warn!(
+            target: "pyxis::auth",
+            server,
+            error = %error,
+            "refreshed MCP credential could not be written back"
+        );
+    }
     Ok(Some(token))
 }
 
-/// Milliseconds since the Unix epoch, the clock every expiry here is expressed in.
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+/// Runs one blocking keyring call off the async runtime.
+async fn keyring_task<T, F>(what: &'static str, op: F) -> Result<T, AuthError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(op)
+        .await
+        .map_err(|e| AuthError::Discovery(format!("keyring {what} task: {e}")))
 }
 
 #[cfg(test)]
@@ -577,6 +484,19 @@ mod tests {
             token_endpoint: "https://as.example.com/token".to_string(),
             registration_endpoint: Some("https://as.example.com/register".to_string()),
             scopes_supported: vec!["mcp".to_string()],
+        }
+    }
+
+    fn credential() -> McpOAuthCredential {
+        McpOAuthCredential {
+            server: "srv".to_string(),
+            client_id: "c".to_string(),
+            access: Secret::new("at"),
+            refresh: Some(Secret::new("rt")),
+            expires_at: 1_000_000,
+            token_endpoint: "https://as.example.com/token".to_string(),
+            resource: None,
+            scopes: None,
         }
     }
 
@@ -605,44 +525,8 @@ mod tests {
     }
 
     #[test]
-    fn the_callback_checks_the_state_before_reading_the_code() {
-        let line = "GET /pyxis/mcp/callback?code=SECRET&state=good HTTP/1.1";
-        assert_eq!(
-            parse_callback_request_line(line, "good").unwrap().expose(),
-            "SECRET"
-        );
-        // Wrong state: rejected as a state mismatch, and the code is not returned.
-        let err = parse_callback_request_line(line, "other").unwrap_err();
-        assert!(matches!(err, AuthError::StateMismatch));
-        assert!(!err.to_string().contains("SECRET"));
-        // An explicit refusal by the server is surfaced.
-        let denied = "GET /pyxis/mcp/callback?error=access_denied&state=good HTTP/1.1";
-        assert!(
-            parse_callback_request_line(denied, "good")
-                .unwrap_err()
-                .to_string()
-                .contains("access_denied")
-        );
-        // Anything else is "not our callback".
-        assert!(parse_callback_request_line("GET /favicon.ico HTTP/1.1", "good").is_err());
-        assert!(
-            parse_callback_request_line("POST /pyxis/mcp/callback?code=x&state=good", "good")
-                .is_err()
-        );
-    }
-
-    #[test]
     fn a_credential_is_refreshed_before_it_expires_not_after() {
-        let cred = McpOAuthCredential {
-            server: "srv".to_string(),
-            client_id: "c".to_string(),
-            access: Secret::new("at"),
-            refresh: Some(Secret::new("rt")),
-            expires_at: 1_000_000,
-            token_endpoint: "https://as.example.com/token".to_string(),
-            resource: None,
-            scopes: None,
-        };
+        let cred = credential();
         assert!(!cred.needs_refresh(1_000_000 - REFRESH_MARGIN_MS - 1));
         // Inside the margin: refreshed rather than raced.
         assert!(cred.needs_refresh(1_000_000 - REFRESH_MARGIN_MS));
