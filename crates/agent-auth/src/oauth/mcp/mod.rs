@@ -379,13 +379,11 @@ pub async fn refresh(
         cred.resource.clone(),
         now_ms,
     );
-    // A server that rotates nothing keeps the token we already hold.
-    if refreshed.refresh.is_none() {
-        refreshed.refresh = cred.refresh.clone();
-    }
-    refreshed
-        .scopes
-        .get_or_insert_with(|| cred.scopes.clone().unwrap_or_default());
+    // What the server did not rotate, we keep. `or_else` and not
+    // `get_or_insert_with(|| ...unwrap_or_default())`: the latter turned a
+    // credential that never had scopes into one carrying `Some("")`.
+    refreshed.refresh = refreshed.refresh.or_else(|| cred.refresh.clone());
+    refreshed.scopes = refreshed.scopes.or_else(|| cred.scopes.clone());
     Ok(refreshed)
 }
 

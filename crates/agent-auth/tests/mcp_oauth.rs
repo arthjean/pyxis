@@ -86,6 +86,9 @@ struct Quirk {
     foreign_resource: bool,
     /// Answer the authorization-server document with a body far over the cap.
     oversized_metadata: bool,
+    /// Issue a token that rotates nothing: no `refresh_token`, no `scope`. What
+    /// the server left out must be carried over, not invented.
+    bare_token: bool,
 }
 
 /// Fake MCP resource + authorization server on one loopback port. Plain http is
@@ -165,18 +168,20 @@ async fn spawn_server_with(quirk: Quirk) -> (String, Seen, Arc<Mutex<Vec<String>
                         .await;
                     }
                     "/token" => {
-                        respond(
-                            &mut stream,
-                            "200 OK",
-                            &serde_json::json!({
+                        let token = if quirk.bare_token {
+                            serde_json::json!({
+                                "access_token": "fresh-access",
+                                "token_type": "Bearer",
+                            })
+                        } else {
+                            serde_json::json!({
                                 "access_token": "fresh-access",
                                 "refresh_token": "rotated-refresh",
                                 "expires_in": 3600,
                                 "token_type": "Bearer",
                             })
-                            .to_string(),
-                        )
-                        .await;
+                        };
+                        respond(&mut stream, "200 OK", &token.to_string()).await;
                     }
                     _ => respond(&mut stream, "404 Not Found", "{}").await,
                 }
@@ -277,6 +282,47 @@ async fn a_refresh_returns_the_rotated_credential() {
     assert_eq!(refreshed.expires_at, 1_000_000 + 3_600_000);
     assert!(!refreshed.needs_refresh(1_000_000));
     assert_eq!(seen.lock().unwrap().clone(), vec!["/token".to_string()]);
+}
+
+/// What a refresh response leaves out is carried over from the credential we
+/// already hold, and stays absent when it was absent there. The merge used to
+/// run through `get_or_insert_with(|| ...unwrap_or_default())`, which turned a
+/// credential that never had scopes into one carrying `Some("")` and wrote that
+/// back to the keyring.
+#[tokio::test]
+async fn a_refresh_that_rotates_nothing_carries_the_old_values_over_unchanged() {
+    let (base, _, _) = spawn_server_with(Quirk {
+        bare_token: true,
+        ..Quirk::default()
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    let stale = mcp::McpOAuthCredential {
+        server: "remote".to_string(),
+        client_id: "issued-client-id".to_string(),
+        access: agent_auth::Secret::new("stale-access"),
+        refresh: Some(agent_auth::Secret::new("kept-refresh")),
+        expires_at: 1,
+        token_endpoint: format!("{base}/token"),
+        resource: None,
+        scopes: None,
+    };
+
+    let refreshed = mcp::refresh(&client, &stale, 1_000_000)
+        .await
+        .expect("refresh must succeed");
+    assert_eq!(refreshed.access.expose(), "fresh-access");
+    // Not rotated: the token we already hold is still the one to use.
+    assert_eq!(
+        refreshed.refresh.as_ref().map(agent_auth::Secret::expose),
+        Some("kept-refresh")
+    );
+    // Never granted: still not granted. `Some("")` is a different credential.
+    assert_eq!(refreshed.scopes, None);
+    // No declared expiry means no expiry, not an expiry at the epoch.
+    assert_eq!(refreshed.expires_at, 0);
+    assert!(!refreshed.needs_refresh(u64::MAX));
 }
 
 #[tokio::test]
