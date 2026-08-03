@@ -693,9 +693,14 @@ fn run_wrapped(scope: &mut v8::PinScope<'_, '_>, source: &str) -> Option<CellSto
             return Some(caught!(try_catch));
         }
     }
-    // Still pending with nothing left to run: unawaited promises are
-    // discarded, exactly like the baseline.
-    None
+    // The cell's OWN promise is still pending with the queue drained. Nothing
+    // can settle it: the allowlist has no timer and no I/O, so a nested call is
+    // the only thing that ever resolves one and it answers synchronously. That
+    // is a cell blocked on itself, and reporting it as a success would hand the
+    // model a truncated result with nothing saying it is truncated.
+    Some(CellStop::Script(format!(
+        "cell is still awaiting a promise nothing can settle, after {MAX_CHECKPOINTS} microtask checkpoints"
+    )))
 }
 
 /// Human-readable form of a thrown value: the `stack` of an `Error` when there

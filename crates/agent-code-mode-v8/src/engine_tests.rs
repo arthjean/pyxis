@@ -379,6 +379,28 @@ async fn a_contradictory_jit_mode_is_refused_before_a_session_exists() {
     assert!(crate::initialize_v8(active).is_ok());
 }
 
+/// A cell that awaits a promise nothing can settle is NOT a success: there is
+/// no timer and no I/O in the allowlist, so it can only be a cell blocked on
+/// itself, and the model has to be told rather than handed a truncated result.
+#[tokio::test]
+async fn a_cell_blocked_on_an_unsettlable_promise_is_a_failure() {
+    let session = session("pending", engine(EngineLimits::default()));
+    let response = session
+        .execute(cell("text('before'); await new Promise(() => {});"))
+        .await
+        .unwrap();
+    assert_eq!(response.state(), CellState::Failed);
+    let failure = response.failure().expect("a blocked cell names its cause");
+    assert_eq!(failure.kind, CellFailureKind::Script);
+    assert!(
+        failure.message.contains("still awaiting"),
+        "{}",
+        failure.message
+    );
+    // What ran before the block is still delivered.
+    assert_eq!(texts(&response), vec!["before".to_string()]);
+}
+
 /// `image()` takes a data URL or an object, and the second argument wins over
 /// the detail the object carries.
 #[tokio::test]
