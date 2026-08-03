@@ -11,10 +11,10 @@ use sha2::{Digest, Sha256};
 
 use crate::budget::{estimate_input, estimate_static_input};
 use crate::message::Message;
+use crate::model::is_sha256;
 use crate::model::{ReasoningReplaySupport, ResolvedModelRuntime};
 use crate::provider::CanonicalRequest;
-use crate::model::is_sha256;
-use crate::step::ContextFragmentKind;
+use crate::step::{ContextFragment, ContextFragmentKind};
 use crate::tools::StepToolPlan;
 
 pub const MAX_NON_HISTORY_CONTEXT_BYTES: usize = 64 * 1024;
@@ -135,8 +135,7 @@ impl PromptSnapshot {
         model_runtime: Option<ResolvedModelRuntime>,
         reasoning_effort: Option<String>,
         system: Option<String>,
-        context_messages: Vec<Message>,
-        context_kinds: Vec<ContextFragmentKind>,
+        context: Vec<ContextFragment>,
         messages: &[Message],
         mut ephemeral_messages: Vec<Message>,
         tool_plan: StepToolPlan,
@@ -159,14 +158,16 @@ impl PromptSnapshot {
 
         let mut diagnostics = Vec::new();
         let mut used = fixed_bytes;
-        let (context_messages, context_kinds) = retain_context_within_budget(
-            context_messages,
-            context_kinds,
+        let context = retain_within_budget(
+            context,
+            |fragment| serialized_len(&fragment.message),
             &mut used,
+            "step context",
             &mut diagnostics,
         );
         let ephemeral_messages = retain_within_budget(
             ephemeral_messages,
+            serialized_len,
             &mut used,
             "ephemeral context",
             &mut diagnostics,
@@ -177,14 +178,18 @@ impl PromptSnapshot {
             .map(|runtime| runtime.fingerprint.clone())
             .unwrap_or_else(|| fingerprint(&(model.as_str(), reasoning_effort.as_deref())));
         let instructions_fingerprint = fingerprint(&system);
-        let mut project_context = Vec::new();
-        let mut skills = Vec::new();
-        for (message, kind) in context_messages.iter().zip(&context_kinds) {
-            match kind {
-                ContextFragmentKind::Project => project_context.push(message),
-                ContextFragmentKind::Skill => skills.push(message),
-            }
-        }
+        // Project context and skills are fingerprinted apart: a skill that
+        // appears mid-session must be visible as a skill change, not diluted
+        // into the project hash.
+        let of_kind = |wanted: ContextFragmentKind| {
+            fingerprint(
+                &context
+                    .iter()
+                    .filter(|fragment| fragment.kind == wanted)
+                    .map(|fragment| &fragment.message)
+                    .collect::<Vec<_>>(),
+            )
+        };
         let baseline = ContextBaseline {
             profile_fingerprint,
             model_slug: model.clone(),
@@ -192,10 +197,14 @@ impl PromptSnapshot {
                 .as_ref()
                 .and_then(|runtime| runtime.comp_hash.clone()),
             instructions_fingerprint,
-            project_context_fingerprint: fingerprint(&project_context),
-            skills_fingerprint: fingerprint(&skills),
+            project_context_fingerprint: of_kind(ContextFragmentKind::Project),
+            skills_fingerprint: of_kind(ContextFragmentKind::Skill),
             tool_plan_fingerprint: tool_plan.fingerprint().to_string(),
         };
+        let context_messages: Vec<Message> = context
+            .into_iter()
+            .map(|fragment| fragment.message)
+            .collect();
         baseline.validate()?;
 
         let stable_prefix_fingerprint = fingerprint(&(
@@ -350,19 +359,24 @@ fn bounded_model_switch(
     fragment[..cut].to_string()
 }
 
-fn retain_within_budget(
-    messages: Vec<Message>,
+/// Keeps the fragments that still fit under the non-history byte ceiling, in
+/// order, and reports what was left out. Generic over the fragment type so the
+/// classified step context and the bare ephemeral messages share ONE retention
+/// rule: two copies of it would be two chances to drift apart.
+fn retain_within_budget<T>(
+    fragments: Vec<T>,
+    weight: impl Fn(&T) -> usize,
     used: &mut usize,
     label: &str,
     diagnostics: &mut Vec<String>,
-) -> Vec<Message> {
-    let mut retained = Vec::with_capacity(messages.len());
+) -> Vec<T> {
+    let mut retained = Vec::with_capacity(fragments.len());
     let mut dropped = 0usize;
-    for message in messages {
-        let bytes = serialized_len(&message);
+    for fragment in fragments {
+        let bytes = weight(&fragment);
         if used.saturating_add(bytes) <= MAX_NON_HISTORY_CONTEXT_BYTES {
             *used += bytes;
-            retained.push(message);
+            retained.push(fragment);
         } else {
             dropped += 1;
         }
@@ -373,36 +387,6 @@ fn retain_within_budget(
         ));
     }
     retained
-}
-
-fn retain_context_within_budget(
-    messages: Vec<Message>,
-    mut kinds: Vec<ContextFragmentKind>,
-    used: &mut usize,
-    diagnostics: &mut Vec<String>,
-) -> (Vec<Message>, Vec<ContextFragmentKind>) {
-    if kinds.len() != messages.len() {
-        kinds = vec![ContextFragmentKind::Project; messages.len()];
-    }
-    let mut retained_messages = Vec::with_capacity(messages.len());
-    let mut retained_kinds = Vec::with_capacity(messages.len());
-    let mut dropped = 0usize;
-    for (message, kind) in messages.into_iter().zip(kinds) {
-        let bytes = serialized_len(&message);
-        if used.saturating_add(bytes) <= MAX_NON_HISTORY_CONTEXT_BYTES {
-            *used += bytes;
-            retained_messages.push(message);
-            retained_kinds.push(kind);
-        } else {
-            dropped += 1;
-        }
-    }
-    if dropped > 0 {
-        diagnostics.push(format!(
-            "{dropped} step context message(s) omitted at the {MAX_NON_HISTORY_CONTEXT_BYTES}-byte boundary"
-        ));
-    }
-    (retained_messages, retained_kinds)
 }
 
 fn serialized_len<T: Serialize + ?Sized>(value: &T) -> usize {
@@ -469,8 +453,7 @@ mod tests {
             None,
             None,
             Some("instructions".into()),
-            context.clone(),
-            vec![ContextFragmentKind::Project; context.len()],
+            context.into_iter().map(ContextFragment::project).collect(),
             history,
             Vec::new(),
             plan(),
@@ -537,14 +520,13 @@ mod tests {
 
     #[test]
     fn baseline_separates_project_and_skill_fragments() {
-        let context = vec![Message::user("same visible bytes")];
+        let fragment = Message::user("same visible bytes");
         let project = PromptSnapshot::capture(
             "model".into(),
             None,
             None,
             Some("instructions".into()),
-            context.clone(),
-            vec![ContextFragmentKind::Project],
+            vec![ContextFragment::project(fragment.clone())],
             &[Message::user("task")],
             Vec::new(),
             plan(),
@@ -558,8 +540,7 @@ mod tests {
             None,
             None,
             Some("instructions".into()),
-            context,
-            vec![ContextFragmentKind::Skill],
+            vec![ContextFragment::skill(fragment)],
             &[Message::user("task")],
             Vec::new(),
             plan(),

@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use agent_core::message::Message;
 use agent_core::model::ResolvedModelRuntime;
 use agent_core::provider::ToolSpec;
-use agent_core::step::{ContextFragmentKind, StepContextSource, StepFrame};
+use agent_core::step::{ContextFragment, ContextFragmentKind, StepContextSource, StepFrame};
 use agent_core::tools::ToolDispatchSnapshot;
 use serde::{Deserialize, Serialize};
 
@@ -223,8 +223,8 @@ pub struct StepContext {
     pub generation: u64,
     pub tools: Vec<ToolSpec>,
     pub tool_dispatch: Option<ToolDispatchSnapshot>,
-    pub context_messages: Vec<Message>,
-    pub context_kinds: Vec<ContextFragmentKind>,
+    /// Ordered context fragments, each carrying its own classification.
+    pub context: Vec<ContextFragment>,
     /// Bounded notes about what was truncated, reused or omitted. Section names
     /// and byte counts ONLY: no fragment of context ever lands in a diagnostic,
     /// which is what keeps them safe to trace at `warn` (confidentiality NFR).
@@ -318,8 +318,7 @@ impl StepContexts {
         // 2. Stable sections first, volatile last: the prefix a provider can
         //    cache must not move because the date did.
         let mut total = 0usize;
-        let mut context_messages = Vec::with_capacity(stable.len() + volatile.len());
-        let mut context_kinds = Vec::with_capacity(stable.len() + volatile.len());
+        let mut context = Vec::with_capacity(stable.len() + volatile.len());
         for (name, text, kind) in stable.into_iter().chain(volatile) {
             if total.saturating_add(text.len()) > MAX_STEP_CONTEXT_BYTES {
                 diagnostics.push(format!(
@@ -328,11 +327,13 @@ impl StepContexts {
                 continue;
             }
             total += text.len();
-            context_kinds.push(match kind {
-                StepSectionKind::Project => ContextFragmentKind::Project,
-                StepSectionKind::Skill => ContextFragmentKind::Skill,
+            context.push(ContextFragment {
+                message: Message::user(text),
+                kind: match kind {
+                    StepSectionKind::Project => ContextFragmentKind::Project,
+                    StepSectionKind::Skill => ContextFragmentKind::Skill,
+                },
             });
-            context_messages.push(Message::user(text));
         }
 
         // 3. The generation moves only when the injected bytes moved. This is
@@ -340,8 +341,7 @@ impl StepContexts {
         //    what makes a staged MCP catalog observable at the NEXT step.
         let moved = state.last.as_ref().is_none_or(|last| {
             last.tools != snapshot.tools
-                || last.context_messages != context_messages
-                || last.context_kinds != context_kinds
+                || last.context != context
                 || last
                     .tool_dispatch
                     .as_ref()
@@ -364,8 +364,7 @@ impl StepContexts {
             generation: state.generation,
             tools: snapshot.tools,
             tool_dispatch: snapshot.tool_dispatch,
-            context_messages,
-            context_kinds,
+            context,
             diagnostics,
         };
         state.last = Some(context.clone());
@@ -379,8 +378,7 @@ impl StepContextSource for StepContexts {
         StepFrame {
             generation: context.generation,
             tools: context.tools,
-            context_messages: context.context_messages,
-            context_kinds: context.context_kinds,
+            context: context.context,
             tool_dispatch: context.tool_dispatch,
         }
     }
@@ -446,7 +444,7 @@ mod tests {
         let second = builder.build();
 
         assert_eq!(first.generation, second.generation, "same generation");
-        assert_eq!(first.context_messages, second.context_messages);
+        assert_eq!(first.context, second.context);
         assert_ne!(
             first.step_id, second.step_id,
             "each step keeps its identity"
@@ -464,7 +462,11 @@ mod tests {
             tool_dispatch: None,
         });
         let context = builder(source).build();
-        let texts: Vec<String> = context.context_messages.iter().map(|m| m.text()).collect();
+        let texts: Vec<String> = context
+            .context
+            .iter()
+            .map(|fragment| fragment.message.text())
+            .collect();
         assert_eq!(texts, vec!["stable".to_string(), "volatile".to_string()]);
     }
 
@@ -499,8 +501,8 @@ mod tests {
         });
         let context = builder(source).build();
 
-        assert_eq!(context.context_messages.len(), 1);
-        assert_eq!(context.context_messages[0].text().len(), MAX_SECTION_BYTES);
+        assert_eq!(context.context.len(), 1);
+        assert_eq!(context.context[0].message.text().len(), MAX_SECTION_BYTES);
         assert!(
             context.diagnostics.iter().any(|d| d.contains("truncated")),
             "{:?}",
@@ -522,15 +524,11 @@ mod tests {
         });
         let context = builder(source).build();
 
-        assert_eq!(
-            context.context_messages.len(),
-            2,
-            "64 KiB fits two sections"
-        );
+        assert_eq!(context.context.len(), 2, "64 KiB fits two sections");
         let total: usize = context
-            .context_messages
+            .context
             .iter()
-            .map(|m| m.text().len())
+            .map(|fragment| fragment.message.text().len())
             .sum();
         assert!(total <= MAX_STEP_CONTEXT_BYTES);
         assert!(
@@ -560,7 +558,7 @@ mod tests {
         });
         let second = builder.build();
 
-        assert_eq!(second.context_messages, first.context_messages);
+        assert_eq!(second.context, first.context);
         assert_eq!(
             second.generation, first.generation,
             "reusing the last valid value is not a change"
@@ -580,8 +578,8 @@ mod tests {
         });
         let context = builder(source).build();
 
-        assert_eq!(context.context_messages.len(), 1);
-        assert_eq!(context.context_messages[0].text(), "env");
+        assert_eq!(context.context.len(), 1);
+        assert_eq!(context.context[0].message.text(), "env");
         assert!(context.diagnostics.iter().any(|d| d.contains("omitted")));
     }
 

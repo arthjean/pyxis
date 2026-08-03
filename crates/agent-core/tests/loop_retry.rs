@@ -252,6 +252,54 @@ async fn typed_recovery_failures_survive_the_sampling_boundary() {
     }
 }
 
+/// The fallback is a one-shot: a second overload has nothing left to switch to,
+/// so it goes back to waiting instead of announcing a model change that already
+/// happened.
+#[tokio::test]
+async fn overload_fallback_is_applied_once_per_run() {
+    let overloaded = || ProviderError::Http {
+        status: 529,
+        message: "overloaded".into(),
+        retry_after_ms: None,
+    };
+    let h = harness(
+        vec![
+            MockTurn::Err(overloaded()),
+            MockTurn::Err(overloaded()),
+            text_turn("ok"),
+        ],
+        false,
+        100_000,
+    );
+    let request_models = Arc::clone(&h.request_models);
+    let ctx = AgentContext::new("primary")
+        .with_config(RunConfig {
+            overload_fallback_model: Some("fallback".into()),
+            ..RunConfig::default()
+        })
+        .push(Message::user("go"));
+
+    let events = drive(ctx, h.deps).await;
+
+    assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
+    assert_eq!(
+        *request_models.lock().unwrap(),
+        vec![
+            "primary".to_string(),
+            "fallback".to_string(),
+            "fallback".to_string()
+        ]
+    );
+    let announced: Vec<Option<String>> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::RetryScheduled(view) => Some(view.fallback_model.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(announced, vec![Some("fallback".to_string()), None]);
+}
+
 #[tokio::test]
 async fn overload_opening_stream_switches_to_configured_fallback_model() {
     let h = harness(

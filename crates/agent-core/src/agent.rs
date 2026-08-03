@@ -19,7 +19,7 @@ use crate::deps::Deps;
 use crate::error::{AgentError, ProviderFailure};
 use crate::event::{
     AgentEvent, CredentialRefreshOutcome, CredentialRefreshView, InterruptReason,
-    RetryScheduledView, ToolCallView, ToolOutputDeltaView, ToolResultView,
+    RetryScheduledView, ToolCallView, ToolResultView,
 };
 use crate::guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget, guarded_batch_signature};
 use crate::input::InputQueue;
@@ -31,10 +31,9 @@ use crate::prompt::{ContextTransitionCause, PromptSnapshot, replay_enabled, tran
 use crate::provider::{
     AuthError, ErrorClass, ProviderError, StreamEvent, TURN_ID_METADATA_KEY, TokenUsage, ToolSpec,
 };
-use crate::step::StepContextSource;
+use crate::step::{ContextFragment, StepContextSource};
 use crate::tools::{
-    MAX_MODEL_TOOL_RESULT_BYTES, ModelToolResult, StepToolPlan, ToolDispatchEvent,
-    ToolDispatchSnapshot, ToolEventSink,
+    MAX_MODEL_TOOL_RESULT_BYTES, ModelToolResult, StepToolPlan, ToolDispatchSnapshot, ToolEventSink,
 };
 use crate::transition::{
     Accumulator, ContextErrorKind, ExhaustReason, PendingError, Transition, post_stream_transition,
@@ -375,28 +374,6 @@ fn classified_provider_error(class: ErrorClass, error: &ProviderError) -> AgentE
     AgentError::Provider(ProviderFailure::classified(error, class))
 }
 
-fn maybe_switch_to_overload_fallback(
-    model: &mut String,
-    config: &RunConfig,
-    fallback_used: &mut bool,
-    class: ErrorClass,
-) -> bool {
-    if !matches!(class, ErrorClass::Overloaded(_)) || *fallback_used {
-        return false;
-    }
-    let Some(fallback) = config
-        .overload_fallback_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|fallback| !fallback.is_empty() && *fallback != model)
-    else {
-        return false;
-    };
-    *model = fallback.to_string();
-    *fallback_used = true;
-    true
-}
-
 fn validate_tool_outcomes(
     expected_ids: &[ToolCallId],
     outcomes: &[ModelToolResult],
@@ -503,89 +480,271 @@ fn record_attempt_usage(
     }
 }
 
-fn rebuild_budget_after_model_switch(
-    model: &str,
-    config: &RunConfig,
-    messages: &[Message],
-    static_input_tokens: u32,
-    deps: &Deps,
-) -> Result<ContextBudget, String> {
-    let mut budget = ContextBudget::try_for_model(
-        deps.provider.max_context_for_model(model),
-        config.max_output_tokens,
-    )?;
-    budget.observe_estimated(estimate_current_input(messages, static_input_tokens, deps));
-    Ok(budget)
-}
-
-struct ResolvedFallback {
+/// Model contract and context state of the running turn.
+///
+/// Everything a provider failure can rewrite lives here. The overload fallback
+/// replaces a model, its instructions, its output limit, its tool geometry and
+/// its budget at once; keeping those fields together is what makes that switch
+/// one operation instead of nine assignments a caller could half-apply.
+struct TurnRuntime {
+    model: String,
+    model_runtime: Option<ResolvedModelRuntime>,
+    reasoning_effort: Option<String>,
+    system: Option<String>,
+    /// Effective instructions precomposed for the resolved overload fallback.
+    overload_fallback_system: Option<String>,
+    parallel_tools: bool,
+    tool_plan: StepToolPlan,
     budget: ContextBudget,
+    /// System prompt, step context, tool schemas and ephemeral fragments: the
+    /// overhead the backend counts in `usage.input` beside the transcript.
     static_input_tokens: u32,
-    compact_with: Option<String>,
+    reasoning_replay: bool,
+    reasoning_replay_downgraded: bool,
+    overload_fallback_used: bool,
+    credential_refresh_attempted: bool,
+    attempt_policy: ResolvedAttemptPolicy,
+    /// 1-based provider opening within the current sampling.
+    attempt_ordinal: u32,
+    /// Slug whose compaction profile the transcript still carries, when a
+    /// `comp_hash` change forces a compaction before the next sampling.
+    required_profile_compaction: Option<String>,
+    transition_causes: Vec<ContextTransitionCause>,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn maybe_switch_to_resolved_overload_fallback(
-    class: ErrorClass,
-    fallback_used: &mut bool,
-    model: &mut String,
-    model_runtime: &mut Option<ResolvedModelRuntime>,
-    reasoning_effort: &mut Option<String>,
-    system: &mut Option<String>,
-    overload_fallback_system: &Option<String>,
-    config: &mut RunConfig,
-    parallel_tools: &mut bool,
-    tool_plan: &mut StepToolPlan,
-    context_messages: &[Message],
-    ephemeral_messages: &[Message],
-    messages: &[Message],
-    deps: &Deps,
-) -> Option<Result<ResolvedFallback, String>> {
-    if !matches!(class, ErrorClass::Overloaded(_)) || *fallback_used {
-        return None;
-    }
-    let previous = model_runtime.as_ref()?.clone();
-    let fallback = config
-        .overload_fallback_runtime
-        .as_ref()
-        .filter(|fallback| fallback.fingerprint != previous.fingerprint)?
-        .clone();
-    if let Err(error) = fallback.validate() {
-        return Some(Err(error.to_string()));
+impl TurnRuntime {
+    fn recompute_static_input(
+        &mut self,
+        context: &[ContextFragment],
+        ephemeral_messages: &[Message],
+        deps: &Deps,
+    ) {
+        self.static_input_tokens = estimate_static_input(
+            &self.system,
+            context.iter().map(|fragment| &fragment.message),
+            self.tool_plan.specs(),
+            deps.tokenizer.as_ref(),
+        )
+        .saturating_add(estimate_input(ephemeral_messages, deps.tokenizer.as_ref()));
     }
 
-    *model = fallback.slug.clone();
-    *reasoning_effort = fallback.reasoning_effort.clone();
-    *system = overload_fallback_system
-        .clone()
-        .or_else(|| Some(fallback.instructions.clone()));
-    config.max_output_tokens = fallback.max_output_tokens;
-    *parallel_tools = fallback.supports_parallel_tool_calls;
-    *tool_plan = tool_plan.with_parallel_allowed(*parallel_tools);
-    let static_input_tokens = estimate_static_input(
-        system,
-        context_messages,
-        tool_plan.specs(),
-        deps.tokenizer.as_ref(),
-    )
-    .saturating_add(estimate_input(ephemeral_messages, deps.tokenizer.as_ref()));
-    let mut budget = match ContextBudget::try_for_model_with_auto_limit(
-        fallback.context_window,
-        fallback.max_output_tokens,
-        Some(fallback.auto_compact_token_limit),
-    ) {
-        Ok(budget) => budget,
-        Err(error) => return Some(Err(error)),
-    };
-    budget.observe_estimated(estimate_current_input(messages, static_input_tokens, deps));
-    let compact_with = (previous.comp_hash != fallback.comp_hash).then_some(previous.slug.clone());
-    *model_runtime = Some(fallback);
-    *fallback_used = true;
-    Some(Ok(ResolvedFallback {
-        budget,
-        static_input_tokens,
-        compact_with,
-    }))
+    /// Feeds the compaction threshold with the local projection of the current
+    /// transcript. Used wherever no backend `usage` is available to supersede it.
+    fn observe_estimated(&mut self, messages: &[Message], deps: &Deps) {
+        let estimated = estimate_current_input(messages, self.static_input_tokens, deps);
+        self.budget.observe_estimated(estimated);
+    }
+
+    fn requires_profile_compaction(&self) -> bool {
+        self.required_profile_compaction.is_some()
+    }
+
+    /// Model the compaction summary must be produced by: the profile the
+    /// transcript was written under, which is not always the active one.
+    fn compaction_model(&self) -> &str {
+        self.required_profile_compaction
+            .as_deref()
+            .unwrap_or(self.model.as_str())
+    }
+
+    /// Installs the overload fallback contract, at most once per run.
+    ///
+    /// `None` when nothing can take over, `Some(Err)` when the configured
+    /// fallback is itself invalid (a configuration error, not a retry). The
+    /// budget is built BEFORE anything is assigned, so a rejected geometry
+    /// leaves the turn on its original contract.
+    fn switch_to_overload_fallback(
+        &mut self,
+        config: &mut RunConfig,
+        class: ErrorClass,
+        context: &[ContextFragment],
+        ephemeral_messages: &[Message],
+        messages: &[Message],
+        deps: &Deps,
+    ) -> Option<Result<(), String>> {
+        if !matches!(class, ErrorClass::Overloaded(_)) || self.overload_fallback_used {
+            return None;
+        }
+
+        // A resolved contract carries its own window, instructions and tool
+        // geometry, so switching to it is a complete substitution.
+        if let Some(previous) = self.model_runtime.clone()
+            && let Some(fallback) = config
+                .overload_fallback_runtime
+                .as_ref()
+                .filter(|fallback| fallback.fingerprint != previous.fingerprint)
+                .cloned()
+        {
+            if let Err(error) = fallback.validate() {
+                return Some(Err(error.to_string()));
+            }
+            let budget = match ContextBudget::try_for_model_with_auto_limit(
+                fallback.context_window,
+                fallback.max_output_tokens,
+                Some(fallback.auto_compact_token_limit),
+            ) {
+                Ok(budget) => budget,
+                Err(error) => return Some(Err(error)),
+            };
+
+            self.model = fallback.slug.clone();
+            self.reasoning_effort = fallback.reasoning_effort.clone();
+            self.system = self
+                .overload_fallback_system
+                .clone()
+                .or_else(|| Some(fallback.instructions.clone()));
+            config.max_output_tokens = fallback.max_output_tokens;
+            self.parallel_tools = fallback.supports_parallel_tool_calls;
+            self.tool_plan = self.tool_plan.with_parallel_allowed(self.parallel_tools);
+            self.budget = budget;
+            self.transition_causes
+                .push(ContextTransitionCause::OverloadFallback);
+            // A different compaction profile means the transcript must be
+            // summarized by the OLD model before the new one ever reads it.
+            if previous.comp_hash != fallback.comp_hash {
+                self.required_profile_compaction = Some(previous.slug.clone());
+                self.transition_causes.extend([
+                    ContextTransitionCause::CompHashChanged,
+                    ContextTransitionCause::Compaction,
+                ]);
+            }
+            self.model_runtime = Some(fallback);
+            self.reasoning_replay =
+                !self.reasoning_replay_downgraded && replay_enabled(self.model_runtime.as_ref());
+            self.overload_fallback_used = true;
+            self.recompute_static_input(context, ephemeral_messages, deps);
+            self.observe_estimated(messages, deps);
+            return Some(Ok(()));
+        }
+
+        // Legacy path: a bare slug, with nothing but the provider's declared
+        // window to rebuild a budget from.
+        let fallback = config
+            .overload_fallback_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|fallback| !fallback.is_empty() && *fallback != self.model)?
+            .to_string();
+        self.budget = match ContextBudget::try_for_model(
+            deps.provider.max_context_for_model(&fallback),
+            config.max_output_tokens,
+        ) {
+            Ok(budget) => budget,
+            Err(error) => return Some(Err(error)),
+        };
+        self.model = fallback;
+        self.overload_fallback_used = true;
+        self.observe_estimated(messages, deps);
+        Some(Ok(()))
+    }
+
+    /// Decides what a failed sampling leads to. Taken in ONE place: a failure
+    /// when opening the stream and a failure while draining it differ in what
+    /// they observed, never in what they conclude.
+    fn plan_failure(
+        &mut self,
+        error: &ProviderError,
+        config: &mut RunConfig,
+        context: &[ContextFragment],
+        ephemeral_messages: &[Message],
+        messages: &[Message],
+        deps: &Deps,
+    ) -> (ErrorClass, FailureAction) {
+        // Withholding (invariant 8): a context error is answered by compaction,
+        // never by a bare retry, because reopening the same oversized prompt
+        // fails the same way.
+        if error.is_context_error() {
+            let action = if self.attempt_policy.permits_after(self.attempt_ordinal) {
+                FailureAction::Withhold(ContextErrorKind::PromptTooLong)
+            } else {
+                FailureAction::Fail(classified_provider_error(ErrorClass::ContextLimit, error))
+            };
+            return (ErrorClass::ContextLimit, action);
+        }
+
+        let class = deps.provider.classify_error(error);
+        let action = match class {
+            ErrorClass::Retryable | ErrorClass::RateLimited | ErrorClass::Overloaded(_) => {
+                if !self.attempt_policy.permits_after(self.attempt_ordinal) {
+                    return (
+                        class,
+                        FailureAction::Fail(classified_provider_error(class, error)),
+                    );
+                }
+                match self.switch_to_overload_fallback(
+                    config,
+                    class,
+                    context,
+                    ephemeral_messages,
+                    messages,
+                    deps,
+                ) {
+                    Some(Err(invalid)) => FailureAction::Fail(AgentError::InvalidRequest(invalid)),
+                    // Another model answers right away: the wait the overload
+                    // justified is exactly what the switch removes.
+                    Some(Ok(())) => FailureAction::Retry {
+                        delay: Duration::ZERO,
+                        fallback_model: Some(self.model.clone()),
+                    },
+                    None => FailureAction::Retry {
+                        delay: transient_retry_delay(
+                            self.attempt_policy,
+                            self.attempt_ordinal - 1,
+                            class,
+                            error,
+                            deps.clock.now_ms(),
+                        ),
+                        fallback_model: None,
+                    },
+                }
+            }
+            ErrorClass::ReasoningReplayRejected => {
+                if self.reasoning_replay
+                    && !self.reasoning_replay_downgraded
+                    && self.attempt_policy.permits_after(self.attempt_ordinal)
+                {
+                    self.reasoning_replay = false;
+                    self.reasoning_replay_downgraded = true;
+                    FailureAction::DowngradeReplay
+                } else {
+                    FailureAction::Fail(classified_provider_error(class, error))
+                }
+            }
+            ErrorClass::Auth(AuthError::Expired) => {
+                if self.credential_refresh_attempted
+                    || !self.attempt_policy.permits_after(self.attempt_ordinal)
+                {
+                    FailureAction::Fail(AgentError::Auth(AuthError::ReconnectRequired))
+                } else {
+                    self.credential_refresh_attempted = true;
+                    FailureAction::RefreshCredentials
+                }
+            }
+            ErrorClass::Auth(auth) => FailureAction::Fail(AgentError::Auth(auth)),
+            ErrorClass::ContextLimit | ErrorClass::InvalidRequest => {
+                FailureAction::Fail(classified_provider_error(class, error))
+            }
+        };
+        (class, action)
+    }
+}
+
+/// What the loop does about a failed sampling.
+enum FailureAction {
+    /// Reopen after `delay`, on `fallback_model` when the overload fallback
+    /// took over.
+    Retry {
+        delay: Duration,
+        fallback_model: Option<String>,
+    },
+    /// Refresh the expired credential, then reopen.
+    RefreshCredentials,
+    /// Reopen without encrypted reasoning replay.
+    DowngradeReplay,
+    /// Hold the context error back: the loop head compacts, then retries.
+    Withhold(ContextErrorKind),
+    /// Nothing left to try.
+    Fail(AgentError),
 }
 
 /// Starts the agent. Returns a `Stream<AgentEvent>` to consume (TUI, `-p`).
@@ -594,14 +753,14 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
         let AgentContext {
             turn_id,
             mut model,
-            mut model_runtime,
+            model_runtime,
             mut reasoning_effort,
             mut system,
             overload_fallback_system,
             mut messages,
             tools,
             mut config,
-            mut context_messages,
+            context_messages,
             ephemeral_messages,
             step_source,
             inputs,
@@ -621,10 +780,10 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
             config.overload_fallback_model = None;
         }
 
-        let mut parallel_tools = model_runtime
+        let parallel_tools = model_runtime
             .as_ref()
             .is_none_or(|runtime| runtime.supports_parallel_tool_calls);
-        let mut tool_plan = StepToolPlan::capture(
+        let tool_plan = StepToolPlan::capture(
             ToolDispatchSnapshot::new(0, tools, Arc::clone(&deps.tools)),
             parallel_tools,
         );
@@ -638,7 +797,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
         let auto_compact_token_limit = model_runtime
             .as_ref()
             .map(|runtime| runtime.auto_compact_token_limit);
-        let mut budget = match ContextBudget::try_for_model_with_auto_limit(
+        let budget = match ContextBudget::try_for_model_with_auto_limit(
             max_context,
             config.max_output_tokens,
             auto_compact_token_limit,
@@ -649,35 +808,54 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                 return;
             }
         };
-        // Backend usage counts everything that is sent: system, ephemeral
-        // context, tool schemas and transcript. Local projections must carry
-        // the same static overhead, otherwise compaction comes too late.
-        let mut static_input_tokens = estimate_static_input(
-            &system,
-            &context_messages,
-            tool_plan.specs(),
-            deps.tokenizer.as_ref(),
-        )
-        .saturating_add(estimate_input(&ephemeral_messages, deps.tokenizer.as_ref()));
         // US-006: generation of the step frame currently installed. `None` until
         // the first frame, so a source whose first generation is 0 is still read.
         let mut step_generation: Option<u64> = None;
-        let mut context_kinds = Vec::new();
         let mut context_baseline = deps.session.context_baseline();
-        let mut transition_causes = Vec::new();
-        let mut reasoning_replay = replay_enabled(model_runtime.as_ref());
-        let mut reasoning_replay_downgraded = false;
-        let mut required_profile_compaction = context_baseline.as_ref().and_then(|previous| {
+        // A transcript written under another compaction profile has to be
+        // summarized by the model that wrote it, before the active one reads it.
+        let required_profile_compaction = context_baseline.as_ref().and_then(|previous| {
             model_runtime.as_ref().and_then(|runtime| {
                 (previous.comp_hash != runtime.comp_hash).then(|| previous.model_slug.clone())
             })
         });
-        if required_profile_compaction.is_some() {
-            transition_causes.extend([
+        let transition_causes = if required_profile_compaction.is_some() {
+            vec![
                 ContextTransitionCause::CompHashChanged,
                 ContextTransitionCause::Compaction,
-            ]);
-        }
+            ]
+        } else {
+            Vec::new()
+        };
+        let mut turn = TurnRuntime {
+            attempt_policy: ResolvedAttemptPolicy::resolve(&config, model_runtime.as_ref()),
+            attempt_ordinal: 1,
+            reasoning_replay: replay_enabled(model_runtime.as_ref()),
+            reasoning_replay_downgraded: false,
+            overload_fallback_used: false,
+            credential_refresh_attempted: false,
+            model,
+            model_runtime,
+            reasoning_effort,
+            system,
+            overload_fallback_system,
+            parallel_tools,
+            tool_plan,
+            budget,
+            static_input_tokens: 0,
+            required_profile_compaction,
+            transition_causes,
+        };
+        // Backend usage counts everything that is sent: system, ephemeral
+        // context, tool schemas and transcript. Local projections must carry
+        // the same static overhead, otherwise compaction comes too late.
+        // The context handed in by the caller is unclassified, which is what
+        // project context is: a skill only ever arrives through a step frame.
+        let mut context: Vec<ContextFragment> = context_messages
+            .into_iter()
+            .map(ContextFragment::project)
+            .collect();
+        turn.recompute_static_input(&context, &ephemeral_messages, &deps);
         let mut compaction = CompactionState::default();
         let mut pending: Option<PendingError> = None;
         let mut model_turns: u32 = 0;
@@ -689,10 +867,6 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
         // Armed by a tool the user refused with "stop the turn"; consumed at the
         // next loop boundary so the stop never happens mid-dispatch.
         let mut pending_abort: Option<InterruptReason> = None;
-        let mut attempt_policy = ResolvedAttemptPolicy::resolve(&config, model_runtime.as_ref());
-        let mut attempt_ordinal: u32 = 1;
-        let mut credential_refresh_attempted = false;
-        let mut overload_fallback_used = false;
         let mut iterations: u32 = 0;
         let iter_cap = config.max_turns.saturating_mul(4).saturating_add(32);
         // US-014: deterministic guardrails (override the model's own logic).
@@ -734,7 +908,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                 // other, and reconciliation still runs for the calls that never
                 // got one.
                 Transition::Interrupted(reason)
-            } else if required_profile_compaction.is_some() && pending.is_none() {
+            } else if turn.requires_profile_compaction() && pending.is_none() {
                 Transition::Compact(CompactKind::Auto)
             } else if force_compact && pending.is_none() {
                 // US-030 MidTurn: compaction forced by a long tool_result on the
@@ -748,7 +922,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                 pending,
                 model_turns,
                 config.max_turns,
-                budget.should_autocompact(),
+                turn.budget.should_autocompact(),
             ) {
                 Some(t) => {
                     pending = None;
@@ -789,24 +963,10 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     return;
                                 }
                             };
-                            tool_plan = StepToolPlan::capture(dispatch, parallel_tools);
-                            context_messages = frame.context_messages;
-                            context_kinds = frame.context_kinds;
-                            static_input_tokens = estimate_static_input(
-                                &system,
-                                &context_messages,
-                                tool_plan.specs(),
-                                deps.tokenizer.as_ref(),
-                            )
-                            .saturating_add(estimate_input(
-                                &ephemeral_messages,
-                                deps.tokenizer.as_ref(),
-                            ));
-                            budget.observe_estimated(estimate_current_input(
-                                &messages,
-                                static_input_tokens,
-                                &deps,
-                            ));
+                            turn.tool_plan = StepToolPlan::capture(dispatch, turn.parallel_tools);
+                            context = frame.context;
+                            turn.recompute_static_input(&context, &ephemeral_messages, &deps);
+                            turn.observe_estimated(&messages, &deps);
                         }
                     }
 
@@ -816,17 +976,17 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     // resume will restore more context, never less). So we do
                     // NOT write a boundary (otherwise the clear-on-boundary
                     // resume would wrongly wipe the transcript).
-                    if budget.should_microcompact() {
+                    if turn.budget.should_microcompact() {
                         let pruned = microcompact(&mut messages, config.micro_keep_recent);
                         if pruned > 0 {
                             compaction.record_success();
-                            budget.observe_estimated(estimate_current_input(&messages, static_input_tokens, &deps));
+                            turn.observe_estimated(&messages, &deps);
                             yield AgentEvent::Compacted(CompactKind::Micro);
                         }
                     }
 
                     let model_switch_from = context_baseline.as_ref().filter(|previous| {
-                        model_runtime.as_ref().is_some_and(|runtime| {
+                        turn.model_runtime.as_ref().is_some_and(|runtime| {
                             previous.profile_fingerprint != runtime.fingerprint
                         })
                     });
@@ -838,17 +998,16 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         return;
                     }
                     let snapshot = match PromptSnapshot::capture(
-                        model.clone(),
-                        model_runtime.clone(),
-                        reasoning_effort.clone(),
-                        system.clone(),
-                        context_messages.clone(),
-                        context_kinds.clone(),
+                        turn.model.clone(),
+                        turn.model_runtime.clone(),
+                        turn.reasoning_effort.clone(),
+                        turn.system.clone(),
+                        context.clone(),
                         &messages,
                         ephemeral_messages.clone(),
-                        tool_plan.clone(),
+                        turn.tool_plan.clone(),
                         config.max_output_tokens,
-                        reasoning_replay,
+                        turn.reasoning_replay,
                         model_switch_from,
                     ) {
                         Ok(snapshot) => snapshot,
@@ -864,12 +1023,14 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             "{diagnostic}"
                         );
                     }
-                    static_input_tokens = snapshot.static_input_tokens(deps.tokenizer.as_ref());
+                    turn.static_input_tokens =
+                        snapshot.static_input_tokens(deps.tokenizer.as_ref());
                     // The kill-switch consumes the immutable snapshot's bounded
                     // static input, not the live source values used to build it.
                     if usage_budget.is_active() {
                         let estimated_input =
-                            estimate_current_input(&messages, static_input_tokens, &deps) as u64;
+                            estimate_current_input(&messages, turn.static_input_tokens, &deps)
+                                as u64;
                         if let Some(reason) = usage_budget
                             .would_exceed(estimated_input, config.max_output_tokens as u64)
                         {
@@ -877,19 +1038,19 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             return;
                         }
                     }
-                    budget.begin_turn();
+                    turn.budget.begin_turn();
                     // The figures a reader outside the loop can act on: the
                     // request about to leave carries exactly this much context.
                     // Published here rather than at each budget mutation, so a
                     // tool called during the turn reads the state that turn was
                     // built from instead of a mid-flight intermediate.
-                    deps.context_window.publish((&budget).into());
+                    deps.context_window.publish((&turn.budget).into());
                     active_tool_plan = snapshot.tool_plan().clone();
                     let next_baseline = snapshot.baseline().clone();
                     if let Some(context_transition) = transition_between(
                         context_baseline.as_ref(),
                         &next_baseline,
-                        std::mem::take(&mut transition_causes),
+                        std::mem::take(&mut turn.transition_causes),
                     ) {
                         if let Err(error) = deps
                             .session
@@ -905,7 +1066,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         target: "pyxis::prompt",
                         prompt_fingerprint = snapshot.fingerprint(),
                         stable_prefix_fingerprint = snapshot.stable_prefix_fingerprint(),
-                        reasoning_replay = snapshot.reasoning_replay(),
+                        turn.reasoning_replay = snapshot.reasoning_replay(),
                         "prompt snapshot opened"
                     );
                     let mut req = snapshot.request();
@@ -937,564 +1098,275 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         Cancellable::Cancelled => continue,
                         Cancellable::Completed(opened) => opened,
                     };
-                    let mut stream = match opened {
-                        Ok(s) => s,
-                        Err(e) if e.is_context_error() => {
-                            if !attempt_policy.permits_after(attempt_ordinal) {
-                                yield AgentEvent::Error(classified_provider_error(
-                                    ErrorClass::ContextLimit,
-                                    &e,
-                                ));
-                                return;
-                            }
-                            attempt_ordinal += 1;
-                            yield attempt_context.retry_scheduled(
-                                attempt_ordinal,
-                                attempt_policy,
-                                ErrorClass::ContextLimit,
-                                Duration::ZERO,
-                                None,
-                            );
-                            pending = Some(PendingError { kind: ContextErrorKind::PromptTooLong });
-                            continue;
-                        }
-                        Err(e) => {
-                            let class = deps.provider.classify_error(&e);
-                            match class {
-                            ErrorClass::Retryable
-                            | ErrorClass::RateLimited
-                            | ErrorClass::Overloaded(_) => {
-                                if !attempt_policy.permits_after(attempt_ordinal) {
-                                    yield AgentEvent::Error(classified_provider_error(class, &e));
-                                    return;
-                                }
-                                let mut fallback_applied = false;
-                                if let Some(switched) =
-                                    maybe_switch_to_resolved_overload_fallback(
-                                        class,
-                                        &mut overload_fallback_used,
-                                        &mut model,
-                                        &mut model_runtime,
-                                        &mut reasoning_effort,
-                                        &mut system,
-                                        &overload_fallback_system,
-                                        &mut config,
-                                        &mut parallel_tools,
-                                        &mut tool_plan,
-                                        &context_messages,
-                                        &ephemeral_messages,
-                                        &messages,
-                                        &deps,
-                                    )
-                                {
-                                    match switched {
-                                        Ok(switched) => {
-                                            budget = switched.budget;
-                                            static_input_tokens = switched.static_input_tokens;
-                                            reasoning_replay = !reasoning_replay_downgraded
-                                                && replay_enabled(model_runtime.as_ref());
-                                            transition_causes
-                                                .push(ContextTransitionCause::OverloadFallback);
-                                            if let Some(compact_with) = switched.compact_with {
-                                                required_profile_compaction = Some(compact_with);
-                                                transition_causes.extend([
-                                                    ContextTransitionCause::CompHashChanged,
-                                                    ContextTransitionCause::Compaction,
-                                                ]);
-                                            }
-                                            fallback_applied = true;
-                                        }
-                                        Err(error) => {
-                                            yield AgentEvent::Error(AgentError::InvalidRequest(error));
-                                            return;
-                                        }
-                                    }
-                                }
-                                if !fallback_applied && maybe_switch_to_overload_fallback(
-                                    &mut model,
-                                    &config,
-                                    &mut overload_fallback_used,
-                                    class,
-                                ) {
-                                    match rebuild_budget_after_model_switch(
-                                        &model,
-                                        &config,
-                                        &messages,
-                                        static_input_tokens,
-                                        &deps,
-                                    ) {
-                                        Ok(next_budget) => budget = next_budget,
-                                        Err(e) => {
-                                            yield AgentEvent::Error(AgentError::InvalidRequest(e));
-                                            return;
-                                        }
-                                    }
-                                    fallback_applied = true;
-                                }
-                                let delay = if fallback_applied {
-                                    Duration::ZERO
-                                } else {
-                                    transient_retry_delay(
-                                        attempt_policy,
-                                        attempt_ordinal - 1,
-                                        class,
-                                        &e,
-                                        deps.clock.now_ms(),
-                                    )
-                                };
-                                attempt_ordinal += 1;
-                                yield attempt_context.retry_scheduled(
-                                    attempt_ordinal,
-                                    attempt_policy,
-                                    class,
-                                    delay,
-                                    fallback_applied.then(|| model.clone()),
-                                );
-                                if !delay.is_zero() {
-                                    let _ = guard(&deps.cancel, deps.clock.sleep(delay)).await;
-                                }
-                                continue;
-                            }
-                            ErrorClass::ReasoningReplayRejected => {
-                                if reasoning_replay
-                                    && !reasoning_replay_downgraded
-                                    && attempt_policy.permits_after(attempt_ordinal)
-                                {
-                                    reasoning_replay = false;
-                                    reasoning_replay_downgraded = true;
-                                    attempt_ordinal += 1;
-                                    yield AgentEvent::ReasoningReplayDisabled {
-                                        reason: "backend rejected encrypted reasoning replay".into(),
-                                    };
-                                    yield attempt_context.retry_scheduled(
-                                        attempt_ordinal,
-                                        attempt_policy,
-                                        class,
-                                        Duration::ZERO,
-                                        None,
-                                    );
-                                    continue;
-                                }
-                                yield AgentEvent::Error(classified_provider_error(class, &e));
-                                return;
-                            }
-                            ErrorClass::Auth(AuthError::Expired) => {
-                                if credential_refresh_attempted
-                                    || !attempt_policy.permits_after(attempt_ordinal)
-                                {
-                                    yield AgentEvent::Error(AgentError::Auth(
-                                        AuthError::ReconnectRequired,
-                                    ));
-                                    return;
-                                }
-                                credential_refresh_attempted = true;
-                                yield attempt_context.credential_refresh(
-                                    attempt_ordinal,
-                                    CredentialRefreshOutcome::Started,
-                                );
-                                match guard(&deps.cancel, deps.provider.refresh_auth()).await {
-                                    Cancellable::Cancelled => {
-                                        yield attempt_context.credential_refresh(
-                                            attempt_ordinal,
-                                            CredentialRefreshOutcome::Cancelled,
-                                        );
-                                        continue;
-                                    }
-                                    Cancellable::Completed(Ok(())) => {
-                                        yield attempt_context.credential_refresh(
-                                            attempt_ordinal,
-                                            CredentialRefreshOutcome::Succeeded,
-                                        );
-                                    }
-                                    Cancellable::Completed(Err(error)) => {
-                                        let (outcome, error) = recovery_failure(&error);
-                                        yield attempt_context.credential_refresh(
-                                            attempt_ordinal,
-                                            outcome,
-                                        );
-                                        yield AgentEvent::Error(AgentError::Auth(error));
-                                        return;
-                                    }
-                                }
-                                attempt_ordinal += 1;
-                                yield attempt_context.retry_scheduled(
-                                    attempt_ordinal,
-                                    attempt_policy,
-                                    class,
-                                    Duration::ZERO,
-                                    None,
-                                );
-                                continue;
-                            }
-                            ErrorClass::Auth(a) => {
-                                yield AgentEvent::Error(AgentError::Auth(a));
-                                return;
-                            }
-                            ErrorClass::ContextLimit | ErrorClass::InvalidRequest => {
-                                yield AgentEvent::Error(classified_provider_error(class, &e));
-                                return;
-                            }
-                        }},
-                    };
-
                     // Stream consumption: live yields (never ANSI).
                     let mut acc = Accumulator::new();
-                    let mut stream_err: Option<ProviderError> = None;
                     let mut last_usage: Option<TokenUsage> = None;
                     let mut estimated_input: Option<u32> = None;
                     let mut interrupted = false;
                     let mut steered = false;
-                    loop {
-                        // US-001: cancellation is polled FIRST (`biased`) -> as soon
-                        // as it is signalled, no more `Text` nor `Reasoning` is
-                        // emitted, even if the stream has events ready.
-                        // US-007: a steer comes SECOND, before the stream itself:
-                        // an input accepted while the model is talking must cut
-                        // this sampling, not wait for the whole answer to drain.
-                        let next = tokio::select! {
-                            biased;
-                            () = deps.cancel.cancelled() => {
-                                interrupted = true;
-                                break;
-                            }
-                            () = steer_ready(&inputs) => {
-                                steered = true;
-                                break;
-                            }
-                            ev = stream.next() => ev,
-                        };
-                        let Some(ev) = next else { break };
-                        match ev {
-                            Ok(StreamEvent::TextDelta { text }) => {
-                                yield AgentEvent::Text(text.clone());
-                                if let Err(e) = acc.push(StreamEvent::TextDelta { text }) {
-                                    yield AgentEvent::Error(e);
-                                    return;
-                                }
-                            }
-                            Ok(StreamEvent::ReasoningDelta { text }) => {
-                                yield AgentEvent::Reasoning(text.clone());
-                                if let Err(e) = acc.push(StreamEvent::ReasoningDelta { text }) {
-                                    yield AgentEvent::Error(e);
-                                    return;
-                                }
-                            }
-                            Ok(StreamEvent::Usage { usage }) => {
-                                // Calibration probe (US-021 AC3 / US-029): the core
-                                // COMPUTES the local estimate when the run asks for
-                                // it and carries it in `ModelTurn`; WRITING it is a
-                                // client decision (US-002 AC5, invariant 1). Off by
-                                // default -> no tokenizer pass on the hot path.
-                                if config.usage_probe {
-                                    estimated_input = Some(
-                                        estimate_input(&messages, deps.tokenizer.as_ref())
-                                            .saturating_add(static_input_tokens),
-                                    );
-                                }
-                                budget.observe_usage(usage);
-                                // Real backend usage supersedes the pre-turn
-                                // estimate: republished so the tools of THIS
-                                // turn stop reading an estimate once the
-                                // authoritative count is known.
-                                deps.context_window.publish((&budget).into());
-                                run_usage.add_assign(&usage);
-                                last_usage = Some(usage);
-                            }
-                            Ok(StreamEvent::Quota { snapshot }) => {
-                                if !snapshot.is_empty() {
-                                    yield AgentEvent::Quota(snapshot);
-                                }
-                            }
-                            Ok(StreamEvent::ReasoningReplayDisabled { reason }) => {
-                                reasoning_replay_downgraded = true;
-                                reasoning_replay = false;
-                                yield AgentEvent::ReasoningReplayDisabled { reason };
-                            }
-                            Ok(StreamEvent::ResponseMetadata { metadata }) => {
-                                if !metadata.is_empty() {
-                                    yield AgentEvent::ResponseMetadata(metadata);
-                                }
-                            }
-                            Ok(StreamEvent::ResponseItem {
-                                phase,
-                                output_index,
-                                item,
-                            }) => {
-                                yield AgentEvent::ResponseItem {
-                                    phase,
-                                    output_index,
-                                    item,
-                                };
-                            }
-                            Ok(StreamEvent::ProviderExtension { extension }) => {
-                                yield AgentEvent::ProviderExtension(extension);
-                            }
-                            Ok(StreamEvent::UnmappedItem {
-                                item_type,
-                                extension,
-                            }) => {
-                                // The turn continues: an item we cannot read is a
-                                // gap in what the client can show, never a reason
-                                // to fail a turn the model completed.
-                                yield AgentEvent::UnmappedResponseItem {
-                                    item_type,
-                                    extension,
-                                };
-                            }
-                            Ok(other) => {
-                                if let Err(e) = acc.push(other) {
-                                    yield AgentEvent::Error(e);
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                stream_err = Some(e);
-                                break;
-                            }
+                    // A sampling fails either when opening or while draining. Both
+                    // observations reach the SAME decision below, so all that is kept
+                    // here is the error itself, never which of the two produced it.
+                    let mut failure: Option<ProviderError> = None;
+                    let mut stream = match opened {
+                        Ok(stream) => Some(stream),
+                        Err(error) => {
+                            failure = Some(error);
+                            None
                         }
-                    }
-
-                    if interrupted {
-                        // The partial is COMMITTED: `to_assistant_message` only keeps
-                        // complete calls (a half-streamed `tool_use` is discarded),
-                        // and reconciliation will write them a result when passing
-                        // the stop boundary. So what the client saw scroll by stays
-                        // in the transcript.
-                        if !acc.is_empty() {
-                            messages.push(acc.to_assistant_message());
-                        }
-                        continue;
-                    }
-
-                    if steered {
-                        // US-007 AC2: the deltas of this sampling were NEVER
-                        // committed, so they are dropped with `acc` and the client
-                        // is told to erase what it displayed. The loop head then
-                        // re-samples with the steer already in the transcript.
-                        // Nothing is persisted here: an abandoned sampling has no
-                        // assistant turn to reconcile.
-                        if acc.has_visible_output() {
-                            yield AgentEvent::StreamReset;
-                        }
-                        continue;
-                    }
-
-                    if let Some(e) = stream_err {
-                        record_attempt_usage(
-                            &mut usage_budget,
-                            &mut budget,
-                            last_usage,
-                            &messages,
-                            static_input_tokens,
-                            &acc,
-                            &deps,
-                        );
-                        if e.is_context_error() {
-                            if acc.has_visible_output() {
-                                yield AgentEvent::StreamReset;
-                            }
-                            if !attempt_policy.permits_after(attempt_ordinal) {
-                                yield AgentEvent::Error(classified_provider_error(
-                                    ErrorClass::ContextLimit,
-                                    &e,
-                                ));
-                                return;
-                            }
-                            attempt_ordinal += 1;
-                            yield attempt_context.retry_scheduled(
-                                attempt_ordinal,
-                                attempt_policy,
-                                ErrorClass::ContextLimit,
-                                Duration::ZERO,
-                                None,
-                            );
-                            pending = Some(PendingError { kind: ContextErrorKind::PromptTooLong });
-                            continue;
-                        }
-                        let class = deps.provider.classify_error(&e);
-                        if acc.has_visible_output() {
-                            yield AgentEvent::StreamReset;
-                        }
-                        match class {
-                            ErrorClass::Retryable
-                            | ErrorClass::RateLimited
-                            | ErrorClass::Overloaded(_) => {
-                                if !attempt_policy.permits_after(attempt_ordinal) {
-                                    yield AgentEvent::Error(classified_provider_error(class, &e));
-                                    return;
+                    };
+                    if let Some(stream) = stream.as_mut() {
+                        loop {
+                            // US-001: cancellation is polled FIRST (`biased`) -> as soon
+                            // as it is signalled, no more `Text` nor `Reasoning` is
+                            // emitted, even if the stream has events ready.
+                            // US-007: a steer comes SECOND, before the stream itself:
+                            // an input accepted while the model is talking must cut
+                            // this sampling, not wait for the whole answer to drain.
+                            let next = tokio::select! {
+                                biased;
+                                () = deps.cancel.cancelled() => {
+                                    interrupted = true;
+                                    break;
                                 }
-                                let mut fallback_applied = false;
-                                if let Some(switched) =
-                                    maybe_switch_to_resolved_overload_fallback(
-                                        class,
-                                        &mut overload_fallback_used,
-                                        &mut model,
-                                        &mut model_runtime,
-                                        &mut reasoning_effort,
-                                        &mut system,
-                                        &overload_fallback_system,
-                                        &mut config,
-                                        &mut parallel_tools,
-                                        &mut tool_plan,
-                                        &context_messages,
-                                        &ephemeral_messages,
-                                        &messages,
-                                        &deps,
-                                    )
-                                {
-                                    match switched {
-                                        Ok(switched) => {
-                                            budget = switched.budget;
-                                            static_input_tokens = switched.static_input_tokens;
-                                            reasoning_replay = !reasoning_replay_downgraded
-                                                && replay_enabled(model_runtime.as_ref());
-                                            transition_causes
-                                                .push(ContextTransitionCause::OverloadFallback);
-                                            if let Some(compact_with) = switched.compact_with {
-                                                required_profile_compaction = Some(compact_with);
-                                                transition_causes.extend([
-                                                    ContextTransitionCause::CompHashChanged,
-                                                    ContextTransitionCause::Compaction,
-                                                ]);
-                                            }
-                                            fallback_applied = true;
-                                        }
-                                        Err(error) => {
-                                            yield AgentEvent::Error(AgentError::InvalidRequest(error));
-                                            return;
-                                        }
-                                    }
+                                () = steer_ready(&inputs) => {
+                                    steered = true;
+                                    break;
                                 }
-                                if !fallback_applied && maybe_switch_to_overload_fallback(
-                                    &mut model,
-                                    &config,
-                                    &mut overload_fallback_used,
-                                    class,
-                                ) {
-                                    match rebuild_budget_after_model_switch(
-                                        &model,
-                                        &config,
-                                        &messages,
-                                        static_input_tokens,
-                                        &deps,
-                                    ) {
-                                        Ok(next_budget) => budget = next_budget,
-                                        Err(e) => {
-                                            yield AgentEvent::Error(AgentError::InvalidRequest(e));
-                                            return;
-                                        }
-                                    }
-                                    fallback_applied = true;
-                                }
-                                let delay = if fallback_applied {
-                                    Duration::ZERO
-                                } else {
-                                    transient_retry_delay(
-                                        attempt_policy,
-                                        attempt_ordinal - 1,
-                                        class,
-                                        &e,
-                                        deps.clock.now_ms(),
-                                    )
-                                };
-                                attempt_ordinal += 1;
-                                yield attempt_context.retry_scheduled(
-                                    attempt_ordinal,
-                                    attempt_policy,
-                                    class,
-                                    delay,
-                                    fallback_applied.then(|| model.clone()),
-                                );
-                                if !delay.is_zero() {
-                                    let _ = guard(&deps.cancel, deps.clock.sleep(delay)).await;
-                                }
-                                continue;
-                            }
-                            ErrorClass::ReasoningReplayRejected => {
-                                if reasoning_replay
-                                    && !reasoning_replay_downgraded
-                                    && attempt_policy.permits_after(attempt_ordinal)
-                                {
-                                    reasoning_replay = false;
-                                    reasoning_replay_downgraded = true;
-                                    attempt_ordinal += 1;
-                                    yield AgentEvent::ReasoningReplayDisabled {
-                                        reason: "backend rejected encrypted reasoning replay".into(),
-                                    };
-                                    yield attempt_context.retry_scheduled(
-                                        attempt_ordinal,
-                                        attempt_policy,
-                                        class,
-                                        Duration::ZERO,
-                                        None,
-                                    );
-                                    continue;
-                                }
-                                yield AgentEvent::Error(classified_provider_error(class, &e));
-                                return;
-                            }
-                            ErrorClass::Auth(AuthError::Expired) => {
-                                if credential_refresh_attempted
-                                    || !attempt_policy.permits_after(attempt_ordinal)
-                                {
-                                    yield AgentEvent::Error(AgentError::Auth(
-                                        AuthError::ReconnectRequired,
-                                    ));
-                                    return;
-                                }
-                                credential_refresh_attempted = true;
-                                yield attempt_context.credential_refresh(
-                                    attempt_ordinal,
-                                    CredentialRefreshOutcome::Started,
-                                );
-                                match guard(&deps.cancel, deps.provider.refresh_auth()).await {
-                                    Cancellable::Cancelled => {
-                                        yield attempt_context.credential_refresh(
-                                            attempt_ordinal,
-                                            CredentialRefreshOutcome::Cancelled,
-                                        );
-                                        continue;
-                                    }
-                                    Cancellable::Completed(Ok(())) => {
-                                        yield attempt_context.credential_refresh(
-                                            attempt_ordinal,
-                                            CredentialRefreshOutcome::Succeeded,
-                                        );
-                                    }
-                                    Cancellable::Completed(Err(error)) => {
-                                        let (outcome, error) = recovery_failure(&error);
-                                        yield attempt_context.credential_refresh(
-                                            attempt_ordinal,
-                                            outcome,
-                                        );
-                                        yield AgentEvent::Error(AgentError::Auth(error));
+                                ev = stream.next() => ev,
+                            };
+                            let Some(ev) = next else { break };
+                            match ev {
+                                Ok(StreamEvent::TextDelta { text }) => {
+                                    yield AgentEvent::Text(text.clone());
+                                    if let Err(e) = acc.push(StreamEvent::TextDelta { text }) {
+                                        yield AgentEvent::Error(e);
                                         return;
                                     }
                                 }
-                                attempt_ordinal += 1;
+                                Ok(StreamEvent::ReasoningDelta { text }) => {
+                                    yield AgentEvent::Reasoning(text.clone());
+                                    if let Err(e) = acc.push(StreamEvent::ReasoningDelta { text }) {
+                                        yield AgentEvent::Error(e);
+                                        return;
+                                    }
+                                }
+                                Ok(StreamEvent::Usage { usage }) => {
+                                    // Calibration probe (US-021 AC3 / US-029): the core
+                                    // COMPUTES the local estimate when the run asks for
+                                    // it and carries it in `ModelTurn`; WRITING it is a
+                                    // client decision (US-002 AC5, invariant 1). Off by
+                                    // default -> no tokenizer pass on the hot path.
+                                    if config.usage_probe {
+                                        estimated_input = Some(
+                                            estimate_input(&messages, deps.tokenizer.as_ref())
+                                                .saturating_add(turn.static_input_tokens),
+                                        );
+                                    }
+                                    turn.budget.observe_usage(usage);
+                                    // Real backend usage supersedes the pre-turn
+                                    // estimate: republished so the tools of THIS
+                                    // turn stop reading an estimate once the
+                                    // authoritative count is known.
+                                    deps.context_window.publish((&turn.budget).into());
+                                    run_usage.add_assign(&usage);
+                                    last_usage = Some(usage);
+                                }
+                                Ok(StreamEvent::Quota { snapshot }) => {
+                                    if !snapshot.is_empty() {
+                                        yield AgentEvent::Quota(snapshot);
+                                    }
+                                }
+                                Ok(StreamEvent::ReasoningReplayDisabled { reason }) => {
+                                    turn.reasoning_replay_downgraded = true;
+                                    turn.reasoning_replay = false;
+                                    yield AgentEvent::ReasoningReplayDisabled { reason };
+                                }
+                                Ok(StreamEvent::ResponseMetadata { metadata }) => {
+                                    if !metadata.is_empty() {
+                                        yield AgentEvent::ResponseMetadata(metadata);
+                                    }
+                                }
+                                Ok(StreamEvent::ResponseItem {
+                                    phase,
+                                    output_index,
+                                    item,
+                                }) => {
+                                    yield AgentEvent::ResponseItem {
+                                        phase,
+                                        output_index,
+                                        item,
+                                    };
+                                }
+                                Ok(StreamEvent::ProviderExtension { extension }) => {
+                                    yield AgentEvent::ProviderExtension(extension);
+                                }
+                                Ok(StreamEvent::UnmappedItem {
+                                    item_type,
+                                    extension,
+                                }) => {
+                                    // The turn continues: an item we cannot read is a
+                                    // gap in what the client can show, never a reason
+                                    // to fail a turn the model completed.
+                                    yield AgentEvent::UnmappedResponseItem {
+                                        item_type,
+                                        extension,
+                                    };
+                                }
+                                Ok(other) => {
+                                    if let Err(e) = acc.push(other) {
+                                        yield AgentEvent::Error(e);
+                                        return;
+                                    }
+                                }
+                                Err(e) => {
+                                    failure = Some(e);
+                                    break;
+                                }
+                            }
+                        }
+
+                        if interrupted {
+                            // The partial is COMMITTED: `to_assistant_message` only keeps
+                            // complete calls (a half-streamed `tool_use` is discarded),
+                            // and reconciliation will write them a result when passing
+                            // the stop boundary. So what the client saw scroll by stays
+                            // in the transcript.
+                            if !acc.is_empty() {
+                                messages.push(acc.to_assistant_message());
+                            }
+                            continue;
+                        }
+
+                        if steered {
+                            // US-007 AC2: the deltas of this sampling were NEVER
+                            // committed, so they are dropped with `acc` and the client
+                            // is told to erase what it displayed. The loop head then
+                            // re-samples with the steer already in the transcript.
+                            // Nothing is persisted here: an abandoned sampling has no
+                            // assistant turn to reconcile.
+                            if acc.has_visible_output() {
+                                yield AgentEvent::StreamReset;
+                            }
+                            continue;
+                        }
+                        if failure.is_some() {
+                            // The attempt is lost, its tokens are not: they were spent
+                            // whether or not the answer ever reached us.
+                            record_attempt_usage(
+                                &mut usage_budget,
+                                &mut turn.budget,
+                                last_usage,
+                                &messages,
+                                turn.static_input_tokens,
+                                &acc,
+                                &deps,
+                            );
+                        }
+                    }
+
+                    if let Some(error) = failure {
+                        // The partial deltas were never committed: the client is told to
+                        // erase what it displayed before anything else is emitted.
+                        if acc.has_visible_output() {
+                            yield AgentEvent::StreamReset;
+                        }
+                        let (class, action) = turn.plan_failure(
+                            &error,
+                            &mut config,
+                            &context,
+                            &ephemeral_messages,
+                            &messages,
+                            &deps,
+                        );
+                        match action {
+                            FailureAction::Fail(error) => {
+                                yield AgentEvent::Error(error);
+                                return;
+                            }
+                            FailureAction::Withhold(kind) => {
+                                turn.attempt_ordinal += 1;
                                 yield attempt_context.retry_scheduled(
-                                    attempt_ordinal,
-                                    attempt_policy,
+                                    turn.attempt_ordinal,
+                                    turn.attempt_policy,
+                                    class,
+                                    Duration::ZERO,
+                                    None,
+                                );
+                                pending = Some(PendingError { kind });
+                                continue;
+                            }
+                            FailureAction::DowngradeReplay => {
+                                turn.attempt_ordinal += 1;
+                                yield AgentEvent::ReasoningReplayDisabled {
+                                    reason: "backend rejected encrypted reasoning replay".into(),
+                                };
+                                yield attempt_context.retry_scheduled(
+                                    turn.attempt_ordinal,
+                                    turn.attempt_policy,
                                     class,
                                     Duration::ZERO,
                                     None,
                                 );
                                 continue;
                             }
-                            ErrorClass::Auth(a) => {
-                                yield AgentEvent::Error(AgentError::Auth(a));
-                                return;
+                            FailureAction::RefreshCredentials => {
+                                yield attempt_context.credential_refresh(
+                                    turn.attempt_ordinal,
+                                    CredentialRefreshOutcome::Started,
+                                );
+                                match guard(&deps.cancel, deps.provider.refresh_auth()).await {
+                                    Cancellable::Cancelled => {
+                                        yield attempt_context.credential_refresh(
+                                            turn.attempt_ordinal,
+                                            CredentialRefreshOutcome::Cancelled,
+                                        );
+                                        continue;
+                                    }
+                                    Cancellable::Completed(Ok(())) => {
+                                        yield attempt_context.credential_refresh(
+                                            turn.attempt_ordinal,
+                                            CredentialRefreshOutcome::Succeeded,
+                                        );
+                                    }
+                                    Cancellable::Completed(Err(error)) => {
+                                        let (outcome, error) = recovery_failure(&error);
+                                        yield attempt_context
+                                            .credential_refresh(turn.attempt_ordinal, outcome);
+                                        yield AgentEvent::Error(AgentError::Auth(error));
+                                        return;
+                                    }
+                                }
+                                turn.attempt_ordinal += 1;
+                                yield attempt_context.retry_scheduled(
+                                    turn.attempt_ordinal,
+                                    turn.attempt_policy,
+                                    class,
+                                    Duration::ZERO,
+                                    None,
+                                );
+                                continue;
                             }
-                            ErrorClass::ContextLimit | ErrorClass::InvalidRequest => {
-                                yield AgentEvent::Error(classified_provider_error(class, &e));
-                                return;
+                            FailureAction::Retry { delay, fallback_model } => {
+                                turn.attempt_ordinal += 1;
+                                yield attempt_context.retry_scheduled(
+                                    turn.attempt_ordinal,
+                                    turn.attempt_policy,
+                                    class,
+                                    delay,
+                                    fallback_model,
+                                );
+                                if !delay.is_zero() {
+                                    let _ = guard(&deps.cancel, deps.clock.sleep(delay)).await;
+                                }
+                                continue;
                             }
                         }
                     }
 
-                    attempt_ordinal = 1;
-                    credential_refresh_attempted = false;
-                    attempt_policy = ResolvedAttemptPolicy::resolve(&config, model_runtime.as_ref());
+                    turn.attempt_ordinal = 1;
+                    turn.credential_refresh_attempted = false;
+                    turn.attempt_policy = ResolvedAttemptPolicy::resolve(&config, turn.model_runtime.as_ref());
                     model_turns += 1;
 
                     // Usage fallback: without an `usage` in the stream, estimate
@@ -1503,10 +1375,10 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     // otherwise estimated: context input + generated output).
                     record_attempt_usage(
                         &mut usage_budget,
-                        &mut budget,
+                        &mut turn.budget,
                         last_usage,
                         &messages,
-                        static_input_tokens,
+                        turn.static_input_tokens,
                         &acc,
                         &deps,
                     );
@@ -1537,11 +1409,11 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         // US-002: real occupancy of the window, absent when the
                         // provider reported nothing (never reported as zero).
                         context_tokens: last_usage.map(|usage| usage.input),
-                        context_window: model_runtime
+                        context_window: turn.model_runtime
                             .as_ref()
                             .map(|runtime| runtime.context_window)
-                            .or_else(|| deps.provider.context_window_for_model(&model)),
-                        auto_compact_token_limit: model_runtime
+                            .or_else(|| deps.provider.context_window_for_model(&turn.model)),
+                        auto_compact_token_limit: turn.model_runtime
                             .as_ref()
                             .map(|runtime| runtime.auto_compact_token_limit),
                         estimated_context_tokens: estimated_input,
@@ -1642,7 +1514,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     id: c.id.clone(),
                                     name: c.name.clone(),
                                     input: c.input.clone(),
-                                    kind: tool_plan.dispatcher().call_kind(c),
+                                    kind: turn.tool_plan.dispatcher().call_kind(c),
                                 });
                             }
                             let (tool_event_tx, mut tool_event_rx) =
@@ -1678,7 +1550,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 continue;
                             };
                             let (feedback_tokens, feedback_bytes) =
-                                feedback_limits(&model_runtime);
+                                feedback_limits(&turn.model_runtime);
                             let outcomes: Vec<ModelToolResult> = outcomes
                                 .into_iter()
                                 .map(|outcome| {
@@ -1713,8 +1585,8 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             // usage). We PROJECT their weight (without overwriting the
                             // real budget); if a long result crosses the threshold, we
                             // force compaction on the next turn, before the model.
-                            let projected = estimate_current_input(&messages, static_input_tokens, &deps);
-                            if budget.would_autocompact(projected) {
+                            let projected = estimate_current_input(&messages, turn.static_input_tokens, &deps);
+                            if turn.budget.would_autocompact(projected) {
                                 force_compact = true;
                             }
                             // A tool that asked for a fresh window rides the SAME
@@ -1729,9 +1601,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     }
                 }
                 Transition::Compact(kind) => {
-                    let compact_model = required_profile_compaction
-                        .as_deref()
-                        .unwrap_or(model.as_str());
+                    let compact_model = turn.compaction_model().to_string();
                     // US-001: compaction is a full model call; cancellation does not
                     // wait for it. The transcript is not modified until
                     // `full_compact` has handed back control.
@@ -1739,7 +1609,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         &deps.cancel,
                         full_compact(
                             &mut messages,
-                            compact_model,
+                            &compact_model,
                             deps.provider.as_ref(),
                             config.max_output_tokens,
                         ),
@@ -1760,18 +1630,18 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 yield AgentEvent::Error(AgentError::Session(e.to_string()));
                                 return;
                             }
-                            if required_profile_compaction.take().is_none() {
+                            if turn.required_profile_compaction.take().is_none() {
                                 context_baseline = None;
-                                transition_causes.push(ContextTransitionCause::Compaction);
+                                turn.transition_causes.push(ContextTransitionCause::Compaction);
                             }
                             // US-030: anchors the baseline on the NEXT real usage
                             // (guards against an immediate double compaction).
-                            let compacted_input = estimate_current_input(&messages, static_input_tokens, &deps);
-                            budget.mark_compacted(compacted_input);
+                            let compacted_input = estimate_current_input(&messages, turn.static_input_tokens, &deps);
+                            turn.budget.mark_compacted(compacted_input);
                             yield AgentEvent::Compacted(kind);
                         }
                         Err(_) => {
-                            if required_profile_compaction.is_some() {
+                            if turn.required_profile_compaction.is_some() {
                                 yield AgentEvent::Error(AgentError::Provider(
                                     ProviderFailure::contract(
                                         "required comp_hash compaction failed before model switch",
@@ -1791,7 +1661,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 compaction.record_success();
                                 yield AgentEvent::Compacted(CompactKind::Micro);
                             }
-                            budget.observe_estimated(estimate_current_input(&messages, static_input_tokens, &deps));
+                            turn.budget.observe_estimated(estimate_current_input(&messages, turn.static_input_tokens, &deps));
                         }
                     }
                 }
@@ -1801,7 +1671,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         &deps.cancel,
                         full_compact(
                             &mut messages,
-                            &model,
+                            &turn.model,
                             deps.provider.as_ref(),
                             config.max_output_tokens,
                         ),
@@ -1822,9 +1692,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 return;
                             }
                             context_baseline = None;
-                            transition_causes.push(ContextTransitionCause::Compaction);
-                            let compacted_input = estimate_current_input(&messages, static_input_tokens, &deps);
-                            budget.mark_compacted(compacted_input);
+                            turn.transition_causes.push(ContextTransitionCause::Compaction);
+                            let compacted_input = estimate_current_input(&messages, turn.static_input_tokens, &deps);
+                            turn.budget.mark_compacted(compacted_input);
                             yield AgentEvent::Compacted(CompactKind::Reactive);
                         }
                         Err(e) => {
@@ -2021,29 +1891,6 @@ mod tests {
             transient_retry_delay(policy, 0, ErrorClass::RateLimited, &err, 0),
             Duration::from_millis(MAX_RETRY_AFTER_MS)
         );
-    }
-
-    #[test]
-    fn overload_fallback_switches_once() {
-        let cfg = RunConfig {
-            overload_fallback_model: Some("fallback".into()),
-            ..RunConfig::default()
-        };
-        let mut model = "primary".to_string();
-        let mut used = false;
-        assert!(maybe_switch_to_overload_fallback(
-            &mut model,
-            &cfg,
-            &mut used,
-            ErrorClass::Overloaded(529)
-        ));
-        assert_eq!(model, "fallback");
-        assert!(!maybe_switch_to_overload_fallback(
-            &mut model,
-            &cfg,
-            &mut used,
-            ErrorClass::Overloaded(529)
-        ));
     }
 
     // backoff: exponential capped at 32x (2^5), no overflow.

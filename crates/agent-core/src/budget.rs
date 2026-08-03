@@ -263,35 +263,41 @@ const IMAGE_TOKENS: usize = 1_100;
 /// Estimates the input tokens of a transcript through a `TokenCounter` (fallback
 /// when `usage` is not provided). An image is charged a flat [`IMAGE_TOKENS`].
 pub fn estimate_input(messages: &[Message], counter: &dyn TokenCounter) -> u32 {
-    let mut total = 0usize;
-    for m in messages {
-        for b in &m.content {
-            total += match b {
-                ContentBlock::Text { text }
-                | ContentBlock::Thinking { text }
-                | ContentBlock::Summary { text, .. } => counter.count_text(text),
-                ContentBlock::ToolUse { name, input, .. } => {
-                    counter.count_text(name) + counter.count_text(&input.to_string())
-                }
-                ContentBlock::ToolResult { content, .. } => counter.count_text(content),
-                ContentBlock::Image { .. } => IMAGE_TOKENS,
-                // US-031: encrypted reasoning is sent to the backend when replay
-                // is active -> it counts in the budget (otherwise absent from messages).
-                ContentBlock::EncryptedReasoning {
-                    encrypted_content, ..
-                } => counter.count_text(encrypted_content),
-            };
-        }
-    }
+    let total: usize = messages
+        .iter()
+        .map(|message| estimate_message(message, counter))
+        .sum();
     u32::try_from(total).unwrap_or(u32::MAX)
+}
+
+fn estimate_message(message: &Message, counter: &dyn TokenCounter) -> usize {
+    let mut total = 0usize;
+    for b in &message.content {
+        total += match b {
+            ContentBlock::Text { text }
+            | ContentBlock::Thinking { text }
+            | ContentBlock::Summary { text, .. } => counter.count_text(text),
+            ContentBlock::ToolUse { name, input, .. } => {
+                counter.count_text(name) + counter.count_text(&input.to_string())
+            }
+            ContentBlock::ToolResult { content, .. } => counter.count_text(content),
+            ContentBlock::Image { .. } => IMAGE_TOKENS,
+            // US-031: encrypted reasoning is sent to the backend when replay
+            // is active -> it counts in the budget (otherwise absent from messages).
+            ContentBlock::EncryptedReasoning {
+                encrypted_content, ..
+            } => counter.count_text(encrypted_content),
+        };
+    }
+    total
 }
 
 /// Estimates the static overhead sent with every request: system prompt,
 /// ephemeral context and tool schemas. The backend counts these tokens in
 /// `usage.input`; local projections must therefore include them too.
-pub fn estimate_static_input(
+pub fn estimate_static_input<'a>(
     system: &Option<String>,
-    context_messages: &[Message],
+    context_messages: impl IntoIterator<Item = &'a Message>,
     tools: &[ToolSpec],
     counter: &dyn TokenCounter,
 ) -> u32 {
@@ -299,7 +305,9 @@ pub fn estimate_static_input(
         .as_deref()
         .map(|s| counter.count_text(s))
         .unwrap_or_default();
-    total = total.saturating_add(estimate_input(context_messages, counter) as usize);
+    for message in context_messages {
+        total = total.saturating_add(estimate_message(message, counter));
+    }
     for tool in tools {
         total = total
             .saturating_add(counter.count_text(&tool.name))

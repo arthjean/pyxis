@@ -22,6 +22,34 @@ pub enum ContextFragmentKind {
     Skill,
 }
 
+/// One model-visible context message and what it is.
+///
+/// Message and classification travel TOGETHER because the baseline fingerprints
+/// them apart: project context and skills each get their own hash, so a message
+/// that lost its kind would silently move from one fingerprint to the other.
+/// Two parallel vectors made that desynchronization expressible; this does not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextFragment {
+    pub message: Message,
+    pub kind: ContextFragmentKind,
+}
+
+impl ContextFragment {
+    pub fn project(message: Message) -> Self {
+        Self {
+            message,
+            kind: ContextFragmentKind::Project,
+        }
+    }
+
+    pub fn skill(message: Message) -> Self {
+        Self {
+            message,
+            kind: ContextFragmentKind::Skill,
+        }
+    }
+}
+
 /// Model-visible context of exactly one model request.
 ///
 /// Two frames sharing a `generation` are byte-identical, which is what lets the
@@ -31,10 +59,8 @@ pub enum ContextFragmentKind {
 pub struct StepFrame {
     pub generation: u64,
     pub tools: Vec<ToolSpec>,
-    pub context_messages: Vec<Message>,
-    /// Parallel classification of `context_messages`, used only for baseline
-    /// identity. A missing legacy classification is treated as project context.
-    pub context_kinds: Vec<ContextFragmentKind>,
+    /// Ordered context fragments, each carrying its own classification.
+    pub context: Vec<ContextFragment>,
     /// Immutable dispatch view captured with `tools`. `None` is reserved for
     /// static/test sources, where the injected dispatcher is already frozen.
     pub tool_dispatch: Option<ToolDispatchSnapshot>,
