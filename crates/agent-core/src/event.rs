@@ -255,6 +255,25 @@ impl ToolOutputDeltaView {
     }
 }
 
+/// Projection of a dispatch event onto the client contract. The mapping is a
+/// fact of the vocabulary, not a step of the loop: the loop forwards, it does
+/// not decide what a nested call looks like to a client.
+impl From<crate::tools::ToolDispatchEvent> for AgentEvent {
+    fn from(event: crate::tools::ToolDispatchEvent) -> Self {
+        use crate::tools::ToolDispatchEvent;
+        match event {
+            ToolDispatchEvent::PermissionAsk(request) => Self::PermissionAsk(request),
+            ToolDispatchEvent::NestedToolCall(view) => Self::ToolCall(view),
+            ToolDispatchEvent::NestedToolResult(view) => Self::ToolResult(view),
+            ToolDispatchEvent::OutputDelta { id, stream, chunk } => {
+                Self::ToolOutputDelta(ToolOutputDeltaView { id, stream, chunk })
+            }
+            ToolDispatchEvent::Plan(view) => Self::Plan(view),
+            ToolDispatchEvent::Hook(view) => Self::Hook(view),
+        }
+    }
+}
+
 /// Base64 on the wire: an event is JSON, and a raw byte array would otherwise
 /// serialize as a list of numbers several times its size.
 mod base64_bytes {

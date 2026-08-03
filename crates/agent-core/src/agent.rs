@@ -1665,24 +1665,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     outcomes = &mut dispatch => break Some(outcomes),
                                     event = tool_event_rx.recv(), if tool_events_open => {
                                         match event {
-                                            Some(ToolDispatchEvent::PermissionAsk(req)) => {
-                                                yield AgentEvent::PermissionAsk(req);
-                                            }
-                                            Some(ToolDispatchEvent::NestedToolCall(view)) => {
-                                                yield AgentEvent::ToolCall(view);
-                                            }
-                                            Some(ToolDispatchEvent::NestedToolResult(view)) => {
-                                                yield AgentEvent::ToolResult(view);
-                                            }
-                                            Some(ToolDispatchEvent::OutputDelta { id, stream, chunk }) => {
-                                                yield AgentEvent::ToolOutputDelta(ToolOutputDeltaView { id, stream, chunk });
-                                            }
-                                            Some(ToolDispatchEvent::Plan(view)) => {
-                                                yield AgentEvent::Plan(view);
-                                            }
-                                                Some(ToolDispatchEvent::Hook(view)) => {
-                                                    yield AgentEvent::Hook(view);
-                                                }
+                                            Some(event) => yield AgentEvent::from(event),
                                             None => tool_events_open = false,
                                         }
                                     }
@@ -1707,26 +1690,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 })
                                 .collect();
                             while let Ok(event) = tool_event_rx.try_recv() {
-                                match event {
-                                    ToolDispatchEvent::PermissionAsk(req) => {
-                                        yield AgentEvent::PermissionAsk(req);
-                                    }
-                                    ToolDispatchEvent::NestedToolCall(view) => {
-                                        yield AgentEvent::ToolCall(view);
-                                    }
-                                    ToolDispatchEvent::NestedToolResult(view) => {
-                                        yield AgentEvent::ToolResult(view);
-                                    }
-                                    ToolDispatchEvent::OutputDelta { id, stream, chunk } => {
-                                        yield AgentEvent::ToolOutputDelta(ToolOutputDeltaView { id, stream, chunk });
-                                    }
-                                    ToolDispatchEvent::Plan(view) => {
-                                        yield AgentEvent::Plan(view);
-                                    }
-                                        ToolDispatchEvent::Hook(view) => {
-                                            yield AgentEvent::Hook(view);
-                                        }
-                                }
+                                yield AgentEvent::from(event);
                             }
                             if let Err(e) = validate_tool_outcomes(&expected_ids, &outcomes) {
                                 yield AgentEvent::Error(e);
