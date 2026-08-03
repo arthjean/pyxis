@@ -970,11 +970,15 @@ fn main() -> anyhow::Result<()> {
     // US-020 AC4: `--ephemeral` neither creates it nor asks for a write right on
     // it. Creating the directory "just in case" would already be a trace left in
     // the workspace, which is the whole thing the flag promises not to do.
+    //
+    // Created ONCE, here, and fatal: a session Pyxis cannot record is not a
+    // session. The runtime used to try again on its own and bail, which meant
+    // the same failure was reported twice with two different verdicts.
     let sessions_dir = workspace.join(".pyxis").join("sessions");
-    if !args.ephemeral
-        && let Err(err) = std::fs::create_dir_all(&sessions_dir)
-    {
-        eprintln!("[session] {}: {err}", sessions_dir.display());
+    if !args.ephemeral {
+        std::fs::create_dir_all(&sessions_dir).map_err(|err| {
+            anyhow::anyhow!("session: {}: {err}", sessions_dir.display())
+        })?;
     }
     let session_dirs: &[&std::path::Path] = if args.ephemeral {
         &[]
@@ -1006,6 +1010,7 @@ fn main() -> anyhow::Result<()> {
             cred: credential,
             settings_path,
             config,
+            sessions_dir,
         },
         SandboxSetup { policy, enforced },
     ))
@@ -1407,6 +1412,10 @@ struct PreSandbox {
     settings_path: Option<std::path::PathBuf>,
     /// Effective configuration (global + project), read in both modes.
     config: settings::Config,
+    /// `<workspace>/.pyxis/sessions`, created (unless `--ephemeral`) and granted
+    /// to the sandbox before Landlock. Resolved there and carried here so the
+    /// runtime never rebuilds a path whose creation it did not witness.
+    sessions_dir: std::path::PathBuf,
 }
 
 async fn run(
@@ -1422,6 +1431,7 @@ async fn run(
         cred,
         settings_path,
         mut config,
+        sessions_dir,
     } = pre;
     // The resolved model already accounts for `--model`, which enters the
     // configuration as the strongest layer (US-005): there is nothing left to
@@ -1533,11 +1543,7 @@ async fn run(
     let mcp_harden = Arc::clone(&harden);
 
     // 3. Persistent session: one JSONL file per conversation (timestamped) under
-    // <workspace>/.pyxis/sessions/, listable/resumable through `/resume`.
-    let sessions_dir = workspace.join(".pyxis").join("sessions");
-    if !args.ephemeral {
-        std::fs::create_dir_all(&sessions_dir)?;
-    }
+    // <workspace>/.pyxis/sessions/, created before the sandbox (see `main`).
     let (current_session, initial_messages) = if let Some(resume_arg) = &args.resume {
         let path = resolve_resume_path(&sessions_dir, resume_arg)?;
         let resumed =
