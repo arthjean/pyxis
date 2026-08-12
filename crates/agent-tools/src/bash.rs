@@ -633,15 +633,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A pid is still running only if the kernel has a process behind it that
+    /// is not a zombie.
+    ///
+    /// `kill -0` cannot tell the difference: it succeeds on a zombie, which is
+    /// a process that already died and is only waiting to be reaped. How long
+    /// that wait lasts is decided by whoever inherits the orphan, and nothing
+    /// here controls that. Under `systemd --user` it is instantaneous, so a
+    /// `kill -0` probe looks correct on a developer machine; under a CI
+    /// runner or a container init that does not reap, the same dead process
+    /// answers "alive" for as long as the test cares to ask, and the group
+    /// kill under test gets blamed for a corpse it did kill.
     #[cfg(not(windows))]
     fn alive(pid: u32) -> bool {
-        std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        // `/proc/<pid>/stat` is `pid (comm) state ...`, and `comm` may itself
+        // contain spaces and parentheses: the state is the first field after
+        // the LAST `)`.
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        stat.rfind(')')
+            .and_then(|end| stat[end + 1..].split_whitespace().next())
+            .is_some_and(|state| state != "Z")
     }
 }

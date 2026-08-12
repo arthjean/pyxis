@@ -90,21 +90,6 @@ jobs:
       - name: Build tests
         run: timeout 25m cargo test --workspace --no-run
 
-      # TEMPORARY PROBE. `tests/races.rs` is where the suite stops, and it is
-      # not the binary's own fault: run alone on this runner it finishes in
-      # twenty-four seconds, against more than ten minutes inside the full
-      # workspace run. So the machine state degrades under everything that
-      # runs before it. This records what that state is at the moment the
-      # stall begins. It does not gate the job.
-      - name: Probe machine before races
-        run: |
-          echo "=== memory ==="; free -m
-          echo "=== disk ==="; df -h / /tmp
-          echo "=== process count ==="; ps -e --no-headers | wc -l
-          echo "=== thread count ==="; ps -eLf --no-headers | wc -l
-          echo "=== top by rss ==="
-          ps -eo pid,ppid,etime,rss,args --sort=-rss | head -15
-
       # `--no-fail-fast`: the summary must name ALL the failing tests, not
       # only the first crate that breaks.
       #

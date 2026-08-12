@@ -1916,14 +1916,17 @@ mod tests {
         assert_eq!(output_budget(Some(u64::MAX)), MAX_CHUNK_BYTES);
     }
 
+    /// Same probe as `bash::tests::alive`, and same reason for not using
+    /// `kill -0`: it succeeds on a zombie, so a process this suite already
+    /// killed keeps answering "alive" wherever the orphan's new parent does
+    /// not reap it promptly. The state is the first field after the LAST `)`
+    /// in `/proc/<pid>/stat`, since `comm` may contain parentheses.
     fn is_alive(pid: u32) -> bool {
-        std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        stat.rfind(')')
+            .and_then(|end| stat[end + 1..].split_whitespace().next())
+            .is_some_and(|state| state != "Z")
     }
 }
