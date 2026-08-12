@@ -97,12 +97,27 @@ jobs:
       # CANCELS the job, and a cancelled job archives no log, so a stall here
       # would erase the only evidence of itself. Failing from inside the step
       # keeps the log.
+      #
+      # Redirected to a FILE, never piped: `timeout` kills `cargo`, not the
+      # test binary `cargo` spawned, and a surviving grandchild holds the
+      # write end of a pipe open forever. `tee` would then outlive the
+      # timeout and hand the stall straight back to the job cap.
+      #
+      # `ps` on the way out names the binary still running, which is the one
+      # piece of evidence the log cannot carry: a hung test never prints its
+      # own result line.
       - name: Tests
         id: tests
         run: |
-          set -o pipefail
-          timeout --signal=INT --kill-after=1m 10m \
-            cargo test --workspace --no-fail-fast 2>&1 | tee cargo-test.log
+          timeout --kill-after=1m 10m \
+            cargo test --workspace --no-fail-fast > cargo-test.log 2>&1
+          status=$?
+          cat cargo-test.log
+          if [ "$status" -ne 0 ]; then
+            echo "--- test processes still alive ---"
+            ps -eo pid,etime,args | grep -F "$PWD/target" | grep -v grep || true
+          fi
+          exit "$status"
 
       # AC3: a failure names the failing test in the workflow summary, not
       # only at the bottom of the log.
