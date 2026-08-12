@@ -1,7 +1,6 @@
 # Suite de parité offline
 
-Recette normative de la preuve de parité **sans compte OpenAI et sans réseau**
-(EP-006 / US-020 AC1 de `tasks/prd-parite-totale-codex-cli.md`).
+Recette normative de la preuve de parité **sans compte OpenAI et sans réseau**.
 
 ```bash
 cargo test --workspace --no-fail-fast     # la suite entière, dont tout ce qui suit

@@ -2,9 +2,9 @@
 
 > **Statut : référence d'implémentation + input de décision (pas une des 4 sources de vérité).** Ne contredit pas `ARCHITECTURE/PROVIDERS/DECISIONS/ROADMAP` ; il les complète sur un point que la préférence d'Arthur (« utiliser mon abonnement OpenAI plutôt que l'API ») impose.
 >
-> Source extraite : repo `pi` (TypeScript, `/home/arthur/dev/pi`), packages `ai` + `coding-agent`. **Constantes vérifiées adversarialement : 45/45 claims confirmés contre le code réel** (3 corrections de précision intégrées ci-dessous, marquées ⚠️). Toutes les valeurs sont littérales (recopiables verbatim en Rust). Croisé avec `docs/PROVIDERS.md` et `tasks/prd-pyxis.md` (US-015/016/017/018, EP-004).
+> Source extraite : repo `pi` (TypeScript, `/home/arthur/dev/pi`), packages `ai` + `coding-agent`. **Constantes vérifiées adversarialement : 45/45 claims confirmés contre le code réel** (3 corrections de précision intégrées ci-dessous, marquées ⚠️). Toutes les valeurs sont littérales (recopiables verbatim en Rust). Croisé avec `docs/PROVIDERS.md`.
 >
-> **Décision actée par ADR-10 puis recentrée par ADR-11** : l'auth abonnement ChatGPT force la **Responses API sur le backend ChatGPT** (pas Chat Completions) → un `ProviderKind::OpenAiChatGpt` distinct. Depuis ADR-11, ce provider n'est plus une option gated future : c'est le MVP courant livré en premier. EP-003 du PRD de parité 2026 ajoute WebSocket avec continuation strictement limitée au tour et repli HTTP/SSE; le transcript canonique reste client-side. Voir §2.
+> **Décision actée par ADR-10 puis recentrée par ADR-11** : l'auth abonnement ChatGPT force la **Responses API sur le backend ChatGPT** (pas Chat Completions) → un `ProviderKind::OpenAiChatGpt` distinct. Depuis ADR-11, ce provider n'est plus une option gated future : c'est le MVP courant livré en premier. Le chantier de parité 2026 ajoute WebSocket avec continuation strictement limitée au tour et repli HTTP/SSE; le transcript canonique reste client-side. Voir §2.
 
 ---
 
@@ -158,7 +158,7 @@ Retourne un **nouveau** `{access_token, refresh_token, expires_in}` → **refres
 - Le body exige `store:false`, `input[]` (format Responses), `instructions` (pas `role:system`), `include:["reasoning.encrypted_content"]`.
 - Headers propriétaires obligatoires (`chatgpt-account-id`, `originator`) absents de toute API publique OpenAI.
 
-**Implication pour le canonique Pyxis.** Le canonique est **Anthropic-like, transcript client-side reconstruit à chaque tour** (`PROVIDERS.md §1.1`), indispensable à la compaction / resume JSONL / replay (`US-009`). Or :
+**Implication pour le canonique Pyxis.** Le canonique est **Anthropic-like, transcript client-side reconstruit à chaque tour** (`PROVIDERS.md §1.1`), indispensable à la compaction / resume JSONL / replay. Or :
 - En **SSE**, le backend Codex est **stateless** (pas de `previous_response_id`) → contexte complet dans `input[]` à chaque tour → **mappe proprement** sur le transcript client-side. Bonne nouvelle.
 - En **WebSocket** avec réutilisation de connexion, `previous_response_id` est un état server-side connection-scoped. Pyxis le borne à une extension stricte dans le même tour; toute divergence ou nouvelle session repart du transcript complet.
 
@@ -167,11 +167,11 @@ Retourne un **nouveau** `{access_token, refresh_token, expires_in}` → **refres
 **Recommandation : adapter dédié, séparé du Chat Completions BYOK.**
 
 Introduire `ProviderKind::OpenAiChatGpt` (subscription), **et non** réutiliser `OpenAiResponses` générique ni `OpenAiChat` :
-1. `OpenAiChat` (US-017) reste pur : `api.openai.com/v1/chat/completions`, API key BYOK, mapping client-side, adapter futur depuis ADR-11.
+1. `OpenAiChat` reste pur : `api.openai.com/v1/chat/completions`, API key BYOK, mapping client-side, adapter futur depuis ADR-11.
 2. `OpenAiResponses` (déjà prévu gated) cible `api.openai.com/v1/responses` au token (API publique). Le backend ChatGPT en diverge (base URL, headers, `store:false` forcé). Mélanger = branches conditionnelles fragiles.
 3. L'adapter `openai-chatgpt` préfère WebSocket, mais traite `previous_response_id` comme une compression de transport interne au tour. HTTP/SSE reste le repli stateless. `capabilities().server_side_state = false` car le cœur conserve la propriété du transcript.
 
-**Lien US-017** : son AC dit « la Responses API est hors scope ». L'abonnement ChatGPT *est* de la Responses API → **US-017 ne le couvre pas** (il couvre OpenAI au token, Chat Completions). L'auth abonnement ChatGPT est une US séparée, devenue le chemin MVP courant par ADR-11.
+**Lien avec le canal BYOK** : son cadrage dit « la Responses API est hors scope ». L'abonnement ChatGPT *est* de la Responses API → **le canal BYOK ne le couvre pas** (il couvre OpenAI au token, Chat Completions). L'auth abonnement ChatGPT est un chemin séparé, devenu le MVP courant par ADR-11.
 
 ---
 
@@ -182,7 +182,7 @@ Introduire `ProviderKind::OpenAiChatGpt` (subscription), **et non** réutiliser 
 ```rust
 // agent-auth
 pub enum Credential {
-    /// BYOK : clé brute. Couvre OpenAI Chat (US-017), Gemini, OpenRouter.
+    /// BYOK : clé brute. Couvre OpenAI Chat, Gemini, OpenRouter.
     ApiKey { provider: ProviderId, key: SecretString },
     /// OAuth subscription (sliding refresh). Couvre Anthropic OAuth + ChatGPT.
     OAuth(OAuthCredential),
@@ -271,9 +271,9 @@ fn extract_account_id(access_token: &str) -> Result<String> {
 }
 ```
 
-### 3.c — Stockage keyring (US-018)
+### 3.c — Stockage keyring
 
-Pi stocke en **JSON clair 0o600**. **Pyxis DOIT faire mieux** : `US-018` impose le secret store OS (keyring), jamais en clair (`prd-pyxis.md:345`, NFR Security `:404`).
+Pi stocke en **JSON clair 0o600**. **Pyxis DOIT faire mieux** : le secret store OS (keyring) est imposé, jamais de stockage en clair (NFR Security).
 
 ```rust
 let entry = keyring::Entry::new("pyxis", &format!("oauth:{provider}"))?;
@@ -297,7 +297,7 @@ Refresh tokens **rotatifs** : réécrire le refresh à chaque cycle. Mappe sur `
 
 ### 3.e — Sélection base URL + headers selon le type de credential
 
-| | `Credential::ApiKey` (US-017, MVP) | `Credential::OAuth` ChatGPT (gated) |
+| | `Credential::ApiKey` (BYOK, MVP) | `Credential::OAuth` ChatGPT (gated) |
 |---|---|---|
 | Base URL | `https://api.openai.com/v1` | `https://chatgpt.com/backend-api/codex` |
 | Endpoint | `/chat/completions` | `/responses` (WebSocket puis HTTP/SSE) |
@@ -330,7 +330,7 @@ Conséquence : **deux adapters / deux `ProviderKind`** (`OpenAiChat` vs `OpenAiC
 | Serveur callback local | `hyper` nu (ou `axum`) | un seul handler `GET /auth/callback` ; hyper évite une dép lourde |
 | PKCE | `sha2` + `rand` + base64url maison | base64url **sans padding** |
 | Décodage JWT (account_id) | split+`base64`+`serde_json` manuel | on lit un claim, on ne vérifie **pas** la signature → évite `jsonwebtoken` |
-| Keyring | `keyring` | déjà dans PRD |
+| Keyring | `keyring` | déjà retenu |
 | Ouvrir le navigateur | `open` | équivalent `openBrowser` de Pi |
 | Secret en mémoire | `secrecy` (`SecretString`) | évite les fuites de token en logs/`Debug` |
 
@@ -345,7 +345,7 @@ Conséquence : **deux adapters / deux `ProviderKind`** (`OpenAiChat` vs `OpenAiC
 | `oauth/device-code.ts` | `agent-auth/src/oauth/device.rs` (RFC 8628) |
 | `auth-storage.ts` (JSON 0o600) | `agent-auth/src/store.rs` (**keyring**, pas JSON clair) |
 | `providers/openai-codex-responses.ts` | adapter `agent-provider/src/openai_chatgpt.rs` (`OpenAiChatGpt`) |
-| `login-dialog.ts` / `oauth-selector.ts` | `agent-tui` dialog login (US-019) |
+| `login-dialog.ts` / `oauth-selector.ts` | `agent-tui` dialog login |
 
 ---
 
@@ -353,9 +353,9 @@ Conséquence : **deux adapters / deux `ProviderKind`** (`OpenAiChat` vs `OpenAiC
 
 **ToS-grey (réutilisation du `client_id` Codex).** `app_EMoamEEZ73f0CkXaXp7hrann` est le client OAuth du **Codex CLI officiel**. « Sign in with ChatGPT » est gaté à Codex + IDE partenaires, **aucun programme tiers ouvert** (issue `openai/codex#10974` fermée « not planned »). Réutiliser le client = techniquement possible (client OSS), **zone grise ToS, usage perso, révocable unilatéralement**.
 
-**Précédent Anthropic = preuve que le risque est réel.** Anthropic a coupé les abonnements Pro/Max aux outils tiers (janv→4 avril 2026, `prd-pyxis.md:13`). OpenAI peut faire **pareil** sur le `client_id` Codex du jour au lendemain. C'est le RISQUE N°1 PRODUIT (`PROVIDERS.md §6`) — toute la thèse de Pyxis est d'être **model-agnostic pour ne pas en dépendre**.
+**Précédent Anthropic = preuve que le risque est réel.** Anthropic a coupé les abonnements Pro/Max aux outils tiers (janv→4 avril 2026). OpenAI peut faire **pareil** sur le `client_id` Codex du jour au lendemain. C'est le RISQUE N°1 PRODUIT (`PROVIDERS.md §6`) — toute la thèse de Pyxis est d'être **model-agnostic pour ne pas en dépendre**.
 
-**Refresh / expiry.** Tokens rotatifs sliding : robuste tant que le `client_id` vit. Révocation du client → tous les refresh échouent en bloc → bascule forcée. Prévoir un équivalent `Auth(ThirdPartyBlocked)` côté OpenAI (à sonder en live, comme le leg Anthropic de US-001).
+**Refresh / expiry.** Tokens rotatifs sliding : robuste tant que le `client_id` vit. Révocation du client → tous les refresh échouent en bloc → bascule forcée. Prévoir un équivalent `Auth(ThirdPartyBlocked)` côté OpenAI (à sonder en live, comme le leg Anthropic).
 
 **`chatgpt-account-id` obligatoire.** Sans ce header (dérivé du JWT), le backend ne route pas. Si OpenAI change le namespace `https://api.openai.com/auth`, ça casse silencieusement.
 
@@ -377,4 +377,4 @@ Conséquence : **deux adapters / deux `ProviderKind`** (`OpenAiChat` vs `OpenAiC
 - Le wording exact d'un éventuel message de blocage côté OpenAI (équivalent du « only authorized for use with Claude Code ») est **inconnu** : Pi ne le capture pas. À sonder en live.
 - La validation `originator` côté backend ChatGPT (rejette-t-il un originator inconnu ?) est **non vérifiée** — à tester avec `"pyxis"` au premier run.
 
-> **ADR-10/ADR-11 actées, transport amendé par EP-003** : « Auth abonnement ChatGPT via `ProviderKind::OpenAiChatGpt` (Responses sur backend ChatGPT, WebSocket borné avec repli SSE stateless, fragile) », distinct de `OpenAiChat` (Chat Completions BYOK futur). US-017 ne couvre pas l'abonnement.
+> **ADR-10/ADR-11 actées, transport amendé** : « Auth abonnement ChatGPT via `ProviderKind::OpenAiChatGpt` (Responses sur backend ChatGPT, WebSocket borné avec repli SSE stateless, fragile) », distinct de `OpenAiChat` (Chat Completions BYOK futur), qui ne couvre pas l'abonnement.

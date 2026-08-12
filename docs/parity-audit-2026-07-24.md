@@ -22,7 +22,7 @@ La parité fonctionnelle brute n'est pas le principal enseignement. Trois consta
 
 **Un composer inutilisable au-delà d'une ligne.** `AppState.input` est un `String` plat (`crates/agent-tui/src/state.rs:558`), `Enter` soumet systématiquement (`state.rs:1717`), aucun binding n'insère de saut de ligne, et `render_input` dessine sur une `Rect` de hauteur 1 sans wrap ni défilement horizontal (`crates/agent-tui/src/render.rs:1394-1413`). Au-delà de la largeur du terminal, la saisie devient aveugle. Un collage multi-lignes est inséré brut dans ce champ (`crates/agent-tui/src/bottom_pane.rs:110`).
 
-**Un système de suivi qui déclare fait ce qui ne l'est pas.** `tasks/prd-codex-tui-parity-status.json` marque US-017 « Port du composer Codex » et US-018 « parité snapshot » comme `DONE`. Or `crates/agent-tui/src/bottom_pane/` ne contient qu'un `tests.rs`, `insta` n'est pas une dépendance du workspace et le repo compte zéro snapshot, alors que le critère d'acceptation exige « au moins 20 snapshots » (`tasks/prd-codex-tui-parity.md:388`). Il n'existe par ailleurs aucun répertoire `.github/`, donc aucune CI n'exécute les tests. Tant que ce décalage subsiste, les fichiers de statut ne constituent pas un signal de vérification exploitable.
+**Un système de suivi qui déclare fait ce qui ne l'est pas.** Le suivi produit de l'époque marque « Port du composer Codex » et « parité snapshot » comme `DONE`. Or `crates/agent-tui/src/bottom_pane/` ne contient qu'un `tests.rs`, `insta` n'est pas une dépendance du workspace et le repo compte zéro snapshot, alors que le critère d'acceptation exige « au moins 20 snapshots ». Il n'existe par ailleurs aucun répertoire `.github/`, donc aucune CI n'exécute les tests. Tant que ce décalage subsiste, les fichiers de statut ne constituent pas un signal de vérification exploitable.
 
 ## Ce que Pyxis fait mieux que Codex
 
@@ -70,7 +70,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** Aucun `call_tool` dans tout le dépôt Pyxis (grep -rn "call_tool\|CallTool" --include=*.rs → 0 résultat). crates/agent-mcp/src/client.rs:69-155 n'expose que connect/connect_hardened/list_tools/cancel. crates/agent-tools/src/registry.rs:432-433 a un `register_dyn` commenté « futur outil MCP » jamais appelé. docs/CURRENT_STATUS.md:12 le confirme explicitement.
 
-**Statut documentaire.** Déjà connu et planifié: docs/CURRENT_STATUS.md:19 et docs/ROADMAP.md:86,113 le mettent en Phase 2; tasks/prd-pyxis.md:434 le classe risque n°6 « MCP absent au MVP (table-stake 2026) », bloquant pour la promo publique mais pas pour le dogfood. tasks/prd-codex-orchestration.md:338 l'exclut explicitement de son scope.
+**Statut documentaire.** Déjà connu et planifié: docs/CURRENT_STATUS.md:19 et docs/ROADMAP.md:86,113 le mettent en Phase 2; le cadrage produit de l'époque le classe risque n°6 « MCP absent au MVP (table-stake 2026) », bloquant pour la promo publique mais pas pour le dogfood, et l'exclut explicitement de son scope.
 
 ### [Interface terminal] Composer mono-ligne : aucune insertion de saut de ligne
 
@@ -82,7 +82,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-tui/src/state.rs:1717-1732 : `KeyCode::Enter` soumet toujours, aucune branche d'insertion de '\n' ; /home/arthur/dev/pyxis/crates/agent-tui/src/render.rs:1395-1400 : la zone de saisie fait exactement 1 ligne. Greps infructueux : `insert_newline`, `Shift.*Enter`, `alt\(KeyCode::Enter\)`, `'\\n'` dans state.rs
 
-**Statut documentaire.** tasks/prd-codex-tui-parity.md:365-377 (US-017 « Port du composer Codex ») est marque DONE dans tasks/prd-codex-tui-parity-status.json alors que le composer Codex n'a pas ete porte ; aucune divergence n'est documentee dans docs/CURRENT_STATUS.md comme l'exigeait le dernier critere d'acceptation.
+**Statut documentaire.** Le cadrage de l'époque (« Port du composer Codex ») est marque DONE dans son suivi alors que le composer Codex n'a pas ete porte ; aucune divergence n'est documentee dans docs/CURRENT_STATUS.md comme l'exigeait le dernier critere d'acceptation.
 
 ### [Interface terminal] Saisie longue tronquee : ni wrap ni defilement horizontal
 
@@ -148,19 +148,19 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-provider/src/chatgpt.rs:325 ne lit des headers que `Retry-After`; greps `rate_limit|RateLimit|quota|weekly|resets_at|used_percent|x-codex` sur crates/ ne renvoient que la classification d'erreur 429 (chatgpt.rs:354-376, provider.rs:384) - aucune capture de fenetre de quota, aucun event.
 
-**Statut documentaire.** Aucun ADR ni US ne couvre le sujet : prd-codex-orchestration.md traite les 429 sous l'angle retry/terminal (US-023) mais pas la telemetrie de quota.
+**Statut documentaire.** Aucun ADR ne couvre le sujet : le cadrage de l'époque traite les 429 sous l'angle retry/terminal mais pas la telemetrie de quota.
 
 ##### L'usage tokens reel et la fenetre de contexte ne sont jamais exposes aux clients
 
 `moyen` · `absent` · effort `S`
 
-**Impact.** L'utilisateur n'a aucun indicateur fiable de remplissage du contexte ni de cout du tour : il subit la compaction sans la voir venir, et le compteur affiche est une heuristique connue pour sous-estimer 3 a 24x (note US-021 dans tasks/prd-codex-orchestration-status.json).
+**Impact.** L'utilisateur n'a aucun indicateur fiable de remplissage du contexte ni de cout du tour : il subit la compaction sans la voir venir, et le compteur affiche est une heuristique connue pour sous-estimer 3 a 24x (note consignee dans le suivi de l'époque).
 
 **Codex.** /home/arthur/dev/codex/codex-rs/protocol/src/protocol.rs:2138 `TokenCountEvent { info: Option<TokenUsageInfo>, rate_limits }` avec `TokenUsageInfo { total_token_usage, last_token_usage, model_context_window }` (protocol.rs:2090-2135) et `percent_of_context_window_remaining` (protocol.rs:2244); emis a chaque `Completed` en core/src/session/mod.rs:3870.
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-core/src/agent.rs:568 consomme `StreamEvent::Usage` uniquement en interne (`budget.observe_usage`); /home/arthur/dev/pyxis/crates/agent-core/src/event.rs:13-34 n'a aucune variante d'usage; le TUI affiche une estimation locale caracteres/4 (/home/arthur/dev/pyxis/crates/agent-tui/src/state.rs:613-617 `turn_chars`). L'usage backend n'est visible que derriere `PYXIS_DEBUG_USAGE` sur stderr (agent.rs:559-566).
 
-**Statut documentaire.** US-021/US-029 (prd-codex-orchestration) ont ajoute la sonde de calibration PYXIS_DEBUG_USAGE mais explicitement pas d'event client.
+**Statut documentaire.** Le cadrage de l'époque a ajoute la sonde de calibration PYXIS_DEBUG_USAGE mais explicitement pas d'event client.
 
 ##### Les retries reseau sont silencieux : aucun event pendant le backoff
 
@@ -212,7 +212,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-provider/src/chatgpt.rs:733-736 : un 429 dont le corps matche `GoUsageLimitError|insufficient_quota|quota exceeded` devient `ErrorClass::InvalidRequest`, propage tel quel via `AgentError::Provider(ProviderFailure{status:429, message})` (/home/arthur/dev/pyxis/crates/agent-core/src/error.rs:90-99). Aucun parsing du plan ni du reset.
 
-**Statut documentaire.** US-023 (tasks/prd-codex-orchestration.md:133) couvre la classification terminale des 429, pas la presentation.
+**Statut documentaire.** Le cadrage de l'époque couvre la classification terminale des 429, pas la presentation.
 
 ##### Le mode headless n'expose pas le flux d'evenements, seulement le texte agrege
 
@@ -260,7 +260,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-core/src/event.rs:13 `AgentEvent` ne porte aucun identifiant; la correlation est reconstruite ad hoc par le client via un wrapper `AgentTurnEvent { turn_id, event }` (/home/arthur/dev/pyxis/crates/agent-cli/src/interactive.rs:1110 `active_turn.is_current(turn_event.turn_id)`). Aucune notion d'`Op` : les commandes de controle sont des branches de `match cmd` dans la boucle TUI (interactive.rs:681-1052).
 
-**Statut documentaire.** docs/codex-port-inventory.md:65 classe explicitement les surfaces app-server en `skip` (non-goal PRD). ADR-3 pose le coeur headless + clients, sans exiger de protocole de submission.
+**Statut documentaire.** docs/codex-port-inventory.md:65 classe explicitement les surfaces app-server en `skip` (non-goal assume). ADR-3 pose le coeur headless + clients, sans exiger de protocole de submission.
 
 ##### Taxonomie d'items de reponse reduite : web search, custom tool freeform, image generation, local shell sont silencieusement ignores
 
@@ -282,7 +282,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-session/src/lib.rs:68 retire tous les `ContentBlock::EncryptedReasoning` avant ecriture, et lib.rs:272 ecrit une entree `EncryptedReasoningRedacted`; le replay n'existe donc que pour la duree du process (capture en /home/arthur/dev/pyxis/crates/agent-core/src/transition.rs:199 et reemission en /home/arthur/dev/pyxis/crates/agent-provider/src/chatgpt_request.rs:163-184).
 
-**Statut documentaire.** Choix apparemment deliberé (redaction de donnees sensibles au repos), mais aucun ADR ne le trace : greps `EncryptedReasoning|reasoning_replay|US-031` dans docs/DECISIONS.md et docs/ROADMAP.md sont vides.
+**Statut documentaire.** Choix apparemment deliberé (redaction de donnees sensibles au repos), mais aucun ADR ne le trace : greps `EncryptedReasoning|reasoning_replay` dans docs/DECISIONS.md et docs/ROADMAP.md sont vides.
 
 ##### Pas de rollback de tours (annuler les N derniers echanges du contexte)
 
@@ -350,7 +350,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-mcp/src/lib.rs:7-8 - « Sont reportes : le wrapping des outils en `DynTool` (registre `agent-tools`), l'OAuth PKCE par serveur et les transports SSE / HTTP » ; /home/arthur/dev/pyxis/docs/CURRENT_STATUS.md:12 - « MCP tools are not yet exposed as callable model tools ». Le point d'entree existe pourtant deja : `RegistryBuilder::register_dyn` (agent-tools/src/registry.rs:424-427).
 
-**Statut documentaire.** Ecart connu et assume comme non-goal du PRD courant (tasks/prd-codex-orchestration.md:340 « MCP tools branches dans la boucle modele - hors scope de ce PRD ») mais planifie en Phase 2 (docs/ROADMAP.md:86, :113 « outils MCP enregistres comme DynTool (uniformite), tous returns_untrusted=true » ; docs/CURRENT_STATUS.md:19).
+**Statut documentaire.** Ecart connu et assume comme non-goal du cadrage courant (« MCP tools branches dans la boucle modele - hors scope ») mais planifie en Phase 2 (docs/ROADMAP.md:86, :113 « outils MCP enregistres comme DynTool (uniformite), tous returns_untrusted=true » ; docs/CURRENT_STATUS.md:19).
 
 ##### Le canal provider ne sait emettre que des tools `function` : ni freeform/grammaire, ni web_search hebergee, ni namespace
 
@@ -366,7 +366,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 `moyen` · `absent` · effort `M`
 
-**Impact.** Sur les taches longues, c'est le principal signal de progression rendu dans la TUI et le principal garde-fou contre la derive de l'agent. Son absence coute a la fois en UX (aucune vue du plan) et en qualite d'execution (le modele n'est pas force de materialiser ses etapes). Le PRD TUI parity prevoit du rendu de transcript mais aucune cellule de plan.
+**Impact.** Sur les taches longues, c'est le principal signal de progression rendu dans la TUI et le principal garde-fou contre la derive de l'agent. Son absence coute a la fois en UX (aucune vue du plan) et en qualite d'execution (le modele n'est pas force de materialiser ses etapes). Le cadrage de parite TUI prevoit du rendu de transcript mais aucune cellule de plan.
 
 **Codex.** /home/arthur/dev/codex/codex-rs/core/src/tools/handlers/plan_spec.rs:7-58 - `update_plan(explanation?, plan: [{step, status: pending|in_progress|completed}])`, avec l'invariant « au plus un step in_progress » dans la description ; enregistre sous condition `turn_context.config.update_plan_enabled` (core/src/tools/spec_plan.rs:720-722).
 
@@ -392,7 +392,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-cli/src/main.rs:693-698 - `read`, `glob`, `grep`, `write`, `edit`, `bash` ; /home/arthur/dev/pyxis/crates/agent-cli/src/prompt.rs:28-30 - Pyxis detecte pourtant explicitement les slugs `-codex` pour raccourcir le system prompt, en pariant que « la spec est dans les poids » (prompt.rs:14) ; /home/arthur/dev/pyxis/crates/agent-cli/prompts/codex_finetuned.md:1 - le prompt court re-enumere neanmoins les outils Pyxis (« read, glob, grep, write, edit, bash »), ce qui compense partiellement.
 
-**Statut documentaire.** Le PRD reconnait l'incertitude adjacente sur le traitement du modele (tasks/prd-codex-orchestration.md:320 risque 2 « gpt-5.5 est en realite fine-tune Codex -> prompt long contre-productif », et question ouverte finale « gpt-5.5 est-il traite comme generique ou fine-tune Codex cote backend ? »), mais aucun ADR ne traite l'impact du vocabulaire d'OUTILS sur les modeles fine-tunes.
+**Statut documentaire.** Le cadrage de l'époque reconnait l'incertitude adjacente sur le traitement du modele (risque 2 « gpt-5.5 est en realite fine-tune Codex -> prompt long contre-productif », et question ouverte finale « gpt-5.5 est-il traite comme generique ou fine-tune Codex cote backend ? »), mais aucun ADR ne traite l'impact du vocabulaire d'OUTILS sur les modeles fine-tunes.
 
 ##### Aucune auto-approbation des commandes shell manifestement inoffensives : tout `bash` declenche une confirmation
 
@@ -466,7 +466,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-tools/src/edit.rs:20-25 - `EditInput { path, old_string, new_string }`, une ancre, un fichier ; :110-140 - localisation 4 passes exact/trim_end/trim/Unicode, strictement equivalente a `seek_sequence` cote Codex ; write.rs:33-45 pour la creation ; aucune primitive de suppression ni de rename dans crates/agent-tools/ (grep `delete|rename|move` : rien).
 
-**Statut documentaire.** Rejet explicite et argumente : tasks/prd-codex-orchestration.md:335 « apply_patch format shell-heredoc - Pyxis garde son `Edit` par ancre (rendu fuzzy) ; le format diff multi-op est une optimisation future, pas un prerequis », re-ouvert comme question ouverte a :381 « Faut-il un format diff multi-op (apply_patch-like) a terme ? - a reevaluer apres mesure du taux d'edits multi-hunk sur sessions reelles ».
+**Statut documentaire.** Rejet explicite et argumente dans le cadrage de l'époque : « apply_patch format shell-heredoc - Pyxis garde son `Edit` par ancre (rendu fuzzy) ; le format diff multi-op est une optimisation future, pas un prerequis », re-ouvert comme question ouverte a :381 « Faut-il un format diff multi-op (apply_patch-like) a terme ? - a reevaluer apres mesure du taux d'edits multi-hunk sur sessions reelles ».
 
 ##### Le `strict: true` systematique force tous les parametres optionnels en `required` nullable
 
@@ -518,7 +518,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** Grep `spawn_agent|subagent|sub-agent|multi_agent` sur /home/arthur/dev/pyxis/crates/ : aucun resultat.
 
-**Statut documentaire.** Non-goal explicite : tasks/prd-codex-orchestration.md:334 « Sous-agents / orchestration multi-agent - defere (Phase 2 roadmap) ; le pari est l'excellence single-agent sur Codex d'abord » ; egalement hors scope du PRD TUI (tasks/prd-codex-tui-parity.md:446).
+**Statut documentaire.** Non-goal explicite du cadrage de l'époque : « Sous-agents / orchestration multi-agent - defere (Phase 2 roadmap) ; le pari est l'excellence single-agent sur Codex d'abord » ; egalement hors scope du cadrage de parite TUI.
 
 #### Non applicables à Pyxis
 
@@ -578,7 +578,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-sandbox/src/fs.rs:66-139 : une seule politique en dur (read sur /, write sous workspace). /home/arthur/dev/pyxis/crates/agent-cli/src/main.rs:44-46 et 122-124 : le seul levier est le booleen --no-sandbox. Greps sur 'read-only', 'workspace-write', 'danger-full-access', 'SandboxMode' dans crates/ : aucune occurrence hors les alias de PermissionMode dans settings.rs:29.
 
-**Statut documentaire.** ADR-7 R3 (docs/DECISIONS.md:201) fixe le principe Landlock FS + proxy mais ne tranche pas la question des modes; aucune US du PRD (tasks/prd-pyxis.md:372-382, US-020) ne mentionne de modes de sandbox.
+**Statut documentaire.** ADR-7 R3 (docs/DECISIONS.md:201) fixe le principe Landlock FS + proxy mais ne tranche pas la question des modes; aucun cadrage de l'époque ne mentionne de modes de sandbox.
 
 ##### Aucune classification du risque des commandes shell (safe / dangereuse)
 
@@ -600,7 +600,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** Greps 'execpolicy', 'exec policy', 'Forbidden', 'rules', 'PrefixRule' sur /home/arthur/dev/pyxis/crates et /home/arthur/dev/pyxis/docs : aucune occurrence. Le seul point de decision par outil est `Tool::permission` (crates/agent-tools/src/tool.rs et permission.rs:69-79), qui retourne une constante par outil sans consulter aucune regle utilisateur.
 
-**Statut documentaire.** Aucun ADR de docs/DECISIONS.md ne rejette explicitement un systeme de regles; l absence semble etre un non-dit du scope MVP (tasks/prd-pyxis.md:231-244 decrit le pipeline d outils sans couche de regles).
+**Statut documentaire.** Aucun ADR de docs/DECISIONS.md ne rejette explicitement un systeme de regles; l absence semble etre un non-dit du scope MVP (le cadrage de l'époque decrit le pipeline d outils sans couche de regles).
 
 ##### Pas d escalade apres echec impute au sandbox
 
@@ -1106,7 +1106,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 *Surface Codex.* Codex expose quatre surfaces d'extensibilite distinctes. (1) Skills: unite = un dossier contenant `SKILL.md` plus un manifeste optionnel `agents/openai.yaml` (`/home/arthur/dev/codex/codex-rs/core-skills/src/loader.rs:138-142`); la decouverte parcourt des racines scopees Repo / User / System / Admin derivees de la pile de config (`core-skills/src/loader.rs:291-375`), plus `$HOME/.agents/skills`, `$CODEX_HOME/skills`, `/etc/codex/skills`, les racines `.agents/skills` remontees entre la racine projet et le cwd (`core-skills/src/loader.rs:376-420`) et les racines apportees par les plugins. Le modele recoit un catalogue rendu (nom + description + locator) avec budget de contexte (8000 chars ou 2% de la fenetre, `core-skills/src/render.rs:18-21`), un bloc d'instructions d'usage explicite avec regles de declenchement `$SkillName` et divulgation progressive (`core-skills/src/render.rs:27-45`); le corps du `SKILL.md` mentionne est injecte dans le tour sous marqueurs `<skill>...</skill>` (`core-skills/src/skill_instructions.rs:31-40`, `core-skills/src/injection.rs:26-31`). Metadonnees riches: `SkillPolicy.allow_implicit_invocation`, restriction produit, `SkillInterface` (icones, couleur, prompt par defaut), dependances outils (`skills/src/model.rs:8-92`), regles d'activation persistees (`skills/src/model.rs:100-109`). L'invocation implicite est meme detectee a posteriori quand l'agent lit un `SKILL.md` ou lance un script de `scripts/` (`core-skills/src/invocation_utils.rs:31-44`). Six skills systeme sont embarquees (`skills/src/assets/samples/`: imagegen, openai-docs, plugin-creator, review-agent, skill-creator, skill-installer). (2) Hooks: 11 evenements (`hooks/src/lib.rs:19-32`: PreToolUse, PermissionRequest, PostToolUse, PreCompact, PostCompact, SessionStart, SessionEnd, UserPromptSubmit, SubagentStart, SubagentStop, Stop), declares en `hooks.json` ou dans la config TOML (`hooks/src/engine/discovery.rs:307-311`), avec matchers par outil/trigger, statut de confiance et politique `allow_managed_hooks_only` (`hooks/src/engine/discovery.rs:56-83`). Contrat JSON bidirectionnel: entree typee par evenement, sortie typee capable de bloquer, de reecrire l'input outil et d'injecter du contexte modele (`hooks/src/events/pre_tool_use.rs:38-45` avec `should_block`, `block_reason`, `updated_input`, `additional_contexts`; `hooks/src/schema.rs:127-273`). (3) Plugins: manifeste `plugin.json` (`utils/plugins/src/plugin_namespace.rs:10-13`) empaquetant skills, serveurs MCP, apps et hooks (`plugin/src/manifest.rs:8-38`), gere par `codex plugin add|list|marketplace|remove` (`cli/src/plugin_cmd.rs:48-66`) avec marketplaces, sources npm, catalogue distant et sync au demarrage (`core-plugins/src/`). (4) Commandes: ~65 slash commands builtin (`tui/src/slash_command.rs:12-79`), chacune portant des metadonnees d'availability (args inline, disponibilite pendant un tour, disponibilite en side conversation, visibilite par OS/build: `tui/src/slash_command.rs:153-256`), plus feature-gating dynamique (`tui/src/bottom_pane/slash_commands.rs:70-82`) et commandes de service tier injectees apres `/model`. Deux sigils de mention dans le composer: `@` pour fichiers/plugins, `$` pour outils et skills (`utils/plugins/src/mention_syntax.rs:4-7`, `tui/src/bottom_pane/skill_popup.rs:20-29`). `/skills` ouvre un toggle persistant (`tui/src/bottom_pane/skills_toggle_view.rs:37-43`), `/hooks` un navigateur d'evenements et handlers (`tui/src/bottom_pane/hooks_browser_view.rs:44-50`), `/init` envoie un prompt embarque generant AGENTS.md (`tui/src/chatwidget/slash_dispatch.rs:252-255`). A noter honnetement: Codex n'expose plus de slash commands utilisateur basees sur des fichiers de prompt (`grep custom_prompts` vide dans codex-rs); les skills ont remplace ce mecanisme.
 
-*Surface Pyxis.* Pyxis expose une surface d'extensibilite quasi nulle et une surface de commandes volontairement reduite. Les slash commands sont une table statique de 12 entrees `(nom, description, prend_un_argument)` servant a la fois le menu de completion et le dispatch (`/home/arthur/dev/pyxis/crates/agent-tui/src/state.rs:58-75`): `/help`, `/models`, `/effort`, `/permissions`, `/skills`, `/goal`, `/providers`, `/mcp`, `/resume`, `/new`, `/clear`, `/quit`. Le dispatch vit dans une seule chaine `match` (`crates/agent-cli/src/interactive.rs:682-1060`), avec un garde-fou d'execution pendant un tour pour `/goal`, `/resume`, `/new`, `/clear` (`interactive.rs:819-868`). Le composer supporte des sous-menus a fil d'Ariane multi-niveaux (`/providers subscription codex connect`, `/mcp <serveur> <action>`) que Codex ne modelise pas de facon aussi uniforme (`crates/agent-tui/src/state.rs:1500-1522`), et les mentions fichier `@chemin` existent (`state.rs:1478-1491`). Les "skills" Pyxis ne sont qu'une liste de noms de dossiers: `read_skills()` liste les sous-dossiers de `~/.agents/skills` et n'ouvre aucun fichier (`crates/agent-cli/src/main.rs:511-528`). `/skills <filtre>` ouvre un sous-menu de filtrage (`state.rs:1294-1298`) dont la validation **insere du texte** `"/<nom> "` dans le message (`state.rs:1508`, `state.rs:1556-1562`); ce token est ensuite explicitement traite comme non-commande et part tel quel au modele (`state.rs:360-364`), avec un simple surlignage visuel de "chip" (`crates/agent-tui/src/render.rs:1445-1471`). Taper `/skills` sans argument ne fait qu'afficher une notice (`interactive.rs:1049-1051`). Aucun `SKILL.md` n'est lu, aucun catalogue n'est injecte: le contexte modele se limite a AGENTS.md/CLAUDE.md plus un bloc `<environment>` (`crates/agent-cli/src/context.rs:17-33`). Il n'existe aucun moteur de hooks: `agent-tools` ne contient aucune occurrence de "hook" alors que `docs/ARCHITECTURE.md:351-359` decrit un pipeline `hooks PreToolUse -> permissions -> call() -> taint -> hooks PostToolUse`; seule la couche de rendu TUI possede `HookCell` et `TranscriptPayload::HookRun` (`crates/agent-tui/src/history_cell.rs:1522-1531`), construits uniquement depuis des tests. Aucune notion de plugin (`grep -rni plugin --include=*.rs crates/` = 0 hit) ni de marketplace. La configuration utilisateur persistee se limite a trois cles dans `~/.pyxis/settings.toml` (mode de permission, effort, modele: `crates/agent-cli/src/settings.rs:34-68`). MCP est configurable via `.mcp.json` / `~/.claude.json` mais reste de l'inspection: les outils MCP ne sont pas exposes au modele (`docs/CURRENT_STATUS.md:12`). Le report est assume et documente: `docs/ROADMAP.md:87` et `:114` placent "Skills / commands + hooks utilisateur" en Phase 2, `tasks/prd-pyxis.md:446` les liste comme differes, et `docs/codex-port-inventory.md:64` classe l'emission de hooks en `skip`.
+*Surface Pyxis.* Pyxis expose une surface d'extensibilite quasi nulle et une surface de commandes volontairement reduite. Les slash commands sont une table statique de 12 entrees `(nom, description, prend_un_argument)` servant a la fois le menu de completion et le dispatch (`/home/arthur/dev/pyxis/crates/agent-tui/src/state.rs:58-75`): `/help`, `/models`, `/effort`, `/permissions`, `/skills`, `/goal`, `/providers`, `/mcp`, `/resume`, `/new`, `/clear`, `/quit`. Le dispatch vit dans une seule chaine `match` (`crates/agent-cli/src/interactive.rs:682-1060`), avec un garde-fou d'execution pendant un tour pour `/goal`, `/resume`, `/new`, `/clear` (`interactive.rs:819-868`). Le composer supporte des sous-menus a fil d'Ariane multi-niveaux (`/providers subscription codex connect`, `/mcp <serveur> <action>`) que Codex ne modelise pas de facon aussi uniforme (`crates/agent-tui/src/state.rs:1500-1522`), et les mentions fichier `@chemin` existent (`state.rs:1478-1491`). Les "skills" Pyxis ne sont qu'une liste de noms de dossiers: `read_skills()` liste les sous-dossiers de `~/.agents/skills` et n'ouvre aucun fichier (`crates/agent-cli/src/main.rs:511-528`). `/skills <filtre>` ouvre un sous-menu de filtrage (`state.rs:1294-1298`) dont la validation **insere du texte** `"/<nom> "` dans le message (`state.rs:1508`, `state.rs:1556-1562`); ce token est ensuite explicitement traite comme non-commande et part tel quel au modele (`state.rs:360-364`), avec un simple surlignage visuel de "chip" (`crates/agent-tui/src/render.rs:1445-1471`). Taper `/skills` sans argument ne fait qu'afficher une notice (`interactive.rs:1049-1051`). Aucun `SKILL.md` n'est lu, aucun catalogue n'est injecte: le contexte modele se limite a AGENTS.md/CLAUDE.md plus un bloc `<environment>` (`crates/agent-cli/src/context.rs:17-33`). Il n'existe aucun moteur de hooks: `agent-tools` ne contient aucune occurrence de "hook" alors que `docs/ARCHITECTURE.md:351-359` decrit un pipeline `hooks PreToolUse -> permissions -> call() -> taint -> hooks PostToolUse`; seule la couche de rendu TUI possede `HookCell` et `TranscriptPayload::HookRun` (`crates/agent-tui/src/history_cell.rs:1522-1531`), construits uniquement depuis des tests. Aucune notion de plugin (`grep -rni plugin --include=*.rs crates/` = 0 hit) ni de marketplace. La configuration utilisateur persistee se limite a trois cles dans `~/.pyxis/settings.toml` (mode de permission, effort, modele: `crates/agent-cli/src/settings.rs:34-68`). MCP est configurable via `.mcp.json` / `~/.claude.json` mais reste de l'inspection: les outils MCP ne sont pas exposes au modele (`docs/CURRENT_STATUS.md:12`). Le report est assume et documente: `docs/ROADMAP.md:87` et `:114` placent "Skills / commands + hooks utilisateur" en Phase 2, le cadrage de l'époque les liste comme differes, et `docs/codex-port-inventory.md:64` classe l'emission de hooks en `skip`.
 
 #### Écarts pertinents
 
@@ -1120,7 +1120,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-cli/src/main.rs:513-528 read_skills() ne fait que read_dir + file_name; `grep -rn "SKILL.md" --include=*.rs crates/` = 0 hit, `grep -rni "frontmatter|serde_yaml" --include=*.rs crates/` = 1 hit non lie
 
-**Statut documentaire.** docs/ROADMAP.md:114 et tasks/prd-pyxis.md:446 placent skills/commands/hooks en Phase 2: report assume, pas rejet
+**Statut documentaire.** docs/ROADMAP.md:114 et le cadrage de l'époque placent skills/commands/hooks en Phase 2: report assume, pas rejet
 
 ##### Le catalogue de skills n'est jamais expose au modele
 
@@ -1152,9 +1152,9 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Codex.** /home/arthur/dev/codex/codex-rs/hooks/src/lib.rs:19-32 declare PreToolUse, PermissionRequest, PostToolUse, PreCompact, PostCompact, SessionStart, SessionEnd, UserPromptSubmit, SubagentStart, SubagentStop, Stop; hooks/src/engine/discovery.rs:307-311 charge hooks.json depuis chaque dossier de config
 
-**Pyxis.** `grep -rni hook --include=*.rs crates/agent-tools crates/agent-core crates/agent-cli` = 0 hit; docs/ARCHITECTURE.md:351-359 decrit pourtant `hooks PreToolUse -> permissions -> call() -> taint -> hooks PostToolUse`; tasks/prd-pyxis.md:244 et :395 posent la meme exigence non implementee
+**Pyxis.** `grep -rni hook --include=*.rs crates/agent-tools crates/agent-core crates/agent-cli` = 0 hit; docs/ARCHITECTURE.md:351-359 decrit pourtant `hooks PreToolUse -> permissions -> call() -> taint -> hooks PostToolUse`; le cadrage de l'époque pose la meme exigence non implementee
 
-**Statut documentaire.** docs/ROADMAP.md:114 et tasks/prd-pyxis.md:446 reportent explicitement les hooks utilisateur en Phase 2
+**Statut documentaire.** docs/ROADMAP.md:114 et le cadrage de l'époque reportent explicitement les hooks utilisateur en Phase 2
 
 ##### MCP configurable mais non branche sur le modele: extensibilite par serveur inoperante
 
@@ -1188,7 +1188,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-tui/src/state.rs:58-75 liste exactement /help, /models, /effort, /permissions, /skills, /goal, /providers, /mcp, /resume, /new, /clear, /quit; dispatch a crates/agent-cli/src/interactive.rs:682-1060
 
-**Statut documentaire.** tasks/prd-codex-tui-parity.md:375 exige seulement la preservation des commandes existantes, pas l'ajout des commandes Codex manquantes
+**Statut documentaire.** Le cadrage de parite TUI exige seulement la preservation des commandes existantes, pas l'ajout des commandes Codex manquantes
 
 ##### Le rendu de hooks est deja porte mais aucun evenement ne l'alimente
 
@@ -1274,7 +1274,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 #### Écarts réfutés en vérification
 
 - **Slash commands utilisateur par fichiers de prompt: absentes des deux cotes** : Ce n'est pas un ecart Pyxis vs Codex: la capacite est absente des DEUX cotes, l'auditeur le dit lui-meme. Verifie cote Codex: `grep -rn "custom_prompts|CUSTOM_PROMPTS" --include=*.rs /home/arthur/dev/codex/codex-rs` = 0 hit. Verifie cote Pyxis: /home/arthur/dev/pyxis/crates/agent-cli/src/prompt.rs:11-14 (GPT5_GENERIC et CODEX_FINETUNED en include_str!) et prompt.rs:22-28 select_system_prompt(). Un item symetrique ne peut pas figurer dans un inventaire d'ecarts -> refute comme ecart.
-- **Commandes Codex liees a l'infra ou aux plateformes OpenAI** : Refute comme ecart: l'auditeur conclut lui-meme "aucun equivalent attendu". Les commandes citees relevent de l'infra OpenAI (/apps connectors, /feedback, /import Claude Code, codex cloud), du support macOS/Windows (/app gate a codex-rs/tui/src/slash_command.rs:252) ou des sous-agents (/agent, /subagents, enum a slash_command.rs:38 et :72-74), tous hors scope declare: /home/arthur/dev/pyxis/docs/ROADMAP.md:96 (Linux uniquement, distribution Phase 3), ROADMAP.md:87-92 (mono-provider, sous-agents exclus), tasks/prd-pyxis.md:446 (sous-agents/teams Phase 2). Aucune action a tirer -> non-applicable.
+- **Commandes Codex liees a l'infra ou aux plateformes OpenAI** : Refute comme ecart: l'auditeur conclut lui-meme "aucun equivalent attendu". Les commandes citees relevent de l'infra OpenAI (/apps connectors, /feedback, /import Claude Code, codex cloud), du support macOS/Windows (/app gate a codex-rs/tui/src/slash_command.rs:252) ou des sous-agents (/agent, /subagents, enum a slash_command.rs:38 et :72-74), tous hors scope declare: /home/arthur/dev/pyxis/docs/ROADMAP.md:96 (Linux uniquement, distribution Phase 3), ROADMAP.md:87-92 (mono-provider, sous-agents exclus), le cadrage de l'époque (sous-agents/teams Phase 2). Aucune action a tirer -> non-applicable.
 
 ### MCP
 
@@ -1282,7 +1282,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 *Surface Codex.* Codex traite MCP comme un sous-système de premier plan réparti sur ~34k lignes: `codex-rs/rmcp-client/` (13.5k, transports + OAuth), `codex-rs/codex-mcp/` (12.8k, connection manager, catalogue d'outils, elicitation), `codex-rs/mcp-server/` (3.5k, Codex exposé EN TANT QUE serveur MCP) et `codex-rs/connectors/` (4.8k, annuaire ChatGPT Apps, infra OpenAI). Deux transports client: stdio (`codex-rs/rmcp-client/src/rmcp_client.rs:356`, avec launcher local ou via exec-server) et Streamable HTTP (`rmcp_client.rs:391`); SSE n'est pas un transport autonome mais le mode de réponse du Streamable HTTP (`codex-rs/rmcp-client/src/http_client_adapter.rs:213`, erreur `ServerDoesNotSupportSse` en `:345`). La config par serveur est très riche (`codex-rs/config/src/mcp_types.rs:156-223`): `auth` (oauth|chatgpt), `environment_id`, `enabled`, `required`, `supports_parallel_tool_calls`, `startup_timeout_sec`, `tool_timeout_sec`, `default_tools_approval_mode`, `enabled_tools`/`disabled_tools`, `scopes`, `oauth.client_id`, `oauth_resource` (RFC 8707), et `tools` (approbation par outil). OAuth complet et persistant: `codex-rs/rmcp-client/src/oauth.rs` (1458 l.), `perform_oauth_login.rs` (944 l.), store keyring avec verrou et transaction de refresh (`oauth/store_lock.rs`, `oauth/refresh_transaction.rs`), découverte du statut d'auth (`auth_status.rs:1-535`). L'exposition au modèle passe par une normalisation dédiée (`codex-rs/codex-mcp/src/tools.rs:113-214`): sanitisation Responses API, préfixe historique `mcp__` optionnel, namespace + nom séparés, dédoublonnage par suffixe SHA1 12 chars, plafond 64 octets, plus un filtre allowlist/denylist (`tools.rs:66-103`). Chaque outil MCP devient un handler du routeur d'outils (`codex-rs/core/src/tools/handlers/mcp.rs:32-120`), avec hooks pre/post tool use, parallélisme conditionné au `readOnlyHint`, et une politique d'approbation dérivée des annotations MCP croisée avec 4 modes (`codex-rs/core/src/mcp_tool_call.rs:2156-2187`). Timeouts par défaut 30s startup / 300s appel (`codex-rs/codex-mcp/src/rmcp_client.rs:88-89`), troncature des résultats pour les événements (`mcp_tool_call.rs:106,850-890`) et filtrage des contenus image selon les modalités du modèle (`mcp_tool_call.rs:815-830`). Les ressources MCP sont elles aussi des outils modèle (`codex-rs/core/src/tools/handlers/mcp_resource.rs:30-35`: list_mcp_resources, list_mcp_resource_templates, read_mcp_resource) au-dessus de `rmcp_client.rs:557-603`. L'elicitation serveur→client est implémentée et arbitrée par le guardian (`codex-rs/rmcp-client/src/elicitation_client_service.rs`, `codex-rs/codex-mcp/src/elicitation.rs`, `codex-rs/core/src/session/mcp.rs:381-505`), les notifications progress/logging sont consommées (`codex-rs/rmcp-client/src/logging_client_handler.rs:63,98`) et il existe une échappatoire notification/requête custom (`rmcp_client.rs:663,693`). Côté gestion: sous-commande `codex mcp list|get|add|remove|login|logout` (`codex-rs/cli/src/mcp_cmd.rs:54-169`), surface app-server (`codex-rs/app-server-protocol/src/protocol/common.rs:993-1017,1519,1702-1704`: oauth/login, reload, status list, resource/read, tool/call, elicitation, progress), serveurs MCP fournis par plugins via `.mcp.json` (`codex-rs/codex-mcp/src/plugin_config.rs:37-49`) et désactivation par requirements admin (`codex-rs/config/src/mcp_requirements.rs`, raison exposée en `mcp_types.rs:36-52`). Enfin Codex est lui-même un serveur MCP stdio exposant les outils `codex` et `codex-reply` (`codex-rs/mcp-server/src/lib.rs:1-58`, `codex_tool_config.rs:106-118`), avec approbations exec/patch via elicitation et gestion de `prompts/list` / `prompts/get` (`codex-rs/mcp-server/src/message_processor.rs:319-323`).
 
-*Surface Pyxis.* Pyxis a un crate `crates/agent-mcp/` de 711 lignes de source (client 164, config 300, server 225, error 22) qui couvre exactement trois choses: parser la config, spawner un serveur stdio, lister ses outils. Le transport est stdio uniquement via `TokioChildProcess` (`crates/agent-mcp/src/client.rs:95`), avec handshake `initialize` borné à 30s et `list_tools` borné à 10s (`client.rs:41-42`), descriptions plafonnées à 2048 chars (`client.rs:46`). Le handler client rmcp est le type unité `()` (`client.rs:51,103`), donc aucune notification, elicitation, sampling ou roots n'est traité. La config lit `.mcp.json` du workspace puis les `mcpServers` de `~/.claude.json` en user-scope, avec fusion priorisée et diagnostics de shadowing (`crates/agent-mcp/src/config.rs:147-177`); toute entrée sans `command` est classée `UnsupportedTransport` et conservée en diagnostic (`config.rs:219-225`), tout comme `disabled`, commande vide et entrée invalide. Le registre est un enum d'état discriminé Disconnected/Connecting/Connected/Failed où la connexion n'existe que dans `Connected` (`crates/agent-mcp/src/server.rs:12-28`), avec transitions synchrones et récupération de l'ancienne connexion au reconnect. Côté UI, `/mcp` offre list/connect/reconnect/trust/disconnect/tools/issues (`crates/agent-cli/src/interactive.rs:1306-1387`), mais l'ensemble des actions de connexion est verrouillé derrière la variable d'environnement `PYXIS_EXPERIMENTAL_MCP_CONNECT` (`interactive.rs:1390-1392`). Point tranché sans ambiguïté: **aucun outil MCP n'est exposé à la boucle du modèle**. Le grep `call_tool|CallTool` ne renvoie rien sur tout le dépôt Pyxis; `McpConnection` n'expose que `connect`, `connect_hardened`, `list_tools`, `cancel` (`client.rs:69-155`); `McpToolInfo` conserve les schémas explicitement pour « une future exposition modèle via adapter strict » (`client.rs:54-56`); `Registry::register_dyn` existe avec le commentaire « futur outil MCP » (`crates/agent-tools/src/registry.rs:432-433`) et n'est appelé nulle part. La TUI contient même des cellules `McpToolCell`/`McpInvocation` portées de Codex (`crates/agent-tui/src/history_cell.rs:1929-1996,3512`) qu'aucun émetteur d'événement n'alimente. Les docs sont honnêtes sur cet état: `docs/CURRENT_STATUS.md:12` (« MCP tools are not yet exposed as callable model tools »), `docs/ARCHITECTURE.md:405,423-424`, `docs/ROADMAP.md:86,113`, `tasks/prd-codex-orchestration.md:338`. Deux points où Pyxis fait mieux que Codex: un gate de confiance pré-spawn qui bloque tout serveur d'origine workspace, tout serveur qui masque une config user, ou tout serveur injectant des variables d'env sensibles (PATH, LD_PRELOAD, NODE_OPTIONS, PYTHONPATH…), avec affichage de la commande, des args et des clés d'env avant confirmation, plus une re-vérification TOCTOU de la config au moment du spawn (`interactive.rs:1312-1321,1408-1424,1510-1538`); et un durcissement du sous-process réutilisant le `CommandHardener` des outils Bash avec filtrage des clés proxy pour éviter les bypass via `NO_PROXY`/`ALL_PROXY` (`client.rs:79-94,166-171`).
+*Surface Pyxis.* Pyxis a un crate `crates/agent-mcp/` de 711 lignes de source (client 164, config 300, server 225, error 22) qui couvre exactement trois choses: parser la config, spawner un serveur stdio, lister ses outils. Le transport est stdio uniquement via `TokioChildProcess` (`crates/agent-mcp/src/client.rs:95`), avec handshake `initialize` borné à 30s et `list_tools` borné à 10s (`client.rs:41-42`), descriptions plafonnées à 2048 chars (`client.rs:46`). Le handler client rmcp est le type unité `()` (`client.rs:51,103`), donc aucune notification, elicitation, sampling ou roots n'est traité. La config lit `.mcp.json` du workspace puis les `mcpServers` de `~/.claude.json` en user-scope, avec fusion priorisée et diagnostics de shadowing (`crates/agent-mcp/src/config.rs:147-177`); toute entrée sans `command` est classée `UnsupportedTransport` et conservée en diagnostic (`config.rs:219-225`), tout comme `disabled`, commande vide et entrée invalide. Le registre est un enum d'état discriminé Disconnected/Connecting/Connected/Failed où la connexion n'existe que dans `Connected` (`crates/agent-mcp/src/server.rs:12-28`), avec transitions synchrones et récupération de l'ancienne connexion au reconnect. Côté UI, `/mcp` offre list/connect/reconnect/trust/disconnect/tools/issues (`crates/agent-cli/src/interactive.rs:1306-1387`), mais l'ensemble des actions de connexion est verrouillé derrière la variable d'environnement `PYXIS_EXPERIMENTAL_MCP_CONNECT` (`interactive.rs:1390-1392`). Point tranché sans ambiguïté: **aucun outil MCP n'est exposé à la boucle du modèle**. Le grep `call_tool|CallTool` ne renvoie rien sur tout le dépôt Pyxis; `McpConnection` n'expose que `connect`, `connect_hardened`, `list_tools`, `cancel` (`client.rs:69-155`); `McpToolInfo` conserve les schémas explicitement pour « une future exposition modèle via adapter strict » (`client.rs:54-56`); `Registry::register_dyn` existe avec le commentaire « futur outil MCP » (`crates/agent-tools/src/registry.rs:432-433`) et n'est appelé nulle part. La TUI contient même des cellules `McpToolCell`/`McpInvocation` portées de Codex (`crates/agent-tui/src/history_cell.rs:1929-1996,3512`) qu'aucun émetteur d'événement n'alimente. Les docs sont honnêtes sur cet état: `docs/CURRENT_STATUS.md:12` (« MCP tools are not yet exposed as callable model tools »), `docs/ARCHITECTURE.md:405,423-424`, `docs/ROADMAP.md:86,113`. Deux points où Pyxis fait mieux que Codex: un gate de confiance pré-spawn qui bloque tout serveur d'origine workspace, tout serveur qui masque une config user, ou tout serveur injectant des variables d'env sensibles (PATH, LD_PRELOAD, NODE_OPTIONS, PYTHONPATH…), avec affichage de la commande, des args et des clés d'env avant confirmation, plus une re-vérification TOCTOU de la config au moment du spawn (`interactive.rs:1312-1321,1408-1424,1510-1538`); et un durcissement du sous-process réutilisant le `CommandHardener` des outils Bash avec filtrage des clés proxy pour éviter les bypass via `NO_PROXY`/`ALL_PROXY` (`client.rs:79-94,166-171`).
 
 #### Écarts pertinents
 
@@ -1296,7 +1296,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** Aucun `call_tool` dans tout le dépôt Pyxis (grep -rn "call_tool\|CallTool" --include=*.rs → 0 résultat). crates/agent-mcp/src/client.rs:69-155 n'expose que connect/connect_hardened/list_tools/cancel. crates/agent-tools/src/registry.rs:432-433 a un `register_dyn` commenté « futur outil MCP » jamais appelé. docs/CURRENT_STATUS.md:12 le confirme explicitement.
 
-**Statut documentaire.** Déjà connu et planifié: docs/CURRENT_STATUS.md:19 et docs/ROADMAP.md:86,113 le mettent en Phase 2; tasks/prd-pyxis.md:434 le classe risque n°6 « MCP absent au MVP (table-stake 2026) », bloquant pour la promo publique mais pas pour le dogfood. tasks/prd-codex-orchestration.md:338 l'exclut explicitement de son scope.
+**Statut documentaire.** Déjà connu et planifié: docs/CURRENT_STATUS.md:19 et docs/ROADMAP.md:86,113 le mettent en Phase 2; le cadrage produit de l'époque le classe risque n°6 « MCP absent au MVP (table-stake 2026) », bloquant pour la promo publique mais pas pour le dogfood, et l'exclut explicitement de son scope.
 
 ##### Toute connexion MCP est verrouillée derrière une variable d'environnement expérimentale, sans auto-connexion au démarrage
 
@@ -1400,9 +1400,9 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Codex.** codex-rs/rmcp-client/src/elicitation_client_service.rs:1-320 et codex-rs/codex-mcp/src/elicitation.rs:1-342 implémentent la boucle d'elicitation; l'arbitrage passe par le guardian et l'UI (codex-rs/core/src/session/mcp.rs:381-505), avec exposition protocolaire `mcpServer/elicitation/request` (codex-rs/app-server-protocol/src/protocol/common.rs:1519) et auth-elicitation dédiée (codex-rs/codex-mcp/src/auth_elicitation.rs:1-347).
 
-**Pyxis.** crates/agent-mcp/src/client.rs:51,103: le handler client rmcp est le type unité `()`, donc l'implémentation par défaut décline toute elicitation. Grep `elicit` dans crates/ → 0 résultat côté code (seule tasks/prd-codex-tui-parity.md:321 l'évoque comme cible UI future).
+**Pyxis.** crates/agent-mcp/src/client.rs:51,103: le handler client rmcp est le type unité `()`, donc l'implémentation par défaut décline toute elicitation. Grep `elicit` dans crates/ → 0 résultat côté code (seul le cadrage de parite TUI l'évoque comme cible UI future).
 
-**Statut documentaire.** tasks/prd-codex-tui-parity.md:321 prévoit une overlay d'approbation unifiée incluant « MCP elicitation », donc le besoin est identifié côté UI mais rien n'existe côté protocole.
+**Statut documentaire.** Le cadrage de parite TUI prévoit une overlay d'approbation unifiée incluant « MCP elicitation », donc le besoin est identifié côté UI mais rien n'existe côté protocole.
 
 ##### Notifications MCP (progress, logging, tools/list_changed) non consommées
 
@@ -1460,7 +1460,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** Rien à tronquer côté Pyxis puisqu'aucun appel n'existe (crates/agent-mcp/src/client.rs:69-155). Le seul plafond MCP existant est DESCRIPTION_CAP=2048 sur les descriptions d'outils (client.rs:46,136), pas sur les résultats. Pyxis a bien une politique de troncature d'outils natifs (crates/agent-tools/) mais rien de spécifique MCP.
 
-**Statut documentaire.** tasks/prd-pyxis.md:16 identifie les « coûts runaway » comme mode d'échec majeur, ce qui rend l'absence de plafond MCP cohérente à corriger au moment du câblage.
+**Statut documentaire.** Le cadrage de l'époque identifie les « coûts runaway » comme mode d'échec majeur, ce qui rend l'absence de plafond MCP cohérente à corriger au moment du câblage.
 
 ##### Pyxis ne peut pas être exposé comme serveur MCP
 
@@ -1519,7 +1519,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-tui/src/state.rs:580 `pub context_pct: Option<u8>` et /home/arthur/dev/pyxis/crates/agent-tui/src/render.rs:1497-1499 + `context_gauge` ligne 1572 rendent la jauge. Mais `grep -rn context_pct /home/arthur/dev/pyxis/crates/` ne trouve AUCUNE affectation hors `agent-tui/examples/{welcome,transcript,input}.rs` : en runtime réel le champ reste `None` et le segment est masqué. Cause racine : `AgentEvent` (/home/arthur/dev/pyxis/crates/agent-core/src/event.rs:13-34) n'a aucune variante portant `TokenUsage` ou l'état du budget, alors que `ContextBudget` connaît `current_input`, `max_context` et `prefill_input` (`agent-core/src/budget.rs:64-81`).
 
-**Statut documentaire.** prd-codex-tui-parity.md:343 mentionne « Given des compteurs tokens ou usage disponibles, when le stream se termine, then le pending usage output est insere » - l'AC existe mais le canal `AgentEvent` n'a pas été créé.
+**Statut documentaire.** Le cadrage de parite TUI mentionne « Given des compteurs tokens ou usage disponibles, when le stream se termine, then le pending usage output est insere » - l'AC existe mais le canal `AgentEvent` n'a pas été créé.
 
 ##### Aucun rollback de tours (édition d'un message précédent)
 
@@ -1629,7 +1629,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 *Surface Codex.* Codex expose ~150 modules TUI sous /home/arthur/dev/codex/codex-rs/tui/src/. Le composer (bottom_pane/chat_composer.rs, 12455 l., adosse a bottom_pane/textarea.rs, 3919 l.) est un editeur multiligne complet: newline explicite (keymap.rs:963-969, Ctrl+J/Ctrl+M/Shift+Enter/Alt+Enter), motions mot (keymap.rs:973-983), kill/yank Ctrl+U/Ctrl+K/Ctrl+Y (keymap.rs:1013-1016), mode Vim complet (keymap.rs:141-212, 1019-1105), recherche d'historique inverse Ctrl+R/Ctrl+S (keymap.rs:958-959), overlay de raccourcis sur `?` (keymap.rs:955-957, bottom_pane/footer.rs:168), placeholder `[Pasted Content N chars]` pour gros collages (chat_composer.rs:1086-1090), detection de paste-burst non-bracketed (bottom_pane/paste_burst.rs, 580 l.), pieces jointes image par collage presse-papier (clipboard_paste.rs:51) ou par chemin colle/drag-and-drop (chat_composer.rs:1103-1124, normalize_pasted_path clipboard_paste.rs:251), et lignes `[Image #N]` navigables. Les mentions `@` passent par une session de recherche floue asynchrone relancee a chaque frappe (file_search.rs:16-60, bottom_pane/file_search_popup.rs). Autour: overlay pager/transcript avec tail live (pager_overlay.rs, 1612 l.), backtrack Esc-Esc qui forke avant un message utilisateur et le recharge dans le composer (app_backtrack.rs:1-22), overlay d'approbation a decisions multiples (approval_overlay.rs:810-823, keymap.rs:253-266: approve / approve_for_session / approve_for_prefix / deny / decline / cancel / fullscreen), widget de plan (history_cell/plans.rs, /plan), rendu de diff dedie (diff_render.rs, 2559 l.), indicateur de contexte restant (footer.rs:998-1009) et de rate limits (status/rate_limits.rs, chatwidget/rate_limits.rs:10-13 seuils 75/90/95), status line reconfigurable (/statusline, bottom_pane/status_line_setup.rs:1-20), ~50 slash commands (slash_command.rs:15-78) dont /diff (get_git_diff.rs), /status (status/card.rs), /usage, /copy (clipboard_copy.rs), /theme (theme_picker.rs), /keymap, /vim. Cote terminal: titre de fenetre OSC (terminal_title.rs, pose depuis chatwidget/status_surfaces.rs:246), notifications OSC 9 ou BEL selon detection (notifications/mod.rs:19-30, chatwidget/notifications.rs:6-21), sondes OSC 10/11 bornees a 100 ms (terminal_probe.rs), niveaux de couleur (terminal_palette.rs), editeur externe Ctrl+G (external_editor.rs, keymap.rs:934), mode raw scrollback Alt+R pour la selection souris (chatwidget.rs:1574-1617), reflow du scrollback au resize avec debounce 75 ms et cap de lignes par terminal (app/resize_reflow.rs, transcript_reflow.rs:19, resize_reflow_cap.rs), rendu ANSI des sorties de commande (codex-ansi-escape via exec_cell/render.rs:134). Aucune capture souris n'est activee: Codex s'appuie sur le scrollback natif.
 
-*Surface Pyxis.* Pyxis concentre son TUI dans 20 modules (~15 000 l.) sous /home/arthur/dev/pyxis/crates/agent-tui/src/ plus la boucle d'orchestration crates/agent-cli/src/interactive.rs (1828 l.). Le feature `codex_tui_parity` est actif par defaut (crates/agent-tui/Cargo.toml:11-13) et fournit un vrai socle: viewport inline avec insertion des cellules finalisees dans le scrollback natif (term.rs:39-63, insert_history.rs, interactive.rs:589-596), ChatSurface/HistoryCell (history_cell.rs, 6387 l.), StreamController stable-prefix (streaming.rs), markdown avec coloration syntaxique syntect (markdown.rs, highlight.rs), hyperlinks OSC 8 hors mesure de largeur (terminal_hyperlinks.rs:1-22), moteur de diff partage entre transcript et dialog de permission (diff.rs, render.rs:1600-1615). Le composer est un `String` mono-ligne avec curseur en offset UTF-8 (state.rs:556-565, render.rs:1395-1400, INPUT_HEIGHT=4 render.rs:26): Entree soumet toujours (state.rs:1717-1732), les seuls raccourcis d'edition sont Ctrl+A/E/U/W (state.rs:1689-1711), fleches Haut/Bas parcourent l'historique de prompts agrege par dossier (state.rs:1766-1773, interactive.rs:467-471). Les menus de completion (slash, /models, /effort, /permissions, /skills, /resume, /providers, /mcp, mentions `@`) sont rendus inline au-dessus du composer (render.rs:594, state.rs:1212-1317) et pilotes par filtre `starts_with`/`contains`. Le reste des capacites: overlay transcript Ctrl+T avec navigation vi (state.rs:1786-1825), pill « nouveaux blocs » quand on a remonte le fil (render.rs:767), spinner shimmer avec reduced-motion (spinner.rs, render.rs:1540-1569), status line modele/effort/workspace/mode de permission (render.rs:1480-1519), dialog de permission binaire o/n avec apercu diff borne (state.rs:1623-1639, render.rs:1577-1626), assainissement integral des familles d'echappement ANSI dans tout le contenu affiche (render.rs:1264-1290), realignement du viewport inline quand le terminal grandit (term.rs:120-139). Le PRD tasks/prd-codex-tui-parity.md est marque DONE sur ses 18 stories, mais le `BottomPane` porte (bottom_pane.rs:56-161) ne recoit jamais de vue (seuls appels: interactive.rs:496/628/649) et n'est jamais rendu par render_parity (render.rs:76-160): les overlays de type ListSelectionView/approval restent de l'infrastructure morte.
+*Surface Pyxis.* Pyxis concentre son TUI dans 20 modules (~15 000 l.) sous /home/arthur/dev/pyxis/crates/agent-tui/src/ plus la boucle d'orchestration crates/agent-cli/src/interactive.rs (1828 l.). Le feature `codex_tui_parity` est actif par defaut (crates/agent-tui/Cargo.toml:11-13) et fournit un vrai socle: viewport inline avec insertion des cellules finalisees dans le scrollback natif (term.rs:39-63, insert_history.rs, interactive.rs:589-596), ChatSurface/HistoryCell (history_cell.rs, 6387 l.), StreamController stable-prefix (streaming.rs), markdown avec coloration syntaxique syntect (markdown.rs, highlight.rs), hyperlinks OSC 8 hors mesure de largeur (terminal_hyperlinks.rs:1-22), moteur de diff partage entre transcript et dialog de permission (diff.rs, render.rs:1600-1615). Le composer est un `String` mono-ligne avec curseur en offset UTF-8 (state.rs:556-565, render.rs:1395-1400, INPUT_HEIGHT=4 render.rs:26): Entree soumet toujours (state.rs:1717-1732), les seuls raccourcis d'edition sont Ctrl+A/E/U/W (state.rs:1689-1711), fleches Haut/Bas parcourent l'historique de prompts agrege par dossier (state.rs:1766-1773, interactive.rs:467-471). Les menus de completion (slash, /models, /effort, /permissions, /skills, /resume, /providers, /mcp, mentions `@`) sont rendus inline au-dessus du composer (render.rs:594, state.rs:1212-1317) et pilotes par filtre `starts_with`/`contains`. Le reste des capacites: overlay transcript Ctrl+T avec navigation vi (state.rs:1786-1825), pill « nouveaux blocs » quand on a remonte le fil (render.rs:767), spinner shimmer avec reduced-motion (spinner.rs, render.rs:1540-1569), status line modele/effort/workspace/mode de permission (render.rs:1480-1519), dialog de permission binaire o/n avec apercu diff borne (state.rs:1623-1639, render.rs:1577-1626), assainissement integral des familles d'echappement ANSI dans tout le contenu affiche (render.rs:1264-1290), realignement du viewport inline quand le terminal grandit (term.rs:120-139). Le cadrage de parite TUI est marque entierement livre, mais le `BottomPane` porte (bottom_pane.rs:56-161) ne recoit jamais de vue (seuls appels: interactive.rs:496/628/649) et n'est jamais rendu par render_parity (render.rs:76-160): les overlays de type ListSelectionView/approval restent de l'infrastructure morte.
 
 #### Écarts pertinents
 
@@ -1643,7 +1643,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-tui/src/state.rs:1717-1732 : `KeyCode::Enter` soumet toujours, aucune branche d'insertion de '\n' ; /home/arthur/dev/pyxis/crates/agent-tui/src/render.rs:1395-1400 : la zone de saisie fait exactement 1 ligne. Greps infructueux : `insert_newline`, `Shift.*Enter`, `alt\(KeyCode::Enter\)`, `'\\n'` dans state.rs
 
-**Statut documentaire.** tasks/prd-codex-tui-parity.md:365-377 (US-017 « Port du composer Codex ») est marque DONE dans tasks/prd-codex-tui-parity-status.json alors que le composer Codex n'a pas ete porte ; aucune divergence n'est documentee dans docs/CURRENT_STATUS.md comme l'exigeait le dernier critere d'acceptation.
+**Statut documentaire.** Le cadrage de l'époque (« Port du composer Codex ») est marque DONE dans son suivi alors que le composer Codex n'a pas ete porte ; aucune divergence n'est documentee dans docs/CURRENT_STATUS.md comme l'exigeait le dernier critere d'acceptation.
 
 ##### Saisie longue tronquee : ni wrap ni defilement horizontal
 
@@ -1685,7 +1685,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-tui/src/term.rs:120-139 : `sync_inline_viewport` reconstruit uniquement le `Terminal` inline et efface l'ecran visible, sans reemettre les cellules ; /home/arthur/dev/pyxis/crates/agent-cli/src/interactive.rs:567-575 : en cas d'echec, la synchro est desactivee pour la session avec le message « Restart Pyxis after resizing »
 
-**Statut documentaire.** tasks/prd-codex-tui-parity.md:419 liste « Resize during stream » comme cas limite attendu (« Stream source re-renders »), mais la reemission du scrollback n'est pas implementee.
+**Statut documentaire.** Le cadrage de parite TUI liste « Resize during stream » comme cas limite attendu (« Stream source re-renders »), mais la reemission du scrollback n'est pas implementee.
 
 ##### Mentions @ : instantane fige de 200 fichiers, filtre par sous-chaine
 
@@ -1741,13 +1741,13 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 `moyen` · `partial` · effort `M`
 
-**Impact.** Toute la mecanique d'overlay (approbation riche, elicitation MCP, pickers multi-onglets) est inaccessible a l'execution : le seul chemin reel reste le menu inline de `AppState` et le dialog o/n. Le PRD est marque DONE sur cette story alors que la surface est morte.
+**Impact.** Toute la mecanique d'overlay (approbation riche, elicitation MCP, pickers multi-onglets) est inaccessible a l'execution : le seul chemin reel reste le menu inline de `AppState` et le dialog o/n. Le suivi de l'époque marque ce lot livre alors que la surface est morte.
 
 **Codex.** /home/arthur/dev/codex/codex-rs/tui/src/bottom_pane/mod.rs:730-751 : `handle_paste` route vers `view_stack.last_mut()` puis retombe sur le composer, et la pile porte approval_overlay.rs, list_selection_view.rs, custom_prompt_view.rs, skills_toggle_view.rs, mcp_server_elicitation.rs, feedback_view.rs, hooks_browser_view.rs
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-tui/src/bottom_pane.rs:56-161 definit `BottomPane`/`push_view` et :210-400 `ListSelectionView`, mais grep `push_view` sur /home/arthur/dev/pyxis/crates/agent-cli/ ne remonte rien (seuls appels : interactive.rs:496 construction, :628 route_paste, :649 route_key) et /home/arthur/dev/pyxis/crates/agent-tui/src/render.rs:76-160 (`render_parity`) n'appelle jamais `BottomPane::render`
 
-**Statut documentaire.** tasks/prd-codex-tui-parity.md:352-364 (US-016) est DONE dans tasks/prd-codex-tui-parity-status.json ; la story couvre bien la pile de vues mais rien ne la branche.
+**Statut documentaire.** Le cadrage de parite TUI est marque DONE dans son suivi ; le lot couvre bien la pile de vues mais rien ne la branche.
 
 ##### Surface slash etroite : ni /status, ni /diff, ni /usage, ni /compact
 
@@ -2067,7 +2067,7 @@ Les garde-fous déterministes sont plus explicites : `ExhaustReason` typé (`cra
 
 **Codex.** /home/arthur/dev/codex/sdk/typescript/README.md:1-10 (`@openai/codex-sdk` spawne la CLI et echange du JSONL sur stdin/stdout, `startThread()`, `run()`, `runStreamed()`, output schema par tour) et /home/arthur/dev/codex/sdk/python/ (docs, 15 familles d'exemples, parite sync/async).
 
-**Pyxis.** Aucun repertoire SDK dans /home/arthur/dev/pyxis (arborescence : crates/, docs/, tasks/). L'equivalent est l'API Rust in-process /home/arthur/dev/pyxis/crates/agent-core/src/lib.rs:22-36, non publiee sur crates.io et consommable uniquement par un binaire Rust du meme workspace.
+**Pyxis.** Aucun repertoire SDK dans /home/arthur/dev/pyxis (arborescence : crates/, docs/). L'equivalent est l'API Rust in-process /home/arthur/dev/pyxis/crates/agent-core/src/lib.rs:22-36, non publiee sur crates.io et consommable uniquement par un binaire Rust du meme workspace.
 
 **Statut documentaire.** ADR-3 (docs/DECISIONS.md:77) : le partage se fait par crates Rust in-process, pas par SDK cross-langage.
 
@@ -2146,7 +2146,7 @@ Cote Pyxis, les deux fins anormales sont par ailleurs deja distinguables sur std
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-auth/src/store.rs:22-57 - save/load/delete passent uniquement par keyring::Entry, aucune autre branche. Le message d'erreur promet pourtant un repli inexistant : 'secret store unavailable: {0} (fallback: env var, see docs)' (:17). grep 'PYXIS_ACCESS_TOKEN|OPENAI_API_KEY|auth.json' sur /home/arthur/dev/pyxis/crates/ : aucune lecture de credential par variable d'environnement ou fichier
 
-**Statut documentaire.** docs/DECISIONS.md:324 rejette explicitement le auth.json clair 0600 de Pi au nom d'US-018 ; le mode éphémère en mémoire et un repli chiffré ne sont couverts par aucun ADR
+**Statut documentaire.** docs/DECISIONS.md:324 rejette explicitement le auth.json clair 0600 de Pi au nom de la regle keyring ; le mode éphémère en mémoire et un repli chiffré ne sont couverts par aucun ADR
 
 ##### Le device-code flow est implémenté mais aucun chemin CLI ne l'appelle
 
@@ -2168,7 +2168,7 @@ Cote Pyxis, les deux fins anormales sont par ailleurs deja distinguables sur std
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-auth/src/lib.rs:52 déclare bien Credential::ApiKey { provider, key } et :21 ProviderId::OpenAiChat, mais grep 'Credential::ApiKey' sur /home/arthur/dev/pyxis/crates/ ne trouve aucun site de construction hors définition ; aucun adapter ne le consomme (/home/arthur/dev/pyxis/crates/agent-provider/src/lib.rs:14-18 n'expose que chatgpt)
 
-**Statut documentaire.** docs/DECISIONS.md:337-355 (ADR-11) diffère explicitement US-017 / BYOK au rang de provider futur et assume le risque ; docs/DECISIONS.md:351 nomme la mitigation comme un module isolé à ajouter le jour venu
+**Statut documentaire.** docs/DECISIONS.md:337-355 (ADR-11) diffère explicitement le canal BYOK au rang de provider futur et assume le risque ; docs/DECISIONS.md:351 nomme la mitigation comme un module isolé à ajouter le jour venu
 
 ##### Pas de cache disque du catalogue /models, et aucune découverte en headless
 
@@ -2283,9 +2283,9 @@ Cote Pyxis, les deux fins anormales sont par ailleurs deja distinguables sur std
 
 **Pyxis.** /home/arthur/dev/pyxis/crates/agent-tui/src/insert_history.rs:250-290 utilise `ratatui::backend::TestBackend` avec `Viewport::Inline(1)` et `assert_buffer_lines` : TestBackend ne modelise pas le scrollback ni le defilement du terminal hote. Meme approche dans render.rs:1644-1663 et term.rs:183-201
 
-**Statut documentaire.** tasks/prd-codex-tui-parity.md:80 exige des 'tests terminal pour resize, paste, streaming' ; le status JSON marque EP-005 DONE
+**Statut documentaire.** Le cadrage de parite TUI exige des 'tests terminal pour resize, paste, streaming' ; le suivi de l'époque le marque livre
 
-##### Zero snapshot de rendu alors que le PRD parite TUI en exige au moins 20 et est marque DONE
+##### Zero snapshot de rendu alors que le cadrage de parite TUI en exige au moins 20 et est marque DONE
 
 `majeur` · `divergent` · effort `M`
 
@@ -2293,9 +2293,9 @@ Cote Pyxis, les deux fins anormales sont par ailleurs deja distinguables sur std
 
 **Codex.** 663 fichiers `.snap` dans /home/arthur/dev/codex/codex-rs (dont tui/src/chatwidget/snapshots/, tui/src/history_cell/snapshots/, cli/src/doctor/snapshots/codex__doctor__output__tests__doctor_human_report_environment_rows.snap) ; workflow documente a /home/arthur/dev/codex/AGENTS.md:180-196 (`cargo insta pending-snapshots`, `cargo insta show`)
 
-**Pyxis.** `find /home/arthur/dev/pyxis -name '*.snap' -not -path './target/*'` -> aucun resultat ; aucune dep `insta` dans les Cargo.toml. Les assertions TUI sont soit `assert!(out.contains(...))` (/home/arthur/dev/pyxis/crates/agent-tui/src/render.rs:1685-1687), soit `assert_buffer_lines` inline (/home/arthur/dev/pyxis/crates/agent-tui/src/insert_history.rs:283-289). Or tasks/prd-codex-tui-parity.md:388 pose 'au moins 20 snapshots couvrent: chat idle, user message, streaming deltas, markdown code, table, exec, tool success, tool error, diff, approval, queue input, resize' et tasks/prd-codex-tui-parity-status.json marque EP-005 et le PRD entier DONE
+**Pyxis.** `find /home/arthur/dev/pyxis -name '*.snap' -not -path './target/*'` -> aucun resultat ; aucune dep `insta` dans les Cargo.toml. Les assertions TUI sont soit `assert!(out.contains(...))` (/home/arthur/dev/pyxis/crates/agent-tui/src/render.rs:1685-1687), soit `assert_buffer_lines` inline (/home/arthur/dev/pyxis/crates/agent-tui/src/insert_history.rs:283-289). Or le cadrage de parite TUI pose 'au moins 20 snapshots couvrent: chat idle, user message, streaming deltas, markdown code, table, exec, tool success, tool error, diff, approval, queue input, resize' et le suivi de l'époque marque l'ensemble DONE
 
-**Statut documentaire.** tasks/prd-codex-tui-parity.md:388 et :476 ('Codex TUI flows covered by snapshots : 0 -> >=20') ; status marque DONE, donc divergence doc/code a corriger dans un sens ou dans l'autre
+**Statut documentaire.** Le cadrage de parite TUI ('Codex TUI flows covered by snapshots : 0 -> >=20') ; status marque DONE, donc divergence doc/code a corriger dans un sens ou dans l'autre
 
 ##### Aucune CI n'execute les ~570 tests de Pyxis
 
@@ -2357,11 +2357,11 @@ Cote Pyxis, les deux fins anormales sont par ailleurs deja distinguables sur std
 
 `mineur` · `absent` · effort `S`
 
-**Impact.** Le prompt systeme et l'injection de contexte sont la premiere cause de comportement decevant d'un agent, et c'est precisement le diagnostic pose dans tasks/prd-codex-orchestration.md:18. Sans dump, valider une regression de contexte apres compaction ou apres changement d'AGENTS.md exige d'instrumenter le code.
+**Impact.** Le prompt systeme et l'injection de contexte sont la premiere cause de comportement decevant d'un agent, et c'est precisement le diagnostic pose dans le cadrage de l'époque. Sans dump, valider une regression de contexte apres compaction ou apres changement d'AGENTS.md exige d'instrumenter le code.
 
 **Codex.** /home/arthur/dev/codex/codex-rs/cli/src/main.rs:234-235 `codex debug prompt-input` : 'Render the model-visible prompt input list as JSON', avec support d'images ; complete cote test par core/tests/common/context_snapshot.rs:14-40 (`ContextSnapshotRenderMode` Redacted/Full/KindOnly, strip des instructions de capacite et des ids d'items) pour figer le contexte model-visible en test
 
-**Pyxis.** Pyxis construit un contexte projet non trivial (/home/arthur/dev/pyxis/crates/agent-cli/src/context.rs:122-139 : timezone, shell, cwd, plus AGENTS.md selon tasks/prd-codex-orchestration.md:18) et un system prompt long type gpt_5_2 ; aucune option CLI ni slash ne l'expose. `grep 'PYXIS_' --include=*.rs crates/` recense 8 variables (DEBUG_TUI, DEBUG_USAGE, ORIGINATOR, CODEX_CLIENT_VERSION, IDLE_TIMEOUT_SECS, REDUCED_MOTION, HOME, budgets) : aucune ne dumpe le prompt
+**Pyxis.** Pyxis construit un contexte projet non trivial (/home/arthur/dev/pyxis/crates/agent-cli/src/context.rs:122-139 : timezone, shell, cwd, plus AGENTS.md selon le cadrage de l'époque) et un system prompt long type gpt_5_2 ; aucune option CLI ni slash ne l'expose. `grep 'PYXIS_' --include=*.rs crates/` recense 8 variables (DEBUG_TUI, DEBUG_USAGE, ORIGINATOR, CODEX_CLIENT_VERSION, IDLE_TIMEOUT_SECS, REDUCED_MOTION, HOME, budgets) : aucune ne dumpe le prompt
 
 ##### La sonde PYXIS_DEBUG_USAGE ecrit sur stderr depuis le coeur, en contradiction avec la regle du projet
 

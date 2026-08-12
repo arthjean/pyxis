@@ -15,7 +15,7 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/CURRENT_S
 | ADR-7 | Registre des risques majeurs | Vivant |
 | ADR-8 | Nommage des crates : `pyxis*` publié, `agent-*` interne | Accepté |
 | ADR-9 | Taxonomie d'erreurs canonique : `ErrorClass` | Accepté |
-| ADR-10 | Auth abonnement ChatGPT = `ProviderKind::OpenAiChatGpt` (Responses backend ChatGPT, WebSocket borné avec repli SSE) | Accepté (2026-06-15), transport amendé par EP-003 (2026-08-01) |
+| ADR-10 | Auth abonnement ChatGPT = `ProviderKind::OpenAiChatGpt` (Responses backend ChatGPT, WebSocket borné avec repli SSE) | Accepté (2026-06-15), transport amendé (2026-08-01) |
 | ADR-11 | Scope MVP recentré : abonnement ChatGPT d'abord, Ollama retiré, autres providers différés | Accepté (2026-06-15) |
 | ADR-12 | Runtime de thread `agent-runtime` au-dessus de `run_agent` | Accepté (2026-07-27) |
 
@@ -300,13 +300,13 @@ Règles de retry associées (détail `docs/PROVIDERS.md` §5.1) : `Retryable` �
 - réutilise le `client_id` OAuth du **Codex CLI officiel OSS** (`app_EMoamEEZ73f0CkXaXp7hrann`), flow PKCE S256 sur `auth.openai.com` (browser callback `localhost:1455` + device-code) ;
 - appelle l'inférence sur le **backend ChatGPT via la Responses API** : `https://chatgpt.com/backend-api/codex/responses` (SSE/WS), headers propriétaires `chatgpt-account-id` (claim JWT `https://api.openai.com/auth`.chatgpt_account_id) + `originator`, body `store:false` + `instructions` + `input[]` (jamais `messages[]`).
 
-Cela entre en conflit frontal avec **US-017** (« cible Chat Completions ; Responses API hors scope ») et touche le piège **`docs/PROVIDERS.md §4.1`** (la Responses API à état server-side `previous_response_id` ne mappe pas le transcript client-side, indispensable à compaction/resume/replay).
+Cela entre en conflit frontal avec le cadrage antérieur (« cible Chat Completions ; Responses API hors scope ») et touche le piège **`docs/PROVIDERS.md §4.1`** (la Responses API à état server-side `previous_response_id` ne mappe pas le transcript client-side, indispensable à compaction/resume/replay).
 
 **Décision.** Introduire un **`ProviderKind::OpenAiChatGpt`** distinct, et NON réutiliser `OpenAiChat` ni `OpenAiResponses` :
 - **Surface séparée** : base `https://chatgpt.com/backend-api/codex`, endpoint `/responses`, `capabilities().server_side_state = false`.
-- **Transport amendé par EP-003 en 2026** : le backend Codex est stateless en SSE. WebSocket peut réutiliser `previous_response_id` uniquement pour une extension stricte dans le même tour et sur la même connexion. Nouvelle session, nouveau tour, changement de propriétés non-input ou repli SSE repartent du contexte complet dans `input[]`; compaction/resume restent client-side.
-- **Auth** : OAuth PKCE (réutilise le client Codex), credentials en **keyring** (US-018, jamais en clair — contrairement au `~/.pi/agent/auth.json` clair de Pi), refresh tokens rotatifs. Implémentée dans `agent-auth/src/oauth/openai_chatgpt.rs`.
-- **Statut** : credential **optionnelle, gated, étiquetée « fragile »**. **Jamais en P0**, jamais le défaut, jamais en chemin critique. US-017 reste pur (Chat Completions au token, BYOK) et est **clarifié** : il ne couvre pas l'abonnement ChatGPT.
+- **Transport amendé en 2026** : le backend Codex est stateless en SSE. WebSocket peut réutiliser `previous_response_id` uniquement pour une extension stricte dans le même tour et sur la même connexion. Nouvelle session, nouveau tour, changement de propriétés non-input ou repli SSE repartent du contexte complet dans `input[]`; compaction/resume restent client-side.
+- **Auth** : OAuth PKCE (réutilise le client Codex), credentials en **keyring** (jamais en clair — contrairement au `~/.pi/agent/auth.json` clair de Pi), refresh tokens rotatifs. Implémentée dans `agent-auth/src/oauth/openai_chatgpt.rs`.
+- **Statut** : credential **optionnelle, gated, étiquetée « fragile »**. **Jamais en P0**, jamais le défaut, jamais en chemin critique. Le canal Chat Completions au token (BYOK) reste pur et est **clarifié** : il ne couvre pas l'abonnement ChatGPT.
 
 **Justification.**
 - L'endpoint et le wire format diffèrent totalement de Chat Completions : un `if` dans `OpenAiChat` créerait des branches conditionnelles fragiles. Adapter dédié = divergences localisées (`PROVIDERS.md §1.1`).
@@ -322,16 +322,16 @@ Cela entre en conflit frontal avec **US-017** (« cible Chat Completions ; Respo
 | Réutiliser `OpenAiResponses` générique | Cible l'API publique `api.openai.com/v1/responses`, pas le backend ChatGPT (`chatgpt.com/backend-api/codex`) ni ses headers propriétaires. Mélange = fragilité. |
 | Activer WebSocket + `previous_response_id` | État server-side connection-scoped → casse compaction / resume JSONL / replay (`PROVIDERS §4.1`). |
 | En faire le provider par défaut / P0 | Viole FR-11 et le risque R1 : dépendre d'un canal subscription tiers révocable. |
-| Stocker comme Pi (`auth.json` clair 0600) | Viole US-018 (keyring obligatoire, jamais en clair). |
+| Stocker comme Pi (`auth.json` clair 0600) | Viole la règle du keyring (obligatoire, jamais en clair). |
 
 **Conséquences & risques.**
 - **ToS-grey** : réutiliser le `client_id` du Codex CLI = se faire passer pour Codex. « Sign in with ChatGPT » est gaté à Codex + IDE partenaires (issue `openai/codex#10974` fermée « not planned »). Usage perso, **révocable unilatéralement** — OpenAI peut faire sur ce client ce qu'Anthropic a fait sur Pro/Max le 4 avril 2026 (R1 s'applique aussi à OpenAI).
-- Prévoir un équivalent `Auth(ThirdPartyBlocked)` côté OpenAI si le backend renvoie un message de blocage (wording inconnu à ce jour, à sonder en live comme le leg Anthropic de US-001).
+- Prévoir un équivalent `Auth(ThirdPartyBlocked)` côté OpenAI si le backend renvoie un message de blocage (wording inconnu à ce jour, à sonder en live comme le leg Anthropic).
 - `originator` est hardcodé par client (Pi met `"pi"`) ; Pyxis met `"pyxis"` — le backend **peut** valider l'`originator` contre une liste connue. À tester au premier run ; rejet → soit zone grise totale, soit blocage.
 - Dépendance dure au claim custom `https://api.openai.com/auth`.chatgpt_account_id (header `chatgpt-account-id` requis pour router) : un changement de namespace côté OpenAI casse silencieusement.
-- **Conséquence sur les autres documents** : `docs/PROVIDERS.md §2` (ajouter `OpenAiChatGpt` à `ProviderKind`), US-017 clarifié (scope = Chat Completions au token). Détail d'implémentation : `docs/openai-subscription-auth.md`.
+- **Conséquence sur les autres documents** : `docs/PROVIDERS.md §2` (ajouter `OpenAiChatGpt` à `ProviderKind`), canal BYOK clarifié (scope = Chat Completions au token). Détail d'implémentation : `docs/openai-subscription-auth.md`.
 
-> **Mise à jour (ADR-11, 2026-06-15; EP-003, 2026-08-01)** : le **statut** d'ADR-10 (« gated, optionnelle, jamais en P0 ») est **superseded par ADR-11**. La décision *technique* conserve un ProviderKind distinct, le backend Responses, le transcript client-side et l'OAuth keyring. EP-003 amende le transport: WebSocket borné au tour avec repli SSE stateless.
+> **Mise à jour (ADR-11, 2026-06-15 ; transport, 2026-08-01)** : le **statut** d'ADR-10 (« gated, optionnelle, jamais en P0 ») est **superseded par ADR-11**. La décision *technique* conserve un ProviderKind distinct, le backend Responses, le transcript client-side et l'OAuth keyring. Le transport est amendé : WebSocket borné au tour avec repli SSE stateless.
 
 ---
 
@@ -342,9 +342,9 @@ Cela entre en conflit frontal avec **US-017** (« cible Chat Completions ; Respo
 **Contexte.** Arthur veut dogfooder Pyxis **maintenant**, avec son abonnement ChatGPT (modèles GPT/Codex), exactement comme Pi. Décision explicite : « je ne veux pas faire le multi-provider maintenant, je veux d'abord me concentrer sur Codex et les modèles GPT du plan d'abonnement, que Pyxis fonctionne déjà parfaitement avec, et plus tard j'attaquerai d'autres providers au fur et à mesure. » Et, séparément : **Ollama est retiré du scope** (« trop instable, je ne l'implémenterai certainement jamais »).
 
 **Décision.**
-1. **Seul provider livré au MVP = `OpenAiChatGpt`** (abonnement, Responses WebSocket avec repli SSE, ADR-10 amendé par EP-003). C'est désormais la cible P0 du dogfood, pas une commodité gated.
-2. **Ollama supprimé** : variante `ProviderKind::Ollama` / `ProviderId::Ollama` retirée du code, US-016 **annulée**. Le fallback tokenizer (US-007) reste — il est provider-agnostique (estimation pré-tour US-014, providers futurs sans `usage`), sa justification n'est juste plus « Ollama ».
-3. **US-017 (OpenAI Chat Completions BYOK) différée** au rang de provider futur (plus la cible MVP). US-015 (trait + canonique + retry) et US-018 (auth keyring) restent et sont **satisfaites**.
+1. **Seul provider livré au MVP = `OpenAiChatGpt`** (abonnement, Responses WebSocket avec repli SSE, ADR-10 amendé). C'est désormais la cible P0 du dogfood, pas une commodité gated.
+2. **Ollama supprimé** : variante `ProviderKind::Ollama` / `ProviderId::Ollama` retirée du code, le chantier Ollama **annulé**. Le fallback tokenizer reste — il est provider-agnostique (estimation pré-tour, providers futurs sans `usage`), sa justification n'est juste plus « Ollama ».
+3. **OpenAI Chat Completions BYOK différé** au rang de provider futur (plus la cible MVP). Le trait provider (canonique + retry) et l'auth keyring restent et sont **satisfaits**.
 4. **L'architecture reste multi-provider** : le trait `Provider` est inchangé, les autres adapters (Anthropic, OpenAI Chat, Gemini…) s'ajoutent ensuite, chacun comme un module d'`agent-provider`, sans toucher le cœur.
 
 **Justification.** Levier dogfood maximal et immédiat (Arthur orchestre des agents toute la journée ; il veut SON modèle, tout de suite). La valeur produit se prouve par l'usage quotidien réel, pas par un tableau de 6 providers vides. Le coût d'opportunité (pas de BYOK Chat Completions au MVP) est assumé : c'est de la séquence, pas de l'abandon.
@@ -353,21 +353,21 @@ Cela entre en conflit frontal avec **US-017** (« cible Chat Completions ; Respo
 
 **Pire scénario.** OpenAI révoque le client Codex → l'unique provider livré tombe → Pyxis est temporairement inutilisable jusqu'à l'ajout d'un adapter BYOK. Probabilité moyenne, impact élevé mais borné (le code adapter + auth BYOK est petit, le cœur intact). C'est le prix conscient de la vélocité dogfood.
 
-**Conséquences sur les autres documents.** `docs/PROVIDERS.md §6` (Ollama n'est plus le provider non-bloqué du MVP — l'abonnement ChatGPT est la cible ; la stratégie model-agnostic reste l'assurance), tableau §3 (colonne Ollama caduque), `tasks/prd-pyxis.md` (Goals/FR-02/US-016/edge #9 : Ollama hors scope), `ARCHITECTURE.md` invariant 7 (le fallback tokenizer n'est plus motivé par Ollama mais reste valide). Mise à jour incrémentale ; non bloquant pour le code.
+**Conséquences sur les autres documents.** `docs/PROVIDERS.md §6` (Ollama n'est plus le provider non-bloqué du MVP — l'abonnement ChatGPT est la cible ; la stratégie model-agnostic reste l'assurance), tableau §3 (colonne Ollama caduque), `ARCHITECTURE.md` invariant 7 (le fallback tokenizer n'est plus motivé par Ollama mais reste valide). Mise à jour incrémentale ; non bloquant pour le code.
 
 ---
 
 ## ADR-12 — Runtime de thread `agent-runtime` au-dessus de `run_agent`
 
-**Statut.** Accepté 2026-07-27. Conclusion du spike US-001 de `tasks/prd-runtime-orchestration-durable.md` (EP-001). N'altère ni ADR-3 (cœur headless) ni le trait `Provider` (ADR-4/ADR-11).
+**Statut.** Accepté 2026-07-27. Conclusion du spike de runtime d'orchestration durable. N'altère ni ADR-3 (cœur headless) ni le trait `Provider` (ADR-4/ADR-11).
 
-**Contexte.** Pyxis possédait une boucle d'agent, un transcript durable, des outils, un sandbox, MCP, des skills et deux clients, mais aucun objet durable ne possédait une conversation. `agent-cli` relançait un `run_agent` par tour et gardait l'activité dans un `ActiveTurn` process-local : un redémarrage restaurait des messages, pas l'état d'un thread, d'un turn ou d'une opération de contrôle. Le risque numéro un du PRD était qu'un nouveau module réimplémente progressivement la boucle modèle-outils et laisse deux orchestrateurs vivants.
+**Contexte.** Pyxis possédait une boucle d'agent, un transcript durable, des outils, un sandbox, MCP, des skills et deux clients, mais aucun objet durable ne possédait une conversation. `agent-cli` relançait un `run_agent` par tour et gardait l'activité dans un `ActiveTurn` process-local : un redémarrage restaurait des messages, pas l'état d'un thread, d'un turn ou d'une opération de contrôle. Le risque numéro un était qu'un nouveau module réimplémente progressivement la boucle modèle-outils et laisse deux orchestrateurs vivants.
 
 **Décision.** Un crate `agent-runtime` entre `agent-core` et les clients, avec quatre responsabilités **disjointes** :
 
 1. **Runtime de thread** (`agent-runtime`) : identité durable (`ThreadId`, `TurnId`, `StepId`, `EventId`, `AgentId`), mailbox de contrôle bornée, cycle de vie des turns, persistance des opérations d'orchestration, arbre d'annulation et shutdown. Un thread est possédé par **un** actor ; les clients ne touchent ni `JoinHandle` ni writer JSONL.
 2. **Moteur de turn** (`agent-core::run_agent`) : reste l'**unique** boucle modèle-outils. Retry, compaction, withholding et dispatch d'outils lui appartiennent. Le runtime l'atteint par la seule interface `TurnRunner`, forwarde ses `AgentEvent` sans les modifier et lit exactement un `TurnOutcome`.
-3. **Contexte par requête** : la fabrique de contexte injectée dans `RunAgentRunner` est le point où US-006 branchera `TurnContext` et `StepContext`. Le runtime ne construit aucune requête modèle.
+3. **Contexte par requête** : la fabrique de contexte injectée dans `RunAgentRunner` est le point où `TurnContext` et `StepContext` se branchent. Le runtime ne construit aucune requête modèle.
 4. **Clients** (TUI, headless) : consomment `ThreadHandle` (soumettre, observer, lire le dernier état, arrêter) et le flux `RuntimeEvent`.
 
 Décisions dérivées prises dans le même spike :
@@ -375,45 +375,45 @@ Décisions dérivées prises dans le même spike :
 - **Store.** Le trait `ThreadStore` et l'adapter mémoire vivent dans `agent-runtime`, qui ne touche pas au disque ; l'adapter JSONL vit dans `agent-session` (dépendance à sens unique `agent-session` → `agent-runtime` → `agent-core`). Les deux adapters passent le **même** test de contrat.
 - **Format.** Les événements d'orchestration sont des entrées JSONL **additives** dans le fichier de session existant (`thread_meta`, `thread_event`). `SESSION_SCHEMA_VERSION` n'est **pas** incrémenté : un lecteur v1 les mappe sur `SessionEntry::Unknown` et les ignore, alors qu'un bump rendrait tout fichier neuf illisible par un binaire antérieur qui refuse `schema_version > 1`. Poursuivre une session v1 laisse son préfixe byte-identique.
 - **Identifiants.** Pas de dépendance `uuid` : charge opaque de 128 bits rendue `<prefixe>_<32 hex>`, produite par un `IdGenerator` injecté (`rand` en production, compteur déterministe en test). Le préfixe est le discriminant de type au parsing, ce qui fait échouer un `TurnId` reçu là où un `ThreadId` est attendu, y compris après un aller-retour par un fichier.
-- **Annulation.** `tokio-util` devient une dépendance directe : `CancellationToken` donne l'arbre parent-enfant que le `CancelToken` maison ne savait pas exprimer, `TaskTracker` compte les tâches dynamiques. *Mis à jour par US-008 (EP-002) :* le token maison est **supprimé**. `agent-core::Deps::cancel` porte désormais le `CancellationToken` lui-même, `RunAgentRunner` passe le token du turn tel quel et le point de traduction a disparu avec lui. Ce qui reste du cœur est sa **discipline** d'arrêt (frontières sûres, réconciliation avant terminal), exposée par `agent_core::cancel::guard`, qui poll le futur en premier là où `run_until_cancelled` perdrait la course. Un seul arbre de tokens, un seul mécanisme.
-- **Événements live.** `broadcast` borné à 256 plutôt que `mpsc`, contrairement à la recommandation non normative des *Technical Considerations* du PRD : un client lent ou déconnecté ne doit jamais bloquer l'actor, et perdre un événement **live** est récupérable puisque l'état durable est le store (`RecvError::Lagged` dit au client de relire). Le dernier état voyage bien par `watch`.
+- **Annulation.** `tokio-util` devient une dépendance directe : `CancellationToken` donne l'arbre parent-enfant que le `CancelToken` maison ne savait pas exprimer, `TaskTracker` compte les tâches dynamiques. *Mis à jour ensuite :* le token maison est **supprimé**. `agent-core::Deps::cancel` porte désormais le `CancellationToken` lui-même, `RunAgentRunner` passe le token du turn tel quel et le point de traduction a disparu avec lui. Ce qui reste du cœur est sa **discipline** d'arrêt (frontières sûres, réconciliation avant terminal), exposée par `agent_core::cancel::guard`, qui poll le futur en premier là où `run_until_cancelled` perdrait la course. Un seul arbre de tokens, un seul mécanisme.
+- **Événements live.** `broadcast` borné à 256 plutôt que `mpsc`, contrairement à la recommandation non normative des *Technical Considerations* du cadrage : un client lent ou déconnecté ne doit jamais bloquer l'actor, et perdre un événement **live** est récupérable puisque l'état durable est le store (`RecvError::Lagged` dit au client de relire). Le dernier état voyage bien par `watch`.
 - **Exhausted.** `AgentEvent::Exhausted` est mappé sur l'état terminal `failed` avec une cause préfixée, jamais sur `completed` : un arrêt par garde-fou n'a pas terminé le travail et ne doit pas être lu comme un succès.
 - **Limites v1.** Mailbox 64, flux live 256, inputs pending 16, grâce d'abort 2 s, shutdown 3 s sont des **constantes** de `agent-runtime::thread`. Zéro clé de configuration publique (FR-20).
 
-**Verdict du spike (US-001 AC5).** Le prototype pilote `run_agent` avec un provider et un store factices sans réécrire une seconde boucle : dans `crates/agent-runtime/tests/turn_seam.rs`, un échec provider en milieu de flux est **retenté par le moteur**, un outil est dispatché par le pipeline injecté et le turn se termine sur un unique événement terminal, alors que le code du runner ne contient ni retry, ni compaction, ni dispatch. La réconciliation des tool calls sans résultat reste celle du cœur : une annulation par token hiérarchique produit `Interrupted` après réconciliation. **US-002 et les stories dépendantes ne sont donc pas bloquées.**
+**Verdict du spike.** Le prototype pilote `run_agent` avec un provider et un store factices sans réécrire une seconde boucle : dans `crates/agent-runtime/tests/turn_seam.rs`, un échec provider en milieu de flux est **retenté par le moteur**, un outil est dispatché par le pipeline injecté et le turn se termine sur un unique événement terminal, alors que le code du runner ne contient ni retry, ni compaction, ni dispatch. La réconciliation des tool calls sans résultat reste celle du cœur : une annulation par token hiérarchique produit `Interrupted` après réconciliation. **Les chantiers dépendants ne sont donc pas bloquées.**
 
 **Alternatives écartées.**
 
 | Option | Raison de l'écart |
 |---|---|
 | Mettre le runtime dans `agent-core` | Trois appelants réels (TUI, headless, sous-agents) et un besoin d'état durable ; `agent-core` doit rester le moteur de turn headless sans possession de conversation. |
-| Extraire un `AgentRun` pilotable en remplacement de `run_agent` | Refonte du cœur pour un besoin que le seam `TurnRunner` couvre déjà. À rouvrir seulement si US-006 prouve qu'un contexte par step est impossible via la fabrique injectée. |
+| Extraire un `AgentRun` pilotable en remplacement de `run_agent` | Refonte du cœur pour un besoin que le seam `TurnRunner` couvre déjà. À rouvrir seulement s'il est prouvé qu'un contexte par step est impossible via la fabrique injectée. |
 | Remplacer `SessionEntry` par un nouveau format v2 | Casse la contrainte « toute session v1 reste lisible et poursuivable » et interdit un fork par copie de préfixe. |
 | Garder le `CancelToken` maison comme unique mécanisme | Il n'a ni filiation ni comptage de tâches : impossible de garantir « aucun processus orphelin » ni « stragglers abortés puis drainés ». |
 | Ajouter `uuid` (UUIDv7) | Coût de dépendance pour une propriété (ordonnancement temporel) dont aucune acceptance n'a besoin ; `seq` par thread ordonne déjà le log. |
-| Store SQLite ou fork référencé copy-on-write | Hors scope v1 explicite du PRD ; le trait `ThreadStore` laisse la porte ouverte sans changer l'interface. |
+| Store SQLite ou fork référencé copy-on-write | Hors scope v1 explicite ; le trait `ThreadStore` laisse la porte ouverte sans changer l'interface. |
 
 **Conséquences & risques.**
 - **Risque principal** : `agent-runtime` peut dériver vers une seconde boucle. Garde-fou : `TurnRunner` reste le seul seam, et toute logique de retry, compaction ou dispatch qui y apparaîtrait invalide ADR-12.
-- **Risque de double orchestration** pendant la migration : `ActiveTurn`, son compteur `u64`, son `JoinHandle` direct et la FIFO de prompts legacy vivent encore dans `crates/agent-cli/src/interactive.rs`. US-017 doit les supprimer, pas les faire cohabiter.
+- **Risque de double orchestration** pendant la migration : `ActiveTurn`, son compteur `u64`, son `JoinHandle` direct et la FIFO de prompts legacy vivent encore dans `crates/agent-cli/src/interactive.rs`. La migration doit les supprimer, pas les faire cohabiter.
 - Un store qui bloque indéfiniment bloque l'actor dans `on_submit` et échappe au budget de shutdown. Acceptable en v1 (écritures fichier locales) ; à revoir si un adapter distant apparaît.
 - `agent-session` dépend désormais d'`agent-runtime`. L'inverse est interdit : c'est ce qui garde le runtime sans accès disque.
-- **Conséquence sur les autres documents** : `docs/ARCHITECTURE.md` (nouveau crate et sa place dans le graphe) et `docs/EVENT_SCHEMA.md` (entrées `thread_meta` / `thread_event`) sont mis à jour à la livraison d'EP-005 (US-019), qui possède la relecture documentaire de ce PRD.
+- **Conséquence sur les autres documents** : `docs/ARCHITECTURE.md` (nouveau crate et sa place dans le graphe) et `docs/EVENT_SCHEMA.md` (entrées `thread_meta` / `thread_event`) sont mis à jour à la livraison, avec la relecture documentaire qui l'accompagne.
 
-### Mesures EP-003 — reprise et fork (US-009 AC5, US-010 AC6)
+### Mesures — reprise et fork
 
 Mesurées le 2026-07-27 sur la machine de référence, build release, adapter JSONL (`cargo test --release -p agent-session -- --ignored --nocapture`).
 
-| Opération | Volume | Mesure | Cible PRD |
+| Opération | Volume | Mesure | Cible |
 |---|---|---|---|
 | Reprise (`ThreadStore::read`) | 10 000 événements, 2,5 Mo | **p95 = 12,6 ms** sur 20 runs | < 500 ms p95 |
 | Fork matérialisé (`ThreadStore::fork`) | 10 000 événements | **23,3 ms**, 2 527 919 octets copiés | aucune, à consigner |
 
-**Question ouverte du PRD tranchée.** Un store référencé (copy-on-write entre fichiers) n'est **pas** justifié en v1 : copier le préfixe entier d'une session de 10 000 événements coûte 23 ms et 2,5 Mo, soit deux ordres de grandeur sous le budget de reprise. La matérialisation reste le choix par défaut ; elle est aussi ce qui rend une branche lisible après suppression de sa source. Le trait `ThreadStore` garde la porte ouverte si une session dogfood dépasse un ordre de grandeur de plus.
+**Question ouverte tranchée.** Un store référencé (copy-on-write entre fichiers) n'est **pas** justifié en v1 : copier le préfixe entier d'une session de 10 000 événements coûte 23 ms et 2,5 Mo, soit deux ordres de grandeur sous le budget de reprise. La matérialisation reste le choix par défaut ; elle est aussi ce qui rend une branche lisible après suppression de sa source. Le trait `ThreadStore` garde la porte ouverte si une session dogfood dépasse un ordre de grandeur de plus.
 
 **Un index ou un checkpoint de reprise** n'est pas nécessaire non plus : le scan linéaire est 40 fois sous la cible.
 
-**Décisions dérivées d'EP-003.**
+**Décisions dérivées de ces mesures.**
 
 - **Identité d'une session v1.** `ThreadId` dérivé du hash du chemin canonique **et** de la première ligne durable, puis matérialisé une seule fois dans la ligne `thread_meta`. La dépendance au chemin ne dure donc que jusqu'au premier append ; après, déplacer ou renommer la session ne change plus rien. Deux copies du même transcript dans deux répertoires restent deux threads distincts, ce qui est le comportement voulu.
 - **Provenance d'une branche.** Portée par la **dernière** ligne `thread_meta` du fichier enfant, écrite après le préfixe hérité. Le préfixe est donc copié **verbatim**, sans réécriture d'octets, et l'ancienne liaison du parent qu'il contient est simplement dépassée par celle de l'enfant.
@@ -425,9 +425,9 @@ Mesurées le 2026-07-27 sur la machine de référence, build release, adapter JS
 
 ## ADR-13 — Sous-agent mutateur en worktree Git : **NO-GO v1**
 
-**Statut.** Accepté 2026-07-28. Conclusion du spike US-016 de `tasks/prd-runtime-orchestration-durable.md` (EP-004). N'altère ni ADR-12 (runtime de thread) ni la politique de confinement d'US-020. Aucune surface de production n'est exposée par cette décision.
+**Statut.** Accepté 2026-07-28. Conclusion du spike sous-agents. N'altère ni ADR-12 (runtime de thread) ni la politique de confinement. Aucune surface de production n'est exposée par cette décision.
 
-**Contexte.** EP-004 livre des sous-agents **lecture seule** : autorité = intersection parent ∩ demande, aucun outil mutant exposé par défaut. La question ouverte du PRD était de savoir si un enfant **mutateur** pouvait travailler dans un worktree Git temporaire sans élargir le sandbox global ni exposer `.git` au modèle. Le spike devait trancher avant qu'un PRD ultérieur ne s'appuie sur une hypothèse de sécurité non vérifiée.
+**Contexte.** Les sous-agents livrés sont **lecture seule** : autorité = intersection parent ∩ demande, aucun outil mutant exposé par défaut. La question ouverte était de savoir si un enfant **mutateur** pouvait travailler dans un worktree Git temporaire sans élargir le sandbox global ni exposer `.git` au modèle. Le spike devait trancher avant qu'un chantier ultérieur ne s'appuie sur une hypothèse de sécurité non vérifiée.
 
 **Mesuré.** `crates/agent-sandbox/tests/worktree_spike.rs`, machine de référence, kernel avec Landlock actif (`SandboxStatus::Enforced`). Le process enfant applique `enforce_process(workspace = dépôt de fixture, writable_roots = [$TMPDIR])` puis manipule un worktree réel.
 
@@ -450,12 +450,12 @@ Cas dégradés, chacun avec sa procédure :
 | Hors de tout dépôt Git | REFUS | refuser l'enfant mutateur |
 | Répertoire non-Git **imbriqué** dans un dépôt | `git` **remonte** jusqu'au dépôt englobant | ancrer l'enfant sur une racine de dépôt explicite, **jamais** sur un `cwd` |
 
-**Décision. NO-GO.** La capacité mutatrice n'est pas livrée et aucun PRD de suivi n'est ouvert comme livré.
+**Décision. NO-GO.** La capacité mutatrice n'est pas livrée et aucun chantier de suivi n'est ouvert comme livré.
 
 **Justification.** La mécanique n'est pas le blocage : elle passe intégralement, sans élargir Landlock d'un octet. Le blocage est structurel. Les sous-agents de Pyxis sont des **tâches du même process** que leur parent (ADR-12 : un `ThreadHandle` par enfant, pas un process par enfant), or `landlock::restrict_self` est **process-wide et irréversible**. Un enfant mutateur partagerait donc exactement le périmètre d'écriture de son parent : son isolation ne serait qu'une **convention d'outillage**, pas une garantie du noyau. Le spike le mesure directement, en écrivant depuis l'enfant dans le worktree parent avec succès.
 
 Deuxième raison, subordonnée à la première : créer puis nettoyer un worktree exige d'écrire dans `<dépôt>/.git/worktrees/`, c'est-à-dire précisément ce que `PROTECTED_SUBPATHS` soustrait au niveau des outils. C'est tenable **si le runtime le fait lui-même** et que le modèle ne reçoit jamais cette capacité, mais cela ne vaut d'être construit qu'une fois l'isolation réelle acquise.
 
-**Conditions d'un go ultérieur** (aucune n'est engagée ici) : un **process OS par enfant mutateur**, avec son propre `restrict_self` restreint à son worktree et une frontière d'événements entre parent et enfant. C'est une autre architecture que celle de ce PRD, et les non-goals en vigueur (pas d'app-server, pas de merge/commit automatique) restent applicables.
+**Conditions d'un go ultérieur** (aucune n'est engagée ici) : un **process OS par enfant mutateur**, avec son propre `restrict_self` restreint à son worktree et une frontière d'événements entre parent et enfant. C'est une autre architecture que celle retenue ici, et les non-goals en vigueur (pas d'app-server, pas de merge/commit automatique) restent applicables.
 
 **Ce qui est acquis malgré le no-go.** Le harnais de mesure reste dans l'arbre : il est ignoré par défaut pour sa moitié confinée, il ne crée aucune surface produit, et il rejoue le verdict en une commande le jour où l'architecture change. L'assertion `parent_writable` du spike est volontairement **positive** : si elle tombe, c'est que le modèle de confinement a changé et qu'ADR-13 doit être rejouée.

@@ -1,12 +1,11 @@
 # `apply_patch` contre `edit` : mesure du taux d'échec d'édition
 
-Validation de l'hypothèse déclarée en assumptions de
-`tasks/prd-parite-codex-par-le-code.md` et exigée par le critère AC6 d'US-010 :
+Validation de l'hypothèse déclarée au cadrage du portage Codex :
 « les modèles `*-codex` produisent de meilleurs résultats d'édition avec
 `apply_patch` qu'avec `edit`. Fondé sur le fait qu'ils y sont entraînés, **non
 mesuré sur Pyxis**. »
 
-Mesure conduite le 2026-07-27, sur Pyxis à EP-003, modèle `gpt-5.3-codex-spark`
+Mesure conduite le 2026-07-27, modèle `gpt-5.3-codex-spark`
 (le seul slug `*-codex` servi par le canal d'abonnement ChatGPT au moment de la
 mesure ; `gpt-5.1-codex` est refusé par le backend).
 
@@ -62,10 +61,10 @@ appel. **La différence n'existe que sur les éditions à plusieurs sites.**
 ## Ce que la mesure ne dit pas
 
 - **Effectif faible.** 39 et 24 appels, ce qui satisfait le seuil de 20 éditions
-  du critère mais ne suffit pas à rendre significatif un écart de 7,7 points.
+  retenu mais ne suffit pas à rendre significatif un écart de 7,7 points.
   Une mesure en usage réel sur plusieurs semaines de sessions trancherait mieux.
 - **Un seul modèle.** `gpt-5.3-codex-spark`. Rien n'est mesuré sur les modèles
-  non `*-codex`, alors que l'hypothèse du PRD porte spécifiquement sur les
+  non `*-codex`, alors que l'hypothèse porte spécifiquement sur les
   premiers.
 - **Tâches synthétiques.** Fixtures écrites pour le banc, pas extraites de
   sessions passées. Elles sont réalistes (Rust, Python, Go, JavaScript, shell,
@@ -78,7 +77,7 @@ appel. **La différence n'existe que sur les éditions à plusieurs sites.**
 ## Décision
 
 **`edit` est conservé.** Son retrait serait de toute façon une rupture de
-comportement hors périmètre du PRD, et la mesure ne le justifie pas : les deux
+comportement hors périmètre, et la mesure ne le justifie pas : les deux
 outils aboutissent aussi souvent. C'est la réponse à la question ouverte « faut-il
 conserver `edit` après `apply_patch` ? ».
 

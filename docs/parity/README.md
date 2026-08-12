@@ -5,8 +5,8 @@ Pyxis. Elle est générée, pas rédigée : chaque ligne est extraite du clone C
 en lecture seule figé au commit
 `fa1d4c40d0e63eef2e0ba8a9e004ccd0a80b77f5`, puis empreintée (SHA-256).
 
-Les audits `docs/codex-harness-parity-audit*.md` et
-`docs/strategie-parite-codex-2026-07-27.md` restent du **contexte historique** :
+Les audits `docs/parity-audit-*.md` et
+`docs/parity-strategy-2026-07-27.md` restent du **contexte historique** :
 ils décrivent des instantanés antérieurs et n'arbitrent plus une divergence.
 
 ## Commandes
@@ -17,7 +17,7 @@ cargo run -p agent-parity -- generate   # régénère la matrice après une déc
 cargo run -p agent-parity -- drift      # compare le HEAD amont à la baseline, sans rien modifier
 ```
 
-`drift` est le guetteur amont (EP-006/US-020 AC4) : c'est le SEUL mode qui
+`drift` est le guetteur amont : c'est le SEUL mode qui
 accepte un clone hors du commit épinglé, parce que son travail est justement de
 dire ce qui a bougé. Il n'écrit rien, ni dans Pyxis ni dans Codex, et il ignore
 le numéro de commit dans sa comparaison : ce qui compte est de savoir si le

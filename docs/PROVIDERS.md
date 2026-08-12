@@ -2,7 +2,7 @@
 
 > La couche multi-provider est le cœur architectural de Pyxis. C'est elle qui justifie le projet : « qualité Claude Code, **tous** les modèles frontier ». Là où Claude Code est Anthropic-only, Pyxis est multi-provider first-class. Ce document est la source de vérité du contrat provider. L'état livré courant vit dans [`docs/CURRENT_STATUS.md`](./CURRENT_STATUS.md).
 
-**État courant après EP-005.** Trois adapters existent dans `agent-provider` : `OpenAiChatGpt`, `ConfiguredOpenAiProvider` pour un endpoint Responses configurable, et `AmazonBedrockProvider` sur l'API directe `ConverseStream`. Le binaire reste câblé sur le seul canal abonnement ChatGPT. `OpenAiChat`, `Anthropic`, `Gemini`, `OpenRouter`, Vertex et les surfaces auxiliaires restent futurs. `Ollama` a été retiré du scope et n'existe plus dans `ProviderKind`.
+**État courant.** Trois adapters existent dans `agent-provider` : `OpenAiChatGpt`, `ConfiguredOpenAiProvider` pour un endpoint Responses configurable, et `AmazonBedrockProvider` sur l'API directe `ConverseStream`. Le binaire reste câblé sur le seul canal abonnement ChatGPT. `OpenAiChat`, `Anthropic`, `Gemini`, `OpenRouter`, Vertex et les surfaces auxiliaires restent futurs. `Ollama` a été retiré du scope et n'existe plus dans `ProviderKind`.
 
 **Docs liées.** Décisions : [`docs/DECISIONS.md`](./DECISIONS.md) (ADR-4 = couche provider, ADR-7 = roadmap/risque). Architecture transverse : [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md). Plan d'exécution : [`docs/ROADMAP.md`](./ROADMAP.md). Ce document est la version détaillée d'ADR-4 ; toute divergence de signature entre ADR-4 et ce fichier se résout en faveur de ce fichier (taxonomie d'erreurs notamment, cf. §5.1).
 
@@ -96,7 +96,7 @@ pub enum StreamEvent {
     Done           { stop: StopReason },
 }
 
-/// Format d'entrée d'un appel, fixé au ToolCallStart (EP-001/US-003).
+/// Format d'entrée d'un appel, fixé au ToolCallStart.
 pub enum ToolCallFormat { Json, Text }
 
 /// Invariant fort : à ToolCallEnd, `input_delta` concaténé DOIT être un JSON
@@ -107,7 +107,7 @@ pub enum ToolCallFormat { Json, Text }
 ```
 
 ```rust
-/// Algèbre d'outils provider-neutral (EP-001/US-002). Un outil freeform ne
+/// Algèbre d'outils provider-neutral. Un outil freeform ne
 /// porte AUCUN `input_schema` : aucun adapter ne peut en fabriquer un.
 pub struct ToolSpec { pub name: String, pub description: String, pub kind: ToolKind }
 
@@ -200,7 +200,7 @@ Chaque cellule décrit ce que l'**adapter** doit faire pour ramener le provider 
 | `OpenAiResponses` | Adapter bibliothèque | Base URL, query, headers, retry, timeout, catalogue et WebSocket configurés | API key, bearer, OAuth ChatGPT, PAT, headers préconstruits ou agent identity, tous scopés à l'origin | Client-side par défaut; catalogue statique sans fetch ou distant scopé par provider, endpoint et identité |
 | `AmazonBedrock` | Adapter bibliothèque | API directe AWS `ConverseStream` | Chaîne AWS officielle ou Bedrock API key, jamais de header OpenAI | Catalogue statique, région, account state et modèles préférés explicites |
 
-**Coût du SDK Bedrock mesuré pour EP-005.** Le premier build focalisé après téléchargement a pris 16,68 s sur la machine de développement. Le lockfile final ajoute 55 packages, dont 24 packages `aws-*` uniques dans `cargo tree -p agent-provider`. La première mesure des artefacts AWS `.rlib`/`.rmeta` du profil debug occupait 372 585 545 octets dans 69 fichiers. Ce dernier nombre mesure le cache de compilation debug, pas l'augmentation d'un binaire release. Les features TLS legacy du SDK sont désactivées : le client HTTPS moderne est sélectionné explicitement et `cargo audit` ne trouve aucune vulnérabilité. L'ajout est accepté parce qu'il évite une implémentation locale de SigV4 et du framing event-stream.
+**Coût du SDK Bedrock mesuré.** Le premier build focalisé après téléchargement a pris 16,68 s sur la machine de développement. Le lockfile final ajoute 55 packages, dont 24 packages `aws-*` uniques dans `cargo tree -p agent-provider`. La première mesure des artefacts AWS `.rlib`/`.rmeta` du profil debug occupait 372 585 545 octets dans 69 fichiers. Ce dernier nombre mesure le cache de compilation debug, pas l'augmentation d'un binaire release. Les features TLS legacy du SDK sont désactivées : le client HTTPS moderne est sélectionné explicitement et `cargo audit` ne trouve aucune vulnérabilité. L'ajout est accepté parce qu'il évite une implémentation locale de SigV4 et du framing event-stream.
 
 Le tableau ci-dessous couvre les autres adapters publics/BYOK futurs et conserve Ollama comme contexte historique retiré du scope, pas comme promesse de livraison. Bedrock n'est plus inclus dans la colonne cloud historique : son adapter direct est décrit ci-dessus.
 

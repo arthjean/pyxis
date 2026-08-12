@@ -57,7 +57,7 @@ l'échec : `cause` (le texte que le journal durable a enregistré),
 classificateur partagé (`agent_runtime::TurnFailure`), celui qui alimente aussi
 la TUI, la sortie stderr de `pyxis -p` et le champ `cause_category` de la ligne
 `run_summary` : les quatre surfaces ne peuvent donc pas nommer deux catégories
-différentes pour la même cause (EP-006/US-019 AC1).
+différentes pour la même cause.
 
 Un client **branche sur `causeCategory`**, jamais sur le texte de `cause`. Les
 valeurs sont fermées et publiées dans le schéma : `provider`, `auth`, `context`,
@@ -94,7 +94,7 @@ n'est perdu : ce qui est commité est dans le journal durable et se relit avec
 
 | Divergence | Raison |
 |---|---|
-| 8 méthodes sur les 131 de la baseline | Le reste (comptes, cloud, `fs/*`, marketplace, realtime) relève des non-goals du PRD. |
+| 8 méthodes sur les 131 de la baseline | Le reste (comptes, cloud, `fs/*`, marketplace, realtime) relève des non-goals de Pyxis. |
 | **Un seul thread ouvert** par processus | Le registre d'outils, la session Code Mode et le handle multi-agent appartiennent au thread ouvert. Un deuxième thread vivant les rebinderait sous le premier ; le client reçoit `-32002` plutôt qu'un thread dont les outils pointent ailleurs. |
 | `turn/reasoning/delta` au lieu d'un delta de raisonnement porté par un item | Pyxis ne persiste pas le raisonnement. L'attacher à un item ferait diverger la numérotation d'un thread repris de celle de son journal. |
 | `item/tool/requestApproval` en plus des deux familles Codex | Pyxis dispatche des outils génériques (MCP, multi-agent, Code Mode) par le même pipeline ; les forcer en « commande » ou « changement de fichier » serait faux. |

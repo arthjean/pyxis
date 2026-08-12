@@ -1,4 +1,4 @@
-"""Banc d'édition US-010 AC6: mêmes tâches, deux outils.
+"""Banc d'édition: mêmes tâches, deux outils.
 
 Chaque tâche porte des fichiers de départ, une instruction indépendante de
 l'outil, et une assertion sur l'état final. L'instruction ne décrit JAMAIS un
@@ -302,7 +302,7 @@ TASKS = [
 
 
 # ── Second lot: éditions à plusieurs sites, ancres répétées, indentation.
-# C'est là que l'hypothèse du PRD est censée se jouer: sur une édition à un
+# C'est là que l'hypothèse est censée se jouer: sur une édition à un
 # seul site, les deux outils font la même chose.
 
 RUST_SERVICE = '''use std::time::Duration;

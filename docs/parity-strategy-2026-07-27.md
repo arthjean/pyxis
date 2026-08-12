@@ -9,7 +9,7 @@
 > `docs/parity/offline-suite.md`.
 
 Document de décision, 2026-07-27. Complète
-[`docs/codex-harness-parity-audit-2026-07-27.md`](./codex-harness-parity-audit-2026-07-27.md), qui
+[`docs/parity-audit-2026-07-27.md`](./parity-audit-2026-07-27.md), qui
 énumère les écarts. Celui-ci répond à une question différente : **par quel chemin**.
 
 Mesures prises sur les dépôts réels : Pyxis à `0c1cf17`, Codex à `95637f7056`, tous deux clonés
@@ -127,8 +127,6 @@ laquelle Pyxis existe plutôt que d'être un alias de Codex.
 - Le compteur de tokens par défaut reste l'heuristique `len / 4`
   (`crates/agent-tokenizer/src/lib.rs`), alors que les compteurs réels du backend arrivent
   désormais à chaque tour. Le compteur exact existe derrière la feature `tiktoken`, désactivée.
-- `tasks/prd-harness-parity-status.json` déclare EP-006 « Extensibilité utilisateur » en `TODO` avec
-  0/4 stories, alors que son périmètre a été livré par `prd-harness-capabilities` EP-004 et EP-005.
 
 ---
 

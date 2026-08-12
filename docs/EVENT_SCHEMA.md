@@ -1,6 +1,6 @@
 # Schéma d'événements JSONL
 
-Contrat machine du mode headless (`US-017`, `tasks/prd-harness-parity.md`).
+Contrat machine du mode headless.
 
 ```sh
 pyxis -p "resume ce dépôt" --output-format json
@@ -26,7 +26,7 @@ sur **stderr** et ne polluent jamais le flux JSONL.
 | `schema` | entier | Version du schéma. `1` aujourd'hui. |
 | `type` | chaîne | Discriminant en `snake_case`. |
 | `data` | variable | Charge utile, absente pour les événements sans donnée. |
-| `thread_id` | chaîne | Identité durable de la conversation. Ajout additif d'EP-005 de `tasks/prd-runtime-orchestration-durable.md`. |
+| `thread_id` | chaîne | Identité durable de la conversation. Ajout additif du runtime d'orchestration durable. |
 | `turn_id` | chaîne | Tour auquel l'événement est corrélé. |
 | `event_id` | chaîne | Identité de cette ligne dans le journal durable du thread. |
 
@@ -45,7 +45,7 @@ consommateur strict doit refuser une version majeure inconnue et ignorer les
 `type` inconnus.
 
 Le vocabulaire est celui de Pyxis, pas celui d'un concurrent : la recherche menée
-pour ce PRD n'a trouvé aucun schéma JSONL standardisé entre agents de code, donc
+pour ce contrat n'a trouvé aucun schéma JSONL standardisé entre agents de code, donc
 s'aligner sur l'un d'eux aurait imité un choix arbitraire au lieu de documenter le
 sien.
 
@@ -175,7 +175,7 @@ le code de sortie sont des faits de processus.
 | `exit_code` | Code que le processus rendra. `0` en cas de succès. |
 | `thread_id`, `turn_id` | Thread et tour du run, mêmes identifiants que sur les lignes d'événement. |
 
-`cause_category` et `cause_guidance` sont additifs (EP-006/US-019 AC1) : un
+`cause_category` et `cause_guidance` sont additifs : un
 consommateur qui les ignore lit la ligne qu'il lisait avant. Ils viennent
 d'`agent_runtime::TurnFailure`, le même classificateur qui alimente la TUI, la
 sortie stderr de `-p` et le champ `causeCategory` de `turn/completed` côté
@@ -194,7 +194,7 @@ différentes pour la même cause.
 | `store` | Le journal durable est illisible ou non écrivable. | Vérifier le fichier de session et l'espace disque. |
 | `unknown` | Cause non reconnue, reportée comme telle plutôt que devinée. | Lire `end_detail` et la trace sous `PYXIS_LOG=debug`. |
 
-`end: "interrupted"` est apparu avec EP-005 : avant lui, rien ne pouvait
+`end: "interrupted"` est apparu avec le runtime d'orchestration durable : avant lui, rien ne pouvait
 interrompre un run `-p`, donc le cas n'était pas observable. Ctrl+C passe
 désormais par le runtime, le tour s'arrête coopérativement, réconcilie son
 transcript et écrit son propre terminal. Un consommateur strict qui n'aurait

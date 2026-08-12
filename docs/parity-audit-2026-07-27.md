@@ -10,11 +10,11 @@
 
 Troisième passe, en lecture seule. Aucune ligne de code n'a été modifiée.
 
-**Baseline.** [`docs/codex-harness-parity-audit.md`](./codex-harness-parity-audit.md) (2026-07-24,
+**Baseline.** [`docs/parity-audit-2026-07-24.md`](./parity-audit-2026-07-24.md) (2026-07-24,
 221 écarts retenus après réfutation, 125 énumérés) reste le constat fondateur, laissé intact.
-[`docs/codex-harness-parity-audit-2026-07-25.md`](./codex-harness-parity-audit-2026-07-25.md) mesure
+[`docs/parity-audit-2026-07-25.md`](./parity-audit-2026-07-25.md) mesure
 le delta après les releases R1 à R3 (102 écarts restants). Ce document mesure le delta après R4,
-c'est-à-dire `tasks/prd-harness-capabilities.md` (EP-001 à EP-006, tous `DONE`).
+c'est-à-dire le lot de capacités harness, livré en entier.
 
 **Références de mesure.** Pyxis à `0c1cf17` : 52 093 lignes Rust, 10 crates, 835 tests, 37 snapshots
 de rendu. Codex CLI à `95637f7056` : 1 222 552 lignes Rust, 107 crates. Le rapport est de **23 pour
@@ -42,7 +42,7 @@ nature différente**, qu'il faut arbitrer séparément et pas au même prix :
    drapeaux CLI. Codex expose des profils, des surcharges `-c key=value`, un mode de sandbox
    sélectionnable, une politique d'approbation granulaire, et une couche de configuration managée
    (`requirements.toml`). C'est le bloc le moins spectaculaire et le plus rentable en dogfood.
-2. **La politique d'exécution** (~10 écarts). Le classificateur de commandes livré par EP-002 est
+2. **La politique d'exécution** (~10 écarts). Le classificateur de commandes livré est
    une execpolicy en réduction : une liste d'allow codée en dur contre un langage de règles
    (`codex-rs/execpolicy/`, parseur + décision + amendement). Il n'existe ni mode de sandbox
    sélectionnable, ni escalade après un échec imputé au sandbox.
@@ -270,7 +270,7 @@ Inchangé et confirmé à `0c1cf17` :
 
 1. **Reformuler l'objectif.** Remplacer « parité harness Codex CLI » par « parité sur le harness
    d'agent interactif local », avec le bloc 3 (app-server, cloud, sous-agents, plugins, mémoires,
-   review, OTLP, Windows) déclaré hors périmètre par écrit. Sans cette décision, tout PRD de suite
+   review, OTLP, Windows) déclaré hors périmètre par écrit. Sans cette décision, tout chantier de suite
    hérite d'un dénominateur de 23 pour 1.
 2. **Lot `M` le plus rentable : la surface de configuration.** `--sandbox-mode`, `--permission-mode`,
    `-c key=value`, plus une page de référence des clés. Ferme la moitié du bloc 1 et supprime la
@@ -282,6 +282,3 @@ Inchangé et confirmé à `0c1cf17` :
 5. **Lot `L` à arbitrer : `apply_patch` et `update_plan`.** Ce sont les deux seuls outils manquants
    dont l'absence change le comportement du modèle plutôt que la couverture fonctionnelle. À
    trancher explicitement, pas à laisser dans un backlog.
-6. **EP-006 de `tasks/prd-harness-parity.md` est à réviser.** Son périmètre (extensibilité) a été
-   livré par `tasks/prd-harness-capabilities.md` pendant qu'il restait `TODO`. Le fichier de statut
-   décrit un état faux.

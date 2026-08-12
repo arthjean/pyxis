@@ -73,7 +73,7 @@ Le projet est un workspace Cargo. Chaque crate a une responsabilité unique et u
 | `agent-tokenizer` | Comptage de tokens local (tiktoken-rs / tokenizers). Indispensable pour la compaction sur les providers sans usage fiable en stream. Headless. | Aucune dépendance TUI / HTTP. |
 | `agent-cli` | Binaire `pyxis`, wiring. **Seul crate qui dépend de tout.** | — |
 
-Observabilité (US-020) : les crates **émettent** via la façade `tracing`, jamais sur
+Observabilité : les crates **émettent** via la façade `tracing`, jamais sur
 une sortie de processus. Le binaire est le seul à installer un souscripteur
 (`PYXIS_LOG`) et le seul à écrire sur stdout/stderr. Émettre sans souscripteur
 n'est pas une I/O : l'invariant 1 (cœur headless) reste tenu.
@@ -437,7 +437,7 @@ Articulation withholding ↔ reactive (rappel explicite) : seules les erreurs **
 
 ## 6. MCP via `rmcp`
 
-Pyxis consomme MCP via le SDK Rust officiel `rmcp` (wrappé dans `agent-mcp`). État livré courant : config, lifecycle stdio, listing d'outils et **appel des outils par le modèle** (EP-003 de `tasks/prd-harness-capabilities.md`).
+Pyxis consomme MCP via le SDK Rust officiel `rmcp` (wrappé dans `agent-mcp`). État livré courant : config, lifecycle stdio, listing d'outils et **appel des outils par le modèle**.
 
 L'état d'un serveur MCP est un **enum discriminé** : le `client` n'est **accessible que dans la variante `Connected`.** Impossible d'appeler un serveur non connecté — le compilateur l'interdit.
 
@@ -479,7 +479,7 @@ enum SessionEntry {
 
 - **Append durable par entrée** : chaque entry réussie est écrite puis `flush` + `sync_data`. Un crash peut laisser une queue partielle ; au resume elle est ignorée, et avant tout nouvel append elle est tronquée au dernier offset valide.
 - **Resume** = on **rejoue le log** et on **reconstruit l'état** (messages, frontières de compaction, snapshots fichiers). Couplé au transcript-before-response (§3.2), une session interrompue en plein stream se rouvre proprement. `schema_version` protège les futurs formats incompatibles.
-- **Deux lignes de plus depuis EP-005** (`tasks/prd-runtime-orchestration-durable.md`), additives : `thread_meta` lie le fichier à un `ThreadId` (et, pour une branche, à sa provenance), `thread_event` porte les événements d'orchestration (entrée soumise, transition de tour, fork, filiation d'agent). Une session v1 reste lisible et poursuivable : son préfixe n'est jamais réécrit, son `ThreadId` est dérivé une fois puis matérialisé au premier append. Un fork **copie** le préfixe durable jusqu'à la frontière du tour visé dans un fichier indépendant, ce qui fait qu'une branche survit à la suppression de sa source.
+- **Deux lignes de plus depuis le runtime d'orchestration durable**, additives : `thread_meta` lie le fichier à un `ThreadId` (et, pour une branche, à sa provenance), `thread_event` porte les événements d'orchestration (entrée soumise, transition de tour, fork, filiation d'agent). Une session v1 reste lisible et poursuivable : son préfixe n'est jamais réécrit, son `ThreadId` est dérivé une fois puis matérialisé au premier append. Un fork **copie** le préfixe durable jusqu'à la frontière du tour visé dans un fichier indépendant, ce qui fait qu'une branche survit à la suppression de sa source.
 
 ---
 

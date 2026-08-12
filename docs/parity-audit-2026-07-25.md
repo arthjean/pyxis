@@ -9,13 +9,12 @@
 > `docs/parity/offline-suite.md`.
 
 Seconde passe, en lecture seule. Le constat de référence reste
-[`docs/codex-harness-parity-audit.md`](./codex-harness-parity-audit.md) (2026-07-24, 221 écarts
-retenus après réfutation adversariale), volontairement laissé intact : il fonde les affirmations de
-`tasks/prd-harness-parity.md` et sert de baseline de comparaison. Ce document mesure le delta.
+[`docs/parity-audit-2026-07-24.md`](./parity-audit-2026-07-24.md) (2026-07-24, 221 écarts
+retenus après réfutation adversariale), volontairement laissé intact : il sert de baseline de
+comparaison. Ce document mesure le delta.
 
-**Ce qui a changé entre les deux passes.** Les releases R1, R2 et R3 du PRD de parité ont atterri en
-une journée : EP-001 à EP-005 sont `DONE` dans `tasks/prd-harness-parity-status.json`, seul EP-006
-(extensibilité) reste `TODO`. Chaque affirmation ci-dessous a été revérifiée sur le code à
+**Ce qui a changé entre les deux passes.** Les releases R1, R2 et R3 du chantier de parité ont
+atterri en une journée ; seule l'extensibilité utilisateur restait à livrer. Chaque affirmation ci-dessous a été revérifiée sur le code à
 `4bf6b85`, pas reprise de la passe précédente.
 
 **Références.** Pyxis : ~40k lignes Rust, 10 crates, 693 tests, 33 snapshots. Codex CLI :
@@ -109,7 +108,7 @@ dans le contrat mais personne ne la consomme. Ils sont détaillés en section «
 | MCP | minimal | minimal | 0/14 | 14 |
 
 Cinq dimensions montent d'un cran. Aucune ne descend. Les deux dimensions restées `minimal` sont
-exactement le périmètre d'EP-006.
+exactement le périmètre de l'extensibilité utilisateur.
 
 ---
 
@@ -123,7 +122,7 @@ valeur/effort du dépôt.
 
 `majeur` · `absent` · effort `S`
 
-**Impact.** US-017 a fait entrer l'usage réel du backend dans le contrat client, mais l'utilisateur
+**Impact.** Le contrat client fait entrer l'usage réel du backend, mais l'utilisateur
 voit toujours une estimation `caractères / 4` connue pour dériver d'un facteur 3 à 24. La donnée
 fiable transite à chaque tour et est jetée.
 
@@ -318,8 +317,8 @@ Inchangé depuis la passe du 24, et renforcé par R1 :
    `S` qui ferme trois écarts et supprime la seule métrique produit connue pour être fausse. À faire
    avant tout le reste.
 2. **La friction d'approbation `bash`** est le seul écart restant qui se paie à chaque tour de
-   dogfood. Elle n'est couverte par aucune US du PRD en cours.
-3. **EP-006 reste correctement cadré** mais sous-dimensionné pour MCP : 14 écarts derrière quatre
-   user stories. Le découpage mérite d'être repris.
+   dogfood. Elle n'est couverte par aucun chantier en cours.
+3. **L'extensibilité utilisateur reste correctement cadrée** mais sous-dimensionnée pour MCP :
+   14 écarts derrière quatre chantiers. Le découpage mérite d'être repris.
 4. **Les commandes `/status`, `/usage`, `/diff`, `/compact`** sont des surfaces sur des données déjà
    produites. Effort `S` chacune, valeur immédiate en dogfood.
