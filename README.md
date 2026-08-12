@@ -25,10 +25,10 @@ Pyxis is built around a **headless core** (`agent-core`) that emits only structu
 </p>
 
 <p align="center">
-  <img src="assets/images/session.png" alt="A Pyxis session in flight: streamed tool calls (read, grep, bash) with collapsed output, a working spinner, and the status line showing the model, the workspace, the permission mode, and the remaining context" width="100%" />
+  <img src="assets/images/session.png" alt="A Pyxis session in flight: streamed bash tool calls with collapsed output, per-call wall time, a running cargo test that can be interrupted, and the status line showing the model, the reasoning effort, the workspace, and the permission mode" width="100%" />
 </p>
 <p align="center">
-  <sub>A session in flight: streamed tool calls with collapsed output, and a status line carrying the model, the workspace, the permission mode, and the remaining context.</sub>
+  <sub>A session in flight: streamed tool calls with collapsed output and per-call wall time, a long-running command you can interrupt, and a status line carrying the model, the reasoning effort, the workspace, and the permission mode.</sub>
 </p>
 
 ```console
