@@ -102,6 +102,13 @@ jobs:
       # writes to a file only is unreadable while it stalls and unreadable
       # after, once the job cap cancels it and the archive is dropped.
       #
+      # What reaches the live log is FILTERED, and that is the point: the live
+      # view renders at most a thousand lines, and a per-test log blows
+      # through that long before the end. The filter keeps the binary headers,
+      # the per-binary verdicts and every failure, so the last line of a
+      # stalled run names what is stuck. `cargo-test.log` keeps the whole
+      # thing for the summary below.
+      #
       # `ps` on the way out names what is still alive, which is the one piece
       # of evidence the cargo log cannot carry: a test that never returns
       # never prints its result line, and a leaked grandchild never appears
@@ -112,7 +119,10 @@ jobs:
           set -o pipefail
           status=0
           timeout --kill-after=1m 10m \
-            cargo test --workspace --no-fail-fast 2>&1 | tee cargo-test.log || status=$?
+            cargo test --workspace --no-fail-fast 2>&1 \
+            | tee cargo-test.log \
+            | grep --line-buffered -E '^(\s+Running|\s+Compiling|running [0-9]+ tests|test result:|test .+ (FAILED|ignored)|error|warning: unused|thread .+ panicked|---- )' \
+            || status=$?
           echo "--- processes still alive under the workspace ---"
           ps -eo pid,ppid,etime,args | grep -F "$PWD" | grep -v grep || true
           exit "$status"
