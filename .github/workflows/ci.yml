@@ -90,21 +90,20 @@ jobs:
       - name: Build tests
         run: timeout 25m cargo test --workspace --no-run
 
-      # TEMPORARY PROBE. `tests/races.rs` is where the suite stops on this
-      # runner: four seconds locally, even pinned to four cores, against more
-      # than ten minutes here. The two runs below separate the two candidate
-      # causes, because the fix differs completely. Serial: the six race tests
-      # each open a four-worker runtime and libtest runs four of them at once,
-      # so the default is roughly twenty threads on four vCPUs. Parallel: the
-      # same command the suite runs. Neither gates the job.
-      - name: Probe races
+      # TEMPORARY PROBE. `tests/races.rs` is where the suite stops, and it is
+      # not the binary's own fault: run alone on this runner it finishes in
+      # twenty-four seconds, against more than ten minutes inside the full
+      # workspace run. So the machine state degrades under everything that
+      # runs before it. This records what that state is at the moment the
+      # stall begins. It does not gate the job.
+      - name: Probe machine before races
         run: |
-          echo "=== serial ==="
-          timeout 300 cargo test -p agent-runtime --test races -- --test-threads=1 \
-            && echo "SERIAL_OK" || echo "SERIAL_RC=$?"
-          echo "=== parallel ==="
-          timeout 300 cargo test -p agent-runtime --test races \
-            && echo "PARALLEL_OK" || echo "PARALLEL_RC=$?"
+          echo "=== memory ==="; free -m
+          echo "=== disk ==="; df -h / /tmp
+          echo "=== process count ==="; ps -e --no-headers | wc -l
+          echo "=== thread count ==="; ps -eLf --no-headers | wc -l
+          echo "=== top by rss ==="
+          ps -eo pid,ppid,etime,rss,args --sort=-rss | head -15
 
       # `--no-fail-fast`: the summary must name ALL the failing tests, not
       # only the first crate that breaks.
@@ -139,8 +138,11 @@ jobs:
             | tee cargo-test.log \
             | grep --line-buffered -E '^(\s+Running|\s+Compiling|running [0-9]+ tests|test result:|test .+ (FAILED|ignored)|error|warning: unused|thread .+ panicked|---- )' \
             || status=$?
-          echo "--- processes still alive under the workspace ---"
-          ps -eo pid,ppid,etime,args | grep -F "$PWD" | grep -v grep || true
+          echo "--- machine state at the stall ---"
+          free -m
+          df -h / /tmp
+          echo "processes=$(ps -e --no-headers | wc -l) threads=$(ps -eLf --no-headers | wc -l)"
+          ps -eo pid,ppid,etime,rss,args --sort=-rss | head -25
           exit "$status"
 
       # AC3: a failure names the failing test in the workflow summary, not
