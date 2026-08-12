@@ -242,7 +242,18 @@ async fn a_failing_call_is_traced_under_the_span_of_its_caller() {
 /// running the same dispatch outside any collection and observing that the tools
 /// keep working, at the same cost as before the instrumentation.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn without_a_subscriber_the_dispatch_is_unchanged() {
+    // Under the same lock as the collecting tests, and for the same reason
+    // read the other way round: dispatching with NO subscriber installed
+    // caches "never" on every callsite it touches, for every thread. Left
+    // unserialized, that caching lands between another test's
+    // `rebuild_interest_cache` and its dispatch, and the span it asserts on
+    // never opens.
+    let _serialized = match TRACE_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     let out = registry()
         .dispatch(vec![call("a", serde_json::json!({}))])
         .await;
