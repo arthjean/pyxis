@@ -917,15 +917,18 @@ async fn a_straggler_is_aborted_and_still_produces_one_terminal() {
     wait_for(|| started.lock().unwrap().len() == 1, "the turn to start").await;
 
     let at = Instant::now();
-    handle.shutdown().await;
+    // The upper bound is enforced ON the wait, not measured after it. Read
+    // afterwards, it can only describe a shutdown that already returned: an
+    // actor that never returns hangs this test forever, and with it the whole
+    // binary and the suite around it. `SHUTDOWN_DEADLINE` is a contract, so
+    // exceeding it has to be a failure with a name.
+    tokio::time::timeout(Duration::from_secs(4), handle.shutdown())
+        .await
+        .expect("the full shutdown stays bounded");
     let elapsed = at.elapsed();
     assert!(
         elapsed >= Duration::from_secs(2),
         "the straggler got its grace period, took {elapsed:?}"
-    );
-    assert!(
-        elapsed < Duration::from_secs(4),
-        "the full shutdown stays bounded, took {elapsed:?}"
     );
 
     let snapshot = store.read().await.unwrap();
