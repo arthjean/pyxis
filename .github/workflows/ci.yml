@@ -1,9 +1,9 @@
-# Continuous integration (US-004, `tasks/prd-harness-parity.md`).
+# Continuous integration.
 #
 # A single platform: Linux. ADR-11 sets Linux as the only supported target,
 # so no multi-OS matrix is declared.
 #
-# The three commands are the quality gates of the PRD, from the cheapest
+# The three commands are the quality gates, from the cheapest
 # to the most expensive. `clippy` runs WITHOUT `-D warnings`: the workspace declares
 # `unwrap_used`/`expect_used` as `warn` by documented decision (`Cargo.toml`),
 # and a global hardening would make the command red on healthy code.
@@ -20,7 +20,7 @@ concurrency:
 # The job only reads the repository: `checkout`, compilation, step summary.
 # Without this key, the `GITHUB_TOKEN` inherits the repository default and the three
 # third-party actions below (mutable tags, reassignable by their maintainer)
-# run with that right. The PRD takes an explicit stand against that
+# run with that right. The project takes an explicit stand against that
 # vector ("Configuration-Based Sandbox Escape").
 permissions:
   contents: read
