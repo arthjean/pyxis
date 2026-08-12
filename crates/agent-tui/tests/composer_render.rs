@@ -1,5 +1,4 @@
-//! Rendering contracts of the multi-line composer (US-010,
-//! `tasks/prd-harness-parity.md`).
+//! Rendering contracts of the multi-line composer.
 //!
 //! What snapshots cannot prove: the SCREEN position of the cursor
 //! (it does not appear in the buffer dump) and the rendering time. Both

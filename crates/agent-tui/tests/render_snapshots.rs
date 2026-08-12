@@ -1,5 +1,4 @@
-//! Snapshot coverage of the critical TUI flows (US-006,
-//! `tasks/prd-harness-parity.md`).
+//! Snapshot coverage of the critical TUI flows.
 //!
 //! Each test freezes a full frame for a flow named after its acceptance
 //! criterion. The harness (`harness/mod.rs`) guarantees determinism, panic

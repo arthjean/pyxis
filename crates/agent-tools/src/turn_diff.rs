@@ -1,4 +1,4 @@
-//! Aggregated diff of a turn (US-018, `tasks/prd-harness-parity.md`).
+//! Aggregated diff of a turn.
 //!
 //! The question this module answers: "what did this turn change on disk?",
 //! including what no editing tool produced, for instance a `cargo fmt` or a

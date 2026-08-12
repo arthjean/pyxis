@@ -1,8 +1,8 @@
-# spikes/ — Phase 0 (EP-001), code JETABLE
+# spikes/ — Phase 0, code JETABLE
 
 Workspace de dé-risquage. Chaque crate prouve **une** hypothèse, pas une feature.
 **Rien ici n'est du MVP** : le futur workspace `agent-*` vivra à la racine du repo et
-ne réutilisera pas ce code. Verdicts détaillés : [`../tasks/spike-verdicts.md`](../tasks/spike-verdicts.md).
+ne réutilisera pas ce code.
 
 | Crate | Story | Prouve |
 |---|---|---|

@@ -1,4 +1,4 @@
-//! Snapshot harness of the terminal rendering (US-005, `tasks/prd-harness-parity.md`).
+//! Snapshot harness of the terminal rendering.
 //!
 //! Renders a full frame on `TestBackend` at a fixed terminal size and returns
 //! the buffer as text. Three guarantees carried here rather than in

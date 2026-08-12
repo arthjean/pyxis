@@ -19,7 +19,7 @@ Codex source, the changed file must:
    adapted source.
 4. Keep the resulting Pyxis distribution under GPL-3.0-or-later.
 
-As of EP-002 of `tasks/prd-parite-totale-codex-cli.md` (2026-07-28), the Code
+As of 2026-07-28, the Code
 Mode work adds one piece of VERBATIM Apache-2.0 reuse and three structurally
 derived boundaries. The baseline is the read-only clone at
 `/home/arthur/dev/codex`, commit `fa1d4c40d0e63eef2e0ba8a9e004ccd0a80b77f5`.
@@ -171,7 +171,7 @@ Structurally derived from Codex, written against Pyxis types:
 
 Reference source inventory: `docs/codex-port-inventory.md`.
 
-As of EP-006 of `tasks/prd-parite-client-modele-codex-api.md` (2026-08-02),
+As of 2026-08-02,
 the canonical auxiliary contracts and provider clients study the read-only Codex baseline at commit
 `ee0247f95a6fe2b094ba2253d82cae2a2b4c2dff`. No module is structurally
 transplanted. Endpoint names, JSON field names, Realtime event tags, the

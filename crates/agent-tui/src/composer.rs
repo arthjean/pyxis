@@ -1,4 +1,4 @@
-//! Layout of the multi-line composer (US-010, `tasks/prd-harness-parity.md`).
+//! Layout of the multi-line composer.
 //!
 //! The input model stays a flat `String` with a byte-offset cursor
 //! (`AppState::input`): all the menu logic and the existing tests read

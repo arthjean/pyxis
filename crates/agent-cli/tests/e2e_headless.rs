@@ -1,4 +1,4 @@
-//! End-to-end integration harness (US-007, `tasks/prd-harness-parity.md`).
+//! End-to-end integration harness.
 //!
 //! What this harness checks, and what the unit tests of each crate cannot
 //! see: the **wiring**. A full turn here goes through the core
