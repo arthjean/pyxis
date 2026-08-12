@@ -179,6 +179,10 @@ async fn a_nested_call_reaches_the_same_pipeline_a_direct_call_would() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::panic,
+    reason = "an unexpected event pair has no assertion to make"
+)]
 async fn a_nested_call_publishes_its_native_client_lifecycle() {
     let tools = Arc::new(RecordingTools::default());
     let dispatcher = dispatcher(Arc::clone(&tools), vec![function_spec("read")]);

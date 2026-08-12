@@ -1964,6 +1964,10 @@ async fn default_registry_exposes_every_native_tool_spec() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::panic,
+    reason = "a missing spec has no contract left to assert"
+)]
 async fn terminal_tools_publish_their_structured_output_contract() {
     let reg = crate::default_registry("/tmp", PermissionMode::Default, allow_approver());
     let specs = reg.tool_specs();
