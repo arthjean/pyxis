@@ -90,6 +90,22 @@ jobs:
       - name: Build tests
         run: timeout 25m cargo test --workspace --no-run
 
+      # TEMPORARY PROBE. `tests/races.rs` is where the suite stops on this
+      # runner: four seconds locally, even pinned to four cores, against more
+      # than ten minutes here. The two runs below separate the two candidate
+      # causes, because the fix differs completely. Serial: the six race tests
+      # each open a four-worker runtime and libtest runs four of them at once,
+      # so the default is roughly twenty threads on four vCPUs. Parallel: the
+      # same command the suite runs. Neither gates the job.
+      - name: Probe races
+        run: |
+          echo "=== serial ==="
+          timeout 300 cargo test -p agent-runtime --test races -- --test-threads=1 \
+            && echo "SERIAL_OK" || echo "SERIAL_RC=$?"
+          echo "=== parallel ==="
+          timeout 300 cargo test -p agent-runtime --test races \
+            && echo "PARALLEL_OK" || echo "PARALLEL_RC=$?"
+
       # `--no-fail-fast`: the summary must name ALL the failing tests, not
       # only the first crate that breaks.
       #
