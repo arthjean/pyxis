@@ -33,7 +33,15 @@ jobs:
     name: fmt + clippy + tests
     runs-on: ubuntu-latest
     # Hard cap of AC2: past it, the job fails instead of drifting.
-    timeout-minutes: 15
+    #
+    # 30 rather than 15 because the cap has to cover the run that fills the
+    # cache, not only the runs that hit it. `clippy` leaves the dependency
+    # graph at metadata only, so `cargo test` is the first command that
+    # actually codegens and links the 54 test binaries, and on a cold cache
+    # that is minutes on a four-core runner. A cap the priming run cannot
+    # meet cancels the job, and a cancelled job archives NO log, which is how
+    # this gate stayed undiagnosable.
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v5
@@ -55,8 +63,17 @@ jobs:
           components: rustfmt, clippy
 
       # Registry + `target/` cache: without it the suite recompiles the whole graph
-      # on every push and the 15-minute budget does not hold.
+      # on every push and the time budget does not hold.
+      #
+      # `cache-on-failure` is what makes that budget reachable at all. The
+      # default saves only after a green job, so a workspace whose gate is red
+      # never banks the graph it just compiled and every rerun starts cold:
+      # the cheap gates keep failing on the expensive one's build. Saving on a
+      # red run costs one cache write and makes each fix iteration pay for
+      # compilation once.
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: Format
         run: cargo fmt --all -- --check
