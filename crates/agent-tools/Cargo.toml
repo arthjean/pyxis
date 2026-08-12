@@ -28,6 +28,7 @@ serde_json.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
 tokio = { workspace = true, features = ["process", "fs"] }
+libc.workspace = true
 thiserror.workspace = true
 regex.workspace = true
 globset.workspace = true

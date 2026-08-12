@@ -253,6 +253,7 @@ dependencies = [
  "base64",
  "futures-util",
  "globset",
+ "libc",
  "nix",
  "regex",
  "serde",

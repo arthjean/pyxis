@@ -24,6 +24,12 @@ expect_used = "warn"
 unwrap_in_result = "warn"
 
 [workspace.dependencies]
+# `killpg` for the process-group cleanup in `agent-tools`. The signal has to
+# be a syscall, not an external `kill`: the argv `kill -KILL -<pgid>` means
+# "the group" under util-linux and nothing at all under procps, which is the
+# difference between a Fedora workstation and an Ubuntu CI runner, and it
+# decided whether an interrupted turn left its subprocesses running.
+libc = "0.2"
 # `signal`: the headless client turns Ctrl+C into a runtime interruption
 # (US-018 AC5) instead of letting the default handler kill the process in the
 # middle of a durable write.

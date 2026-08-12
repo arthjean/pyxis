@@ -497,14 +497,7 @@ impl Drop for GroupReaper {
                 .status();
         }
         #[cfg(not(windows))]
-        {
-            let _ = std::process::Command::new("kill")
-                .arg("-KILL")
-                .arg(format!("-{pid}"))
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
+        signal_group(pid, libc::SIGKILL);
     }
 }
 
@@ -526,22 +519,39 @@ pub(crate) async fn kill_process_tree(pid: u32) {
     }
     #[cfg(not(windows))]
     {
-        let group = format!("-{pid}");
-        let _ = tokio::process::Command::new("kill")
-            .arg("-TERM")
-            .arg(&group)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
+        signal_group(pid, libc::SIGTERM);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let _ = tokio::process::Command::new("kill")
-            .arg("-KILL")
-            .arg(&group)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
+        signal_group(pid, libc::SIGKILL);
+    }
+}
+
+/// Signals a whole process group, by syscall.
+///
+/// NOT by running `kill`. The argv this needs is `kill -KILL -<pgid>`, and the
+/// leading `-` on the group is read differently by the two implementations in
+/// circulation: util-linux takes it as a process group, procps takes it as
+/// another signal option and then exits 0 having signalled NOTHING. Fedora
+/// ships the first, Debian and Ubuntu the second, so the cleanup worked on the
+/// workstation it was written on and was a silent no-op on the CI runner and
+/// on any Ubuntu host: an interrupted turn left its `cargo`, its `make` or its
+/// dev server running, and the only visible symptom was a test that could not
+/// be reproduced locally.
+///
+/// `killpg` takes the group as a positive pgid and answers through `errno`,
+/// with no PATH lookup, no argv to misparse and no process to spawn. The last
+/// point matters on its own: this is called from a `Drop`, where spawning a
+/// process blocks the runtime thread.
+#[cfg(not(windows))]
+pub(crate) fn signal_group(pid: u32, signal: i32) {
+    // The group id IS the leader's pid: every command here is started with
+    // `process_group(0)`.
+    //
+    // SAFETY: `killpg` reads two integers and touches no memory owned by this
+    // process. A group that no longer exists is reported through `errno`,
+    // which this cleanup path has nothing to do with: the processes are gone,
+    // which is the outcome it wanted.
+    unsafe {
+        libc::killpg(pid as libc::pid_t, signal);
     }
 }
 
