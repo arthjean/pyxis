@@ -123,11 +123,19 @@ jobs:
             | tee cargo-test.log \
             | grep --line-buffered -E '^(\s+Running|\s+Compiling|running [0-9]+ tests|test result:|test .+ (FAILED|ignored)|error|warning: unused|thread .+ panicked|---- )' \
             || status=$?
-          echo "--- machine state at the stall ---"
-          free -m
-          df -h / /tmp
-          echo "processes=$(ps -e --no-headers | wc -l) threads=$(ps -eLf --no-headers | wc -l)"
-          ps -eo pid,ppid,etime,rss,args --sort=-rss | head -25
+          if [ "$status" -ne 0 ]; then
+            # The filtered stream keeps a failure READABLE; it does not keep it
+            # complete. A panic's message is the line after its location, and
+            # that is the line that says what actually went wrong, so the full
+            # log has to reach the archive whenever the gate is red.
+            echo "--- full cargo output ---"
+            cat cargo-test.log
+            echo "--- machine state at the failure ---"
+            free -m
+            df -h / /tmp
+            echo "processes=$(ps -e --no-headers | wc -l) threads=$(ps -eLf --no-headers | wc -l)"
+            ps -eo pid,ppid,etime,rss,args --sort=-rss | head -25
+          fi
           exit "$status"
 
       # AC3: a failure names the failing test in the workflow summary, not
