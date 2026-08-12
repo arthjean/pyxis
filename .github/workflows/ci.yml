@@ -34,14 +34,16 @@ jobs:
     runs-on: ubuntu-latest
     # Hard cap of AC2: past it, the job fails instead of drifting.
     #
-    # 30 rather than 15 because the cap has to cover the run that fills the
-    # cache, not only the runs that hit it. `clippy` leaves the dependency
-    # graph at metadata only, so `cargo test` is the first command that
-    # actually codegens and links the 54 test binaries, and on a cold cache
-    # that is minutes on a four-core runner. A cap the priming run cannot
-    # meet cancels the job, and a cancelled job archives NO log, which is how
-    # this gate stayed undiagnosable.
-    timeout-minutes: 30
+    # The cap has to cover the run that FILLS the cache, not only the runs
+    # that hit it: `clippy` leaves the dependency graph at metadata only, so
+    # `cargo test` is the first command that codegens and links the 54 test
+    # binaries, and on a cold cache that is minutes on a four-core runner.
+    #
+    # This is the outer backstop only. It is deliberately looser than the
+    # per-step `timeout` calls below, because reaching THIS one cancels the
+    # job and a cancelled job archives no log: the steps must fail first, and
+    # readably.
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v5
@@ -81,13 +83,26 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets
 
+      # Compiling the tests is its OWN step, and not for tidiness: `clippy`
+      # stops at metadata, so this is where the whole graph is codegened and
+      # where 54 test binaries are linked. Merged into the run, a slow build
+      # and a hung test are the same opaque stall.
+      - name: Build tests
+        run: timeout 25m cargo test --workspace --no-run
+
       # `--no-fail-fast`: the summary must name ALL the failing tests, not
       # only the first crate that breaks.
+      #
+      # `timeout` rather than the job-level cap alone: `timeout-minutes`
+      # CANCELS the job, and a cancelled job archives no log, so a stall here
+      # would erase the only evidence of itself. Failing from inside the step
+      # keeps the log.
       - name: Tests
         id: tests
         run: |
           set -o pipefail
-          cargo test --workspace --no-fail-fast 2>&1 | tee cargo-test.log
+          timeout --signal=INT --kill-after=1m 10m \
+            cargo test --workspace --no-fail-fast 2>&1 | tee cargo-test.log
 
       # AC3: a failure names the failing test in the workflow summary, not
       # only at the bottom of the log.
