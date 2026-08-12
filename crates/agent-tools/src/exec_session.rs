@@ -615,7 +615,10 @@ impl Tool for ExecCommand {
         let tty = input.tty.unwrap_or(false);
         // US-004: taken before the process exists, so what the proxy logs after
         // it is this call's doing and nobody else's.
-        let sandbox_mark = ctx.sandbox_observer.as_ref().map(|observer| observer.mark());
+        let sandbox_mark = ctx
+            .sandbox_observer
+            .as_ref()
+            .map(|observer| observer.mark());
         let id = sessions.reserve()?;
 
         let session = match spawn_session(&shell, &input.cmd, &workdir, tty, ctx) {
@@ -772,7 +775,10 @@ impl Tool for WriteStdin {
         let terminating = input.terminates();
         // Same mark as `exec_command`: what the session reaches while this write
         // is being consumed is attributable to this call.
-        let sandbox_mark = ctx.sandbox_observer.as_ref().map(|observer| observer.mark());
+        let sandbox_mark = ctx
+            .sandbox_observer
+            .as_ref()
+            .map(|observer| observer.mark());
 
         if !input.chars.is_empty() {
             write_to_session(&sessions, id, input.chars.as_bytes()).await?;
@@ -1235,8 +1241,9 @@ fn finish(
         // proxy's own record outranks the text anyway.
         let attributed = crate::sandbox::attributed_failure(ctx, mark, body.clone());
         match attributed.denial {
-            Some(denial) => ToolOutput::error(format!("{text}\n{}", denial.explain()))
-                .with_denial(denial),
+            Some(denial) => {
+                ToolOutput::error(format!("{text}\n{}", denial.explain())).with_denial(denial)
+            }
             None => ToolOutput::error(text),
         }
     } else {

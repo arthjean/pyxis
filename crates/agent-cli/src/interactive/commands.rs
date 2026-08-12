@@ -195,10 +195,9 @@ impl Loop {
             "/compact" => self.cmd_compact().await,
             "/providers" => self.cmd_providers(arg).await,
             "/mcp" => self.mcp_command(arg),
-            "/skills" => self
-                .state
-                .blocks
-                .push(Block::Notice("Choose a skill in the /skills submenu.".into())),
+            "/skills" => self.state.blocks.push(Block::Notice(
+                "Choose a skill in the /skills submenu.".into(),
+            )),
             "/quit" => self.begin_shutdown(),
             other => self
                 .state
@@ -272,9 +271,9 @@ impl Loop {
             .as_deref()
             .map(|effort| format!(" [{}]", reasoning_effort_label(effort)))
             .unwrap_or_default();
-        self.state
-            .blocks
-            .push(Block::Notice(format!("Model: {arg}{effort_suffix}{suffix}")));
+        self.state.blocks.push(Block::Notice(format!(
+            "Model: {arg}{effort_suffix}{suffix}"
+        )));
         self.persist_model(arg);
         self.persist_reasoning_effort(next_effort.as_deref());
         self.sync_settings();
@@ -283,23 +282,27 @@ impl Loop {
     fn cmd_effort(&mut self, arg: &str) {
         let supported = supported_reasoning_efforts_for_model(&self.cfg.model);
         if arg.is_empty() {
-            self.state.blocks.push(Block::Notice(if supported.is_empty() {
-                format!("No known reasoning efforts for model {}", self.cfg.model)
-            } else {
-                format!("Usage : /effort <{}>", supported.join("|"))
-            }));
+            self.state
+                .blocks
+                .push(Block::Notice(if supported.is_empty() {
+                    format!("No known reasoning efforts for model {}", self.cfg.model)
+                } else {
+                    format!("Usage : /effort <{}>", supported.join("|"))
+                }));
             return;
         }
         let Some(effort) = normalize_reasoning_effort_for_model(&self.cfg.model, arg) else {
-            self.state.blocks.push(Block::Notice(if supported.is_empty() {
-                format!("No known reasoning efforts for model {}", self.cfg.model)
-            } else {
-                format!(
-                    "Unsupported reasoning effort for {}: {arg}. Available: {}",
-                    self.cfg.model,
-                    supported.join("|")
-                )
-            }));
+            self.state
+                .blocks
+                .push(Block::Notice(if supported.is_empty() {
+                    format!("No known reasoning efforts for model {}", self.cfg.model)
+                } else {
+                    format!(
+                        "Unsupported reasoning effort for {}: {arg}. Available: {}",
+                        self.cfg.model,
+                        supported.join("|")
+                    )
+                }));
             return;
         };
         self.cfg.reasoning_effort = Some(effort.clone());
@@ -346,9 +349,9 @@ impl Loop {
         if let Some(path) = &self.cfg.settings_path
             && let Err(err) = crate::settings::save_model(path, model)
         {
-            self.state
-                .blocks
-                .push(Block::Error(format!("settings: failed to save model: {err}")));
+            self.state.blocks.push(Block::Error(format!(
+                "settings: failed to save model: {err}"
+            )));
         }
     }
 
@@ -377,9 +380,7 @@ impl Loop {
                 self.cfg.goal = None;
                 self.sync_settings();
                 if let Err(err) = self.conversation.forget_goal() {
-                    self.state
-                        .blocks
-                        .push(Block::Error(format!("goal: {err}")));
+                    self.state.blocks.push(Block::Error(format!("goal: {err}")));
                 }
                 self.state
                     .blocks
@@ -395,9 +396,7 @@ impl Loop {
                     .write_goal(goal)
                     .and_then(|()| self.conversation.write_iters())
                 {
-                    self.state
-                        .blocks
-                        .push(Block::Error(format!("goal: {err}")));
+                    self.state.blocks.push(Block::Error(format!("goal: {err}")));
                 }
                 match self.runtime.submit(Submission::new(goal)).await {
                     Ok(_) => self.push_user(goal),
@@ -509,9 +508,9 @@ impl Loop {
     /// exactly its scope.
     async fn cmd_diff(&mut self) {
         let block = match agent_tools::turn_diff::workspace_diff(&self.cfg.workspace).await {
-            Ok(agent_tools::turn_diff::WorkspaceDiff::NoRepository) => Block::Notice(
-                "Diff unavailable: this directory is not a git repository.".into(),
-            ),
+            Ok(agent_tools::turn_diff::WorkspaceDiff::NoRepository) => {
+                Block::Notice("Diff unavailable: this directory is not a git repository.".into())
+            }
             Ok(agent_tools::turn_diff::WorkspaceDiff::Changes(diff)) => {
                 Block::Notice(workspace_diff_report(&diff))
             }
@@ -951,7 +950,14 @@ mod tests {
         assert!(NEEDS_IDLE.contains(&"/goal"));
         assert!(NEEDS_IDLE.contains(&"/init"));
         // Read-only surfaces never wait.
-        for command in ["/status", "/usage", "/diff", "/copy", "/hooks", "/approvals"] {
+        for command in [
+            "/status",
+            "/usage",
+            "/diff",
+            "/copy",
+            "/hooks",
+            "/approvals",
+        ] {
             assert!(!NEEDS_IDLE.contains(&command), "`{command}` reads only");
         }
         // Every entry is a command someone can actually type.

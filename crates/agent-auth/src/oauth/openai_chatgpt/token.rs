@@ -119,7 +119,10 @@ mod tests {
 
     #[test]
     fn extract_account_id_reads_custom_claim() {
-        assert_eq!(extract_account_id(&account_jwt("acct_42")).unwrap(), "acct_42");
+        assert_eq!(
+            extract_account_id(&account_jwt("acct_42")).unwrap(),
+            "acct_42"
+        );
     }
 
     #[test]

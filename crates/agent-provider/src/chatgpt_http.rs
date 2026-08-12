@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::time::Duration;
 
-use agent_auth::oauth::openai_chatgpt::CHATGPT_BASE_URL;
 use agent_auth::Secret;
+use agent_auth::oauth::openai_chatgpt::CHATGPT_BASE_URL;
 use agent_auth::provider::ProviderRequestAuth;
 use agent_core::model::{ModelRetryPolicy, ResponsesDialect};
 use agent_core::provider::{CanonicalRequest, ProviderError};

@@ -72,9 +72,7 @@ impl agent_sandbox::NetworkApprover for TuiNetworkApprover {
             // client to correlate the dialog with its answer.
             call_id: format!("network:{host}"),
             tool: NETWORK_APPROVAL_TOOL.to_string(),
-            reason: format!(
-                "{host} is outside the network allow-list (allowed: {allowed})"
-            ),
+            reason: format!("{host} is outside the network allow-list (allowed: {allowed})"),
             // A blocked host is reached BY a command, whose output may itself
             // have been shaped by untrusted content. Marking the question as
             // taint-forced is what keeps the dialog from looking routine.
@@ -210,10 +208,7 @@ impl agent_tools::PermissionBroker for CliPermissionBroker {
                     ));
                 }
                 self.mode.set(*mode);
-                GrantOutcome::Granted(format!(
-                    "the session is now in `{}`.",
-                    mode.id()
-                ))
+                GrantOutcome::Granted(format!("the session is now in `{}`.", mode.id()))
             }
         }
     }

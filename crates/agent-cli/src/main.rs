@@ -969,9 +969,8 @@ fn main() -> anyhow::Result<()> {
     // the same failure was reported twice with two different verdicts.
     let sessions_dir = workspace.join(".pyxis").join("sessions");
     if !args.ephemeral {
-        std::fs::create_dir_all(&sessions_dir).map_err(|err| {
-            anyhow::anyhow!("session: {}: {err}", sessions_dir.display())
-        })?;
+        std::fs::create_dir_all(&sessions_dir)
+            .map_err(|err| anyhow::anyhow!("session: {}: {err}", sessions_dir.display()))?;
     }
     let session_dirs: &[&std::path::Path] = if args.ephemeral {
         &[]
@@ -1524,12 +1523,15 @@ async fn run(
     // app-server keep the historical behavior (immediate 403), because a
     // question nobody can answer is a socket held open for the bound and then
     // refused anyway.
-    let network_approver: Option<Arc<dyn agent_sandbox::NetworkApprover>> =
-        (!headless && !args.app_server)
-            .then(|| Arc::new(TuiNetworkApprover::new(perm_tx.clone())) as Arc<_>);
-    let proxy =
-        agent_sandbox::spawn_proxy_with_approver(proxy_policy, Some(proxy_notice), network_approver)
-            .await?;
+    let network_approver: Option<Arc<dyn agent_sandbox::NetworkApprover>> = (!headless
+        && !args.app_server)
+        .then(|| Arc::new(TuiNetworkApprover::new(perm_tx.clone())) as Arc<_>);
+    let proxy = agent_sandbox::spawn_proxy_with_approver(
+        proxy_policy,
+        Some(proxy_notice),
+        network_approver,
+    )
+    .await?;
     let proxy_addr = proxy.addr.clone();
     let harden: agent_tools::CommandHardener =
         Arc::new(move |cmd: &mut tokio::process::Command| set_proxy_env(cmd, &proxy_addr));

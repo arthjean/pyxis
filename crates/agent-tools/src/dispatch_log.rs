@@ -218,7 +218,10 @@ mod tests {
         let summary = log.summary();
         assert!(summary[0].starts_with("read: 2 call(s)"), "{summary:?}");
         assert!(summary[0].contains("5 ms average"), "{summary:?}");
-        assert!(summary[1].starts_with("bash: 1 call(s), 1 failed"), "{summary:?}");
+        assert!(
+            summary[1].starts_with("bash: 1 call(s), 1 failed"),
+            "{summary:?}"
+        );
     }
 
     #[test]

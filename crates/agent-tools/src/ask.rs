@@ -398,10 +398,11 @@ mod tests {
     async fn a_question_reaches_the_user_channel_with_its_options() {
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
-        let ctx = ToolCtx::new(std::env::temp_dir())
-            .with_user_notice(Arc::new(move |message: String| {
+        let ctx = ToolCtx::new(std::env::temp_dir()).with_user_notice(Arc::new(
+            move |message: String| {
                 sink.lock().expect("test lock").push(message);
-            }));
+            },
+        ));
         let out = RequestUserInput
             .call(
                 RequestUserInputInput {

@@ -126,7 +126,10 @@ impl CommandPolicy {
                 ));
                 continue;
             }
-            if extra.iter().any(|other: &SafeCommand| other.program == program) {
+            if extra
+                .iter()
+                .any(|other: &SafeCommand| other.program == program)
+            {
                 rejected.push(format!("safe_commands: `{program}` declared twice"));
                 continue;
             }
@@ -141,7 +144,10 @@ impl CommandPolicy {
 
     /// Programs the user added, for `/status` and diagnostics.
     pub fn programs(&self) -> Vec<&str> {
-        self.extra.iter().map(|safe| safe.program.as_str()).collect()
+        self.extra
+            .iter()
+            .map(|safe| safe.program.as_str())
+            .collect()
     }
 
     fn find(&self, program: &str) -> Option<&SafeCommand> {
@@ -553,10 +559,7 @@ mod policy_tests {
             CommandClass::Argv(_)
         ));
         // And the built-in table alone still asks.
-        assert!(matches!(
-            classify("just --list"),
-            CommandClass::Argv(_)
-        ));
+        assert!(matches!(classify("just --list"), CommandClass::Argv(_)));
     }
 
     #[test]

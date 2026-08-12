@@ -85,8 +85,7 @@ impl CredentialManager {
         if state.cred.is_none() {
             return Err(disconnected_error());
         }
-        self.refresh_locked(&mut state, now_ms())
-            .await
+        self.refresh_locked(&mut state, now_ms()).await
     }
 
     /// Invalidates the in-memory credential. Used by the interactive logout after

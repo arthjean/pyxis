@@ -27,9 +27,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use agent_core::AgentEvent;
 use agent_core::message::{Message, recent_untrusted_content};
 use agent_core::provider::Provider;
-use agent_core::AgentEvent;
 use agent_provider::KEYRING_ACCOUNT;
 use agent_runtime::lifecycle::TurnState;
 use agent_runtime::thread::{
@@ -48,8 +48,8 @@ use crate::approver::{PermissionMsg, to_prompt};
 use crate::runtime::{CliStepSource, EngineDeps, SessionRuntime, SettingsCell};
 use crate::settings::permission_mode_id;
 
-pub(crate) use mcp::mcp_requires_trust;
 use mcp::McpEvent;
+pub(crate) use mcp::mcp_requires_trust;
 
 /// Maximum number of prompt history entries aggregated per directory.
 const PROMPT_HISTORY_CAP: usize = 200;
@@ -780,7 +780,11 @@ impl Loop {
         // US-017 AC2: the submission is gated by its hooks before anything else
         // happens. A refusal keeps the message in the composer and names the
         // reason, so the user can amend it.
-        if self.cfg.hooks.watches(agent_tools::HookEvent::UserPromptSubmit) {
+        if self
+            .cfg
+            .hooks
+            .watches(agent_tools::HookEvent::UserPromptSubmit)
+        {
             let hooks = Arc::clone(&self.cfg.hooks);
             let decision = hooks
                 .lifecycle(agent_tools::Lifecycle::UserPromptSubmit { prompt: &prompt })
@@ -943,15 +947,13 @@ impl Loop {
                     .write_goal(&goal)
                     .and_then(|()| self.conversation.write_iters())
             {
-                self.state
-                    .blocks
-                    .push(Block::Error(format!("goal: {err}")));
+                self.state.blocks.push(Block::Error(format!("goal: {err}")));
             }
         }
-        if switch == Switch::Fresh && let Err(err) = self.conversation.forget_goal() {
-            self.state
-                .blocks
-                .push(Block::Error(format!("goal: {err}")));
+        if switch == Switch::Fresh
+            && let Err(err) = self.conversation.forget_goal()
+        {
+            self.state.blocks.push(Block::Error(format!("goal: {err}")));
         }
         self.sync_settings();
 
@@ -1080,12 +1082,10 @@ impl Loop {
             // A cancellation or a shutdown is not a fault: it says so in words
             // either way, but tinting it red would report a failure the user
             // caused on purpose.
-            self.state
-                .blocks
-                .push(match failure.category {
-                    agent_runtime::FailureCategory::Interrupted => Block::Notice(line),
-                    _ => Block::Error(line),
-                });
+            self.state.blocks.push(match failure.category {
+                agent_runtime::FailureCategory::Interrupted => Block::Notice(line),
+                _ => Block::Error(line),
+            });
         }
         // US-019 AC1 of the harness PRD: re-read BEFORE any continuation turn, so
         // the goal loop sees the fresh context too.
@@ -1100,8 +1100,9 @@ impl Loop {
                     Some(name) => format!(
                         "{name} is part of the project context from the next model request on."
                     ),
-                    None => "No instruction file written: the project context is unchanged."
-                        .to_string(),
+                    None => {
+                        "No instruction file written: the project context is unchanged.".to_string()
+                    }
                 },
             ));
         }
@@ -1140,9 +1141,7 @@ impl Loop {
             self.cfg.goal = None;
             self.sync_settings();
             if let Err(err) = self.conversation.forget_goal() {
-                self.state
-                    .blocks
-                    .push(Block::Error(format!("goal: {err}")));
+                self.state.blocks.push(Block::Error(format!("goal: {err}")));
             }
             self.state
                 .blocks
@@ -1157,9 +1156,7 @@ impl Loop {
         }
         self.conversation.iters += 1;
         if let Err(err) = self.conversation.write_iters() {
-            self.state
-                .blocks
-                .push(Block::Error(format!("goal: {err}")));
+            self.state.blocks.push(Block::Error(format!("goal: {err}")));
             return;
         }
         let iters = self.conversation.iters;
@@ -1175,9 +1172,9 @@ impl Loop {
             .submit(Submission::new(GOAL_CONTINUE_PROMPT))
             .await
         {
-            self.state.blocks.push(Block::Error(format!(
-                "goal: continuation refused: {err}"
-            )));
+            self.state
+                .blocks
+                .push(Block::Error(format!("goal: continuation refused: {err}")));
         }
     }
 }
@@ -1219,7 +1216,10 @@ impl Screen {
 
     fn commit(&mut self, tui: &mut agent_tui::Tui, session: &mut Loop) -> anyhow::Result<()> {
         let width = tui.size()?.width;
-        session.chat.surface_mut().commit_tick(width, Instant::now());
+        session
+            .chat
+            .surface_mut()
+            .commit_tick(width, Instant::now());
         Ok(())
     }
 

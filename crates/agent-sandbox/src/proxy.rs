@@ -178,9 +178,7 @@ impl NetworkGrants {
             Ok(session) => session,
             Err(poisoned) => poisoned.into_inner(),
         };
-        session
-            .iter()
-            .any(|granted| is_suffix_match(host, granted))
+        session.iter().any(|granted| is_suffix_match(host, granted))
     }
 
     fn release(&self, host: &str) {
@@ -425,11 +423,7 @@ async fn handle_conn(
 /// Consults the approver under a bound. A question that never comes back is a
 /// refusal, so an unattended run degrades to the historical behavior instead of
 /// holding a socket open forever.
-async fn decide(
-    approver: &dyn NetworkApprover,
-    host: &str,
-    allowed: &str,
-) -> NetworkDecision {
+async fn decide(approver: &dyn NetworkApprover, host: &str, allowed: &str) -> NetworkDecision {
     match tokio::time::timeout(APPROVAL_TIMEOUT, approver.approve(host, allowed)).await {
         Ok(decision) => decision,
         Err(_) => NetworkDecision::Deny,

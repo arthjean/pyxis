@@ -358,8 +358,11 @@ pub async fn refresh(
     if let Some(resource) = cred.resource.as_deref() {
         form.push(("resource", resource));
     }
-    let token: TokenResponse =
-        post_json(client.post(&cred.token_endpoint).form(&form), "token refresh").await?;
+    let token: TokenResponse = post_json(
+        client.post(&cred.token_endpoint).form(&form),
+        "token refresh",
+    )
+    .await?;
     let mut refreshed = credential_from_token(
         token,
         cred.server.clone(),

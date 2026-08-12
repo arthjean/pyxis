@@ -105,7 +105,10 @@ impl std::fmt::Debug for OpenAiAuthTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenAiAuthTarget")
             .field("provider", &self.provider)
-            .field("endpoint_origin", &self.endpoint.origin().ascii_serialization())
+            .field(
+                "endpoint_origin",
+                &self.endpoint.origin().ascii_serialization(),
+            )
             .field("allow_unauthenticated", &self.allow_unauthenticated)
             .finish()
     }
@@ -205,7 +208,8 @@ mod tests {
     #[test]
     fn an_unauthenticated_credential_needs_the_policy_that_allows_it() {
         assert!(matches!(
-            ProviderCredential::Unauthenticated.resolve_openai(&openai(ProviderId::OpenAiResponses)),
+            ProviderCredential::Unauthenticated
+                .resolve_openai(&openai(ProviderId::OpenAiResponses)),
             Err(ProviderAuthError::AuthenticationRequired)
         ));
         let allowed = OpenAiAuthTarget {

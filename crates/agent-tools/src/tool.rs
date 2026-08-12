@@ -176,10 +176,7 @@ impl ToolCtx {
         self
     }
     /// Shares the handle the loop publishes its context budget into.
-    pub fn with_context_window(
-        mut self,
-        window: agent_core::budget::ContextWindowState,
-    ) -> Self {
+    pub fn with_context_window(mut self, window: agent_core::budget::ContextWindowState) -> Self {
         self.context_window = window;
         self
     }

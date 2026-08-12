@@ -348,9 +348,7 @@ pub fn apply_deferral(
     }
     specs
         .into_iter()
-        .filter(|spec| {
-            !deferrable.contains(&spec.name) || deferred.is_revealed(&spec.name)
-        })
+        .filter(|spec| !deferrable.contains(&spec.name) || deferred.is_revealed(&spec.name))
         .collect()
 }
 
@@ -369,9 +367,18 @@ mod tests {
     fn catalog() -> DeferredTools {
         let deferred = DeferredTools::new();
         deferred.publish(vec![
-            entry("mcp__github__create_issue", "Open an issue on a repository."),
-            entry("mcp__github__list_pulls", "List the pull requests of a repository."),
-            entry("mcp__pg__query", "Run a read-only SQL query on the database."),
+            entry(
+                "mcp__github__create_issue",
+                "Open an issue on a repository.",
+            ),
+            entry(
+                "mcp__github__list_pulls",
+                "List the pull requests of a repository.",
+            ),
+            entry(
+                "mcp__pg__query",
+                "Run a read-only SQL query on the database.",
+            ),
         ]);
         deferred
     }
@@ -431,7 +438,11 @@ mod tests {
             )
             .await
             .expect("an empty search is a result");
-        assert!(out.content.contains("3 tool(s) are currently hidden"), "{}", out.content);
+        assert!(
+            out.content.contains("3 tool(s) are currently hidden"),
+            "{}",
+            out.content
+        );
         assert!(!out.is_error, "finding nothing is not a failure");
     }
 

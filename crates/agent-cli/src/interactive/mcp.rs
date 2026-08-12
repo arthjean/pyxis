@@ -79,9 +79,8 @@ impl Loop {
                 if let Some(cfg) = config_for(&self.mcp, &server)
                     && mcp_requires_trust(&cfg)
                 {
-                    let lead = format!(
-                        "Connection blocked before spawn. Retry with /mcp {server} trust."
-                    );
+                    let lead =
+                        format!("Connection blocked before spawn. Retry with /mcp {server} trust.");
                     self.state
                         .blocks
                         .push(Block::Notice(trust_notice(&server, &cfg, &lead)));
@@ -167,9 +166,7 @@ impl Loop {
         let (cfg_srv, old) = match begin {
             Ok(pair) => pair,
             Err(err) => {
-                self.state
-                    .blocks
-                    .push(Block::Notice(format!("MCP: {err}")));
+                self.state.blocks.push(Block::Notice(format!("MCP: {err}")));
                 return;
             }
         };
@@ -477,8 +474,7 @@ impl Loop {
         }
         let mut taken: BTreeSet<String> = self.mcp_tool_names.values().flatten().cloned().collect();
         let client = conn.client(&name);
-        let (exposed, skipped) =
-            agent_mcp::dyn_tools(&name, &tools, &policy, &client, &mut taken);
+        let (exposed, skipped) = agent_mcp::dyn_tools(&name, &tools, &policy, &client, &mut taken);
         for skip in skipped {
             self.state.blocks.push(Block::Notice(skip.summary()));
         }

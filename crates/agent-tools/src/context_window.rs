@@ -25,8 +25,7 @@ use crate::tool::{Tool, ToolCtx, ToolOutput};
 /// Reason shown when no turn has published a window yet. Stated rather than
 /// guessed: a fabricated "100% free" is exactly the answer that makes a model
 /// read another twenty files.
-const NOT_PUBLISHED: &str =
-    "The context budget has not been published yet (no model turn has completed \
+const NOT_PUBLISHED: &str = "The context budget has not been published yet (no model turn has completed \
      in this run). Proceed without a remaining-token figure.";
 
 #[derive(Debug, Deserialize)]
@@ -82,13 +81,14 @@ impl Tool for GetContextRemaining {
         let Some(window) = ctx.context_window.get() else {
             return Ok(ToolOutput::text(NOT_PUBLISHED));
         };
-        Ok(ToolOutput::text(render(&window))
-            .with_structured_content(serde_json::json!({
+        Ok(
+            ToolOutput::text(render(&window)).with_structured_content(serde_json::json!({
                 "remaining_tokens": window.remaining_before_compaction(),
                 "used_percent": window.used_percent(),
                 "max_context_tokens": window.max_context,
                 "measured": window.usage_seen,
-            })))
+            })),
+        )
     }
 }
 
@@ -227,7 +227,11 @@ mod tests {
             .call(GetContextRemainingInput {}, &ctx)
             .await
             .expect("reading an empty handle must not fail");
-        assert!(out.content.contains("not been published"), "{}", out.content);
+        assert!(
+            out.content.contains("not been published"),
+            "{}",
+            out.content
+        );
         assert!(
             out.structured_content.is_none(),
             "no figure must be published when none is known"

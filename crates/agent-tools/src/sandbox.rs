@@ -97,7 +97,11 @@ pub trait SandboxEscalator: Send + Sync {
 /// the tool can reach the network; `None` for a tool that cannot, which leaves
 /// only the filesystem classification. Fail-closed on the CLAIM: an ambiguous
 /// failure returns `None` and nothing is attributed.
-pub fn attribute(ctx: &crate::tool::ToolCtx, mark: Option<usize>, body: &str) -> Option<SandboxDenial> {
+pub fn attribute(
+    ctx: &crate::tool::ToolCtx,
+    mark: Option<usize>,
+    body: &str,
+) -> Option<SandboxDenial> {
     let blocked = match (ctx.sandbox_observer.as_ref(), mark) {
         (Some(observer), Some(mark)) => observer.blocked_since(mark),
         _ => Vec::new(),

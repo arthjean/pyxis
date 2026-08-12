@@ -75,10 +75,7 @@ pub(super) fn identity_fingerprint(scope: &[&str], identity: IdentitySource<'_>)
     hex::encode(hash.finalize())
 }
 
-pub(super) fn invalid(
-    field: &'static str,
-    reason: impl Into<String>,
-) -> ProviderAuthError {
+pub(super) fn invalid(field: &'static str, reason: impl Into<String>) -> ProviderAuthError {
     ProviderAuthError::InvalidField {
         field,
         reason: reason.into(),
