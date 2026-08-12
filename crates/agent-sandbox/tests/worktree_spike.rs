@@ -35,7 +35,8 @@ fn a_worktree_is_reachable_under_confinement_but_isolates_nothing() {
     // Témoin hors des racines accordées : ni le workspace, ni `$TMPDIR`.
     let outside = scratch_in(&target_tmp(), "spike-outside");
 
-    let output = Command::new(std::env::current_exe().unwrap())
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
         .args([
             "--exact",
             "child_probes_a_worktree_under_confinement",
@@ -45,9 +46,8 @@ fn a_worktree_is_reachable_under_confinement_but_isolates_nothing() {
         ])
         .env(CHILD_MARKER, "1")
         .env(CHILD_REPO, &repo)
-        .env(CHILD_OUTSIDE, &outside)
-        .output()
-        .expect("relance du binaire de test");
+        .env(CHILD_OUTSIDE, &outside);
+    let output = wait_bounded(command, &scratch_in(&target_tmp(), "spike-child-io"));
 
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
@@ -330,6 +330,63 @@ fn each_degraded_case_gets_a_verdict_and_a_recovery() {
 
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&plain);
+}
+
+/// Runs the confined child under a deadline and returns what it produced.
+///
+/// `Command::output()` waits forever, and forever is not a test outcome: the
+/// child applies an irreversible process-wide confinement and then drives
+/// `git` through it, so a single blocked syscall there freezes this test, the
+/// binary around it and the whole suite behind it, until the CI job is
+/// cancelled and its log discarded with it. That is how this spike hid for
+/// entire runs.
+///
+/// The streams go to FILES rather than pipes, so a child that has to be killed
+/// still leaves its partial output readable: whatever it managed to print
+/// before blocking is the only description of where it blocked. They are
+/// written OUTSIDE the fixture repository, which this test then checks is
+/// still clean.
+fn wait_bounded(mut command: Command, scratch: &Path) -> Output {
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+    let out_path = scratch.join("child-stdout.log");
+    let err_path = scratch.join("child-stderr.log");
+    let out_file = std::fs::File::create(&out_path).expect("journal stdout de l'enfant");
+    let err_file = std::fs::File::create(&err_path).expect("journal stderr de l'enfant");
+    let mut child = command
+        .stdout(out_file)
+        .stderr(err_file)
+        .spawn()
+        .expect("relance du binaire de test");
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait().expect("état du process enfant") {
+            Some(status) => break Some(status),
+            None if start.elapsed() >= DEADLINE => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+
+    let stdout = std::fs::read(&out_path).unwrap_or_default();
+    let stderr = std::fs::read(&err_path).unwrap_or_default();
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "l'enfant confiné n'a pas rendu la main en {DEADLINE:?}, tué.\n\
+             stdout partiel:\n{}\nstderr partiel:\n{}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        )
+    });
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
 }
 
 fn verdict(output: &Output) -> &'static str {
