@@ -42,17 +42,9 @@
       "state": "requested controls remain distinct through canonical projection",
       "error": "invalid or model-incompatible controls fail before credential and network access",
       "edge_case": "absent and explicitly empty instructions remain distinguishable",
-      "expected_proof": "US-002 serde compatibility plus US-003 request golden fixtures",
-      "residual_stories": [
-        "US-002",
-        "US-003"
-      ],
+      "expected_proof": "serde compatibility plus request golden fixtures",
       "existing_proofs": [
-        {
-          "tracker": "tasks/prd-parite-totale-codex-cli-status.json",
-          "story": "US-004",
-          "artifact": "crates/agent-provider/tests/conformance.rs"
-        }
+        "crates/agent-provider/tests/conformance.rs"
       ]
     },
     {
@@ -74,17 +66,9 @@
       "state": "metadata is merged in causal order without becoming transcript text",
       "error": "malformed metadata is diagnosed without inventing a terminal",
       "edge_case": "unknown metadata remains bounded and redacted",
-      "expected_proof": "US-002 vertical core-to-app-server fixture and US-005 transport fixtures",
-      "residual_stories": [
-        "US-002",
-        "US-005"
-      ],
+      "expected_proof": "vertical core-to-app-server fixture and transport fixtures",
       "existing_proofs": [
-        {
-          "tracker": "tasks/prd-parite-totale-codex-cli-status.json",
-          "story": "US-019",
-          "artifact": "crates/agent-app-server/tests/protocol.rs"
-        }
+        "crates/agent-app-server/tests/protocol.rs"
       ]
     },
     {
@@ -104,16 +88,9 @@
       "state": "transport configuration is immutable for an in-flight request",
       "error": "invalid URL, header, compression or policy fails before opening a socket",
       "edge_case": "zstd body decompresses byte-identically to the source JSON",
-      "expected_proof": "US-004 request-builder and capture-server fixtures",
-      "residual_stories": [
-        "US-004"
-      ],
+      "expected_proof": "request-builder and capture-server fixtures",
       "existing_proofs": [
-        {
-          "tracker": "tasks/prd-codex-orchestration-status.json",
-          "story": "US-022",
-          "artifact": "crates/agent-provider/src/chatgpt.rs"
-        }
+        "crates/agent-provider/src/chatgpt.rs"
       ]
     },
     {
@@ -134,16 +111,9 @@
       "state": "deltas publish immediately and terminal payloads remain authoritative",
       "error": "an isolated malformed frame is diagnostic, not a stream restart",
       "edge_case": "additive event types are observable and bounded",
-      "expected_proof": "US-005 ordered golden stream fixtures",
-      "residual_stories": [
-        "US-005"
-      ],
+      "expected_proof": "ordered golden stream fixtures",
       "existing_proofs": [
-        {
-          "tracker": "tasks/prd-parite-totale-codex-cli-status.json",
-          "story": "US-003",
-          "artifact": "crates/agent-provider/fixtures/conformance"
-        }
+        "crates/agent-provider/fixtures/conformance"
       ]
     },
     {
@@ -170,21 +140,10 @@
       "state": "usage and response identity precede the terminal",
       "error": "incomplete, failed and premature close never synthesize success",
       "edge_case": "multiple limit pools and counters above u32::MAX remain distinct and exact",
-      "expected_proof": "US-006 terminal/error/quota fixtures",
-      "residual_stories": [
-        "US-006"
-      ],
+      "expected_proof": "terminal/error/quota fixtures",
       "existing_proofs": [
-        {
-          "tracker": "tasks/prd-codex-orchestration-status.json",
-          "story": "US-023",
-          "artifact": "crates/agent-provider/src/chatgpt.rs"
-        },
-        {
-          "tracker": "tasks/prd-harness-capabilities-status.json",
-          "story": "US-003",
-          "artifact": "crates/agent-provider/src/quota.rs"
-        }
+        "crates/agent-provider/src/chatgpt.rs",
+        "crates/agent-provider/src/quota.rs"
       ]
     },
     {
@@ -211,11 +170,7 @@
       "state": "one response in flight, bounded prewarm/reuse/renew/close lifecycle",
       "error": "auth, incompatibility and absent capability remain distinct",
       "edge_case": "premature close invalidates the connection without leaking a task",
-      "expected_proof": "US-007 opt-in probe plus US-008 deterministic WebSocket fixtures",
-      "residual_stories": [
-        "US-007",
-        "US-008"
-      ]
+      "expected_proof": "opt-in probe plus deterministic WebSocket fixtures"
     },
     {
       "id": "incremental-continuation-fallback",
@@ -235,11 +190,7 @@
       "state": "previous response, turn state and session-scoped fallback are explicit",
       "error": "previous_response_not_found permits one full retry only",
       "edge_case": "fallback before acknowledgement cannot double execution or publication",
-      "expected_proof": "US-009 state machine and US-010 SSE/WebSocket equivalence fixtures",
-      "residual_stories": [
-        "US-009",
-        "US-010"
-      ]
+      "expected_proof": "state machine and SSE/WebSocket equivalence fixtures"
     },
     {
       "id": "responses-tools",
@@ -258,16 +209,9 @@
       "state": "call identity and namespace survive added/done",
       "error": "local incompatibility is typed before network access",
       "edge_case": "strict is preserved when present and never forced when absent",
-      "expected_proof": "US-011 request and round-trip fixtures",
-      "residual_stories": [
-        "US-011"
-      ],
+      "expected_proof": "request and round-trip fixtures",
       "existing_proofs": [
-        {
-          "tracker": "tasks/prd-parite-totale-codex-cli-status.json",
-          "story": "US-002",
-          "artifact": "crates/agent-core/src/provider.rs"
-        }
+        "crates/agent-core/src/provider.rs"
       ]
     },
     {
@@ -287,17 +231,9 @@
       "state": "items remain ordered independently from their deltas",
       "error": "unrepresentable content is a bounded Other or a typed contract error",
       "edge_case": "sensitive fields and signed URLs are redacted before projection or persistence",
-      "expected_proof": "US-002 unknown-item fixture plus US-012 full item matrix",
-      "residual_stories": [
-        "US-002",
-        "US-012"
-      ],
+      "expected_proof": "unknown-item fixture plus full item matrix",
       "existing_proofs": [
-        {
-          "tracker": "tasks/prd-parite-totale-codex-cli-status.json",
-          "story": "US-003",
-          "artifact": "crates/agent-provider/src/chatgpt_events.rs"
-        }
+        "crates/agent-provider/src/chatgpt_events.rs"
       ]
     },
     {
@@ -324,16 +260,9 @@
       "state": "fresh, stale and bypass-cache snapshots are distinguishable",
       "error": "empty, oversized and transient failures preserve a scoped last-good snapshot",
       "edge_case": "headless and interactive resolve through the same path",
-      "expected_proof": "US-013 scoped-cache and headless integration fixtures",
-      "residual_stories": [
-        "US-013"
-      ],
+      "expected_proof": "scoped-cache and headless integration fixtures",
       "existing_proofs": [
-        {
-          "tracker": "tasks/prd-parite-totale-codex-cli-status.json",
-          "story": "US-010",
-          "artifact": "crates/agent-provider/src/models.rs"
-        }
+        "crates/agent-provider/src/models.rs"
       ]
     },
     {
@@ -360,17 +289,9 @@
       "state": "auth scope and at most one 401 recovery belong to a sampling",
       "error": "transient refresh and permanent reconnect are distinct",
       "edge_case": "credentials never cross provider origin or appear in errors",
-      "expected_proof": "US-014 provider fixtures and US-015 auth recovery fixtures",
-      "residual_stories": [
-        "US-014",
-        "US-015"
-      ],
+      "expected_proof": "provider fixtures and auth recovery fixtures",
       "existing_proofs": [
-        {
-          "tracker": "tasks/prd-frontier-harness-runtime-status.json",
-          "story": "US-017",
-          "artifact": "crates/agent-core/src/agent.rs"
-        }
+        "crates/agent-core/src/agent.rs"
       ]
     },
     {
@@ -390,10 +311,7 @@
       "state": "capabilities are probed and captured per provider",
       "error": "service and stream exceptions retain typed retry classes",
       "edge_case": "AWS credentials and signed material never enter fixtures or logs",
-      "expected_proof": "US-016 provider conformance and supply-chain gates",
-      "residual_stories": [
-        "US-016"
-      ]
+      "expected_proof": "provider conformance and supply-chain gates"
     },
     {
       "id": "remote-compact-memories",
@@ -419,16 +337,9 @@
       "state": "operation capability and timeout are explicit",
       "error": "unsupported, timeout and malformed response have operation-specific errors",
       "edge_case": "remote output never rewrites history until accepted by the caller",
-      "expected_proof": "US-017 success/error/timeout fixtures",
-      "residual_stories": [
-        "US-017"
-      ],
+      "expected_proof": "success/error/timeout fixtures",
       "existing_proofs": [
-        {
-          "tracker": "tasks/prd-codex-orchestration-status.json",
-          "story": "US-030",
-          "artifact": "crates/agent-core/src/compaction.rs"
-        }
+        "crates/agent-core/src/compaction.rs"
       ]
     },
     {
@@ -448,10 +359,7 @@
       "state": "operation capability and timeout are explicit",
       "error": "invalid image, policy and transport errors remain distinguishable",
       "edge_case": "binary payload and signed URL content never enter logs or fixtures",
-      "expected_proof": "US-018 success/error/timeout and redaction fixtures",
-      "residual_stories": [
-        "US-018"
-      ]
+      "expected_proof": "success/error/timeout and redaction fixtures"
     },
     {
       "id": "search-files",
@@ -477,10 +385,7 @@
       "state": "file creation, upload and finalization states are explicit",
       "error": "files over 512 MiB fail locally and upload-host failures stay typed",
       "edge_case": "provider credentials are not forwarded to the signed upload host",
-      "expected_proof": "US-019 capture-server, size-bound and timeout fixtures",
-      "residual_stories": [
-        "US-019"
-      ]
+      "expected_proof": "capture-server, size-bound and timeout fixtures"
     },
     {
       "id": "realtime",
@@ -506,11 +411,8 @@
       "state": "session mode, sideband join and writer lifecycle are bounded",
       "error": "handshake, protocol and close failures remain distinct",
       "edge_case": "cancellation reaches a terminal task state within the shutdown bound",
-      "expected_proof": "US-020 call/WebSocket success/error/timeout fixtures",
-      "residual_stories": [
-        "US-020"
-      ]
+      "expected_proof": "call/WebSocket success/error/timeout fixtures"
     }
   ],
-  "fingerprint": "dc101983b5dc44104c29df2e865a453f056978148b708a808151bd0892909cc7"
+  "fingerprint": "845c114bd66f5f2cf567ed59b550fcd13e46567c770f0d8ce2670c9fa462ca82"
 }

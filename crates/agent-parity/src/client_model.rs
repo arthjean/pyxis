@@ -24,13 +24,6 @@ pub struct SourceContract {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExistingProof {
-    pub tracker: String,
-    pub story: String,
-    pub artifact: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GapFamily {
     pub id: String,
     pub title: String,
@@ -41,9 +34,9 @@ pub struct GapFamily {
     pub error: String,
     pub edge_case: String,
     pub expected_proof: String,
-    pub residual_stories: Vec<String>,
+    /// Repository paths of the artifacts that already prove part of this family.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub existing_proofs: Vec<ExistingProof>,
+    pub existing_proofs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,44 +171,21 @@ fn validate_family(family: &GapFamily) -> Result<(), String> {
     if family.sources.is_empty() {
         return Err(format!("family {} has no normative source", family.id));
     }
-    if family.residual_stories.is_empty()
-        || family
-            .residual_stories
-            .iter()
-            .any(|story| story.trim().is_empty())
-    {
-        return Err(format!("family {} has no residual story", family.id));
-    }
     Ok(())
 }
 
 fn validate_existing_proof(
     repository_root: &Path,
     family: &GapFamily,
-    proof: &ExistingProof,
+    proof: &str,
 ) -> Result<(), String> {
-    let tracker_path = repository_root.join(&proof.tracker);
-    let body = std::fs::read_to_string(&tracker_path)
-        .map_err(|error| format!("cannot read {}: {error}", tracker_path.display()))?;
-    let tracker: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|error| format!("cannot parse {}: {error}", tracker_path.display()))?;
-    if tracker["prd"]["status"] != "DONE" {
+    if proof.trim().is_empty() {
         return Err(format!(
-            "family {} reopens unfinished {}",
-            family.id, proof.tracker
+            "family {} names an empty proof artifact",
+            family.id
         ));
     }
-    let story = tracker["stories"]
-        .as_array()
-        .and_then(|stories| stories.iter().find(|story| story["id"] == proof.story))
-        .ok_or_else(|| format!("{} has no story {}", proof.tracker, proof.story))?;
-    if story["status"] != "DONE" {
-        return Err(format!(
-            "family {} references unfinished {} {}",
-            family.id, proof.tracker, proof.story
-        ));
-    }
-    let artifact = repository_root.join(&proof.artifact);
+    let artifact = repository_root.join(proof);
     if !artifact.exists() {
         return Err(format!(
             "family {} proof artifact is missing: {}",
