@@ -19,6 +19,27 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// A shell fixture server, launched THROUGH `sh` instead of being executed.
+///
+/// Executing a file this process has just written races with every other
+/// thread in the binary: between a sibling test's `fork` and its `exec`, the
+/// child still holds the write descriptor this one opened, and the kernel
+/// answers `ETXTBSY` to anyone trying to execute that file. `O_CLOEXEC` does
+/// not close the window, because it only takes effect AT the exec that has
+/// not happened yet. The window is microseconds wide, so it never opens on a
+/// workstation with cores to spare and opens readily on a four-vCPU runner.
+///
+/// Handing the script to `sh` as an ARGUMENT means the file is only ever
+/// read. The race has nothing left to bite, and the fixture needs no execute
+/// bit either.
+fn shell_server(script: &Path, body: &str) -> McpServerConfig {
+    std::fs::write(script, body).unwrap();
+    McpServerConfig::stdio(
+        "/bin/sh".to_string(),
+        vec![script.to_string_lossy().into_owned()],
+    )
+}
+
 fn fixture_exe_name() -> &'static str {
     if cfg!(windows) {
         "mcp_fixture.exe"
@@ -92,20 +113,12 @@ async fn stdio_connect_lists_tools_and_cancel_closes_child() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_failing_server_reports_its_last_stderr_lines() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = temp_dir("stdio-stderr");
     let script = dir.join("broken-server");
-    std::fs::write(
+    let cfg = shell_server(
         &script,
-        "#!/bin/sh\necho 'FATAL: EXAMPLE_API_KEY is not set' >&2\nexit 1\n",
-    )
-    .unwrap();
-    let mut perms = std::fs::metadata(&script).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&script, perms).unwrap();
-
-    let cfg = McpServerConfig::stdio(script.to_string_lossy().into_owned(), Vec::new());
+        "echo 'FATAL: EXAMPLE_API_KEY is not set' >&2\nexit 1\n",
+    );
     let Err(err) = McpConnection::connect("broken", &cfg).await else {
         unreachable!("a server that exits during the handshake must fail")
     };
@@ -129,27 +142,20 @@ async fn a_failing_server_reports_its_last_stderr_lines() {
 #[cfg(unix)]
 #[tokio::test]
 async fn an_unterminated_frame_is_cut_off_rather_than_allocated() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = temp_dir("stdio-frame");
     let script = dir.join("flooding-server");
-    std::fs::write(
+    // 12 MiB on a single line, then silence: over the bound, and the process
+    // stays alive so the failure can only come from the frame check.
+    let flooding = shell_server(
         &script,
-        // 12 MiB on a single line, then silence: over the bound, and the process
-        // stays alive so the failure can only come from the frame check.
-        "#!/bin/sh\nhead -c 12582912 /dev/zero | tr '\\0' 'x'\nsleep 30\n",
-    )
-    .unwrap();
-    let mut perms = std::fs::metadata(&script).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&script, perms).unwrap();
-
+        "head -c 12582912 /dev/zero | tr '\\0' 'x'\nsleep 30\n",
+    );
     let cfg = McpServerConfig {
         policy: McpServerPolicy {
             startup_timeout: Some(Duration::from_secs(20)),
             ..McpServerPolicy::default()
         },
-        ..McpServerConfig::stdio(script.to_string_lossy().into_owned(), Vec::new())
+        ..flooding
     };
     let started = std::time::Instant::now();
     let Err(err) = McpConnection::connect("flood", &cfg).await else {
@@ -173,21 +179,15 @@ async fn an_unterminated_frame_is_cut_off_rather_than_allocated() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_hung_server_expires_on_its_configured_bound() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = temp_dir("stdio-timeout");
     let script = dir.join("hung-server");
-    std::fs::write(&script, "#!/bin/sh\nsleep 60\n").unwrap();
-    let mut perms = std::fs::metadata(&script).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&script, perms).unwrap();
-
+    let hung = shell_server(&script, "sleep 60\n");
     let cfg = McpServerConfig {
         policy: McpServerPolicy {
             startup_timeout: Some(Duration::from_millis(300)),
             ..McpServerPolicy::default()
         },
-        ..McpServerConfig::stdio(script.to_string_lossy().into_owned(), Vec::new())
+        ..hung
     };
     let started = std::time::Instant::now();
     let Err(err) = McpConnection::connect("hung", &cfg).await else {
