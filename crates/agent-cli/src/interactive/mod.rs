@@ -130,6 +130,9 @@ pub struct InteractiveConfig {
     /// `sandbox_scope`: the policy is enforced before this loop exists. Holds
     /// the shared permission state, so `/permissions` needs nothing here.
     pub workspace_access: crate::context::WorkspaceAccess,
+    /// The run's persistent shell sessions, shared with the tool registry. Read
+    /// at the end of a turn to report what is still running.
+    pub exec_sessions: agent_tools::ExecSessions,
     /// Configuration layer each displayed value comes from (US-005 AC2), in the
     /// `agent_tui::SOURCE_KEY_*` vocabulary.
     pub config_sources: Vec<(&'static str, &'static str)>,
@@ -1125,6 +1128,15 @@ impl Loop {
             self.status = self.runtime.status();
             self.running = is_running(&self.status);
         }
+        // A shell session outlives the turn that opened it, which is what makes
+        // a background build possible. Reported when the agent really stops so
+        // it is a background job the user knows about, rather than a process
+        // burning CPU until the idle watchdog reaps it.
+        if !self.running
+            && let Some(notice) = left_running_notice(&self.cfg.exec_sessions)
+        {
+            self.state.blocks.push(Block::Notice(notice));
+        }
         // `Stop` fires when the agent really stops, hence not when the goal loop
         // or a queued input opens another turn right away.
         if !self.running && self.cfg.hooks.watches(agent_tools::HookEvent::Stop) {
@@ -1341,6 +1353,44 @@ pub fn compose_system(base: &str, goal: Option<&str>) -> String {
         ),
         _ => base.to_string(),
     }
+}
+
+/// Names the shell sessions a finished turn is leaving behind, or `None` when
+/// it left none.
+///
+/// The command is truncated on a char boundary: it is untrusted text that the
+/// model composed, and a hundred-line heredoc must not take over the screen.
+fn left_running_notice(sessions: &agent_tools::ExecSessions) -> Option<String> {
+    format_left_running(&sessions.open_sessions())
+}
+
+fn format_left_running(open: &[(u64, String)]) -> Option<String> {
+    const MAX_COMMAND: usize = 60;
+    if open.is_empty() {
+        return None;
+    }
+    let listed = open
+        .iter()
+        .map(|(id, command)| {
+            let single_line = command.split('\n').next().unwrap_or_default().trim();
+            let mut cut = MAX_COMMAND.min(single_line.len());
+            while cut > 0 && !single_line.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            if cut < single_line.len() {
+                format!("{id} ({}…)", &single_line[..cut])
+            } else {
+                format!("{id} ({single_line})")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let count = open.len();
+    let plural = if count > 1 { "s" } else { "" };
+    Some(format!(
+        "{count} shell session{plural} still running: {listed}. Each keeps running until it \
+         finishes, until the agent ends it, or until this run does."
+    ))
 }
 
 /// Injects the behavioral guidelines of the tools (US-026) into the system
@@ -1573,14 +1623,60 @@ pub(crate) fn new_session_path(dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        Conversation, GOAL_DONE_MARKER, Switch, apply_runtime_status, compose_system, is_running,
-        session_path_from_arg, take_goal_done, workspace_file_mentions,
+        Conversation, GOAL_DONE_MARKER, Switch, apply_runtime_status, compose_system,
+        format_left_running, is_running, left_running_notice, session_path_from_arg,
+        take_goal_done, workspace_file_mentions,
     };
     use agent_runtime::lifecycle::TurnState;
     use agent_runtime::thread::{ThreadStatus, TurnStatus};
     use agent_tui::{AppState, Block};
     use std::path::Path;
     use std::time::SystemTime;
+
+    /// A turn that leaves nothing running says nothing: a notice on every turn
+    /// would be noise, and noise is what makes the real one invisible.
+    #[test]
+    fn a_turn_that_leaves_nothing_running_reports_nothing() {
+        assert_eq!(format_left_running(&[]), None);
+        // The live path agrees with the pure one: a fresh store holds nothing.
+        assert_eq!(left_running_notice(&agent_tools::ExecSessions::new()), None);
+    }
+
+    /// The command comes from the model, so the notice bounds it. A char
+    /// boundary is the interesting case: cutting a multi-byte command mid-glyph
+    /// would panic on the slice.
+    #[test]
+    fn a_long_command_is_cut_on_a_char_boundary() {
+        let command = format!("écho {}", "é".repeat(80));
+        let notice = format_left_running(&[(7, command)]).expect("one session is left running");
+        assert!(
+            notice.starts_with("1 shell session still running: 7 (écho"),
+            "{notice}"
+        );
+        assert!(notice.contains('…'), "{notice}");
+        assert!(
+            notice.contains("keeps running until it finishes"),
+            "{notice}"
+        );
+    }
+
+    /// Only the first line of a command reaches the notice, and the count is
+    /// spelled in the plural once more than one session survives the turn.
+    #[test]
+    fn several_sessions_are_listed_on_their_first_line() {
+        let notice = format_left_running(&[
+            (1, "cargo test --workspace\nsecond line".to_string()),
+            (3, "npm run dev".to_string()),
+        ])
+        .expect("two sessions are left running");
+        assert!(
+            notice.starts_with(
+                "2 shell sessions still running: 1 (cargo test --workspace), 3 (npm run dev)."
+            ),
+            "{notice}"
+        );
+        assert!(!notice.contains("second line"), "{notice}");
+    }
 
     /// US-017 AC7: the legacy orchestration is GONE, not merely unused. A static
     /// search is the acceptance criterion itself, so it is the test: leaving two

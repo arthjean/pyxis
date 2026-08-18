@@ -1961,6 +1961,7 @@ async fn run(
                 workspace: workspace.clone(),
                 sandbox_scope,
                 workspace_access,
+                exec_sessions: exec_sessions.clone(),
                 // US-005 AC2: computed here, where the layers were resolved. The loop
                 // only filters out the values it changed in session.
                 config_sources: settings::status_sources(&config),

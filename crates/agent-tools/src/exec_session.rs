@@ -356,6 +356,26 @@ impl ExecSessions {
         self.len() == 0
     }
 
+    /// The live sessions, as `(id, command)`, ordered by id.
+    ///
+    /// A session outlives the turn that opened it, on purpose: a build left
+    /// running is the point of a background terminal. What is NOT wanted is for
+    /// it to be forgotten, still burning CPU until the idle watchdog reaps it
+    /// five minutes later. The turn end reads this to say what it is leaving
+    /// behind (Codex exposes the same thing as `list_background_terminals`).
+    pub fn open_sessions(&self) -> Vec<(u64, String)> {
+        let Ok(store) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let mut open: Vec<(u64, String)> = store
+            .sessions
+            .iter()
+            .map(|(id, session)| (*id, session.command.clone()))
+            .collect();
+        open.sort_by_key(|(id, _)| *id);
+        open
+    }
+
     /// Closes every session and kills every process tree. Called when the Pyxis
     /// session ends; also what `Drop` falls back on.
     pub fn shutdown(&self) {
