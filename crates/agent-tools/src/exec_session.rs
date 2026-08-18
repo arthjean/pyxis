@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -45,12 +45,11 @@ use crate::tool::{MAX_COMMAND_BYTES, Tool, ToolCtx, ToolOutput, terminates};
 /// Concurrent sessions cap. A session holds a process and its reader task;
 /// past a handful the model is juggling, not working.
 pub const MAX_SESSIONS: usize = 4;
-/// Inactivity past which a session is closed and its process tree killed.
-/// Counted from the last read or write on the session.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-/// Watchdog tick. Fine enough that a forgotten session does not survive long,
-/// coarse enough to cost nothing.
-const WATCHDOG_TICK: Duration = Duration::from_secs(5);
+/// A session is NOT closed for being quiet. It lives until the model ends it,
+/// until its process exits, or until the run shuts down (`shutdown`, which
+/// `Drop` falls back on). This is the baseline's own shape: `unified_exec` has
+/// no idle reaper, and one would make long-horizon work impossible, since
+/// watching a build or a CI run means minutes of deliberate silence.
 /// Yield bounds of the baseline (`shell_spec.rs`): a call waits at least
 /// `MIN_YIELD` and at most `MAX_YIELD` for output.
 const MIN_YIELD: Duration = Duration::from_millis(250);
@@ -123,7 +122,6 @@ enum ClosedCause {
         code: Option<i32>,
         signal: Option<i32>,
     },
-    Idle,
     Terminated,
     Shutdown,
 }
@@ -193,7 +191,6 @@ struct Session {
     io: SessionIo,
     buffer: Arc<Mutex<OutputBuffer>>,
     status: SessionStatus,
-    last_activity: Instant,
     command: String,
     /// Monotonic chunk counter (US-015 AC1): the model can order two reads of
     /// the same session without comparing their content.
@@ -279,7 +276,6 @@ impl Drop for Session {
 #[derive(Clone)]
 pub struct ExecSessions {
     inner: Arc<Mutex<Store>>,
-    idle_timeout: Duration,
 }
 
 impl Default for ExecSessions {
@@ -316,7 +312,7 @@ impl Store {
     /// Names the state of an id that is not live. The three the story asks to
     /// tell apart (unknown, expired, already terminated) each get their own
     /// sentence, because the model's next move differs in each case.
-    fn missing(&self, id: u64, idle: Duration) -> ToolError {
+    fn missing(&self, id: u64) -> ToolError {
         let cause = self
             .closed
             .iter()
@@ -324,11 +320,6 @@ impl Store {
             .find(|(closed, _)| *closed == id)
             .map(|(_, cause)| *cause);
         let message = match cause {
-            Some(ClosedCause::Idle) => format!(
-                "shell session {id} expired after {}s without activity: open a new one \
-                 with exec_command",
-                idle.as_secs()
-            ),
             Some(ClosedCause::Exited { code, signal }) => format!(
                 "shell session {id} already ended ({}): open a new one with exec_command",
                 describe_end(code, signal)
@@ -351,15 +342,8 @@ impl Store {
 
 impl ExecSessions {
     pub fn new() -> Self {
-        Self::with_idle_timeout(IDLE_TIMEOUT)
-    }
-
-    /// Same store with another inactivity window. Exists so the closing
-    /// behavior can be proven in a test without waiting five minutes.
-    pub fn with_idle_timeout(idle_timeout: Duration) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Store::default())),
-            idle_timeout,
         }
     }
 
@@ -426,57 +410,16 @@ impl ExecSessions {
         self.inner.lock().ok()?.close(id, cause)
     }
 
-    /// Runs `f` on a live session, refreshing its activity stamp.
+    /// Runs `f` on a live session.
     fn with_session<T>(&self, id: u64, f: impl FnOnce(&mut Session) -> T) -> Result<T, ToolError> {
         let mut store = self
             .inner
             .lock()
             .map_err(|_| ToolError::Io("session store poisoned".to_string()))?;
-        let idle = self.idle_timeout;
         let Some(session) = store.sessions.get_mut(&id) else {
-            return Err(store.missing(id, idle));
+            return Err(store.missing(id));
         };
-        session.last_activity = Instant::now();
         Ok(f(session))
-    }
-
-    /// Watchdog of one session: closes it once idle past the timeout.
-    fn watch(&self, id: u64) {
-        let weak = Arc::downgrade(&self.inner);
-        let idle = self.idle_timeout;
-        // A window shorter than the tick would never be observed: the watchdog
-        // has to look at least as often as it is asked to close.
-        let tick = WATCHDOG_TICK.min(idle);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(tick).await;
-                let Some(inner) = Weak::upgrade(&weak) else {
-                    // The store is gone with the run: `Drop` already killed.
-                    return;
-                };
-                let expired = {
-                    let Ok(mut store) = inner.lock() else {
-                        return;
-                    };
-                    match store.sessions.get(&id) {
-                        None => return,
-                        Some(session) if session.last_activity.elapsed() >= idle => {
-                            store.close(id, ClosedCause::Idle)
-                        }
-                        Some(_) => None,
-                    }
-                };
-                if let Some(session) = expired {
-                    tracing::debug!(
-                        target: "pyxis::tools",
-                        session = id,
-                        "shell session closed after inactivity"
-                    );
-                    drop(session);
-                    return;
-                }
-            }
-        });
     }
 }
 
@@ -526,18 +469,18 @@ impl Tool for ExecCommand {
         }
     }
     fn description(&self) -> String {
-        format!(
-            "Run a command in a PERSISTENT terminal session whose standard input \
+        "Run a command in a PERSISTENT terminal session whose standard input \
              stays open, returning its output or a session_id for ongoing \
              interaction. Use it for anything that asks a question, waits for a \
              keypress or runs long; `bash` stays the right tool for a one-shot \
              command. `tty: true` allocates a real pseudo-terminal, which is what \
              a program checking isatty needs. Answer a prompt with write_stdin on \
              the session_id returned, and end a session with write_stdin \
-             terminate. A session is closed after {}s of inactivity. Parameters: \
-             cmd, workdir, shell, tty, yield_time_ms, max_output_tokens.",
-            IDLE_TIMEOUT.as_secs()
-        )
+             terminate. A session stays open until you end it or its process \
+             exits, so a long build or a watch command can keep running while \
+             you do something else. Parameters: cmd, workdir, shell, tty, \
+             yield_time_ms, max_output_tokens."
+            .to_string()
     }
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
@@ -644,7 +587,6 @@ impl Tool for ExecCommand {
             }
         };
         sessions.commit(id, session);
-        sessions.watch(id);
 
         let window = yield_window(
             input.yield_time_ms,
@@ -976,7 +918,6 @@ fn spawn_session(
             },
             buffer,
             status: SessionStatus::Running,
-            last_activity: Instant::now(),
             command: command.to_string(),
             next_chunk: 0,
         });
@@ -1008,7 +949,6 @@ fn spawn_session(
         io: SessionIo::Pipe { stdin },
         buffer,
         status: SessionStatus::Running,
-        last_activity: Instant::now(),
         command: command.to_string(),
         next_chunk: 0,
     })
@@ -1756,12 +1696,11 @@ mod tests {
         assert!(out.content.contains("bytes omitted"), "{}", out.content);
     }
 
-    // US-015 AC4: unknown, expired and already terminated are three different
-    // answers, and none of them writes to another process.
+    // US-015 AC4: unknown and already terminated are two different answers, and
+    // neither of them writes to another process.
     #[tokio::test]
-    async fn the_three_dead_session_states_are_told_apart() {
-        let mut ctx = ctx();
-        ctx.sessions = ExecSessions::with_idle_timeout(Duration::from_millis(150));
+    async fn the_dead_session_states_are_told_apart() {
+        let ctx = ctx();
 
         let unknown = WriteStdin
             .call(poll(999, Some(250)), &ctx)
@@ -1784,19 +1723,6 @@ mod tests {
             .expect_err("an ended session must be refused");
         assert!(matches!(&ended, ToolError::SessionClosed(_)));
         assert!(ended.to_string().contains("already ended"), "{ended}");
-
-        // Expired: the watchdog closed an idle session.
-        ExecCommand
-            .call(exec("sleep 30", Some(250)), &ctx)
-            .await
-            .expect("the session must open");
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        let expired = WriteStdin
-            .call(poll(2, Some(250)), &ctx)
-            .await
-            .expect_err("an expired session must be refused");
-        assert!(matches!(&expired, ToolError::SessionClosed(_)));
-        assert!(expired.to_string().contains("expired"), "{expired}");
     }
 
     // US-014 AC4: the three refusals land BEFORE any process exists.
@@ -1932,12 +1858,14 @@ mod tests {
         assert!(err.to_string().contains(".git"), "{err}");
     }
 
-    // AC3: past the inactivity window the session is closed and its process
-    // killed, WITHOUT waiting for another call to notice.
+    /// Silence is not abandonment. A session used to be reaped after five
+    /// minutes without a call, which is exactly what a long build or a CI watch
+    /// looks like from the outside: the job the model is waiting on would be
+    /// killed for the crime of taking its time. Only the model, the process
+    /// itself, or the end of the run closes a session now.
     #[tokio::test]
-    async fn an_idle_session_is_closed_and_its_process_killed() {
-        let mut ctx = ctx();
-        ctx.sessions = ExecSessions::with_idle_timeout(Duration::from_millis(150));
+    async fn a_quiet_session_is_not_reaped_and_shutdown_still_kills_it() {
+        let ctx = ctx();
         ExecCommand
             .call(exec("sleep 30", Some(250)), &ctx)
             .await
@@ -1948,13 +1876,15 @@ mod tests {
             .expect("the session must exist")
             .expect("the process must have a pid");
 
-        // Nothing touches the session: only the watchdog can close it.
+        // Nothing touches the session for far longer than the old watchdog tick.
         tokio::time::sleep(Duration::from_millis(600)).await;
-        assert!(
-            ctx.sessions.is_empty(),
-            "the idle session must have been closed on its own"
-        );
-        assert!(!is_alive(pid), "no orphan process may survive the closing");
+        assert_eq!(ctx.sessions.len(), 1, "a quiet session must stay open");
+        assert!(is_alive(pid), "its process must still be running");
+
+        // The run ending is what reaps it, and it takes the process tree with it.
+        ctx.sessions.shutdown();
+        assert!(ctx.sessions.is_empty());
+        assert!(!is_alive(pid), "no orphan process may survive the shutdown");
     }
 
     #[test]
