@@ -55,11 +55,26 @@ const WATCHDOG_TICK: Duration = Duration::from_secs(5);
 /// `MIN_YIELD` and at most `MAX_YIELD` for output.
 const MIN_YIELD: Duration = Duration::from_millis(250);
 const MAX_YIELD: Duration = Duration::from_millis(30_000);
+/// Bounds of an EMPTY poll, which is a different question from an interactive
+/// write: not "did the program answer me?" but "is the background job done?".
+///
+/// The floor is what stops a model from spending a whole turn on a second of
+/// silence. Observed on `cargo test --workspace`: seven polls at 1000 ms, six of
+/// them returning zero bytes, then the model gave up and left the session
+/// running. Codex bounds the same call at `[MIN_EMPTY_YIELD_TIME_MS,
+/// background_terminal_max_timeout]` (`core/src/unified_exec/process_manager.rs`),
+/// and the ceiling is what lets one call cover an entire build.
+///
+/// The ceiling is the baseline's `DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS`.
+/// Codex exposes it as `background_terminal_max_timeout`; here it is a constant
+/// (see the note in the module docs).
+const MIN_POLL_YIELD: Duration = Duration::from_millis(5_000);
+const MAX_POLL_YIELD: Duration = Duration::from_millis(300_000);
 /// Baseline defaults, per call shape: a command opens with 10 s, a write yields
 /// after 250 ms, an empty poll waits 5 s in the background.
 const DEFAULT_EXEC_YIELD: Duration = Duration::from_millis(10_000);
 const DEFAULT_WRITE_YIELD: Duration = Duration::from_millis(250);
-const DEFAULT_POLL_YIELD: Duration = Duration::from_millis(5_000);
+const DEFAULT_POLL_YIELD: Duration = MIN_POLL_YIELD;
 /// Polling period of the output buffer during a yield.
 const POLL: Duration = Duration::from_millis(50);
 /// Cap of what one chunk hands back, and of what a session keeps between two
@@ -544,7 +559,7 @@ impl Tool for ExecCommand {
                 "yield_time_ms": {
                     "type": ["integer", "null"],
                     "minimum": 1,
-                    "description": "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms."
+                    "description": "Wait before yielding output. Null takes the 10000 ms default; effective range is 250-30000 ms. A command that outlives the wait keeps running and returns a session_id: poll it with write_stdin."
                 },
                 "max_output_tokens": {
                     "type": ["integer", "null"],
@@ -631,7 +646,11 @@ impl Tool for ExecCommand {
         sessions.commit(id, session);
         sessions.watch(id);
 
-        let window = yield_window(input.yield_time_ms, DEFAULT_EXEC_YIELD);
+        let window = yield_window(
+            input.yield_time_ms,
+            DEFAULT_EXEC_YIELD,
+            YieldShape::Interactive,
+        );
         let collected = collect(&sessions, id, window, ctx).await?;
         Ok(finish(
             &sessions,
@@ -696,8 +715,12 @@ impl Tool for WriteStdin {
          return the output produced within the wait. The text is sent verbatim: \
          end it with a newline when the program waits for a line. An empty chars \
          polls the session and returns only what it produced since the previous \
-         chunk; terminate ends the session and its process group. Parameters: \
-         session_id, chars, yield_time_ms, max_output_tokens, terminate."
+         chunk; terminate ends the session and its process group. Size a poll to \
+         the job you are waiting on: a build or a test suite is worth one poll of \
+         tens of seconds, not a run of one-second polls that each come back \
+         empty. End a session you are done with instead of leaving it running. \
+         Parameters: session_id, chars, yield_time_ms, max_output_tokens, \
+         terminate."
             .to_string()
     }
     fn input_schema(&self) -> serde_json::Value {
@@ -712,7 +735,7 @@ impl Tool for WriteStdin {
                 "yield_time_ms": {
                     "type": ["integer", "null"],
                     "minimum": 1,
-                    "description": "Wait before yielding output. Writes default to 250 ms, empty polls to 5000 ms; effective range is 250-30000 ms."
+                    "description": "Wait before yielding output. Null takes the default for the call shape. A write yields after 250 ms and caps at 30000 ms. An empty poll watches a background job: it waits 5000 ms by default and accepts up to 300000 ms, so a long build is worth ONE patient poll rather than a series of short ones. Values below the floor of their shape are raised to it."
                 },
                 "max_output_tokens": {
                     "type": ["integer", "null"],
@@ -792,16 +815,8 @@ impl Tool for WriteStdin {
             terminate_session(&sessions, id).await?;
         }
 
-        let window = yield_window(
-            input.yield_time_ms,
-            if terminating {
-                MIN_YIELD
-            } else if input.chars.is_empty() {
-                DEFAULT_POLL_YIELD
-            } else {
-                DEFAULT_WRITE_YIELD
-            },
-        );
+        let (default, shape) = write_stdin_window(input.chars.is_empty(), terminating);
+        let window = yield_window(input.yield_time_ms, default, shape);
         let collected = collect(&sessions, id, window, ctx).await?;
         Ok(finish(
             &sessions,
@@ -863,11 +878,52 @@ fn resolve_shell(requested: Option<&str>) -> Result<crate::shell::ShellChoice, V
     }
 }
 
-/// Clamps a requested wait to the baseline range, defaulting per call shape.
-fn yield_window(requested: Option<u64>, default: Duration) -> Duration {
+/// Which bounds a wait is clamped to. An empty poll watches a background job,
+/// every other call is an interactive round trip, and the two want opposite
+/// ceilings: seconds for one, minutes for the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum YieldShape {
+    Interactive,
+    BackgroundPoll,
+}
+
+impl YieldShape {
+    fn bounds(self) -> (Duration, Duration) {
+        match self {
+            Self::Interactive => (MIN_YIELD, MAX_YIELD),
+            Self::BackgroundPoll => (MIN_POLL_YIELD, MAX_POLL_YIELD),
+        }
+    }
+}
+
+/// Default and bounds of one `write_stdin`, by what the call actually does.
+///
+/// A terminate collects the tail of a process already being torn down, and a
+/// write awaits an answer: both are interactive round trips. Only a bare poll
+/// watches a background job, and only it earns the long window. The distinction
+/// lives here rather than inline because "an empty chars is a poll" stops being
+/// true the moment `terminate` is set.
+fn write_stdin_window(chars_empty: bool, terminating: bool) -> (Duration, YieldShape) {
+    if terminating {
+        (MIN_YIELD, YieldShape::Interactive)
+    } else if chars_empty {
+        (DEFAULT_POLL_YIELD, YieldShape::BackgroundPoll)
+    } else {
+        (DEFAULT_WRITE_YIELD, YieldShape::Interactive)
+    }
+}
+
+/// Clamps a requested wait to the range of its call shape, defaulting when the
+/// model passes no value.
+///
+/// The clamp applies to what the model ASKED for, not only to the default: a
+/// requested value below the floor of its shape is raised, never honored. A
+/// default is clamped too, so the two can never disagree.
+fn yield_window(requested: Option<u64>, default: Duration, shape: YieldShape) -> Duration {
+    let (min, max) = shape.bounds();
     match requested {
-        Some(ms) => Duration::from_millis(ms).clamp(MIN_YIELD, MAX_YIELD),
-        None => default.clamp(MIN_YIELD, MAX_YIELD),
+        Some(ms) => Duration::from_millis(ms).clamp(min, max),
+        None => default.clamp(min, max),
     }
 }
 
@@ -1903,10 +1959,70 @@ mod tests {
 
     #[test]
     fn the_yield_window_follows_the_baseline_range() {
-        assert_eq!(yield_window(None, DEFAULT_EXEC_YIELD), DEFAULT_EXEC_YIELD);
-        assert_eq!(yield_window(None, DEFAULT_WRITE_YIELD), MIN_YIELD);
-        assert_eq!(yield_window(Some(10), DEFAULT_EXEC_YIELD), MIN_YIELD);
-        assert_eq!(yield_window(Some(u64::MAX), DEFAULT_EXEC_YIELD), MAX_YIELD);
+        use YieldShape::Interactive;
+        assert_eq!(
+            yield_window(None, DEFAULT_EXEC_YIELD, Interactive),
+            DEFAULT_EXEC_YIELD
+        );
+        assert_eq!(
+            yield_window(None, DEFAULT_WRITE_YIELD, Interactive),
+            MIN_YIELD
+        );
+        assert_eq!(
+            yield_window(Some(10), DEFAULT_EXEC_YIELD, Interactive),
+            MIN_YIELD
+        );
+        assert_eq!(
+            yield_window(Some(u64::MAX), DEFAULT_EXEC_YIELD, Interactive),
+            MAX_YIELD
+        );
+    }
+
+    /// The regression: a model polling a build with `yield_time_ms: 1000` spent
+    /// six turns collecting zero bytes, then abandoned the session. A poll asks
+    /// "is the background job done?", so its wait is raised to the floor and may
+    /// run far past the interactive ceiling.
+    #[test]
+    fn an_empty_poll_is_never_shorter_than_the_background_floor() {
+        use YieldShape::BackgroundPoll;
+        assert_eq!(
+            yield_window(Some(1_000), DEFAULT_POLL_YIELD, BackgroundPoll),
+            MIN_POLL_YIELD,
+            "a one-second poll is raised, not honored"
+        );
+        assert_eq!(
+            yield_window(None, DEFAULT_POLL_YIELD, BackgroundPoll),
+            MIN_POLL_YIELD
+        );
+        // A whole build fits in one call: the interactive ceiling does not apply.
+        assert_eq!(
+            yield_window(Some(120_000), DEFAULT_POLL_YIELD, BackgroundPoll),
+            Duration::from_millis(120_000)
+        );
+        assert!(MAX_POLL_YIELD > MAX_YIELD);
+        assert_eq!(
+            yield_window(Some(u64::MAX), DEFAULT_POLL_YIELD, BackgroundPoll),
+            MAX_POLL_YIELD
+        );
+    }
+
+    /// Only a BARE poll is a background watch. A terminate also carries an empty
+    /// `chars`, and holding it for five seconds would stall every clean shutdown
+    /// of a session.
+    #[test]
+    fn a_terminate_is_not_a_background_poll_despite_its_empty_chars() {
+        assert_eq!(
+            write_stdin_window(true, true),
+            (MIN_YIELD, YieldShape::Interactive)
+        );
+        assert_eq!(
+            write_stdin_window(true, false),
+            (DEFAULT_POLL_YIELD, YieldShape::BackgroundPoll)
+        );
+        assert_eq!(
+            write_stdin_window(false, false),
+            (DEFAULT_WRITE_YIELD, YieldShape::Interactive)
+        );
     }
 
     #[test]
