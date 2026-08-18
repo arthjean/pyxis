@@ -7,17 +7,18 @@
 //! result it already knows is not ready. Neither reads the workspace, neither
 //! mutates anything, so both are read-only, non-sensitive and concurrency-safe.
 //!
-//! Two deliberate deviations from the baseline:
+//! [`MAX_SLEEP`] matches the baseline's twelve hours. The bound is what makes
+//! long-horizon work possible at all: watching a CI run to completion is mostly
+//! waiting, and a ceiling of minutes turns one pause into a hundred model turns
+//! that each cost a round trip to say "not yet". `timeout` outlasts it, so the
+//! bound the model reads in the schema is the bound that applies.
 //!
-//! 1. **The sleep is bounded to [`MAX_SLEEP`], not to Codex's twelve hours.**
-//!    The Registry wraps every call in its own timeout and cannot read the
-//!    call's arguments to widen it, so a sleep longer than the bound would be
-//!    killed mid-way and reported as a tool failure. A bound the tool states is
-//!    better than one the pipeline enforces silently.
-//! 2. **A sleep does not end early on new input.** Pyxis carries steering
-//!    through the loop's input queue (US-007), which a tool never sees. What a
-//!    sleep does honour is cancellation: the future is a node of the run's
-//!    cancel tree (invariant 13), so an interrupt drops it immediately.
+//! One deliberate deviation remains: **a sleep does not end early on new
+//! input.** Pyxis carries steering through the loop's input queue (US-007),
+//! which a tool never sees: `ToolCtx` has no channel to it. What a sleep does
+//! honour is cancellation: the future is a node of the run's cancel tree
+//! (invariant 13), so an interrupt drops it immediately. A user who wants to
+//! steer a sleeping agent interrupts it rather than waiting the pause out.
 
 use std::time::Duration;
 
@@ -28,9 +29,11 @@ use crate::error::{ToolError, ValidationError};
 use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{Tool, ToolCtx, ToolOutput};
 
-/// Longest pause a single call may ask for. The Registry timeout has to outlast
-/// it and is computed without reading the arguments, hence a fixed bound.
-pub const MAX_SLEEP: Duration = Duration::from_secs(300);
+/// Longest pause a single call may ask for, twelve hours, as in the baseline
+/// (`MAX_SLEEP_DURATION_MS` in `codex-rs/core/src/tools/handlers/sleep.rs`). The
+/// Registry timeout has to outlast it and is computed without reading the
+/// arguments, hence a fixed bound rather than one derived per call.
+pub const MAX_SLEEP: Duration = Duration::from_secs(12 * 60 * 60);
 /// Grace added on top of [`MAX_SLEEP`] for the tool's own timeout, so the pause
 /// itself is never what trips the pipeline.
 const SLEEP_TIMEOUT_GRACE: Duration = Duration::from_secs(5);
@@ -259,6 +262,16 @@ mod tests {
             .await
             .expect("a bounded sleep must succeed");
         assert!(out.content.contains("requested 5 ms"), "{}", out.content);
+    }
+
+    /// The bound is a product decision, not an implementation detail: it is what
+    /// decides whether an agent can hold a long-horizon task (watching a CI run,
+    /// a deploy) in ONE pause instead of a hundred round trips. Twelve hours is
+    /// the baseline's own `MAX_SLEEP_DURATION_MS`.
+    #[test]
+    fn the_longest_pause_is_the_twelve_hours_of_the_baseline() {
+        assert_eq!(MAX_SLEEP.as_millis(), 12 * 60 * 60 * 1000);
+        assert!(validate_sleep(12 * 60 * 60 * 1000).is_ok());
     }
 
     #[test]
