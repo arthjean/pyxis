@@ -597,16 +597,16 @@ fn build_context(
     let (base, fallback_base, goal, mut config) = settings.read(|settings| {
         (
             crate::interactive::with_tool_guidelines(
-                request
+                &request
                     .model_runtime
                     .as_ref()
                     .map(crate::prompt::select_system_prompt)
-                    .unwrap_or("You are a helpful assistant."),
+                    .unwrap_or_else(|| "You are a helpful assistant.".to_string()),
                 &settings.tool_guidelines,
             ),
             request.overload_fallback_runtime.as_ref().map(|runtime| {
                 crate::interactive::with_tool_guidelines(
-                    crate::prompt::select_system_prompt(runtime),
+                    &crate::prompt::select_system_prompt(runtime),
                     &settings.tool_guidelines,
                 )
             }),
@@ -1308,10 +1308,15 @@ mod code_mode_plan_tests {
         source_with_shell_surface(mode, multi_agent, false)
     }
 
+    /// `codex_surface` registers the tools the UPSTREAM instructions name by
+    /// hand (`exec_command`, `write_stdin`, `apply_patch`, and the legacy `bash`
+    /// they replace). The remote prompt tells the model to reach for those
+    /// spellings, so what happens to them under each tool mode is worth a test
+    /// of its own.
     fn source_with_shell_surface(
         mode: ModelToolMode,
         multi_agent: agent_core::model::MultiAgentVersion,
-        unified_shell: bool,
+        codex_surface: bool,
     ) -> Arc<CliStepSource> {
         let handle = Arc::new(CodeModeHandle::new(
             Arc::new(NoEngineFactory),
@@ -1320,11 +1325,12 @@ mod code_mode_plan_tests {
         let agents = Arc::new(agent_tools::AgentHandle::new());
         let mut registry =
             agent_tools::Registry::builder(std::env::temp_dir()).register(agent_tools::read::Read);
-        if unified_shell {
+        if codex_surface {
             registry = registry
                 .register(agent_tools::Bash)
                 .register(agent_tools::ExecCommand)
-                .register(agent_tools::WriteStdin);
+                .register(agent_tools::WriteStdin)
+                .register(agent_tools::ApplyPatch);
         }
         let registry = Arc::new(
             registry
@@ -1409,6 +1415,44 @@ mod code_mode_plan_tests {
         assert!(nested.contains(&"exec_command".to_string()), "{nested:?}");
         assert!(nested.contains(&"write_stdin".to_string()), "{nested:?}");
         assert!(!nested.contains(&"bash".to_string()), "{nested:?}");
+    }
+
+    /// The upstream instructions tell the model to edit with `apply_patch` and
+    /// to run commands with `exec_command`. On a `code_mode_only` model neither
+    /// is directly callable, and `crate::prompt` answers that by pointing at the
+    /// `tools` object. That answer is only true while both really sit in the
+    /// nested catalog under those exact names: unregister one and the harness
+    /// section starts promising a tool that is nowhere.
+    #[tokio::test]
+    async fn the_tool_names_the_instructions_use_stay_reachable_from_a_cell() {
+        let source = source_with_shell_surface(
+            ModelToolMode::CodeModeOnly,
+            agent_core::model::MultiAgentVersion::Disabled,
+            true,
+        );
+        assert_eq!(
+            names_of(&source.snapshot().tools),
+            vec!["exec".to_string(), "wait".to_string()],
+            "the direct surface is the orchestration pair alone"
+        );
+
+        let nested = source
+            .code_mode
+            .as_ref()
+            .map(|handle| {
+                handle
+                    .catalog()
+                    .into_iter()
+                    .map(|tool| tool.binding)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for named in ["apply_patch", "exec_command"] {
+            assert!(
+                nested.contains(&named.to_string()),
+                "`{named}` is named by the instructions but absent from `tools`: {nested:?}"
+            );
+        }
     }
 
     /// AC2: a `code_mode` model keeps its direct tools AND the pair.

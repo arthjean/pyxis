@@ -930,7 +930,10 @@ fn main() -> anyhow::Result<()> {
     // US-015: the skill catalog travels with the project context, framed the same
     // way, and `project_messages` is the single place that decides that order
     // (shared with the `/init` refresh, US-019).
-    let context_msgs = context::project_messages(&workspace, &context::today_utc(), &skills);
+    // Only the disk-reading half here: the environment block is closed in
+    // `run`, where the sandbox policy and the permission state that it announces
+    // finally exist (see `context::with_environment`).
+    let context_docs = context::project_documents(&workspace, &skills);
 
     let credential = prepare_credential_before_sandbox(&args)?;
 
@@ -998,7 +1001,7 @@ fn main() -> anyhow::Result<()> {
         PreSandbox {
             skills,
             mcp_config,
-            context_msgs,
+            context_docs,
             cred: credential,
             settings_path,
             config,
@@ -1398,7 +1401,9 @@ fn project_skills_root(workspace: &std::path::Path) -> std::path::PathBuf {
 struct PreSandbox {
     skills: skills::Catalog,
     mcp_config: agent_mcp::McpConfigFile,
-    context_msgs: Vec<Message>,
+    /// The disk-read half of the project context, in block order. The
+    /// environment block is appended in `run`.
+    context_docs: Vec<Message>,
     cred: OAuthCredential,
     /// Writable settings file (interactive only). `None` in headless mode.
     settings_path: Option<std::path::PathBuf>,
@@ -1419,7 +1424,7 @@ async fn run(
     let PreSandbox {
         skills,
         mcp_config,
-        context_msgs,
+        context_docs,
         cred,
         settings_path,
         mut config,
@@ -1582,6 +1587,10 @@ async fn run(
         );
     }
     let permission_mode = PermissionModeState::new(initial_permission_mode);
+    // What the `<environment>` block announces to the model. Holds the shared
+    // permission state rather than a snapshot of it, so `/permissions` reaches
+    // the next turn without recomposing the project context.
+    let workspace_access = context::WorkspaceAccess::new(&sandbox.policy, permission_mode.clone());
     // EP-005: the slot the app-server connection binds itself into. Built here
     // because the registry is assembled once, before any thread exists, and
     // fail-closed while nothing is bound: an app-server with no client attached
@@ -1861,7 +1870,12 @@ async fn run(
 
     let steps = runtime::CliStepSource::with_code_mode(
         Arc::clone(&registry),
-        context_msgs,
+        context::with_environment(
+            context_docs,
+            &workspace,
+            &context::today_utc(),
+            &workspace_access,
+        ),
         code_mode.clone(),
         Arc::clone(&settings),
     );
@@ -1946,6 +1960,7 @@ async fn run(
                 settings_path,
                 workspace: workspace.clone(),
                 sandbox_scope,
+                workspace_access,
                 // US-005 AC2: computed here, where the layers were resolved. The loop
                 // only filters out the values it changed in session.
                 config_sources: settings::status_sources(&config),

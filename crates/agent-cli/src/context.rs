@@ -4,9 +4,11 @@
 //! Landlock is in place. The content is re-injected on every request but never persisted
 //! (see `agent_core::AgentContext::context_messages`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use agent_core::message::Message;
+use agent_core::sandbox::SandboxPolicy;
+use agent_tools::permission::PermissionModeState;
 
 /// Byte budget of the concatenated AGENTS.md block (bounds the prompt). Aligned on the
 /// historical Codex default (`project_doc_max_bytes`, 32 KiB).
@@ -19,16 +21,33 @@ const CANDIDATES: &[&str] = &["AGENTS.md", "CLAUDE.md"];
 /// Max ancestor-walking depth (backstop when no `.git` is found).
 const MAX_WALK_DEPTH: usize = 24;
 
-/// Builds the ephemeral context messages: AGENTS.md (when present) THEN
-/// environment. Stable (AGENTS.md) before volatile (date) -> cacheable prefix.
-/// `date` is provided by the harness (see [`today_utc`]).
-pub fn messages(workspace: &Path, date: &str) -> Vec<Message> {
+/// Everything the project context READS FROM DISK, in block order and without
+/// the environment. Split out because the two halves are available at different
+/// moments: the ancestor walk has to happen before Landlock, while what the
+/// workspace grants is only resolved once the sandbox policy and the permission
+/// state exist. Close it with [`with_environment`].
+pub fn project_documents(workspace: &Path, skills: &crate::skills::Catalog) -> Vec<Message> {
     let mut out = Vec::new();
     if let Some(agents) = discover_agents_md(workspace) {
         out.push(Message::user(agents));
     }
-    out.push(Message::user(environment_block(workspace, date)));
+    if let Some(block) = crate::skills::catalog_block(&skills.skills) {
+        out.push(Message::user(block));
+    }
     out
+}
+
+/// Appends the volatile environment block to what [`project_documents`] read.
+/// Last, always: `StepContexts` orders volatile sections after stable ones, and
+/// that is what keeps the cacheable prefix stable.
+pub fn with_environment(
+    mut documents: Vec<Message>,
+    workspace: &Path,
+    date: &str,
+    access: &WorkspaceAccess,
+) -> Vec<Message> {
+    documents.push(Message::user(environment_block(workspace, date, access)));
+    documents
 }
 
 /// Full project context injected per turn: AGENTS.md, then the skill catalog,
@@ -40,13 +59,14 @@ pub fn project_messages(
     workspace: &Path,
     date: &str,
     skills: &crate::skills::Catalog,
+    access: &WorkspaceAccess,
 ) -> Vec<Message> {
-    let mut out = messages(workspace, date);
-    if let Some(block) = crate::skills::catalog_block(&skills.skills) {
-        let before_environment = out.len().saturating_sub(1);
-        out.insert(before_environment, Message::user(block));
-    }
-    out
+    with_environment(
+        project_documents(workspace, skills),
+        workspace,
+        date,
+        access,
+    )
 }
 
 /// Name of the instruction file already present at the root of `workspace`, if
@@ -145,17 +165,90 @@ pub(crate) fn read_capped(path: &Path, cap: usize) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Environment block (US-028): cwd, shell, date, timezone. `user` message injected
-/// every turn. Shell aligned on the `bash` tool; timezone best-effort from the env.
-fn environment_block(workspace: &Path, date: &str) -> String {
+/// What the workspace grants the model, as the binary resolved it.
+///
+/// Announced because nothing else says it. The cwd alone reads as an address,
+/// not as an authorization: a model handed the Codex instructions and a bare
+/// `<cwd>` has answered that it had no access to the repository at all. The
+/// sandbox parts are fixed for the session; the permission mode is read through
+/// the shared state, so a `/permissions` change reaches the next turn without
+/// anything having to rebuild this.
+#[derive(Debug, Clone)]
+pub struct WorkspaceAccess {
+    sandbox: &'static str,
+    /// `None` when the policy confines no write at all. Distinct from an empty
+    /// list, which is what `read-only` grants: `SandboxPolicy::writable_roots`
+    /// answers the empty slice for BOTH, and reading "unrestricted" out of a
+    /// read-only session would be the one wrong thing to announce.
+    writable_roots: Option<Vec<PathBuf>>,
+    network_access: bool,
+    permission_mode: PermissionModeState,
+}
+
+impl WorkspaceAccess {
+    pub fn new(policy: &SandboxPolicy, permission_mode: PermissionModeState) -> Self {
+        Self {
+            sandbox: policy.id(),
+            writable_roots: policy.confines_writes().then(|| {
+                policy
+                    .writable_roots()
+                    .iter()
+                    .map(|root| root.root.clone())
+                    .collect()
+            }),
+            network_access: policy.network_access(),
+            permission_mode,
+        }
+    }
+
+    /// Codex announces the same three facts in its `<filesystem>` block
+    /// (`codex-rs/core/src/context/environment_context.rs`): where writes land,
+    /// under which profile, and whether the network is open.
+    fn render(&self) -> String {
+        let mut rendered = String::from("<filesystem>");
+        match self.writable_roots.as_deref() {
+            None => rendered.push_str("\n<writable>unrestricted</writable>"),
+            Some([]) => rendered.push_str("\n<writable>none</writable>"),
+            Some(roots) => {
+                for root in roots {
+                    rendered.push_str(&format!(
+                        "\n<writable_root>{}</writable_root>",
+                        root.display()
+                    ));
+                }
+            }
+        }
+        rendered.push_str(&format!("\n<sandbox>{}</sandbox>", self.sandbox));
+        rendered.push_str(&format!(
+            "\n<network_access>{}</network_access>",
+            if self.network_access {
+                "enabled"
+            } else {
+                "restricted"
+            }
+        ));
+        rendered.push_str(&format!(
+            "\n<permission_mode>{}</permission_mode>",
+            self.permission_mode.get().id()
+        ));
+        rendered.push_str("\n</filesystem>");
+        rendered
+    }
+}
+
+/// Environment block (US-028): cwd, shell, date, timezone, then what the
+/// workspace grants. `user` message injected every turn. Shell aligned on the
+/// `bash` tool; timezone best-effort from the env.
+fn environment_block(workspace: &Path, date: &str, access: &WorkspaceAccess) -> String {
     let shell = default_shell();
     let timezone = std::env::var("TZ").unwrap_or_else(|_| "UTC".to_string());
     format!(
-        "<environment>\n<cwd>{}</cwd>\n<shell>{}</shell>\n<current_date>{}</current_date>\n<timezone>{}</timezone>\n</environment>",
+        "<environment>\n<cwd>{}</cwd>\n<shell>{}</shell>\n<current_date>{}</current_date>\n<timezone>{}</timezone>\n{}\n</environment>",
         workspace.display(),
         shell,
         date,
-        timezone
+        timezone,
+        access.render()
     )
 }
 
@@ -205,11 +298,30 @@ mod tests {
         dir
     }
 
+    fn access_for(policy: &SandboxPolicy) -> WorkspaceAccess {
+        WorkspaceAccess::new(
+            policy,
+            PermissionModeState::new(agent_core::permission::PermissionMode::Default),
+        )
+    }
+
+    fn catalog() -> crate::skills::Catalog {
+        crate::skills::Catalog::default()
+    }
+
+    fn access() -> WorkspaceAccess {
+        access_for(&SandboxPolicy::workspace_write(
+            "/work/repo",
+            Vec::new(),
+            Vec::<&str>::new(),
+        ))
+    }
+
     #[test]
     fn agents_md_discovered_and_wrapped() {
         let ws = tmp("agents");
         std::fs::write(ws.join("AGENTS.md"), "Use bun, never npm.").unwrap();
-        let msgs = messages(&ws, "2026-06-17");
+        let msgs = project_messages(&ws, "2026-06-17", &catalog(), &access());
         // 2 messages: AGENTS.md then environment.
         assert_eq!(msgs.len(), 2);
         let agents = msgs[0].text();
@@ -222,7 +334,7 @@ mod tests {
     #[test]
     fn no_agents_md_yields_only_env_no_error() {
         let ws = tmp("noagents");
-        let msgs = messages(&ws, "2026-06-17");
+        let msgs = project_messages(&ws, "2026-06-17", &catalog(), &access());
         assert_eq!(msgs.len(), 1, "only the environment block is injected");
         assert!(msgs[0].text().contains("<environment>"));
     }
@@ -231,7 +343,7 @@ mod tests {
     fn claude_md_is_tolerated_fallback() {
         let ws = tmp("claude");
         std::fs::write(ws.join("CLAUDE.md"), "Projet en Rust.").unwrap();
-        let msgs = messages(&ws, "2026-06-17");
+        let msgs = project_messages(&ws, "2026-06-17", &catalog(), &access());
         assert_eq!(msgs.len(), 2);
         assert!(msgs[0].text().contains("Projet en Rust."));
     }
@@ -243,7 +355,7 @@ mod tests {
         let sub = root.join("sub");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("AGENTS.md"), "SUB_RULES").unwrap();
-        let msgs = messages(&sub, "2026-06-17");
+        let msgs = project_messages(&sub, "2026-06-17", &catalog(), &access());
         let agents = msgs[0].text();
         let root_at = agents.find("ROOT_RULES").expect("root présent");
         let sub_at = agents.find("SUB_RULES").expect("sub présent");
@@ -260,7 +372,7 @@ mod tests {
         let ws = tmp("symlink");
         std::fs::write(ws.join("secret.txt"), "SECRET_CONTENT").unwrap();
         std::os::unix::fs::symlink(ws.join("secret.txt"), ws.join("AGENTS.md")).unwrap();
-        let msgs = messages(&ws, "2026-06-17");
+        let msgs = project_messages(&ws, "2026-06-17", &catalog(), &access());
         assert_eq!(msgs.len(), 1, "symlink ignoré → bloc env seul");
         assert!(!msgs[0].text().contains("SECRET_CONTENT"));
     }
@@ -268,18 +380,72 @@ mod tests {
     #[test]
     fn env_block_has_required_quartet() {
         let ws = tmp("env");
-        let block = environment_block(&ws, "2026-06-17");
+        let block = environment_block(&ws, "2026-06-17", &access());
         assert!(block.contains("<cwd>"));
         assert!(block.contains("<shell>"));
         assert!(block.contains("<current_date>2026-06-17</current_date>"));
         assert!(block.contains("<timezone>"));
     }
 
+    /// The regression the block exists for: the model has to learn from the
+    /// environment that the workspace is reachable, and where writes land.
+    #[test]
+    fn env_block_announces_what_the_workspace_grants() {
+        let ws = tmp("grants");
+        let block = environment_block(&ws, "2026-06-17", &access());
+        assert!(block.contains("<filesystem>"), "bloc: {block}");
+        assert!(block.contains("<writable_root>/work/repo</writable_root>"));
+        assert!(block.contains("<sandbox>workspace-write</sandbox>"));
+        assert!(block.contains("<permission_mode>ask</permission_mode>"));
+    }
+
+    /// `SandboxPolicy::writable_roots` answers the empty slice under read-only
+    /// AND under full access. Announcing one as the other would either invite
+    /// writes that get refused, or hide the ones that go through.
+    #[test]
+    fn an_empty_root_list_is_never_read_as_unrestricted() {
+        let ws = tmp("empty-roots");
+        let read_only = environment_block(
+            &ws,
+            "2026-06-17",
+            &access_for(&SandboxPolicy::ReadOnly {
+                network_access: false,
+            }),
+        );
+        assert!(
+            read_only.contains("<writable>none</writable>"),
+            "{read_only}"
+        );
+        assert!(read_only.contains("<network_access>restricted</network_access>"));
+
+        let full = environment_block(
+            &ws,
+            "2026-06-17",
+            &access_for(&SandboxPolicy::DangerFullAccess),
+        );
+        assert!(full.contains("<writable>unrestricted</writable>"), "{full}");
+    }
+
+    /// `/permissions` moves the shared state, not this struct: the next turn
+    /// announces the new mode without anything having rebuilt the context.
+    #[test]
+    fn a_permission_mode_change_reaches_the_next_block() {
+        let ws = tmp("perm-mode");
+        let mode = PermissionModeState::new(agent_core::permission::PermissionMode::Default);
+        let access = WorkspaceAccess::new(&SandboxPolicy::DangerFullAccess, mode.clone());
+        assert!(environment_block(&ws, "2026-06-17", &access).contains("<permission_mode>ask<"));
+
+        mode.set(agent_core::permission::PermissionMode::BypassPermissions);
+        assert!(
+            environment_block(&ws, "2026-06-17", &access).contains("<permission_mode>full-access<")
+        );
+    }
+
     #[test]
     fn env_block_announces_the_shell_that_will_execute() {
         // US-014 AC3: a single source for the announcement and for the execution.
         let ws = tmp("shell");
-        let block = environment_block(&ws, "2026-06-17");
+        let block = environment_block(&ws, "2026-06-17", &access());
         let shell = agent_tools::shell::resolve();
         assert!(
             block.contains(&format!("<shell>{}</shell>", shell.label)),
@@ -309,12 +475,12 @@ mod tests {
         let catalog = crate::skills::Catalog::default();
 
         // Startup: no instruction file yet, only the environment block.
-        let before = project_messages(&ws, "2026-07-27", &catalog);
+        let before = project_messages(&ws, "2026-07-27", &catalog, &access());
         assert_eq!(before.len(), 1);
 
         // What a `/init` turn does, then what the refresh reads back.
         std::fs::write(ws.join("AGENTS.md"), "Use bun, never npm.").unwrap();
-        let after = project_messages(&ws, "2026-07-27", &catalog);
+        let after = project_messages(&ws, "2026-07-27", &catalog, &access());
         assert!(after[0].text().contains("Use bun, never npm."));
         assert!(
             after

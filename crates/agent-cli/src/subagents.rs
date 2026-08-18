@@ -276,7 +276,7 @@ fn child_context(
         .model_runtime
         .as_ref()
         .map(crate::prompt::select_system_prompt)
-        .unwrap_or("You are a helpful assistant.");
+        .unwrap_or_else(|| "You are a helpful assistant.".to_string());
     let mut config = agent_core::RunConfig {
         max_output_tokens: request.context.limits.max_output_tokens,
         ..agent_core::RunConfig::default()

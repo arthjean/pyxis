@@ -126,6 +126,10 @@ pub struct InteractiveConfig {
     /// (US-005). Resolved there because enforcement happens before this loop
     /// exists.
     pub sandbox_scope: String,
+    /// What the `<environment>` block announces to the model. Same reason as
+    /// `sandbox_scope`: the policy is enforced before this loop exists. Holds
+    /// the shared permission state, so `/permissions` needs nothing here.
+    pub workspace_access: crate::context::WorkspaceAccess,
     /// Configuration layer each displayed value comes from (US-005 AC2), in the
     /// `agent_tui::SOURCE_KEY_*` vocabulary.
     pub config_sources: Vec<(&'static str, &'static str)>,
@@ -1094,6 +1098,7 @@ impl Loop {
                 &self.cfg.workspace,
                 &crate::context::today_utc(),
                 &self.cfg.skills,
+                &self.cfg.workspace_access,
             ));
             self.state.blocks.push(Block::Notice(
                 match crate::context::instructions_file(&self.cfg.workspace) {
@@ -1224,8 +1229,8 @@ impl Screen {
     }
 
     fn draw(&mut self, tui: &mut agent_tui::Tui, session: &mut Loop) -> anyhow::Result<()> {
-        session.chat.sync_local_blocks(&session.state);
         let size = tui.size()?;
+        session.chat.sync_local_blocks(&session.state);
         // A width change invalidates every row already written: the terminal
         // does not rewrap what it was handed. The transcript cells are the
         // source of truth, so the scrollback is dropped and rewritten. The
