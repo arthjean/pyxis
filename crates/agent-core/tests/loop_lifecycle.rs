@@ -3,7 +3,6 @@
 
 use agent_core::AgentContext;
 use agent_core::AgentEvent;
-use agent_core::RunConfig;
 use agent_core::message::ContentBlock;
 use agent_core::message::Message;
 use agent_core::provider::ErrorClass;
@@ -107,8 +106,16 @@ async fn continuation_commits_assistant_and_resamples_without_user_input() {
     ));
 }
 
+/// A long run is not a runaway. Nothing counts turns any more, so a task that
+/// legitimately needs hundreds of them (watching a CI run to completion, which
+/// is hours of sleeping and re-checking) reaches its own end.
+///
+/// The count is deliberately far above the ceiling this loop used to carry: at
+/// 50 turns, or at the iteration guard derived from it, this test would stop
+/// early and the last event would not be `EndTurn`.
 #[tokio::test]
-async fn repeated_continuations_exhaust_the_model_turn_budget() {
+async fn a_run_far_longer_than_the_old_ceiling_is_never_cut_short() {
+    const CONTINUATIONS: usize = 400;
     let continuation = || {
         MockTurn::Stream(vec![
             StreamEvent::TextDelta {
@@ -119,19 +126,25 @@ async fn repeated_continuations_exhaust_the_model_turn_budget() {
             },
         ])
     };
-    let h = harness(vec![continuation(), continuation()], false, 100_000);
-    let ctx = AgentContext::new("mock")
-        .push(Message::user("task"))
-        .with_config(RunConfig {
-            max_turns: 2,
-            ..RunConfig::default()
-        });
+    let mut turns: Vec<MockTurn> = (0..CONTINUATIONS).map(|_| continuation()).collect();
+    turns.push(text_turn("done"));
+
+    let h = harness(turns, false, 100_000);
+    let ctx = AgentContext::new("mock").push(Message::user("watch the CI"));
     let events = drive(ctx, h.deps).await;
-    assert!(matches!(
-        events.last(),
-        Some(AgentEvent::Exhausted(ExhaustReason::MaxTurns(2)))
-    ));
-    assert_eq!(h.requests.lock().unwrap().len(), 2);
+
+    assert!(
+        matches!(events.last(), Some(AgentEvent::EndTurn)),
+        "a long run must end on its own terms: {:?}",
+        events.last()
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Exhausted(_))),
+        "nothing may exhaust a run that is merely long"
+    );
+    assert_eq!(h.requests.lock().unwrap().len(), CONTINUATIONS + 1);
 }
 
 // US-028: context messages (AGENTS.md + env) are prefixed to EVERY

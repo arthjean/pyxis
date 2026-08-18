@@ -278,7 +278,6 @@ fn child_context(
         .map(crate::prompt::select_system_prompt)
         .unwrap_or("You are a helpful assistant.");
     let mut config = agent_core::RunConfig {
-        max_turns: request.context.limits.max_turns,
         max_output_tokens: request.context.limits.max_output_tokens,
         ..agent_core::RunConfig::default()
     };

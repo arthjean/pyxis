@@ -38,7 +38,6 @@ pub const MAX_STEP_CONTEXT_BYTES: usize = 64 * 1024;
 /// (FR-20).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnLimits {
-    pub max_turns: u32,
     pub max_output_tokens: u32,
     /// Steering inputs this turn may hold at once.
     pub max_pending_inputs: usize,

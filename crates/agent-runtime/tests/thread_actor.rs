@@ -161,7 +161,6 @@ pub fn turn_context(turn_id: TurnId) -> TurnContext {
         sandbox: "workspace-write".into(),
         workspace: std::path::PathBuf::from("/tmp/pyxis-test"),
         limits: TurnLimits {
-            max_turns: 50,
             max_output_tokens: 4096,
             max_pending_inputs: MAX_PENDING_INPUTS,
         },

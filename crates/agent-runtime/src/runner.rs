@@ -176,7 +176,7 @@ mod tests {
             TurnState::Interrupted
         );
         assert_eq!(
-            TurnOutcome::Exhausted("MaxTurns(50)".into()).terminal_state(),
+            TurnOutcome::Exhausted("ToolLoop { count: 4 }".into()).terminal_state(),
             TurnState::Failed
         );
         assert_eq!(
@@ -190,8 +190,8 @@ mod tests {
         assert_eq!(TurnOutcome::Completed.cause(), None);
         assert_eq!(TurnOutcome::Interrupted.cause(), None);
         assert_eq!(
-            TurnOutcome::Exhausted("MaxTurns(50)".into()).cause(),
-            Some("exhausted: MaxTurns(50)".into())
+            TurnOutcome::Exhausted("ToolLoop { count: 4 }".into()).cause(),
+            Some("exhausted: ToolLoop { count: 4 }".into())
         );
         assert_eq!(
             TurnOutcome::Failed("boom".into()).cause(),

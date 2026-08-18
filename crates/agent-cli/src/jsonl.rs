@@ -552,9 +552,11 @@ mod tests {
         assert_eq!(interrupted.parts().0, "interrupted");
         assert_eq!(interrupted.parts().2, 1);
 
-        let exhausted =
-            RunEnd::from_terminal(TurnState::Failed, Some("exhausted: MaxTurns(50)".into()));
-        assert_eq!(exhausted, RunEnd::Exhausted("MaxTurns(50)".into()));
+        let exhausted = RunEnd::from_terminal(
+            TurnState::Failed,
+            Some("exhausted: ToolLoop { count: 4 }".into()),
+        );
+        assert_eq!(exhausted, RunEnd::Exhausted("ToolLoop { count: 4 }".into()));
         assert_eq!(exhausted.parts().2, 1);
 
         let failed = RunEnd::from_terminal(TurnState::Failed, Some("provider down".into()));
@@ -584,8 +586,10 @@ mod tests {
         // A guardrail stop is a failure of its own kind, not a provider one:
         // `from_terminal` strips the prefix and `failure()` rebuilds it, so one
         // classifier keeps deciding.
-        let exhausted =
-            RunEnd::from_terminal(TurnState::Failed, Some("exhausted: MaxTurns(50)".into()));
+        let exhausted = RunEnd::from_terminal(
+            TurnState::Failed,
+            Some("exhausted: ToolLoop { count: 4 }".into()),
+        );
         assert_eq!(
             exhausted.failure().map(|f| f.category),
             Some(FailureCategory::Guardrail)

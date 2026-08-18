@@ -217,7 +217,6 @@ mod tests {
                     sandbox: "workspace-write".into(),
                     workspace: std::path::PathBuf::from("/home/arthur/dev/pyxis"),
                     limits: TurnLimits {
-                        max_turns: 50,
                         max_output_tokens: 4096,
                         max_pending_inputs: 16,
                     },

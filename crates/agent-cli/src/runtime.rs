@@ -225,7 +225,6 @@ impl TurnContextSource for SettingsCell {
                 sandbox: settings.sandbox.clone(),
                 workspace: settings.workspace.clone(),
                 limits: TurnLimits {
-                    max_turns: settings.run_config.max_turns,
                     max_output_tokens: settings.run_config.max_output_tokens,
                     max_pending_inputs: MAX_PENDING_INPUTS,
                 },
@@ -615,7 +614,6 @@ fn build_context(
             settings.run_config.clone(),
         )
     });
-    config.max_turns = captured.limits.max_turns;
     config.max_output_tokens = captured.limits.max_output_tokens;
     config.overload_fallback_runtime = request.overload_fallback_runtime.clone();
     let overload_fallback_system =

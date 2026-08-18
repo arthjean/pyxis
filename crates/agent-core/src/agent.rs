@@ -43,7 +43,6 @@ use crate::transition::{
 /// Loop settings (guardrails, thresholds).
 #[derive(Debug, Clone)]
 pub struct RunConfig {
-    pub max_turns: u32,
     pub max_output_tokens: u32,
     pub max_retries: u32,
     pub micro_keep_recent: usize,
@@ -71,7 +70,6 @@ pub struct RunConfig {
 impl Default for RunConfig {
     fn default() -> Self {
         Self {
-            max_turns: 50,
             max_output_tokens: 4096,
             max_retries: 3,
             micro_keep_recent: 2,
@@ -867,8 +865,6 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
         // Armed by a tool the user refused with "stop the turn"; consumed at the
         // next loop boundary so the stop never happens mid-dispatch.
         let mut pending_abort: Option<InterruptReason> = None;
-        let mut iterations: u32 = 0;
-        let iter_cap = config.max_turns.saturating_mul(4).saturating_add(32);
         // US-014: deterministic guardrails (override the model's own logic).
         let mut loop_guard = LoopGuard::new(config.loop_guard_threshold);
         let mut usage_budget = UsageBudget::new(config.token_budget, config.cost_budget);
@@ -876,15 +872,11 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
         // forces compaction on the next turn, BEFORE calling the model again.
         let mut force_compact = false;
 
+        // No iteration ceiling: it was derived from the turn cap and would have
+        // been the same limit under another name. What ends this loop is a
+        // terminal decision (end of turn, budget kill-switch, interrupt, loop
+        // guard) or an error, never a count of laps.
         loop {
-            iterations += 1;
-            if iterations > iter_cap {
-                yield AgentEvent::Error(AgentError::Provider(ProviderFailure::contract(
-                    "iteration guard reached",
-                )));
-                return;
-            }
-
             // transcript-before-response (invariant 6): idempotent delta.
             if let Err(e) = deps.session.sync(&messages).await {
                 yield AgentEvent::Error(AgentError::Session(e.to_string()));
@@ -918,12 +910,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                 force_compact = false;
                 Transition::Compact(CompactKind::Auto)
             } else {
-                match pre_stream_transition(
-                pending,
-                model_turns,
-                config.max_turns,
-                turn.budget.should_autocompact(),
-            ) {
+                match pre_stream_transition(pending, turn.budget.should_autocompact()) {
                 Some(t) => {
                     pending = None;
                     t

@@ -33,12 +33,8 @@ pub struct PendingError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExhaustReason {
-    MaxTurns(u32),
     /// Token budget kill-switch reached (US-014): `spent >= limit`.
-    TokenBudget {
-        spent: u64,
-        limit: u64,
-    },
+    TokenBudget { spent: u64, limit: u64 },
     /// Cost budget kill-switch reached (US-014), in micro-USD (1e-6 $).
     CostBudget {
         spent_micro_usd: u64,
@@ -46,15 +42,11 @@ pub enum ExhaustReason {
     },
     /// Tool loop persisting past the signal (US-014): deterministic stop
     /// after `count` identical repeats.
-    ToolLoop {
-        count: u32,
-    },
+    ToolLoop { count: u32 },
     /// The model reached its output budget. This is not a clean end:
     /// the answer may be truncated, or even empty if reasoning consumed the
     /// budget.
-    MaxOutputTokens {
-        visible_output: bool,
-    },
+    MaxOutputTokens { visible_output: bool },
 }
 
 /// Exhaustive transition. Each variant is a decision event.
@@ -83,18 +75,19 @@ pub enum Transition {
 }
 
 /// Decision BEFORE the API call. `None` means proceed to the stream. Priority:
-/// withholding (recover) > exhaustion > proactive compaction.
+/// withholding (recover) > proactive compaction.
+///
+/// There is deliberately no turn ceiling here. A turn ends when the work is
+/// done, when a budget kill-switch fires, or when the user interrupts it, never
+/// because a counter ran out: watching a CI run to completion is one task that
+/// legitimately spans hundreds of model turns and hours of wall clock. This is
+/// the baseline's own shape, which carries no equivalent of a turn cap.
 pub fn pre_stream_transition(
     pending: Option<PendingError>,
-    model_turns: u32,
-    max_turns: u32,
     should_autocompact: bool,
 ) -> Option<Transition> {
     if let Some(p) = pending {
         return Some(Transition::Recover(p));
-    }
-    if model_turns >= max_turns {
-        return Some(Transition::Exhausted(ExhaustReason::MaxTurns(max_turns)));
     }
     if should_autocompact {
         return Some(Transition::Compact(CompactKind::Auto));
@@ -384,23 +377,30 @@ mod tests {
     }
 
     #[test]
-    fn pre_stream_priority_recover_then_exhaust_then_compact() {
+    fn pre_stream_priority_recover_then_compact() {
         let p = PendingError {
             kind: ContextErrorKind::PromptTooLong,
         };
         assert!(matches!(
-            pre_stream_transition(Some(p), 0, 10, true),
+            pre_stream_transition(Some(p), true),
             Some(Transition::Recover(_))
         ));
         assert!(matches!(
-            pre_stream_transition(None, 10, 10, true),
-            Some(Transition::Exhausted(ExhaustReason::MaxTurns(10)))
-        ));
-        assert!(matches!(
-            pre_stream_transition(None, 0, 10, true),
+            pre_stream_transition(None, true),
             Some(Transition::Compact(CompactKind::Auto))
         ));
-        assert!(pre_stream_transition(None, 0, 10, false).is_none());
+        assert!(pre_stream_transition(None, false).is_none());
+    }
+
+    /// No count of turns can end a run. A task that legitimately takes hundreds
+    /// of model turns (watching a CI run to completion) must reach its own end,
+    /// so the only things that stop the loop before it are the budget
+    /// kill-switches and an interrupt.
+    #[test]
+    fn nothing_here_exhausts_a_run_that_is_merely_long() {
+        for _ in 0..10_000 {
+            assert!(pre_stream_transition(None, false).is_none());
+        }
     }
 
     #[test]
