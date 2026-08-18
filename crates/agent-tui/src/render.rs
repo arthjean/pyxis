@@ -188,9 +188,14 @@ pub fn parity_content_height(
     width: u16,
     screen_height: u16,
 ) -> u16 {
-    parity_layout(state, surface, width, screen_height)
-        .total()
-        .clamp(1, screen_height.max(1))
+    let layout = parity_layout(state, surface, width, screen_height);
+    // The welcome card is the top of a session, not a block floating above the
+    // composer: the viewport takes the whole screen so the card sits at the top
+    // and the slack falls between it and the input.
+    if layout.welcome > 0 {
+        return screen_height.max(1);
+    }
+    layout.total().clamp(1, screen_height.max(1))
 }
 
 #[cfg(feature = "codex_tui_parity")]

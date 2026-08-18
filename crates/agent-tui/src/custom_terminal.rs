@@ -220,9 +220,26 @@ impl<B: Backend> Terminal<B> {
     /// writes history into them.
     pub fn anchor_viewport(&mut self, min_height: u16) -> io::Result<()> {
         let size = self.size()?;
+        let previous_screen_height = self.last_known_screen_size.height;
         self.record_screen_size(size);
         if size.width == 0 || size.height == 0 {
             return Ok(());
+        }
+
+        // A screen that lost rows scrolled its content up by the difference, the
+        // viewport included: its recorded position is stale. Re-anchoring on it
+        // would clear from below the rows that moved and leave the previous
+        // frame's top on screen, as a ghost of the card above the new one.
+        if size.height < previous_screen_height {
+            let shift = previous_screen_height - size.height;
+            let moved = Rect {
+                y: self.viewport_area.y.saturating_sub(shift),
+                ..self.viewport_area
+            };
+            self.set_viewport_area(moved);
+            // The terminal moved those cells behind our back, so the previous
+            // buffer no longer describes the screen: every cell must be re-sent.
+            self.invalidate_viewport();
         }
 
         let previous = self.viewport_area;

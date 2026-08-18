@@ -58,15 +58,21 @@ pub fn enter() -> io::Result<Tui> {
 
     match Terminal::new(CrosstermBackend::new(out)) {
         Ok(tui) => {
-            // Legacy owns the whole (alternate) screen; parity starts with an
-            // empty viewport anchored at the cursor and grows on the first draw.
-            #[cfg(not(feature = "codex_tui_parity"))]
             let mut tui = tui;
+            // Legacy owns the whole (alternate) screen; parity wipes the visible
+            // screen so the session starts on a clean one instead of below
+            // whatever the shell left there (build output, a previous command).
             #[cfg(not(feature = "codex_tui_parity"))]
             {
                 let size = tui.size()?;
                 tui.set_viewport_area(Rect::new(0, 0, size.width, size.height));
                 tui.clear_screen()?;
+            }
+            #[cfg(feature = "codex_tui_parity")]
+            if let Err(e) = clear(&mut tui) {
+                let _ = execute!(io::stdout(), DisableBracketedPaste);
+                let _ = disable_raw_mode();
+                return Err(e);
             }
             #[cfg(feature = "codex_tui_parity")]
             crate::debug_log::log(&format!("enter: viewport={:?}", tui.viewport_area));
@@ -116,12 +122,28 @@ pub fn clear_for_reflow(tui: &mut Tui) -> io::Result<u16> {
     tui.clear_owned_history()
 }
 
+/// Wipes the visible screen and anchors an empty viewport at its top, the state
+/// a session starts and ends on.
+///
+/// Anchoring at the top rather than at the last row matters on the way in: the
+/// first frame then grows into an empty screen instead of scrolling as many
+/// blank rows into the scrollback as it needs.
+///
+/// Deliberately not `ESC[3J` here either: the screen is cleared, the scrollback
+/// is not purged, so whatever the user had before Pyxis started stays one scroll
+/// away.
 pub fn clear(tui: &mut Tui) -> io::Result<()> {
-    execute!(tui.backend_mut(), Clear(ClearType::All), MoveTo(0, 0))?;
+    write_clear_sequence(tui.backend_mut())?;
     let size = tui.size()?;
-    tui.set_viewport_area(Rect::new(0, size.height.saturating_sub(1), size.width, 1));
+    tui.set_viewport_area(Rect::new(0, 0, size.width, 0));
     tui.invalidate_viewport();
     Ok(())
+}
+
+/// The escape sequences of `clear`, isolated from the real terminal so a test
+/// can read what a session start emits.
+pub fn write_clear_sequence(out: &mut impl Write) -> io::Result<()> {
+    execute!(out, Clear(ClearType::All), MoveTo(0, 0))
 }
 
 /// Restores the terminal from OUTSIDE the normal exit path: panic hook, signal,
@@ -198,7 +220,7 @@ pub fn supports_truecolor() -> bool {
 }
 
 #[cfg(test)]
-mod restore_tests {
+mod sequence_tests {
     use super::*;
 
     /// US-020 AC1: the sequence that a panic emits before its message actually
@@ -216,6 +238,21 @@ mod restore_tests {
             "collage entre crochets: {rendered:?}"
         );
         assert!(rendered.contains("?25h"), "curseur masqué: {rendered:?}");
+    }
+
+    /// The screen a session starts on is wiped, but the scrollback is not
+    /// purged: what the user had in the terminal before Pyxis stays reachable.
+    #[test]
+    fn the_clear_sequence_wipes_the_screen_without_purging_the_scrollback() {
+        let mut out: Vec<u8> = Vec::new();
+        write_clear_sequence(&mut out).expect("écriture en mémoire");
+        let rendered = String::from_utf8_lossy(&out);
+        assert!(rendered.contains("[2J"), "écran non effacé: {rendered:?}");
+        assert!(
+            rendered.contains("[1;1H"),
+            "curseur non replacé: {rendered:?}"
+        );
+        assert!(!rendered.contains("[3J"), "défilement purgé: {rendered:?}");
     }
 
     /// Nothing is active outside an interactive session: a headless panic must
@@ -289,6 +326,23 @@ mod viewport_tests {
 
         assert_eq!(tui.viewport_area.bottom(), 8);
         assert_eq!(tui.viewport_area.y, 6, "aucune rangée reprise sans besoin");
+    }
+
+    /// A screen that loses rows scrolls its content up, the viewport included.
+    /// Re-anchoring on the stale position would leave the rows the previous
+    /// frame wrote above the new one, as a ghost of the card.
+    #[test]
+    fn a_shorter_screen_re_anchors_the_viewport_on_the_rows_that_moved() {
+        let mut tui = terminal(10, 20);
+        tui.set_viewport_area(Rect::new(0, 8, 10, 12));
+        draw_at(&mut tui, 12).expect("rendu");
+
+        tui.backend_mut().resize(10, 14);
+        draw_at(&mut tui, 6).expect("rendu après réduction");
+
+        // The twelve rows moved from 8..20 to 2..14; the viewport owns them
+        // again instead of starting at row 8 and leaving six behind.
+        assert_eq!(tui.viewport_area, Rect::new(0, 2, 10, 12));
     }
 
     #[test]

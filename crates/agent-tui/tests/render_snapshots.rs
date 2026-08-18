@@ -119,6 +119,30 @@ fn welcome_screen_drops_the_logo() {
     );
 }
 
+/// The welcome card is the top of a session: the viewport it asks for covers
+/// the whole screen, so the card sits at the top and the slack falls between it
+/// and the composer. Once the conversation starts, the viewport only asks for
+/// what it draws again.
+#[cfg(feature = "codex_tui_parity")]
+#[test]
+fn welcome_reserves_the_whole_screen() {
+    let mut s = state();
+    let mut chat = agent_tui::ChatWidget::new(&[]);
+    assert_eq!(
+        agent_tui::parity_content_height(&s, chat.surface(), W, H),
+        H,
+        "the welcome viewport must cover the screen"
+    );
+
+    let prompt = "Bonjour";
+    s.push_user(prompt);
+    chat.push_user_message(&s, prompt);
+    assert!(
+        agent_tui::parity_content_height(&s, chat.surface(), W, H) < H,
+        "the conversation viewport must shrink back to its content"
+    );
+}
+
 /// Regression: the welcome card and the first submitted message are rendered
 /// on successive frames of the same inline terminal. A fresh-frame snapshot
 /// cannot catch stale cells left on the physical screen when the viewport gives
