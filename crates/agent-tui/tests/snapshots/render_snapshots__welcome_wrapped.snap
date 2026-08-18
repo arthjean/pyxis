@@ -1,0 +1,28 @@
+---
+source: crates/agent-tui/tests/render_snapshots.rs
+expression: "harness::frame(\"welcome_wrapped\", &s, 72, H)"
+---
+
+ ╭────────────────────────────────────────────────────────────────────╮
+ │                                                                    │
+ │                         PYXIS                                      │
+ │                         your terminal coding agent                 │
+ │   ⢄⢵⣴⢵⢤⢄⣄   ⢀⢀⠴⠕⠷⢿⢅⠁                                               │
+ │   ⠑⢿⠅⠁ ⠁⠁⠉⠵⠷⢍⠁  ⢀⠝⠅     ◆ gpt-5 [high]  ·  /home/arthur/dev/pyxis  │
+ │    ⠉⠵⢅ ⢠ ⢕⢵⢕⠅⠙⢵⢴⠏⠁        Ask for approval                         │
+ │      ⢽⠟⠅ ⠙⠝⠟⢅⠕⠍⠁⠑⢅⠄     ✓ codex  ChatGPT subscription              │
+ │    ⢀⣽⠁   ⢁⠤⢟⣅    ⢙⣷⠅                                               │
+ │    ⠝⢷⠵⠴⠗⠉⠁  ⠁⠉⠙⠓⠗⠟⠝⠁    /help  ·  /models  ·  /effort              │
+ │    ⠁ ⠁                  /permissions  ·  /goal                     │
+ │                         ? for shortcuts   ·   ↑ history            │
+ │                                                                    │
+ ╰────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────
+› Ask Pyxis to do anything
+────────────────────────────────────────────────────────────────────────
+  gpt-5 high · /home/arthur/dev/pyxis

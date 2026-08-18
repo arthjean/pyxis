@@ -533,29 +533,23 @@ fn top_centered_rect(area: Rect, w: u16, h: u16) -> Rect {
 /// Welcome screen (Grok-style hero): a card at the top, braille logo (Dyson
 /// sphere, monochrome) on the left, identity + shortcuts on the right. Displayed as long
 /// as no conversation has started (`AppState::is_welcome`); the input stays
-/// rendered below, unchanged. Compact fallback (without logo nor border) when the terminal
-/// is too narrow for the full card.
+/// rendered below, unchanged.
+///
+/// The card is fitted to the terminal instead of being drawn at one fixed size:
+/// see [`welcome_plan`] for the three steps it goes through as the width
+/// shrinks.
 fn render_welcome(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     // No transcript to scroll on the welcome screen.
     state.scroll_max.set(0);
 
-    let (logo, info) = welcome_parts(state, theme);
-    let logo_w = logo.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
-    let WelcomeMetrics {
-        card_w,
-        card_h,
-        inner_h,
-        gap,
-        pad,
-    } = welcome_metrics(&logo, &info);
-
-    // Terminal too small for the full card -> compact fallback.
-    if area.width < card_w || area.height < card_h {
-        render_welcome_compact(frame, area, &info);
+    let plan = welcome_plan(state, theme, area.width);
+    // Too short for the framed card -> the identity block alone.
+    if !plan.bordered || area.height < plan.card_h {
+        render_welcome_compact(frame, area, &plan.info);
         return;
     }
 
-    let rect = top_centered_rect(area, card_w, card_h);
+    let rect = top_centered_rect(area, plan.card_w, plan.card_h);
     let frame_block = Boundary::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -565,17 +559,22 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
 
     // Composes each line: logo (left) + gap + info (right), both blocks
     // vertically centered in `inner_h`.
-    let logo_off = (inner_h - logo.len() as u16) / 2;
-    let info_off = (inner_h - info.len() as u16) / 2;
+    let logo_w = lines_width(&plan.logo);
+    let gap = if plan.logo.is_empty() { 0 } else { WELCOME_GAP };
+    let inner_h = plan.card_h.saturating_sub(4);
+    let logo_off = (inner_h.saturating_sub(plan.logo.len() as u16)) / 2;
+    let info_off = (inner_h.saturating_sub(plan.info.len() as u16)) / 2;
     let mut rows: Vec<Line> = Vec::with_capacity(inner_h as usize);
     for i in 0..inner_h {
         let mut spans: Vec<Span> = Vec::new();
-        match i.checked_sub(logo_off).map(|j| logo.get(j as usize)) {
-            Some(Some(line)) => spans.extend(line.spans.iter().cloned()),
-            _ => spans.push(Span::raw(" ".repeat(logo_w as usize))),
+        if logo_w > 0 {
+            match i.checked_sub(logo_off).map(|j| plan.logo.get(j as usize)) {
+                Some(Some(line)) => spans.extend(line.spans.iter().cloned()),
+                _ => spans.push(Span::raw(" ".repeat(logo_w as usize))),
+            }
+            spans.push(Span::raw(" ".repeat(gap as usize)));
         }
-        spans.push(Span::raw(" ".repeat(gap as usize)));
-        if let Some(Some(line)) = i.checked_sub(info_off).map(|j| info.get(j as usize)) {
+        if let Some(Some(line)) = i.checked_sub(info_off).map(|j| plan.info.get(j as usize)) {
             spans.extend(line.spans.iter().cloned());
         }
         rows.push(Line::from(spans));
@@ -583,121 +582,302 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
 
     // 1 margin line at the top, `pad` columns on the left, inside the frame.
     let body = Rect {
-        x: content.x + pad,
+        x: content.x + WELCOME_PAD,
         y: content.y + 1,
-        width: content.width.saturating_sub(pad),
+        width: content.width.saturating_sub(WELCOME_PAD),
         height: content.height.saturating_sub(1),
     };
     frame.render_widget(Paragraph::new(rows), body);
 }
 
-struct WelcomeMetrics {
+/// Breathing column between the logo and the text.
+const WELCOME_GAP: u16 = 3;
+/// Inner horizontal margin, on both sides of the card.
+const WELCOME_PAD: u16 = 2;
+/// Narrowest text column the framed card is still worth drawing at. Below it
+/// the border and its margins eat more room than the frame is worth, and the
+/// welcome falls back to the bare identity block.
+const WELCOME_MIN_INFO: u16 = 24;
+
+/// Welcome card fitted to a given width: what to draw, and how much room it
+/// takes. Shared by the renderer and the height budget so the drawn card and
+/// the reserved rows cannot drift apart.
+struct WelcomePlan {
+    /// Empty when the width does not pay for the logo column.
+    logo: Vec<Line<'static>>,
+    info: Vec<Line<'static>>,
+    bordered: bool,
     card_w: u16,
     card_h: u16,
-    inner_h: u16,
-    gap: u16,
-    pad: u16,
 }
 
-fn welcome_metrics(logo: &[Line<'static>], info: &[Line<'static>]) -> WelcomeMetrics {
-    let logo_w = logo.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
-    let info_w = info.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
-    let gap: u16 = 3; // breathing column between logo and text
-    let pad: u16 = 2; // inner horizontal margin (on both sides)
-    let inner_w = logo_w + gap + info_w;
-    let inner_h = logo.len().max(info.len()) as u16;
-    WelcomeMetrics {
-        card_w: inner_w + pad * 2 + 2, // + 2 borders
-        card_h: inner_h + 4,           // 2 margin lines (top/bottom) + 2 borders
-        inner_h,
-        gap,
-        pad,
+/// Fits the welcome card to `width` in three steps: full card, card without its
+/// logo, then the bare identity block. The text column reflows at each step
+/// (segments wrap, the workspace path loses its head) rather than being cut, so
+/// a resize narrows the card instead of breaking it.
+fn welcome_plan(state: &AppState, theme: &Theme, width: u16) -> WelcomePlan {
+    let logo = logo_lines(theme);
+    let logo_w = lines_width(&logo);
+    // Borders plus the inner margin on both sides.
+    let chrome = 2 + WELCOME_PAD * 2;
+    let inner = width.saturating_sub(chrome);
+
+    let beside_logo = inner.saturating_sub(logo_w + WELCOME_GAP);
+    if beside_logo >= WELCOME_MIN_INFO {
+        let info = welcome_info(state, theme, beside_logo);
+        let card_w = logo_w + WELCOME_GAP + lines_width(&info) + chrome;
+        return WelcomePlan::new(logo, info, true, card_w);
+    }
+    if inner >= WELCOME_MIN_INFO {
+        let info = welcome_info(state, theme, inner);
+        let card_w = lines_width(&info) + chrome;
+        return WelcomePlan::new(Vec::new(), info, true, card_w);
+    }
+    let info = welcome_info(state, theme, width.max(1));
+    let card_w = lines_width(&info);
+    WelcomePlan::new(Vec::new(), info, false, card_w)
+}
+
+impl WelcomePlan {
+    fn new(
+        logo: Vec<Line<'static>>,
+        info: Vec<Line<'static>>,
+        bordered: bool,
+        card_w: u16,
+    ) -> Self {
+        let inner_h = (logo.len().max(info.len())) as u16;
+        // 2 margin lines (top/bottom) + 2 borders.
+        let card_h = if bordered {
+            inner_h + 4
+        } else {
+            inner_h.max(1)
+        };
+        Self {
+            logo,
+            info,
+            bordered,
+            card_w,
+            card_h,
+        }
     }
 }
 
 /// Rows the welcome screen asks for. The parity viewport must reserve them
-/// before drawing, and the fallback card is shorter than the full one.
+/// before drawing, and the fitted card is shorter than the full one.
 fn welcome_height(state: &AppState, width: u16) -> u16 {
     let theme = Theme::new(state.truecolor);
-    let (logo, info) = welcome_parts(state, &theme);
-    let metrics = welcome_metrics(&logo, &info);
-    if width < metrics.card_w {
-        // The compact fallback keeps `top_centered_rect`'s one-row top offset.
-        (info.len() as u16).max(1).saturating_add(1)
-    } else {
-        metrics.card_h.saturating_add(1)
-    }
+    // Both branches keep `top_centered_rect`'s one-row top offset.
+    welcome_plan(state, &theme, width).card_h.saturating_add(1)
 }
 
-/// Left column (logo) and right column (identity, model, shortcuts) of the
-/// welcome card, shared by the renderer and the height budget.
-fn welcome_parts(state: &AppState, theme: &Theme) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
-    let logo = logo_lines(theme);
+/// Widest line of a block, in terminal cells.
+fn lines_width(lines: &[Line<'static>]) -> u16 {
+    lines.iter().map(|l| l.width()).max().unwrap_or(0) as u16
+}
+
+/// Text column of the welcome card (identity, model, shortcuts), laid out for
+/// a text column `max_w` cells wide.
+fn welcome_info(state: &AppState, theme: &Theme, max_w: u16) -> Vec<Line<'static>> {
     let mut info: Vec<Line> = vec![
-        Line::from(Span::styled(
-            "PYXIS",
-            theme.accent().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "your terminal coding agent",
-            theme.dim().add_modifier(Modifier::ITALIC),
-        )),
+        truncate_line(
+            vec![Span::styled(
+                "PYXIS",
+                theme.accent().add_modifier(Modifier::BOLD),
+            )],
+            max_w,
+        ),
+        truncate_line(
+            vec![Span::styled(
+                "your terminal coding agent",
+                theme.dim().add_modifier(Modifier::ITALIC),
+            )],
+            max_w,
+        ),
         Line::default(),
     ];
-    let mut meta = vec![
+
+    let mut model = vec![
         Span::styled("◆ ", theme.faint()),
         Span::styled(state.model.clone(), theme.dim()),
     ];
     if let Some(effort) = &state.reasoning_effort
         && !effort.trim().is_empty()
     {
-        meta.push(Span::styled(format!(" [{}]", effort.trim()), theme.faint()));
+        model.push(Span::styled(format!(" [{}]", effort.trim()), theme.faint()));
     }
+    let mut meta = vec![model];
     if !state.workspace.is_empty() {
-        meta.push(Span::styled("  ·  ", theme.faint()));
-        meta.push(Span::styled(state.workspace.clone(), theme.dim()));
+        // The head of the path is what a narrow card can afford to drop.
+        meta.push(vec![Span::styled(
+            shorten_path(&state.workspace, max_w),
+            theme.dim(),
+        )]);
     }
-    meta.push(Span::styled("  ·  ", theme.faint()));
-    meta.push(Span::styled(state.permission_mode_label(), theme.dim()));
-    info.push(Line::from(meta));
-    if state.provider_connected {
-        info.push(Line::from(vec![
-            Span::styled("✓ codex", theme.brand()),
-            Span::styled("  ChatGPT subscription", theme.dim()),
-        ]));
+    meta.push(vec![Span::styled(
+        state.permission_mode_label(),
+        theme.dim(),
+    )]);
+    // Continuations line up under the text, past the `◆ ` bullet.
+    info.extend(wrap_segments(meta, "  ·  ", theme.faint(), max_w, 2));
+
+    let provider = if state.provider_connected {
+        vec![
+            vec![Span::styled("✓ codex", theme.brand())],
+            vec![Span::styled("ChatGPT subscription", theme.dim())],
+        ]
     } else {
-        info.push(Line::from(vec![
-            Span::styled("○ not connected", theme.accent()),
-            Span::styled("  restart pyxis to reconnect", theme.dim()),
-        ]));
-    }
+        vec![
+            vec![Span::styled("○ not connected", theme.accent())],
+            vec![Span::styled("restart pyxis to reconnect", theme.dim())],
+        ]
+    };
+    info.extend(wrap_segments(provider, "  ", Style::default(), max_w, 2));
+
     info.push(Line::default());
-    info.push(Line::from(vec![
-        Span::styled("/help", theme.accent()),
-        Span::styled("  ·  ", theme.faint()),
-        Span::styled("/models", theme.accent()),
-        Span::styled("  ·  ", theme.faint()),
-        Span::styled("/effort", theme.accent()),
-    ]));
-    info.push(Line::from(vec![
-        Span::styled("/permissions", theme.accent()),
-        Span::styled("  ·  ", theme.faint()),
-        Span::styled("/goal", theme.accent()),
-    ]));
+    let commands = |names: &[&'static str]| -> Vec<Vec<Span<'static>>> {
+        names
+            .iter()
+            .map(|name| vec![Span::styled(*name, theme.accent())])
+            .collect()
+    };
+    info.extend(wrap_segments(
+        commands(&["/help", "/models", "/effort"]),
+        "  ·  ",
+        theme.faint(),
+        max_w,
+        0,
+    ));
+    info.extend(wrap_segments(
+        commands(&["/permissions", "/goal"]),
+        "  ·  ",
+        theme.faint(),
+        max_w,
+        0,
+    ));
     // The footer spends its row on the status line, so `?` is announced here:
     // without it the shortcut overlay would be unreachable by discovery.
-    info.push(Line::from(Span::styled(
-        "? for shortcuts   ·   ↑ history",
+    info.extend(wrap_segments(
+        vec![
+            vec![Span::styled("? for shortcuts", theme.faint())],
+            vec![Span::styled("↑ history", theme.faint())],
+        ],
+        "   ·   ",
         theme.faint(),
-    )));
+        max_w,
+        0,
+    ));
 
-    (logo, info)
+    info
+}
+
+/// Packs `segments` into lines at most `max_w` cells wide, joined by `sep`.
+/// Lines after the first are indented by `indent` so a wrapped row still reads
+/// as one row. A segment too wide for a line of its own is truncated.
+fn wrap_segments(
+    segments: Vec<Vec<Span<'static>>>,
+    sep: &'static str,
+    sep_style: Style,
+    max_w: u16,
+    indent: u16,
+) -> Vec<Line<'static>> {
+    let sep_w = measure::width(sep) as u16;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut used = 0u16;
+    for segment in segments {
+        let seg_w = spans_width(&segment);
+        if current.is_empty() {
+            current = truncate_spans(segment, max_w);
+            used = spans_width(&current);
+            continue;
+        }
+        if used.saturating_add(sep_w).saturating_add(seg_w) <= max_w {
+            current.push(Span::styled(sep, sep_style));
+            current.extend(segment);
+            used = used.saturating_add(sep_w).saturating_add(seg_w);
+            continue;
+        }
+        lines.push(Line::from(std::mem::take(&mut current)));
+        let room = max_w.saturating_sub(indent);
+        current = truncate_spans(segment, room);
+        used = spans_width(&current).saturating_add(indent);
+        if indent > 0 {
+            current.insert(0, Span::raw(" ".repeat(indent as usize)));
+        }
+    }
+    if !current.is_empty() {
+        lines.push(Line::from(current));
+    }
+    lines
+}
+
+fn spans_width(spans: &[Span<'static>]) -> u16 {
+    spans
+        .iter()
+        .map(|s| measure::width(&s.content) as u16)
+        .sum()
+}
+
+fn truncate_line(spans: Vec<Span<'static>>, max_w: u16) -> Line<'static> {
+    Line::from(truncate_spans(spans, max_w))
+}
+
+/// Cuts a run of spans at `max_w` cells, keeping the style of the span the cut
+/// lands in.
+fn truncate_spans(spans: Vec<Span<'static>>, max_w: u16) -> Vec<Span<'static>> {
+    if spans_width(&spans) <= max_w {
+        return spans;
+    }
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(spans.len());
+    let mut used = 0u16;
+    for span in spans {
+        let room = max_w.saturating_sub(used);
+        if room == 0 {
+            break;
+        }
+        let width = measure::width(&span.content) as u16;
+        if width <= room {
+            used += width;
+            out.push(span);
+            continue;
+        }
+        let style = span.style;
+        out.push(Span::styled(
+            measure::truncate(&span.content, room as usize),
+            style,
+        ));
+        break;
+    }
+    out
+}
+
+/// Shortens a path from the left: the tail names the directory the session runs
+/// in, which is the point of showing it; the head is what a narrow card drops.
+fn shorten_path(path: &str, max_w: u16) -> String {
+    let max = max_w as usize;
+    if measure::width(path) <= max {
+        return path.to_string();
+    }
+    let mut tail = String::new();
+    for part in path.rsplit('/').filter(|part| !part.is_empty()) {
+        let candidate = format!("/{part}{tail}");
+        // + 1 cell for the leading ellipsis.
+        if measure::width(&candidate) + 1 > max {
+            break;
+        }
+        tail = candidate;
+    }
+    if tail.is_empty() {
+        measure::truncate(path, max)
+    } else {
+        format!("…{tail}")
+    }
 }
 
 /// Welcome fallback for a narrow terminal: the identity block alone at the top,
 /// without logo nor border (avoids truncating the card).
 fn render_welcome_compact(frame: &mut Frame, area: Rect, info: &[Line<'static>]) {
-    let w = info.iter().map(|l| l.width()).max().unwrap_or(1).max(1) as u16;
+    let w = lines_width(info).max(1);
     let h = (info.len() as u16).max(1);
     let rect = top_centered_rect(area, w, h);
     frame.render_widget(Paragraph::new(info.to_vec()), rect);

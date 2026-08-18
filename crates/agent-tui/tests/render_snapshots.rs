@@ -91,6 +91,34 @@ fn welcome_screen_wide() {
     insta::assert_snapshot!("welcome_wide", harness::frame("welcome_wide", &s, WIDE, H));
 }
 
+/// A card whose text column no longer fits beside the logo on one line: the
+/// segments wrap under the bullet instead of the card losing its frame.
+#[test]
+fn welcome_screen_wraps_beside_the_logo() {
+    let mut s = state();
+    s.workspace = "/home/arthur/dev/pyxis".into();
+    s.reasoning_effort = Some("high".into());
+    s.provider_connected = true;
+    insta::assert_snapshot!(
+        "welcome_wrapped",
+        harness::frame("welcome_wrapped", &s, 72, H)
+    );
+}
+
+/// Narrower still: the logo column costs more than the text can spare, so the
+/// card keeps its frame without it.
+#[test]
+fn welcome_screen_drops_the_logo() {
+    let mut s = state();
+    s.workspace = "/home/arthur/dev/pyxis".into();
+    s.reasoning_effort = Some("high".into());
+    s.provider_connected = true;
+    insta::assert_snapshot!(
+        "welcome_no_logo",
+        harness::frame("welcome_no_logo", &s, 48, H)
+    );
+}
+
 /// Regression: the welcome card and the first submitted message are rendered
 /// on successive frames of the same inline terminal. A fresh-frame snapshot
 /// cannot catch stale cells left on the physical screen when the viewport gives

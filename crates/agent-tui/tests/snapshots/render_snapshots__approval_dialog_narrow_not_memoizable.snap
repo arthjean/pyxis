@@ -3,21 +3,21 @@ source: crates/agent-tui/tests/render_snapshots.rs
 expression: "harness::frame(\"approval_dialog_narrow_not_memoizable\", &s, NARROW, H)"
 ---
 
-PYXIS
-your terminal coding agent
-
-◆ gpt-5  ·  pyxis  ·  Ask for approval
-○ not connected  restart pyxis to reconn
-
-/help  ·  /models  ·  /effort
-/permissions  ·  /goal
-? for shortcuts   ·   ↑ history
-
-
-
-
-
-
+ ╭───────────────────────────────────╮
+ │                                   │
+ │  PYXIS                            │
+ │  your terminal coding agent       │
+ │                                   │
+ │  ◆ gpt-5  ·  pyxis                │
+ │    Ask for approval               │
+ │  ○ not connected                  │
+ │    restart pyxis to reconnect     │
+ │                                   │
+ │  /help  ·  /models  ·  /effort    │
+ │  /permissions  ·  /goal           │
+ │  ? for shortcuts   ·   ↑ history  │
+ │                                   │
+ ╰───────────────────────────────────╯
 
 
 
