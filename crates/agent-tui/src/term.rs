@@ -146,6 +146,34 @@ pub fn write_clear_sequence(out: &mut impl Write) -> io::Result<()> {
     execute!(out, Clear(ClearType::All), MoveTo(0, 0))
 }
 
+/// Wipes the visible screen AND purges the scrollback, then anchors an empty
+/// viewport at its top: the state a freshly started process shows, minus the
+/// rows this session had written.
+///
+/// This is what `/clear` asks for, and the one place where purging is right:
+/// the user asked for a clean terminal, so the transcript is dropped for good
+/// instead of staying one scroll away. Everywhere else (session start, reflow)
+/// the scrollback is left alone.
+pub fn clear_including_scrollback(tui: &mut Tui) -> io::Result<()> {
+    write_clear_scrollback_sequence(tui.backend_mut())?;
+    let size = tui.size()?;
+    tui.set_viewport_area(Rect::new(0, 0, size.width, 0));
+    tui.invalidate_viewport();
+    Ok(())
+}
+
+/// The escape sequence of `clear_including_scrollback`, isolated from the real
+/// terminal so a test can read it.
+///
+/// One write rather than a chain of crossterm commands: some terminals
+/// (Terminal.app, Warp) do not reliably drop their scrollback when the clear and
+/// the purge reach them separately. Scroll region reset, attributes reset,
+/// cursor home, screen cleared, scrollback purged, cursor home again.
+pub fn write_clear_scrollback_sequence(out: &mut impl Write) -> io::Result<()> {
+    write!(out, "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H")?;
+    out.flush()
+}
+
 /// Restores the terminal from OUTSIDE the normal exit path: panic hook, signal,
 /// any place holding no `Tui`. Best effort and infallible by construction, because
 /// its caller is already handling a failure (US-020 AC1). A no-op when the
@@ -253,6 +281,19 @@ mod sequence_tests {
             "curseur non replacé: {rendered:?}"
         );
         assert!(!rendered.contains("[3J"), "défilement purgé: {rendered:?}");
+    }
+
+    /// `/clear` is the opposite promise: the screen AND the scrollback go, so
+    /// the session leaves nothing behind to scroll back into.
+    #[test]
+    fn the_clear_scrollback_sequence_purges_what_the_session_wrote() {
+        let mut out: Vec<u8> = Vec::new();
+        write_clear_scrollback_sequence(&mut out).expect("écriture en mémoire");
+        let rendered = String::from_utf8_lossy(&out);
+        assert_eq!(
+            rendered, "\u{1b}[r\u{1b}[0m\u{1b}[H\u{1b}[2J\u{1b}[3J\u{1b}[H",
+            "séquence inattendue: {rendered:?}"
+        );
     }
 
     /// Nothing is active outside an interactive session: a headless panic must

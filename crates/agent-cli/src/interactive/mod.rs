@@ -314,6 +314,11 @@ struct Loop {
     refresh_context: bool,
     /// Set when the loop must stop because the runtime went away (AC8).
     runtime_failure: Option<String>,
+    /// `/clear` asked for the terminal itself to be wiped. Posted here rather
+    /// than acted on where it is typed: a command owns the conversation, and the
+    /// screen belongs to [`Screen`], which is the only place holding the `Tui`.
+    /// Consumed by the next frame.
+    pending_terminal_clear: bool,
     #[cfg(feature = "codex_tui_parity")]
     chat: ChatWidget,
 }
@@ -569,6 +574,7 @@ impl Loop {
             diff_tracker: None,
             refresh_context: false,
             runtime_failure: None,
+            pending_terminal_clear: false,
             #[cfg(feature = "codex_tui_parity")]
             chat: ChatWidget::new(&initial_messages),
             cfg,
@@ -1242,6 +1248,18 @@ impl Screen {
 
     fn draw(&mut self, tui: &mut agent_tui::Tui, session: &mut Loop) -> anyhow::Result<()> {
         let size = tui.size()?;
+        // `/clear`: the transcript is already gone from the state, the screen
+        // and the scrollback go here. What is left is what a freshly
+        // started process shows: an empty viewport at the top of a blank
+        // terminal, which the frame below fills with the welcome card again.
+        if std::mem::take(&mut session.pending_terminal_clear) {
+            agent_tui::clear_including_scrollback(tui)?;
+            // Those rows no longer exist, so a reflow still pending on them has
+            // nothing left to rewrite, and the width it would rewrite at is the
+            // one this frame is about to draw.
+            self.reflow_due = None;
+            self.reflow_width = Some(size.width);
+        }
         session.chat.sync_local_blocks(&session.state);
         // A width change invalidates every row already written: the terminal
         // does not rewrap what it was handed. The transcript cells are the
@@ -1330,6 +1348,12 @@ impl Screen {
 
     fn draw(&mut self, tui: &mut agent_tui::Tui, session: &mut Loop) -> anyhow::Result<()> {
         let size = tui.size()?;
+        // This path owns the alternate screen: the terminal scrollback holds
+        // nothing of this session, so `/clear` only has the visible screen to
+        // wipe before the frame below redraws it.
+        if std::mem::take(&mut session.pending_terminal_clear) {
+            tui.clear_screen()?;
+        }
         let state = &session.state;
         agent_tui::draw(tui, size.height, |frame| agent_tui::render(frame, state))?;
         Ok(())

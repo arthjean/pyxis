@@ -465,6 +465,14 @@ impl Loop {
         let Some(messages) = self.switch_to(path, switch, cmd).await else {
             return;
         };
+        // `/new` opens a new session below the current transcript; `/clear` also
+        // wipes the terminal it was written to, so what is left is what a fresh
+        // start shows. Asked only once the switch succeeded: a session that
+        // could not be replaced still owns what is on screen, and an error is
+        // worth nothing on a screen that just lost its context.
+        if cmd == "/clear" {
+            self.pending_terminal_clear = true;
+        }
         // A cleared transcript brings the welcome screen back, which is its own
         // confirmation.
         if !messages.is_empty() {

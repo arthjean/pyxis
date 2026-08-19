@@ -94,7 +94,7 @@ pub use streaming::{
     COMMIT_TICK_INTERVAL, ChunkingMode, ChunkingPolicy, StreamController, StreamView,
 };
 pub use term::{
-    REFLOW_DEBOUNCE, Tui, clear, clear_for_reflow, draw, enter, is_active, leave, restore,
-    supports_truecolor,
+    REFLOW_DEBOUNCE, Tui, clear, clear_for_reflow, clear_including_scrollback, draw, enter,
+    is_active, leave, restore, supports_truecolor,
 };
 pub use theme::Theme;

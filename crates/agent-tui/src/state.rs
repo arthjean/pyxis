@@ -103,7 +103,7 @@ pub const COMMANDS: &[(&str, &str, bool)] = &[
     ),
     ("/compact", "Compact the context now", false),
     ("/new", "Start a new session and clear context", false),
-    ("/clear", "Clear context and start fresh", false),
+    ("/clear", "Clear the terminal and start a new session", false),
     ("/logout", "Sign out and delete the local credential", false),
     ("/quit", "Quit Pyxis", false),
 ];
