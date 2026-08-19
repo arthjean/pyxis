@@ -19,7 +19,7 @@ use agent_core::message::{ContentBlock, Message};
 use agent_runtime::thread::Submission;
 use agent_tui::{
     Block, COMMANDS, default_reasoning_effort_for_model, normalize_reasoning_effort_for_model,
-    permission_mode_label, reasoning_effort_label, supported_reasoning_efforts_for_model,
+    supported_reasoning_efforts_for_model,
 };
 
 use super::{Loop, Switch, new_session_path, sign_out};
@@ -262,18 +262,17 @@ impl Loop {
         self.state.model = arg.to_string();
         self.state.reasoning_effort = next_effort.clone();
 
-        let suffix = if removed > 0 {
-            format!(" ({removed} reasoning items removed)")
-        } else {
-            String::new()
-        };
-        let effort_suffix = next_effort
-            .as_deref()
-            .map(|effort| format!(" [{}]", reasoning_effort_label(effort)))
-            .unwrap_or_default();
-        self.state.blocks.push(Block::Notice(format!(
-            "Model: {arg}{effort_suffix}{suffix}"
-        )));
+        // The switch itself says nothing: the status line carries the model and
+        // its effort permanently, so a line in the thread would only repeat what
+        // the screen already shows, and would keep repeating it for the rest of
+        // the session. A redaction is not a setting though: it REMOVED content
+        // from the transcript, and nothing else would ever say so.
+        if removed > 0 {
+            self.state.blocks.push(Block::Notice(format!(
+                "{removed} encrypted reasoning item(s) dropped from the transcript: \
+                 {arg} cannot resume the reasoning of another model."
+            )));
+        }
         self.persist_model(arg);
         self.persist_reasoning_effort(next_effort.as_deref());
         self.sync_settings();
@@ -307,10 +306,8 @@ impl Loop {
         };
         self.cfg.reasoning_effort = Some(effort.clone());
         self.state.reasoning_effort = Some(effort.clone());
-        self.state.blocks.push(Block::Notice(format!(
-            "Reasoning effort: {}",
-            reasoning_effort_label(&effort)
-        )));
+        // Silent like the model switch: the status line already shows the effort
+        // next to the model it belongs to.
         self.persist_reasoning_effort(Some(&effort));
         self.sync_settings();
     }
@@ -331,10 +328,10 @@ impl Loop {
         self.cfg.permission_mode.set(mode);
         let id = permission_mode_id(mode);
         self.state.set_permission_mode(id);
-        self.state.blocks.push(Block::Notice(format!(
-            "Permissions updated to {}",
-            permission_mode_label(id)
-        )));
+        // Silent as well, and this is the one place Pyxis diverges from Codex,
+        // which still writes `Permissions updated to ...` into its thread: the
+        // footer indicator names the mode as long as it is not the default one,
+        // and its disappearance is what says the default is back.
         if let Some(path) = &self.cfg.settings_path
             && let Err(err) = crate::settings::save_permission_mode(path, mode)
         {
