@@ -37,7 +37,7 @@ use agent_tokenizer::HeuristicCounter;
 use agent_tools::permission::{AutoDeny, PermissionMode, PermissionModeState};
 use agent_tools::{
     ApplyPatch, Bash, DynTool, Edit, ExecCommand, ExecSessions, Glob, Grep, Read, Registry,
-    UpdatePlan, ViewImage, Write, WriteStdin,
+    SpillStore, UpdatePlan, ViewImage, Write, WriteStdin,
 };
 
 use crate::approver::{CliPermissionBroker, TuiApprover, TuiNetworkApprover};
@@ -774,6 +774,43 @@ fn sandbox_policy_from_args(
     )
 }
 
+/// Spill storage of the run (US-072), created HERE for the same reason as the
+/// session directory: under a confining policy nothing in the workspace stays
+/// writable afterwards, and a Landlock rule needs a path that already opens.
+///
+/// Unlike a session, a spill root Pyxis cannot create is NOT fatal. The absence
+/// means no spill at all, which is exactly the behavior before EP-022, so the
+/// failure is named and the binary starts. `--ephemeral` skips it for the same
+/// reason it skips the session directory: the flag promises no trace left in
+/// the workspace, and creating the root "just in case" would already be one.
+fn open_spill_store(workspace: &std::path::Path, ephemeral: bool) -> Option<Arc<SpillStore>> {
+    if ephemeral {
+        return None;
+    }
+    match SpillStore::create(workspace, &agent_tools::spill::run_id()) {
+        Ok(store) => Some(Arc::new(store)),
+        Err(err) => {
+            eprintln!("[spill] {err}; large tool outputs stay truncated");
+            None
+        }
+    }
+}
+
+/// The directories Pyxis writes for ITSELF whatever the policy: the session
+/// directory, and the spill root when one exists. Assembled apart from `main`
+/// so what reaches `writable_dirs` is provable without restricting the test
+/// process.
+fn agent_state_dirs<'a>(
+    session_dirs: &[&'a std::path::Path],
+    spill: Option<&'a SpillStore>,
+) -> Vec<&'a std::path::Path> {
+    let mut dirs = session_dirs.to_vec();
+    if let Some(store) = spill {
+        dirs.push(store.root());
+    }
+    dirs
+}
+
 fn enforce_sandbox(
     args: &Args,
     policy: &SandboxPolicy,
@@ -981,6 +1018,9 @@ fn main() -> anyhow::Result<()> {
         &[sessions_dir.as_path()]
     };
 
+    let spill = open_spill_store(&workspace, args.ephemeral);
+    let state_dirs = agent_state_dirs(session_dirs, spill.as_deref());
+
     // FS sandbox BEFORE the runtime (main thread -> inherited by the workers).
     let policy = sandbox_policy_from_args(&args, &workspace, &config, &writable_roots);
     let enforced = enforce_sandbox(
@@ -989,7 +1029,7 @@ fn main() -> anyhow::Result<()> {
         settings_path.as_deref(),
         &diagnostics,
         &writable_roots,
-        session_dirs,
+        &state_dirs,
     );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1006,6 +1046,7 @@ fn main() -> anyhow::Result<()> {
             settings_path,
             config,
             sessions_dir,
+            spill,
         },
         SandboxSetup { policy, enforced },
     ))
@@ -1413,6 +1454,10 @@ struct PreSandbox {
     /// to the sandbox before Landlock. Resolved there and carried here so the
     /// runtime never rebuilds a path whose creation it did not witness.
     sessions_dir: std::path::PathBuf,
+    /// Spill storage of the run (US-072), created and granted to the sandbox
+    /// alongside the session directory. `None` = no spill, either because
+    /// `--ephemeral` forbids the trace or because the root could not be created.
+    spill: Option<Arc<SpillStore>>,
 }
 
 async fn run(
@@ -1429,6 +1474,7 @@ async fn run(
         settings_path,
         mut config,
         sessions_dir,
+        spill,
     } = pre;
     // The resolved model already accounts for `--model`, which enters the
     // configuration as the strongest layer (US-005): there is nothing left to
@@ -1803,6 +1849,12 @@ async fn run(
     if let Some(notice) = user_notice {
         builder = builder.user_notice(notice);
     }
+    // US-072: the root created before Landlock, handed to the tools. Absent
+    // under `--ephemeral` or after a creation failure, and the absence keeps
+    // every tool at its pre-EP-022 behavior.
+    if let Some(store) = &spill {
+        builder = builder.spill(Arc::clone(store));
+    }
     if let Some(handle) = &code_mode {
         builder = builder
             .register(agent_tools::ExecTool::new(Arc::clone(handle)))
@@ -2009,10 +2061,10 @@ async fn run(
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, SandboxPolicy, default_permission_mode, jsonl, parse_args_from, precedence_string,
-        precedence_u64, resolve_permission_mode, resolve_prompt, resolve_resume_path,
-        run_config_from_args, sandbox_policy_from_args, sandbox_scope_label, settings,
-        validate_ephemeral,
+        Args, SandboxPolicy, agent_state_dirs, default_permission_mode, jsonl, open_spill_store,
+        parse_args_from, precedence_string, precedence_u64, resolve_permission_mode,
+        resolve_prompt, resolve_resume_path, run_config_from_args, sandbox_policy_from_args,
+        sandbox_scope_label, settings, validate_ephemeral,
     };
     use agent_tools::permission::PermissionMode;
 
@@ -2741,5 +2793,69 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("--output-last-message"), "message: {err}");
+    }
+
+    /// Scoped workspace for the spill wiring tests.
+    fn spill_workspace() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("pyxis-cli-spill-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// US-072 AC1/AC2: the root exists before the sandbox is enforced and joins
+    /// the set `writable_dirs` grants, next to the session directory. Proved on
+    /// the read-only policy, where the workspace itself grants nothing: the
+    /// spill root would be unwritable if the wiring did not carry it.
+    #[test]
+    fn the_spill_root_is_created_and_granted_to_the_sandbox() {
+        let workspace = spill_workspace();
+        let sessions = workspace.join(".pyxis").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let store = open_spill_store(&workspace, false).expect("a spill root");
+
+        assert!(store.root().is_dir(), "the root must open before Landlock");
+        assert!(
+            store
+                .root()
+                .starts_with(workspace.join(".pyxis").join("spill"))
+        );
+
+        let session_dirs: &[&std::path::Path] = &[sessions.as_path()];
+        let dirs = agent_state_dirs(session_dirs, Some(store.as_ref()));
+        let policy = SandboxPolicy::ReadOnly {
+            network_access: false,
+        };
+        let writable = agent_sandbox::fs::writable_dirs(&policy, &dirs);
+        assert!(writable.contains(&store.root()), "{writable:?}");
+        assert!(writable.contains(&sessions.as_path()), "{writable:?}");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// US-072 AC6, unhappy path: a root that cannot be created must not stop
+    /// the binary. `.pyxis` occupied by a FILE is the cheapest real failure.
+    #[test]
+    fn a_spill_root_that_cannot_be_created_leaves_the_binary_starting() {
+        let workspace = spill_workspace();
+        std::fs::write(workspace.join(".pyxis"), "not a directory").unwrap();
+
+        assert!(open_spill_store(&workspace, false).is_none());
+        assert!(agent_state_dirs(&[], None).is_empty());
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// US-020 AC4 extended to the spill root: `--ephemeral` promises no trace
+    /// left in the workspace, so nothing is created and nothing is granted.
+    #[test]
+    fn an_ephemeral_run_creates_no_spill_root() {
+        let workspace = spill_workspace();
+        assert!(open_spill_store(&workspace, true).is_none());
+        assert!(!workspace.join(".pyxis").join("spill").exists());
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }
