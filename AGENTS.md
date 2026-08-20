@@ -111,6 +111,15 @@ subagent NO-GO. `docs/parity/audits/`, the decision notes under `docs/notes/`, a
 `docs/ROADMAP.md` are historical context for intent and rationale; they no longer
 arbitrate shipped scope.
 
+The boundary between the two registers is a test, not a taste: a decision belongs in
+`docs/DECISIONS.md` when a future change to the shipped crates can violate it, and in the
+note tree when nothing in `crates/` can. ADR-12 fixes how `agent-runtime` reaches
+`run_agent` and a pull request can break it, so it is an ADR; not starting from the Codex
+base is a path already taken that no crate contradicts, so it is a note. An ADR gets no
+mirror note, and a note that touches one links it. When the two disagree the ADR wins and
+the note is stale: correct it or move it to `rejected/`. The reciprocal rule and the format
+the gate enforces live in [`docs/notes/README.md`](docs/notes/README.md).
+
 The normative parity artifacts are `docs/parity/codex-baseline-matrix.json` and
 `docs/parity/codex-client-model-matrix.json`. Both are generated and
 fingerprinted, never hand-edited.
@@ -144,3 +153,4 @@ fingerprinted, never hand-edited.
 | Headless JSONL event contract | `docs/EVENT_SCHEMA.md` |
 | Parity baseline and offline proof recipe | `docs/parity/README.md` |
 | App-server protocol | `docs/app-server/README.md` |
+| Decision notes: tree, format, and ADR boundary | [`docs/notes/README.md`](docs/notes/README.md) |
