@@ -3747,3 +3747,292 @@ async fn the_dispatch_record_covers_refusals_and_unknown_tools() {
         "the refusal keeps its kind: {entries:?}"
     );
 }
+
+// ══════════════════════ EP-023: spill policy ═══════════════════════
+
+/// A tool whose output is whatever the test needs it to be, including the
+/// shapes the policy must refuse to touch.
+struct Oversized {
+    name: &'static str,
+    bytes: usize,
+    structured: bool,
+    image: bool,
+}
+
+impl Oversized {
+    fn plain(name: &'static str, bytes: usize) -> Self {
+        Self {
+            name,
+            bytes,
+            structured: false,
+            image: false,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for Oversized {
+    type Input = serde_json::Value;
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> String {
+        "oversized".into()
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        empty_schema()
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
+    fn is_sensitive(&self) -> bool {
+        false
+    }
+    fn permission(&self, _i: &Self::Input, _c: &PermCtx) -> PermissionDecision {
+        PermissionDecision::Allow
+    }
+    async fn call(&self, _i: Self::Input, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        let mut out = ToolOutput::text(spill_body(self.bytes));
+        if self.structured {
+            out.structured_content = Some(serde_json::json!({ "rows": 3 }));
+        }
+        if self.image {
+            out.images.push(agent_core::tools::ToolImage {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Numbered lines, so a test can tell the head of the output from its tail.
+fn spill_body(bytes: usize) -> String {
+    let mut body = String::with_capacity(bytes + 32);
+    let mut line = 0u32;
+    while body.len() < bytes {
+        body.push_str(&format!(
+            "line {line:08} 0123456789abcdefghijklmnopqrstuv\n"
+        ));
+        line += 1;
+    }
+    body
+}
+
+fn spill_registry(ws: &TempWs, tool: Oversized) -> (Registry, Arc<crate::spill::SpillStore>) {
+    let store = Arc::new(crate::spill::SpillStore::create(ws.path(), "thread_spill").unwrap());
+    let reg = Registry::builder(ws.path())
+        .approver(allow_approver())
+        .spill(Arc::clone(&store))
+        .register(tool)
+        .build();
+    (reg, store)
+}
+
+/// US-073 AC1/AC2 and US-074, from the real entry point: an oversized output
+/// dispatched through the registry comes back bounded, and the bytes it no
+/// longer carries are on disk, whole.
+#[tokio::test]
+async fn an_oversized_output_is_spilled_and_replaced_by_a_bounded_preview() {
+    let ws = TempWs::new("spill-ok");
+    let full = spill_body(10 * 1024 * 1024);
+    let (reg, _store) = spill_registry(&ws, Oversized::plain("big", full.len()));
+
+    let out = reg
+        .dispatch(vec![call("c1", "big", serde_json::json!({}))])
+        .await;
+    let result = by_id(&out, "c1");
+
+    assert!(!result.is_error, "a spill is not a failure: {result:?}");
+    assert!(
+        result.content.len() <= crate::tool::MAX_TOOL_OUTPUT_BYTES,
+        "the model-facing result must fit the cap, got {}",
+        result.content.len()
+    );
+    let truncation = result.truncation.as_ref().expect("a truncation record");
+    assert_eq!(truncation.original_bytes, full.len());
+    assert_eq!(truncation.kept_bytes, result.content.len());
+    // US-075 AC1: the locator, relative to the workspace and nothing else.
+    let locator = &truncation.continuation_hint;
+    assert!(
+        locator.starts_with(".pyxis/spill/"),
+        "locator must be workspace-relative: {locator}"
+    );
+    assert!(!std::path::Path::new(locator).is_absolute());
+    assert_eq!(
+        std::fs::read_to_string(ws.path().join(locator)).unwrap(),
+        full
+    );
+    // Both ends of the output survived, and the notice says where the rest is.
+    assert!(result.content.starts_with("line 00000000"), "head lost");
+    assert!(result.content.contains(locator.as_str()), "notice lost");
+    let preview = result.content.split("\n\n(Omitted").next().unwrap();
+    assert!(
+        preview.ends_with("uv\n"),
+        "tail lost: {:?}",
+        &preview[preview.len().saturating_sub(40)..]
+    );
+}
+
+/// US-073 AC3: a result the policy must not touch keeps every byte it had.
+#[tokio::test]
+async fn a_result_carrying_structured_content_or_an_image_is_never_spilled() {
+    let ws = TempWs::new("spill-skip");
+    let bytes = crate::tool::MAX_TOOL_OUTPUT_BYTES * 2;
+    for probe in [
+        Oversized {
+            name: "structured",
+            bytes,
+            structured: true,
+            image: false,
+        },
+        Oversized {
+            name: "imaged",
+            bytes,
+            structured: false,
+            image: true,
+        },
+    ] {
+        let name = probe.name;
+        let (reg, store) = spill_registry(&ws, probe);
+        let out = reg
+            .dispatch(vec![call("c1", name, serde_json::json!({}))])
+            .await;
+        let result = by_id(&out, "c1");
+
+        assert!(result.truncation.is_none(), "{name} was spilled");
+        assert_eq!(result.content, spill_body(bytes), "{name} content changed");
+        assert_eq!(
+            std::fs::read_dir(store.root()).unwrap().count(),
+            0,
+            "{name} wrote a file it should never have written"
+        );
+    }
+}
+
+/// US-073 AC4: `read` is excluded, so the read -> spill -> read loop stays shut.
+#[tokio::test]
+async fn the_read_tool_is_never_spilled() {
+    let ws = TempWs::new("spill-read");
+    let bytes = crate::tool::MAX_TOOL_OUTPUT_BYTES * 2;
+    let (reg, store) = spill_registry(&ws, Oversized::plain("read", bytes));
+
+    let out = reg
+        .dispatch(vec![call("c1", "read", serde_json::json!({}))])
+        .await;
+    let result = by_id(&out, "c1");
+
+    assert!(result.truncation.is_none());
+    assert_eq!(result.content.len(), spill_body(bytes).len());
+    assert_eq!(std::fs::read_dir(store.root()).unwrap().count(), 0);
+}
+
+/// US-073 AC5 and its unhappy path: with the storage broken, an oversized call
+/// produces exactly the result it produced before EP-023, and stays a success.
+#[tokio::test]
+async fn a_storage_failure_leaves_the_original_result_untouched() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let ws = TempWs::new("spill-fail");
+    let bytes = crate::tool::MAX_TOOL_OUTPUT_BYTES * 2;
+
+    // The reference run: no storage at all, which is what every caller outside
+    // the binary sees.
+    let bare = Registry::builder(ws.path())
+        .approver(allow_approver())
+        .register(Oversized::plain("big", bytes))
+        .build();
+    let reference = by_id(
+        &bare
+            .dispatch(vec![call("c1", "big", serde_json::json!({}))])
+            .await,
+        "c1",
+    )
+    .clone();
+
+    let (reg, store) = spill_registry(&ws, Oversized::plain("big", bytes));
+    let mut perms = std::fs::metadata(store.root()).unwrap().permissions();
+    perms.set_mode(0o500);
+    std::fs::set_permissions(store.root(), perms).unwrap();
+
+    let out = reg
+        .dispatch(vec![call("c1", "big", serde_json::json!({}))])
+        .await;
+    let result = by_id(&out, "c1");
+
+    assert!(!result.is_error, "a spill failure must not become an error");
+    assert_eq!(result.status, reference.status);
+    assert_eq!(result.content, reference.content);
+    assert!(result.truncation.is_none());
+
+    let mut perms = std::fs::metadata(store.root()).unwrap().permissions();
+    perms.set_mode(0o700);
+    std::fs::set_permissions(store.root(), perms).unwrap();
+}
+
+/// US-075 unhappy path: a result that fits carries no truncation at all, so the
+/// field stays absent from every projection of it.
+#[tokio::test]
+async fn a_result_under_the_cap_carries_no_truncation() {
+    let ws = TempWs::new("spill-small");
+    let (reg, store) = spill_registry(&ws, Oversized::plain("small", 100));
+
+    let out = reg
+        .dispatch(vec![call("c1", "small", serde_json::json!({}))])
+        .await;
+    let result = by_id(&out, "c1");
+
+    assert!(result.truncation.is_none());
+    assert_eq!(std::fs::read_dir(store.root()).unwrap().count(), 0);
+    let view = agent_core::event::ToolResultView::from_model(result);
+    let json = serde_json::to_value(&view).unwrap();
+    assert!(
+        json.get("truncation").is_none(),
+        "an absent truncation must stay out of the serialization: {json}"
+    );
+}
+
+/// US-073 AC1, wired end to end with a REAL tool: nothing about the spill is
+/// specific to a test double. `grep` caps its matches, not its bytes, so 500
+/// long lines are an ordinary way for a production tool to hand `run_one_inner`
+/// far more than the cap, and the decision point must catch it there.
+#[tokio::test]
+async fn a_real_tool_output_over_the_cap_is_spilled_through_the_registry() {
+    let ws = TempWs::new("spill-grep");
+    let line = format!("needle {}\n", "z".repeat(280));
+    ws.write("big.txt", &line.repeat(500));
+    let store = Arc::new(crate::spill::SpillStore::create(ws.path(), "thread_grep").unwrap());
+    let reg = Registry::builder(ws.path())
+        .mode(PermissionMode::Default)
+        .approver(allow_approver())
+        .spill(Arc::clone(&store))
+        .register(Grep)
+        .build();
+
+    let out = reg
+        .dispatch(vec![call(
+            "c1",
+            "grep",
+            serde_json::json!({"pattern": "needle"}),
+        )])
+        .await;
+    let result = by_id(&out, "c1");
+
+    assert!(!result.is_error, "{}", result.content);
+    let truncation = result
+        .truncation
+        .as_ref()
+        .expect("a real oversized grep must be spilled");
+    assert!(
+        truncation.original_bytes > crate::tool::MAX_TOOL_OUTPUT_BYTES,
+        "the test file must actually overflow the cap: {}",
+        truncation.original_bytes
+    );
+    assert!(result.content.len() <= crate::tool::MAX_TOOL_OUTPUT_BYTES);
+    let spilled = std::fs::read_to_string(ws.path().join(&truncation.continuation_hint))
+        .expect("the locator addresses a readable file under the workspace");
+    assert_eq!(spilled.len(), truncation.original_bytes);
+    assert!(spilled.starts_with("big.txt:1: needle"));
+}

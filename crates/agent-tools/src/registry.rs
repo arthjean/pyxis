@@ -700,11 +700,19 @@ impl Registry {
                 }
                 tool_error_outcome(id.clone(), e, untrusted)
             }
-            Ok(Ok(Ok(out))) => {
+            Ok(Ok(Ok(mut out))) => {
                 // 5. taint: an untrusted output just entered the context.
                 if untrusted {
                     self.taint.mark();
                 }
+                // 5a. US-073: the spill decision, HERE and nowhere else. This is
+                // the last point where the full text still exists (the outcome
+                // is built two statements below and every later stage sees only
+                // what fits) and the first where the call context is known.
+                // `bound_feedback`, which owns the model-facing cap, lives in
+                // `agent-core` and has no I/O at all: it can decide to drop
+                // bytes, it can never decide to keep them.
+                let spilled = self.spill_oversized(&call.name, &id, &mut out);
                 let sandbox_denied = out.denial.is_some();
                 denial = out.denial;
                 // US-009: the plan is addressed to the client, so it travels
@@ -723,6 +731,10 @@ impl Registry {
                     sandbox_denied,
                 );
                 outcome.requests_compaction = out.requests_compaction;
+                // US-075: the locator rides the field the contract already
+                // documents as "what to do about the bytes that are missing",
+                // so no consumer discovers a path in a field nobody announced.
+                outcome.truncation = spilled;
                 outcome
             }
         };
@@ -862,10 +874,15 @@ impl Registry {
                 }
                 tool_error_outcome(id, e, untrusted)
             }
-            Ok(Ok(Ok(out))) => {
+            Ok(Ok(Ok(mut out))) => {
                 if untrusted {
                     self.taint.mark();
                 }
+                // The widened re-run is a second production site for the same
+                // call, so it goes through the same US-073 decision at the same
+                // stage: an output that only became large once the perimeter
+                // opened is spilled exactly like the first attempt's.
+                let spilled = self.spill_oversized(tool.name(), &id, &mut out);
                 let sandbox_denied = out.denial.is_some();
                 if let Some(plan) = out.plan {
                     events.emit(ToolDispatchEvent::Plan(plan));
@@ -881,9 +898,63 @@ impl Registry {
                     sandbox_denied,
                 );
                 outcome.requests_compaction = out.requests_compaction;
+                outcome.truncation = spilled;
                 outcome
             }
         }
+    }
+
+    /// US-073: decides whether this output is spilled, and replaces it in place
+    /// when it is.
+    ///
+    /// The trigger is the byte size of the model-visible content against
+    /// [`MAX_TOOL_OUTPUT_BYTES`], the cap every tool output already shares. No
+    /// new threshold is introduced: a second one would be a second policy, and
+    /// the invariant forbidding a configuration key for orchestration limits
+    /// would then have two constants to protect instead of one.
+    ///
+    /// Returns the truncation record to hang on the outcome, or `None` when the
+    /// result must be left exactly as the tool produced it.
+    fn spill_oversized(
+        &self,
+        tool_name: &str,
+        call_id: &agent_core::message::ToolCallId,
+        out: &mut crate::tool::ToolOutput,
+    ) -> Option<agent_core::tools::ToolResultTruncation> {
+        // The trigger is the size the tools already agree on. No new constant:
+        // a second threshold would let a result be "too large" for one of them
+        // and not for the other.
+        if out.content.len() <= crate::tool::MAX_TOOL_OUTPUT_BYTES {
+            return None;
+        }
+        // A result carrying images or a structured payload is left alone: both
+        // are atomic elsewhere in the pipeline (`bound_feedback` includes the
+        // JSON whole or drops it whole, the loop turns images into content
+        // blocks), and a text preview standing beside a payload the model still
+        // receives in full would replace nothing.
+        if !out.images.is_empty() || out.structured_content.is_some() {
+            return None;
+        }
+        if crate::spill_policy::NEVER_SPILLED.contains(&tool_name) {
+            return None;
+        }
+        // Absence of storage means NO spill, never an implicit default root:
+        // outside the binary nobody created one, and a caller that cannot spill
+        // must behave exactly as it did before EP-022. Logged only here, where
+        // an output that WOULD have been spilled is about to stay truncated.
+        let Some(store) = self.ctx.spill.as_ref() else {
+            tracing::warn!(
+                target: "pyxis::tools",
+                tool = %tool_name,
+                bytes = out.content.len(),
+                "no spill storage; keeping the original result"
+            );
+            return None;
+        };
+        let spilled =
+            crate::spill_policy::replace_with_spill(store, tool_name, call_id, &out.content)?;
+        out.content = spilled.content;
+        Some(spilled.truncation)
     }
 
     fn can_run_parallel_without_permission(&self, call: &ToolInvocation) -> bool {

@@ -35,6 +35,7 @@ pub mod registry;
 pub mod sandbox;
 pub mod shell;
 pub mod spill;
+pub mod spill_policy;
 pub mod taint;
 pub mod time;
 pub mod tool;
