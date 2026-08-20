@@ -13,6 +13,10 @@
 //! dependency graph forbids `core -> tools`, and stopping the loop (`Exhausted`)
 //! is a termination decision that belongs to the core. Pure, no I/O ->
 //! unit-testable.
+//!
+//! Written up in `docs/ARCHITECTURE.md` §3.6 (« Garde-fous déterministes »), and
+//! decided in `docs/DECISIONS.md`, ADR-14: why the offending batch is never
+//! executed, why the detection key is never truncated, and what the ladder beat.
 
 use crate::provider::TokenUsage;
 use crate::tools::{ToolDispatch, ToolInvocation};

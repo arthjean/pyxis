@@ -303,6 +303,35 @@ fn run_agent(mut ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
 
 `decide_transition` est pur (pas d'I/O), donc testable unitairement : on lui passe un `Accumulator` + un `ContextBudget` + un `Option<PendingError>` et on vérifie la transition produite. C'est le nœud de la testabilité headless. Noter la séparation stricte : les transitoires (`Retryable`/`Overloaded`/`RateLimited`) sont absorbés par `deps.backoff` **dans** la boucle de stream et ne deviennent jamais des `PendingError` ; seules les erreurs de contexte alimentent le withholding.
 
+### 3.6 Garde-fous déterministes (ADR-14)
+
+Deux garde-fous vivent dans `crates/agent-core/src/guardrail.rs`. Ils **surchargent** la logique faillible du modèle, depuis l'extérieur de la boucle, et ils sont dans `agent-core` parce que le graphe interdit `core -> tools` et qu'arrêter la boucle est une décision de terminaison du cœur. Purs, sans horloge, sans aléa, sans I/O : la décision est une fonction de la suite des observations.
+
+- **`UsageBudget`** : budget cumulé en jetons et en coût, avec kill-switch à 100 % et estimation pré-tour qui arrête *avant* un tour trop cher.
+- **`LoopGuard`** : détecte le batch d'outils identique répété et **refuse de l'exécuter**. C'est un veto, pas un rappel consultatif.
+
+**Signature.** La clé d'un batch est `nom\0json` par appel, triée puis jointe. Le `Display` de `serde_json::Value` produit du JSON compact aux clés triées, donc ni l'ordre des clés d'un argument ni l'ordre des appels dans le batch ne changent la signature. Les appels que le dispatcher déclare exempts (`ToolDispatch::loop_guard_exempt`) en sont retirés : le cœur ne voit qu'un nom et une valeur JSON, ce qui ne suffit pas à distinguer une cellule d'orchestration d'un outil homonyme, donc il demande au lieu de deviner. **La clé n'est jamais tronquée**, quelle que soit la taille des arguments.
+
+**Échelle.** `LOOP_GUARD_THRESHOLDS = [3, 5, 8]` est une constante de crate validée à la compilation (invariant 15 : aucune clé de configuration pour une limite d'orchestration). En dessous de 3, le batch s'exécute. À partir de 3, **il ne s'exécute plus à aucun cran** ; ce qui escalade est le registre de la réponse rendue au modèle :
+
+| Compte consécutif | Décision | Ce que le modèle reçoit |
+|---|---|---|
+| 1 à 2 | `Proceed` | le batch s'exécute normalement |
+| 3 à 4 | `Signal(Gentle)` | rappel générique, court, **citant aucun argument** |
+| 5 à 7 | `Signal(Detailed)` | rappel nommant l'outil, la longueur de la série et les arguments canoniques, bornés à `LOOP_GUARD_ARGS_PREVIEW_BYTES` (500 octets) sur une frontière de caractère, avec mention de ce qui a été retiré |
+| 8 | `Abort` | arrêt déterministe |
+
+Le garde parle sur des **plages** et non sur des comptes exacts : il doit rendre un `tool_result` par `tool_use` à chaque batch pour que le transcript reste valide, donc il ne peut pas se taire entre deux crans.
+
+**Deux sites d'appel, une seule échelle**, portée par le type et non par les sites, deux échelles divergentes étant une seconde source de vérité.
+
+- **Site externe**, `crates/agent-core/src/agent.rs` : `observe` est appelé **en amont** de la dispatch, ce qui fait qu'un appel refusé par permission ou portant un nom inconnu compte comme un appel ordinaire. Sur `Signal`, un `tool_result` est émis par `tool_use` avec `ToolErrorKind::Semantic` et la boucle repart. Sur `Abort`, un unique `AgentEvent::Exhausted(ExhaustReason::ToolLoop { count })` termine le tour (invariant 11), portant le compte réel.
+- **Site imbriqué**, `crates/agent-code-mode/src/nested.rs` : même échelle par effet gardé, plus un **verrou**. Au cran terminal, `NestedLoopGuard` retient le message terminal et le rend à tout appel ultérieur du tour, quel que soit l'outil, sans atteindre le dispatcher. Une cellule est du JavaScript : elle peut attraper l'erreur et retenter, ou alterner les outils, là où le modèle externe ne peut pas ignorer un `Exhausted`.
+
+**Frontières de la chaîne.** Deux déclencheurs de remise à zéro, et deux seulement : un tour neuf, et une entrée de steering qui entre effectivement dans le transcript au point sûr de `run_agent` (US-007), propagée au site imbriqué par `ToolDispatch::steering_input_accepted`, méthode à défaut no-op. Une répétition de part et d'autre d'une intervention humaine est un utilisateur qui redemande l'appel, pas un modèle qui tourne en rond. À l'inverse, un batch entièrement exempt est **transparent** : il ne compte pas et ne remet pas à zéro, faute de quoi un `wait` intercalé blanchirait la boucle dont il fait partie.
+
+Le raisonnement complet, les alternatives écartées (détection sensible au résultat, fenêtre glissante, clé de configuration publique) et les risques assumés sont dans [`docs/DECISIONS.md`](./DECISIONS.md), ADR-14.
+
 ---
 
 ## 4. Système d'outils
