@@ -25,10 +25,10 @@
     {
       "id": "EP-024",
       "title": "La sortie que la politique ne peut pas atteindre",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 1,
-      "stories_done": 0
+      "stories_done": 1
     },
     {
       "id": "EP-025",
@@ -135,16 +135,16 @@
       "id": "US-076",
       "title": "bash déverse au fil de l'acquisition",
       "epic": "EP-024",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-070",
         "US-072"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-20",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-077",
