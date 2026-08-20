@@ -218,9 +218,23 @@ impl ModelToolResult {
             )
         });
         let original = render_feedback(&original_text, structured.as_deref(), execution.as_deref());
-        let original_bytes = original.len();
+        // A spill already replaced this content upstream (`agent-tools`): its
+        // record describes the FULL output and carries the locator to what was
+        // set aside. Nothing decided here can improve on either, so both are
+        // preserved instead of being overwritten with the generic advice and
+        // with the size of a preview.
+        let spilled = self.truncation.take();
+        let original_bytes = spilled
+            .as_ref()
+            .map_or(original.len(), |truncation| truncation.original_bytes);
         if feedback_fits(&original, counter, token_limit, byte_limit) {
             self.content = original;
+            // Only the kept size moves: the rendering added the execution
+            // envelope the policy could not know about.
+            self.truncation = spilled.map(|truncation| ToolResultTruncation {
+                kept_bytes: self.content.len(),
+                ..truncation
+            });
             return self;
         }
 
@@ -229,7 +243,14 @@ impl ModelToolResult {
         } else {
             TruncationStrategy::Head
         };
-        let hint = "Re-run the tool with a narrower query or explicit range.".to_string();
+        // Re-running is the only recourse a bounded result can offer on its
+        // own, and it is unavailable in exactly the cases that matter: a
+        // non-reproducible build, a network response, a consumed session. When
+        // a spill happened, the locator says where the bytes actually are.
+        let hint = spilled.as_ref().map_or_else(
+            || "Re-run the tool with a narrower query or explicit range.".to_string(),
+            |truncation| truncation.continuation_hint.clone(),
+        );
         let marker = format!(
             "[tool output truncated; strategy={}; continuation={hint}]",
             match strategy {
@@ -909,5 +930,51 @@ mod tests {
         assert!(bounded.content.len() <= 128);
         assert!(std::str::from_utf8(bounded.content.as_bytes()).is_ok());
         assert!(!bounded.content.contains("\"blob\""));
+    }
+
+    /// US-075: the locator survives the second bounding. `bound_feedback` runs
+    /// after the spill and re-truncates whenever the profile budget is tighter
+    /// than the tool cap; overwriting the record there would replace the only
+    /// pointer to the full output with the advice to re-run a command whose
+    /// result is already gone.
+    #[test]
+    fn a_spill_record_survives_the_model_side_bounding() {
+        let counter = HeuristicCounter;
+        let locator = ".pyxis/spill/0123456789ab/fedcba987654-grep";
+        let preview = format!(
+            "head\n{}\ntail\n\n(Omitted bytes. Full output saved to {locator}.)",
+            "x".repeat(400)
+        );
+        let spilled = ToolResultTruncation {
+            original_bytes: 10_000_000,
+            kept_bytes: preview.len(),
+            strategy: TruncationStrategy::Head,
+            continuation_hint: locator.to_string(),
+        };
+
+        // The preview fits: only the kept size may move.
+        let mut result = ModelToolResult::new("call".into(), preview.clone(), false, true, None);
+        result.truncation = Some(spilled.clone());
+        let bounded = result.bound_feedback(&counter, 100_000, MAX_MODEL_TOOL_RESULT_BYTES);
+        let kept = bounded.truncation.expect("the spill record is preserved");
+        assert_eq!(kept.continuation_hint, locator);
+        assert_eq!(kept.original_bytes, 10_000_000);
+        assert_eq!(kept.kept_bytes, bounded.content.len());
+
+        // The preview does NOT fit: the marker must point at the spill, never
+        // at the generic re-run advice, and the size must stay the real one.
+        let mut result = ModelToolResult::new("call".into(), preview, false, true, None);
+        result.truncation = Some(spilled);
+        let bounded = result.bound_feedback(&counter, 24, 96);
+        let kept = bounded
+            .truncation
+            .expect("a re-truncated result is recorded");
+        assert_eq!(kept.continuation_hint, locator);
+        assert_eq!(kept.original_bytes, 10_000_000);
+        assert!(
+            !bounded.content.contains("Re-run the tool"),
+            "{}",
+            bounded.content
+        );
     }
 }
