@@ -9,7 +9,7 @@
 > `docs/parity/offline-suite.md`.
 
 Seconde passe, en lecture seule. Le constat de référence reste
-[`docs/parity-audit-2026-07-24.md`](./parity-audit-2026-07-24.md) (2026-07-24, 221 écarts
+[`docs/parity/audits/parity-audit-2026-07-24.md`](./parity-audit-2026-07-24.md) (2026-07-24, 221 écarts
 retenus après réfutation adversariale), volontairement laissé intact : il sert de baseline de
 comparaison. Ce document mesure le delta.
 

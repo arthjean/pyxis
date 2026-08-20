@@ -5,9 +5,12 @@ Pyxis. Elle est générée, pas rédigée : chaque ligne est extraite du clone C
 en lecture seule figé au commit
 `fa1d4c40d0e63eef2e0ba8a9e004ccd0a80b77f5`, puis empreintée (SHA-256).
 
-Les audits `docs/parity-audit-*.md` et
-`docs/parity-strategy-2026-07-27.md` restent du **contexte historique** :
-ils décrivent des instantanés antérieurs et n'arbitrent plus une divergence.
+Les audits d'`audits/` ([24](./audits/parity-audit-2026-07-24.md),
+[25](./audits/parity-audit-2026-07-25.md),
+[27](./audits/parity-audit-2026-07-27.md) juillet 2026) et
+[`docs/parity-strategy-2026-07-27.md`](../parity-strategy-2026-07-27.md) restent du
+**contexte historique** : ils décrivent des instantanés antérieurs et n'arbitrent
+plus une divergence.
 
 ## Commandes
 

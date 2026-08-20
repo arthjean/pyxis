@@ -10,9 +10,9 @@
 
 Troisième passe, en lecture seule. Aucune ligne de code n'a été modifiée.
 
-**Baseline.** [`docs/parity-audit-2026-07-24.md`](./parity-audit-2026-07-24.md) (2026-07-24,
+**Baseline.** [`docs/parity/audits/parity-audit-2026-07-24.md`](./parity-audit-2026-07-24.md) (2026-07-24,
 221 écarts retenus après réfutation, 125 énumérés) reste le constat fondateur, laissé intact.
-[`docs/parity-audit-2026-07-25.md`](./parity-audit-2026-07-25.md) mesure
+[`docs/parity/audits/parity-audit-2026-07-25.md`](./parity-audit-2026-07-25.md) mesure
 le delta après les releases R1 à R3 (102 écarts restants). Ce document mesure le delta après R4,
 c'est-à-dire le lot de capacités harness, livré en entier.
 

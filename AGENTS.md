@@ -107,7 +107,7 @@ dependency bans; these are the ones nothing mechanical catches:
 Order of authority when documents disagree: the code, then `docs/DECISIONS.md`,
 then `docs/CURRENT_STATUS.md`. No single ADR arbitrates: ADR-9 fixes the error
 taxonomy, ADR-11 the current MVP scope, ADR-12 the thread runtime, ADR-13 the
-subagent NO-GO. `docs/parity-audit-*.md`, `docs/parity-strategy-*.md`, and
+subagent NO-GO. `docs/parity/audits/`, `docs/parity-strategy-*.md`, and
 `docs/ROADMAP.md` are historical context for intent and rationale; they no longer
 arbitrate shipped scope.
 

@@ -9,7 +9,7 @@
 > `docs/parity/offline-suite.md`.
 
 Document de décision, 2026-07-27. Complète
-[`docs/parity-audit-2026-07-27.md`](./parity-audit-2026-07-27.md), qui
+[`docs/parity/audits/parity-audit-2026-07-27.md`](./parity/audits/parity-audit-2026-07-27.md), qui
 énumère les écarts. Celui-ci répond à une question différente : **par quel chemin**.
 
 Mesures prises sur les dépôts réels : Pyxis à `0c1cf17`, Codex à `95637f7056`, tous deux clonés
