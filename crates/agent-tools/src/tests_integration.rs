@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agent_core::ToolErrorKind;
 use agent_core::tools::{
-    ModelToolResult, StepToolPlan, ToolEventSink, ToolInvocation, ToolResultStatus,
+    ModelToolResult, StepToolPlan, ToolDispatch, ToolEventSink, ToolInvocation, ToolResultStatus,
 };
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -581,6 +581,18 @@ async fn unknown_tool_is_failclosed_error() {
     assert_eq!(out.len(), 1);
     assert!(out[0].is_error);
     assert!(out[0].content.contains("unknown"));
+}
+
+/// US-066 AC3. The exemption is asked of the tool, and there is no tool behind
+/// an unknown name, so the call is NOT exempt: it is about to be rejected, and
+/// a rejected call has to count as a repetition like any other. Exempting it
+/// would drop the batch out of the loop guard's signature entirely, and the
+/// ladder in `agent-core` could no longer stop a model looping on a misspelled
+/// name.
+#[test]
+fn an_unknown_tool_name_is_not_exempt_from_the_loop_guard() {
+    let reg = Registry::builder("/tmp").approver(allow_approver()).build();
+    assert!(!reg.loop_guard_exempt(&call("a", "missing", serde_json::json!({}))));
 }
 
 #[tokio::test]
