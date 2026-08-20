@@ -6,11 +6,16 @@ use agent_core::AgentEvent;
 use agent_core::RunConfig;
 use agent_core::compaction::CompactKind;
 use agent_core::message::Message;
+use agent_core::message::ToolErrorKind;
 use agent_core::provider::ProviderError;
 use agent_core::provider::StopReason;
 use agent_core::provider::StreamEvent;
 use agent_core::provider::TokenUsage;
 use agent_core::provider::ToolSpec;
+use agent_core::tools::ModelToolResult;
+use agent_core::tools::ToolDispatch;
+use agent_core::tools::ToolEventSink;
+use agent_core::tools::ToolInvocation;
 use agent_core::transition::ExhaustReason;
 use std::sync::Arc;
 
@@ -579,6 +584,174 @@ async fn a_run_of_exempt_calls_crosses_no_tier_and_leaves_the_count_unchanged() 
             .count(),
         7,
         "five polls and two `bash` ran: {events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(AgentEvent::EndTurn)),
+        "expected normal end: {events:?}"
+    );
+}
+
+/// The command `PermissionWall` refuses. Destructive on purpose: this is the
+/// shape of call a real permission gate stops.
+const DENIED_CMD: &str = "rm -rf /";
+
+fn denied_turn(id: &str) -> MockTurn {
+    named_tool_turn(id, "bash", &format!("{{\"cmd\":\"{DENIED_CMD}\"}}"))
+}
+
+fn allowed_turn(id: &str) -> MockTurn {
+    named_tool_turn(id, "bash", "{\"cmd\":\"pwd\"}")
+}
+
+/// Dispatcher standing in for the registry at its permission gate: the
+/// destructive call is refused, every other one echoes. The refusal is produced
+/// INSIDE the dispatch, which is the only place the guardrail cannot see it.
+struct PermissionWall;
+
+#[async_trait::async_trait]
+impl ToolDispatch for PermissionWall {
+    async fn dispatch(
+        &self,
+        calls: Vec<ToolInvocation>,
+        _events: ToolEventSink,
+    ) -> Vec<ModelToolResult> {
+        calls
+            .into_iter()
+            .map(|call| {
+                if call.input.get("cmd").and_then(serde_json::Value::as_str) == Some(DENIED_CMD) {
+                    ModelToolResult::rejected(
+                        call.id,
+                        "the user refused this command",
+                        ToolErrorKind::PermissionDenied,
+                    )
+                } else {
+                    ModelToolResult::new(call.id, "ok".into(), false, true, None)
+                }
+            })
+            .collect()
+    }
+}
+
+/// Results the dispatch refused, told apart from the guardrail's own answers by
+/// their error kind.
+fn results_of_kind(events: &[AgentEvent], kind: ToolErrorKind) -> usize {
+    events
+        .iter()
+        .filter(
+            |event| matches!(event, AgentEvent::ToolResult(view) if view.error_kind == Some(kind)),
+        )
+        .count()
+}
+
+/// US-066 AC1. `observe` runs UPSTREAM of the dispatch, and a permission
+/// refusal is produced inside it, so a refused call counts as an ordinary
+/// repetition. Move `observe` under the dispatch and this test fails: without
+/// it, a model hammering a call the user keeps refusing would never be stopped,
+/// which is exactly the loop the guardrail exists to break.
+#[tokio::test]
+async fn a_call_refused_by_permission_still_counts_up_the_ladder_to_the_stop() {
+    let mut h = harness(
+        (0..9).map(|i| denied_turn(&format!("d{i}"))).collect(),
+        false,
+        100_000,
+    );
+    h.deps.tools = Arc::new(PermissionWall);
+    let ctx = AgentContext::new("mock").push(Message::user("insiste sur l'appel refusé"));
+    let events = drive(ctx, h.deps).await;
+
+    assert_eq!(
+        results_of_kind(&events, ToolErrorKind::PermissionDenied),
+        2,
+        "the two batches below the first tier reached the gate and were refused: {events:?}"
+    );
+    assert_eq!(
+        loop_guard_reminders(&events).len(),
+        5,
+        "the refusals crossed the tiers at 3, 4, 5, 6 and 7: {events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Exhausted(ExhaustReason::ToolLoop { count: 8 }))
+        ),
+        "a refused call must reach the deterministic stop like any other: {events:?}"
+    );
+}
+
+/// US-066 AC3. Same property one step earlier: an unknown name is rejected by
+/// the step's catalog before the dispatcher is even touched, and
+/// `crates/agent-tools/src/registry.rs` states that such a call is NOT exempt.
+/// A model looping on a misspelled tool is therefore stopped like any other.
+#[tokio::test]
+async fn an_unknown_tool_name_counts_up_the_ladder_because_nothing_exempts_it() {
+    let h = harness(
+        (0..9)
+            .map(|i| named_tool_turn(&format!("u{i}"), "bahs", "{\"cmd\":\"ls\"}"))
+            .collect(),
+        false,
+        100_000,
+    );
+    let ctx = AgentContext::new("mock").push(Message::user("boucle sur un nom inconnu"));
+    let events = drive(ctx, h.deps).await;
+
+    assert_eq!(
+        results_of_kind(&events, ToolErrorKind::UnknownTool),
+        2,
+        "the two batches below the first tier were rejected as unknown: {events:?}"
+    );
+    assert_eq!(
+        loop_guard_reminders(&events).len(),
+        5,
+        "an unknown name crosses the tiers like a known one: {events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Exhausted(ExhaustReason::ToolLoop { count: 8 }))
+        ),
+        "expected the deterministic stop: {events:?}"
+    );
+}
+
+/// US-066 unhappy path: a refusal is an ordinary call, not a state of its own.
+/// Two refused batches then a different, accepted one, and the count restarts
+/// at 1: the accepted call has to be repeated three times of its own to reach
+/// the first tier.
+#[tokio::test]
+async fn an_accepted_call_after_a_refusal_restarts_the_count_at_one() {
+    let mut h = harness(
+        vec![
+            denied_turn("d0"),
+            denied_turn("d1"),
+            allowed_turn("p1"),
+            allowed_turn("p2"),
+            allowed_turn("p3"),
+            text_turn("done"),
+        ],
+        false,
+        100_000,
+    );
+    h.deps.tools = Arc::new(PermissionWall);
+    let ctx = AgentContext::new("mock").push(Message::user("refus puis autre chose"));
+    let events = drive(ctx, h.deps).await;
+
+    assert_eq!(
+        results_of_kind(&events, ToolErrorKind::PermissionDenied),
+        2,
+        "both refusals happened: {events:?}"
+    );
+    assert_eq!(
+        loop_guard_reminders(&events).len(),
+        1,
+        "one tier, reached by the third accepted call and not sooner: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolCall(_)))
+            .count(),
+        4,
+        "two refused batches and two accepted ones ran: {events:?}"
     );
     assert!(
         matches!(events.last(), Some(AgentEvent::EndTurn)),
