@@ -447,6 +447,34 @@ Tout output d'outil (`Bash`, `Read`, MCP, etc.) est **untrusted par défaut** (`
 
 ---
 
+### 4.7 Déversement de sortie d'outil (ADR-15)
+
+Borner une sortie d'outil ne veut plus dire la détruire. Au-delà de `MAX_TOOL_OUTPUT_BYTES` (30 000 octets, le plafond que toute sortie d'outil partage déjà), la sortie **complète est écrite sur disque avant toute réduction**, et le modèle reçoit un aperçu tête et queue suivi d'une notice portant l'adresse du fichier.
+
+Trois responsabilités, trois endroits, et aucun ne fait le travail d'un autre :
+
+| Module | Ce qu'il fait | Ce qu'il ne fait pas |
+|---|---|---|
+| `crates/agent-tools/src/spill.rs` | persiste un texte, rend un localisateur, borne la racine | ne décide jamais qu'un déversement a lieu |
+| `crates/agent-tools/src/spill_policy.rs` | construit le remplacement borné et la notice | n'écrit rien, donc « meilleur effort » y est prouvable |
+| `run_one_inner` (`registry.rs`) | décide **quand** | ne connaît ni la disposition du stockage ni la forme de l'aperçu |
+
+Le point de décision est `run_one_inner` parce que c'est le seul endroit où le texte complet existe encore et où l'identifiant d'appel est connu. Le hook `PostToolUse` qui suit observe sans réécrire (US-019), et `bound_feedback` vit dans `agent-core`, qui n'a aucune I/O.
+
+**La racine est `<workspace>/.pyxis/spill/<12 hex du hachage de l'identifiant de run>`**, créée par le binaire **avant** l'application du sandbox et déclarée dans les répertoires d'état inscriptibles, exactement comme le répertoire de sessions. Répertoire en `0700`, fichiers en `0600`, ouverture `create_new` qui échoue sur tout chemin préexistant, lien symbolique compris. Le nom d'outil, qu'un serveur MCP choisit librement, traverse un encodage injectif avant tout usage du système de fichiers. Elle est sous `.pyxis` et non sous le tmp du système parce que `confine` refuse à `read` et à `grep` tout chemin hors du workspace : un artefact ailleurs serait une adresse que le modèle ne peut pas ouvrir.
+
+**Meilleur effort strict.** Absence de stockage, échec d'écriture, notice qui ne tient pas elle-même sous le plafond : chacun journalise à l'échelon avertissement et rend le résultat **original**, octet pour octet. `is_error` n'est jamais levé pour un échec de déversement. `read` n'est jamais déversé, faute de quoi la boucle « lire, déverser, relire » se refermerait, et un résultat non textuel reste intact.
+
+**Le localisateur voyage dans le champ qui existait déjà**, `ToolResultTruncation.continuation_hint`, en chemin **relatif** au workspace : aucun chemin absolu n'entre dans le fil JSONL ni chez l'app-server. `bash` déverse au fil de l'acquisition, un fichier par flux, parce qu'il ne détient jamais sa propre sortie complète. La relecture est celle qui existe déjà : `read` pagine par `offset` et `limit` jusqu'au dernier octet, `grep` nomme les fichiers qu'il a sautés, et les parcours récursifs de `grep` et de `glob` n'entrent pas dans `.pyxis` alors que `confine` continue d'accepter un chemin qui y est explicitement visé.
+
+**La racine est bornée** par `MAX_SPILL_ROOT_BYTES` (256 Mio), constante de crate et non clé de configuration (invariant 15). Au démarrage d'un thread, les répertoires de threads les plus anciens sont évincés jusqu'à repasser sous le plafond ; le répertoire du thread courant n'est jamais candidat, l'éviction porte sur un thread entier et journalise ce qu'elle supprime.
+
+**Le déversement ne blanchit rien** : la relecture d'un artefact reste `untrusted`, et §4.6 s'y applique comme à toute lecture.
+
+Le raisonnement complet, les alternatives écartées (racine sous le tmp du système, outil de relecture dédié, couture de stockage abstraite, clé de configuration du seuil) et les risques assumés sont dans [`docs/DECISIONS.md`](./DECISIONS.md), ADR-15. Le contrat de fil est décrit dans [`docs/EVENT_SCHEMA.md`](./EVENT_SCHEMA.md).
+
+---
+
 ## 5. Compaction en cascade
 
 La compaction va du **moins** au **plus** destructeur. On ne déclenche un niveau plus agressif que si le précédent ne suffit pas.
