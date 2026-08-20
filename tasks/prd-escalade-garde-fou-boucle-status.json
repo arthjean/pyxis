@@ -9,10 +9,10 @@
     {
       "id": "EP-018",
       "title": "Échelle d'escalade à trois crans",
-      "status": "IN_REVIEW",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 4,
-      "stories_done": 0
+      "stories_done": 4
     },
     {
       "id": "EP-019",
@@ -44,33 +44,33 @@
       "id": "US-059",
       "title": "Échelle de seuils validée à la compilation",
       "epic": "EP-018",
-      "status": "IN_REVIEW",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [],
       "started_at": "2026-08-20",
-      "completed_at": null,
-      "reviewed_at": null
+      "completed_at": "2026-08-20",
+      "reviewed_at": "2026-08-20"
     },
     {
       "id": "US-060",
       "title": "Deux registres de message, arguments bornés",
       "epic": "EP-018",
-      "status": "IN_REVIEW",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-059"
       ],
       "started_at": "2026-08-20",
-      "completed_at": null,
-      "reviewed_at": null
+      "completed_at": "2026-08-20",
+      "reviewed_at": "2026-08-20"
     },
     {
       "id": "US-061",
       "title": "Site externe sur l'échelle",
       "epic": "EP-018",
-      "status": "IN_REVIEW",
+      "status": "DONE",
       "priority": "P0",
       "size": "S",
       "blocked_by": [
@@ -78,14 +78,14 @@
         "US-060"
       ],
       "started_at": "2026-08-20",
-      "completed_at": null,
-      "reviewed_at": null
+      "completed_at": "2026-08-20",
+      "reviewed_at": "2026-08-20"
     },
     {
       "id": "US-062",
       "title": "Site imbriqué sur l'échelle, avec verrou terminal",
       "epic": "EP-018",
-      "status": "IN_REVIEW",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
@@ -93,8 +93,8 @@
         "US-060"
       ],
       "started_at": "2026-08-20",
-      "completed_at": null,
-      "reviewed_at": null
+      "completed_at": "2026-08-20",
+      "reviewed_at": "2026-08-20"
     },
     {
       "id": "US-063",
