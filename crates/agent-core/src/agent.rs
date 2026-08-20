@@ -21,7 +21,10 @@ use crate::event::{
     AgentEvent, CredentialRefreshOutcome, CredentialRefreshView, InterruptReason,
     RetryScheduledView, ToolCallView, ToolResultView,
 };
-use crate::guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget, guarded_batch_signature};
+use crate::guardrail::{
+    CostBudget, LOOP_GUARD_THRESHOLDS, LoopDecision, LoopGuard, UsageBudget,
+    guarded_batch_signature, loop_guard_message,
+};
 use crate::input::InputQueue;
 use crate::message::{
     ContentBlock, INTERRUPTED_TOOL_RESULT, Message, ToolCallId, unanswered_tool_calls,
@@ -48,9 +51,6 @@ pub struct RunConfig {
     pub micro_keep_recent: usize,
     pub compaction_breaker_limit: u32,
     pub backoff_base_ms: u64,
-    /// US-014: identical tool-batch repeats before the loop signal
-    /// (default 3). Past the signal -> deterministic stop.
-    pub loop_guard_threshold: u32,
     /// US-014: cumulated token budget (kill-switch). `None` = disabled.
     pub token_budget: Option<u64>,
     /// US-014: cumulated cost budget (kill-switch). `None` = disabled.
@@ -75,7 +75,6 @@ impl Default for RunConfig {
             micro_keep_recent: 2,
             compaction_breaker_limit: 3,
             backoff_base_ms: 50,
-            loop_guard_threshold: crate::guardrail::DEFAULT_LOOP_GUARD_THRESHOLD,
             token_budget: None,
             cost_budget: None,
             overload_fallback_model: None,
@@ -866,7 +865,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
         // next loop boundary so the stop never happens mid-dispatch.
         let mut pending_abort: Option<InterruptReason> = None;
         // US-014: deterministic guardrails (override the model's own logic).
-        let mut loop_guard = LoopGuard::new(config.loop_guard_threshold);
+        let mut loop_guard = LoopGuard::new(LOOP_GUARD_THRESHOLDS);
         let mut usage_budget = UsageBudget::new(config.token_budget, config.cost_budget);
         // US-030 (MidTurn): armed when a long tool_result crosses the threshold ->
         // forces compaction on the next turn, BEFORE calling the model again.
@@ -1452,9 +1451,11 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         return;
                     }
 
-                    // US-014: deterministic loop guardrail (FR-05). It OVERRIDES the
-                    // model's logic. At the threshold -> signal without executing;
-                    // past it -> deterministic stop (iter_cap stays the last resort).
+                    // US-014 / ADR-14: deterministic loop guardrail (FR-05). It
+                    // OVERRIDES the model's logic. From the first tier of
+                    // LOOP_GUARD_THRESHOLDS on, the batch is never executed; what
+                    // escalates is the register of the answer, and the last tier
+                    // stops the run (iter_cap stays the last resort).
                     let loop_decision = match guarded_batch_signature(
                         &calls,
                         active_tool_plan.dispatcher().as_ref(),
@@ -1467,21 +1468,24 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     };
                     match loop_decision {
                         LoopDecision::Abort => {
+                            // One terminal state per turn (invariant 11): the whole
+                            // batch dies on this single event, however many calls it
+                            // carried.
                             yield AgentEvent::Exhausted(ExhaustReason::ToolLoop {
                                 count: loop_guard.count(),
                             });
                             return;
                         }
-                        LoopDecision::Signal => {
+                        LoopDecision::Signal(register) => {
                             // Hard stop on the repeated batch: we DO NOT EXECUTE, we send
                             // an explicit signal back to the agent (edge case #2). One
                             // tool_result per tool_use -> valid transcript.
                             for c in &calls {
-                                let msg = format!(
-                                    "Loop detected on {} (x{}). Stopping. Reframe the approach \
-                                     or ask for intervention.",
-                                    c.name,
+                                let msg = loop_guard_message(
+                                    register,
+                                    &c.name,
                                     loop_guard.count(),
+                                    &c.input,
                                 );
                                 let result = ModelToolResult::new(
                                     c.id.clone(),

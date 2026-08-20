@@ -2,8 +2,10 @@
 //! fallible logic, from outside the loop:
 //!
 //! - `LoopGuard`: detects the same tool batch (same names + same args)
-//!   repeated N times in a row. On the Nth -> **explicit signal** to the agent (the
-//!   batch is NOT executed); if it persists -> deterministic **abort**.
+//!   repeated N times in a row, and escalates over the three tiers of
+//!   `LOOP_GUARD_THRESHOLDS`. At every tier the batch is NOT executed; what
+//!   changes is the register of the message handed back and, at the last tier,
+//!   the fact that the run stops.
 //! - `UsageBudget`: cumulated token/cost budget with a **kill-switch** at 100% and
 //!   a pre-turn estimate to stop *before* a turn that costs too much.
 //!
@@ -16,36 +18,134 @@ use crate::provider::TokenUsage;
 use crate::tools::{ToolDispatch, ToolInvocation};
 use crate::transition::ExhaustReason;
 
-/// Default number of identical effectful calls accepted before the guard
-/// signals. Shared by the outer agent loop and Code Mode nested dispatch.
-pub const DEFAULT_LOOP_GUARD_THRESHOLD: u32 = 3;
+/// Escalation ladder, in consecutive identical batches. Shared by the outer
+/// agent loop and by Code Mode nested dispatch, because two ladders would be a
+/// second source of truth for the same decision.
+///
+/// Below the first tier the batch runs. From the first tier on it never runs
+/// again; what escalates is the register of the message the model gets, and the
+/// last tier stops the run. An orchestration limit, so a crate constant and not
+/// a configuration key (invariant 15).
+pub const LOOP_GUARD_THRESHOLDS: [u32; 3] = [3, 5, 8];
+
+/// Byte ceiling on the arguments quoted back by the detailed reminder. Bounds
+/// the MESSAGE only: the detection key stays the full canonical string, because
+/// truncating it would make two megabyte-sized `write` bodies that differ past
+/// the ceiling look like a loop.
+pub const LOOP_GUARD_ARGS_PREVIEW_BYTES: usize = 500;
+
+/// Is a ladder usable? Fail-loud rather than a silent fallback to a default:
+/// the fallback does not erase the mistake, it moves it downstream.
+///
+/// Strictly increasing rejects both a decreasing ladder and a duplicate tier. A
+/// first tier under 2 is refused because a guard that fires on the first repeat
+/// cannot tell a loop from a retry after a transient failure.
+pub const fn loop_guard_thresholds_are_valid(thresholds: &[u32; 3]) -> bool {
+    thresholds[0] >= 2 && thresholds[0] < thresholds[1] && thresholds[1] < thresholds[2]
+}
+
+// Applied to the constant itself: an invalid ladder written in this file fails
+// `cargo build`, which is where a Rust crate validates what dsh validates at
+// plugin load time.
+const _: () = {
+    assert!(
+        loop_guard_thresholds_are_valid(&LOOP_GUARD_THRESHOLDS),
+        "LOOP_GUARD_THRESHOLDS must be strictly increasing and start at 2 or more"
+    );
+};
+
+/// Register of the message the guard hands back to the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopRegister {
+    /// First tier: generic and short, quotes nothing, so its cost is constant.
+    Gentle,
+    /// Second tier: names the tool, the length of the run and the arguments
+    /// being repeated, because a model that did not act on the generic reminder
+    /// needs to be told what it is repeating.
+    Detailed,
+    /// Last tier: the run is over. Carried by the message the nested site locks
+    /// itself with; the outer site ends the turn instead of answering.
+    Terminal,
+}
 
 /// Loop guardrail decision for a tool batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopDecision {
     /// No loop: run normally.
     Proceed,
-    /// Nth identical repeat: do not execute, signal the agent.
-    Signal,
-    /// Repeat past the signal: deterministic stop of the loop.
+    /// A reminder tier was reached: do not execute, answer in this register.
+    /// `observe` never puts `LoopRegister::Terminal` here; that case is `Abort`.
+    Signal(LoopRegister),
+    /// Last tier: deterministic stop of the loop.
     Abort,
 }
 
-/// Tool loop detector (ARCHITECTURE section 3 guardrails / FR-05). Compares the
-/// signature of the current batch to the previous one; counts consecutive
-/// repeats.
+/// Builds the English text the model reads. Both call sites go through it, so
+/// the ladder speaks with one voice; composing a message locally is what let
+/// the nested site say the same thing at two different tiers.
+pub fn loop_guard_message(
+    register: LoopRegister,
+    tool: &str,
+    count: u32,
+    arguments: &serde_json::Value,
+) -> String {
+    match register {
+        LoopRegister::Gentle => {
+            "Loop guard: this tool call repeats the previous one exactly, so it \
+             was not executed. Take a different approach before calling again."
+                .to_string()
+        }
+        LoopRegister::Detailed => format!(
+            "Loop guard: `{tool}` was called {count} times in a row with identical arguments, and \
+             this call was not executed. Arguments: {}. Change the arguments or the approach, or \
+             ask the user.",
+            preview_arguments(arguments)
+        ),
+        LoopRegister::Terminal => format!(
+            "Loop guard: `{tool}` was called {count} times in a row with identical arguments. \
+             Dispatch is stopped for the rest of this turn. Arguments: {}.",
+            preview_arguments(arguments)
+        ),
+    }
+}
+
+/// Canonical arguments, cut on a character boundary under
+/// `LOOP_GUARD_ARGS_PREVIEW_BYTES`, saying how much was dropped. Never truncate
+/// in silence what the model is reasoning about.
+fn preview_arguments(arguments: &serde_json::Value) -> String {
+    let canonical = arguments.to_string();
+    if canonical.len() <= LOOP_GUARD_ARGS_PREVIEW_BYTES {
+        return canonical;
+    }
+    let mut cut = LOOP_GUARD_ARGS_PREVIEW_BYTES;
+    while cut > 0 && !canonical.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let dropped = canonical.len() - cut;
+    format!("{}... [{dropped} more bytes]", &canonical[..cut])
+}
+
+/// Tool loop detector (FR-05). Compares the signature of the current batch to
+/// the previous one; counts consecutive repeats and reads the tier off the
+/// ladder it was built with.
 #[derive(Debug)]
 pub struct LoopGuard {
-    threshold: u32,
+    thresholds: [u32; 3],
     last_sig: Option<String>,
     count: u32,
 }
 
 impl LoopGuard {
-    /// `threshold` = number of identical repeats before the signal (default 3).
-    pub fn new(threshold: u32) -> Self {
+    /// `thresholds` is the escalation ladder, normally `LOOP_GUARD_THRESHOLDS`.
+    /// Invalid ladders are a programming error, not a value to repair: a
+    /// `debug_assert!` rather than the silent `max(1)` that used to hide one.
+    pub fn new(thresholds: [u32; 3]) -> Self {
+        debug_assert!(
+            loop_guard_thresholds_are_valid(&thresholds),
+            "loop guard thresholds must be strictly increasing and start at 2 or more"
+        );
         Self {
-            threshold: threshold.max(1),
+            thresholds,
             last_sig: None,
             count: 0,
         }
@@ -71,10 +171,15 @@ impl LoopGuard {
             self.last_sig = Some(signature);
             self.count = 1;
         }
-        if self.count < self.threshold {
+        // Ranges, not exact counts: a guard that does not execute owes one
+        // `tool_result` per `tool_use` at every batch, so it cannot fall silent
+        // between two tiers the way a consultative reminder can.
+        if self.count < self.thresholds[0] {
             LoopDecision::Proceed
-        } else if self.count == self.threshold {
-            LoopDecision::Signal
+        } else if self.count < self.thresholds[1] {
+            LoopDecision::Signal(LoopRegister::Gentle)
+        } else if self.count < self.thresholds[2] {
+            LoopDecision::Signal(LoopRegister::Detailed)
         } else {
             LoopDecision::Abort
         }
@@ -242,22 +347,111 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loop_guard_signals_then_aborts() {
-        let mut g = LoopGuard::new(3);
+    fn the_ladder_escalates_over_two_registers_before_it_aborts() {
+        let mut g = LoopGuard::new(LOOP_GUARD_THRESHOLDS);
         assert_eq!(g.observe("a".into()), LoopDecision::Proceed); // 1
         assert_eq!(g.observe("a".into()), LoopDecision::Proceed); // 2
-        assert_eq!(g.observe("a".into()), LoopDecision::Signal); // 3 = threshold
-        assert_eq!(g.observe("a".into()), LoopDecision::Abort); // 4 > threshold
+        let gentle = LoopDecision::Signal(LoopRegister::Gentle);
+        let detailed = LoopDecision::Signal(LoopRegister::Detailed);
+        assert_eq!(g.observe("a".into()), gentle); // 3 = first tier
+        assert_eq!(g.observe("a".into()), gentle); // 4 = still the first tier
+        assert_eq!(g.observe("a".into()), detailed); // 5 = second tier
+        assert_eq!(g.observe("a".into()), detailed); // 6
+        assert_eq!(g.observe("a".into()), detailed); // 7
+        assert_eq!(g.observe("a".into()), LoopDecision::Abort); // 8 = last tier
+        assert_eq!(g.count(), 8, "the abort carries the real count, not 4");
+    }
+
+    /// Unhappy path of US-059: a run that stops short of the first tier leaves
+    /// no residue, so the next batch starts a run of its own.
+    #[test]
+    fn a_different_batch_ends_the_run_without_crossing_any_tier() {
+        let mut g = LoopGuard::new(LOOP_GUARD_THRESHOLDS);
+        assert_eq!(g.observe("a".into()), LoopDecision::Proceed);
+        assert_eq!(g.observe("a".into()), LoopDecision::Proceed);
+        assert_eq!(g.observe("b".into()), LoopDecision::Proceed);
+        assert_eq!(g.count(), 1, "the count restarts at 1 on a new signature");
+        assert_eq!(g.observe("b".into()), LoopDecision::Proceed);
+        assert_eq!(
+            g.observe("b".into()),
+            LoopDecision::Signal(LoopRegister::Gentle)
+        );
+    }
+
+    /// The `const _` block below the constant proves the ladder that ships; this
+    /// proves the validator itself, without a `trybuild` dependency.
+    #[test]
+    fn the_validator_refuses_a_duplicate_a_decrease_and_a_hair_trigger() {
+        assert!(loop_guard_thresholds_are_valid(&LOOP_GUARD_THRESHOLDS));
+        assert!(
+            !loop_guard_thresholds_are_valid(&[3, 3, 8]),
+            "duplicate tier"
+        );
+        assert!(!loop_guard_thresholds_are_valid(&[8, 5, 3]), "decreasing");
+        assert!(
+            !loop_guard_thresholds_are_valid(&[1, 5, 8]),
+            "a first tier under 2 cannot tell a loop from a retry"
+        );
     }
 
     #[test]
-    fn loop_guard_resets_on_different_batch() {
-        let mut g = LoopGuard::new(3);
-        assert_eq!(g.observe("a".into()), LoopDecision::Proceed);
-        assert_eq!(g.observe("a".into()), LoopDecision::Proceed);
-        assert_eq!(g.observe("b".into()), LoopDecision::Proceed); // reset
-        assert_eq!(g.observe("b".into()), LoopDecision::Proceed);
-        assert_eq!(g.observe("b".into()), LoopDecision::Signal);
+    fn the_gentle_register_quotes_nothing_and_the_detailed_one_quotes_everything() {
+        let args = serde_json::json!({"cmd": "ls -la"});
+        let gentle = loop_guard_message(LoopRegister::Gentle, "bash", 3, &args);
+        assert!(!gentle.contains("ls -la"), "gentle cost must stay constant");
+        assert!(!gentle.contains("bash"));
+
+        let detailed = loop_guard_message(LoopRegister::Detailed, "bash", 5, &args);
+        assert!(detailed.contains("bash"));
+        assert!(detailed.contains('5'));
+        assert!(detailed.contains("ls -la"));
+    }
+
+    /// US-060 unhappy path + NFR-01. A multi-byte character straddling the
+    /// ceiling must not produce a truncated code point, and the message stays
+    /// bounded whatever the argument weighs.
+    #[test]
+    fn a_megabyte_argument_is_cut_on_a_character_boundary_under_the_ceiling() {
+        // `{"a":"` is 6 bytes, so 493 filler bytes put a two-byte `e` acute at
+        // bytes 499..=500: the ceiling falls inside it.
+        let mut payload = "x".repeat(493);
+        payload.push('\u{e9}');
+        payload.push_str(&"y".repeat(1024 * 1024));
+        let args = serde_json::json!({ "a": payload });
+        let canonical = args.to_string();
+        assert!(!canonical.is_char_boundary(LOOP_GUARD_ARGS_PREVIEW_BYTES));
+
+        let message = loop_guard_message(LoopRegister::Detailed, "write", 5, &args);
+        assert!(
+            message.contains(&format!("{}... [", &canonical[..499])),
+            "the cut must fall back to the previous character boundary"
+        );
+        assert!(
+            !message.contains('\u{e9}'),
+            "the straddling character is dropped whole, never split"
+        );
+        assert!(
+            message.len() < LOOP_GUARD_ARGS_PREVIEW_BYTES + 256,
+            "NFR-01: {} bytes",
+            message.len()
+        );
+    }
+
+    /// FR-06. The ceiling bounds the message, never the key: two bodies that
+    /// differ only past the ceiling are two distinct signatures.
+    #[test]
+    fn the_detection_key_is_never_truncated_by_the_preview_ceiling() {
+        let dispatch = Exempting("");
+        let body = |tail: &str| {
+            let mut value = "x".repeat(1024 * 1024);
+            value.push_str(tail);
+            ToolInvocation::json("x", "write", serde_json::json!({ "body": value }))
+        };
+        assert_ne!(
+            guarded_batch_signature(&[body("left")], &dispatch),
+            guarded_batch_signature(&[body("right")], &dispatch),
+            "truncating the key would make every large write look like a loop"
+        );
     }
 
     /// Dispatcher that exempts whatever it was told to exempt. WHICH calls are
@@ -300,7 +494,7 @@ mod tests {
 
     #[test]
     fn an_ignored_batch_breaks_a_repetition_run() {
-        let mut guard = LoopGuard::new(3);
+        let mut guard = LoopGuard::new(LOOP_GUARD_THRESHOLDS);
         assert_eq!(guard.observe("same".into()), LoopDecision::Proceed);
         assert_eq!(guard.observe("same".into()), LoopDecision::Proceed);
 

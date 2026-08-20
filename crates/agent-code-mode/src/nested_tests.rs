@@ -413,8 +413,86 @@ async fn repeated_nested_effects_are_guarded_across_outer_cells() {
     assert!(!outcomes[0].is_error);
     assert!(!outcomes[1].is_error);
     assert_eq!(outcomes[2].error_kind, Some("semantic"));
-    assert!(outcomes[2].content.contains("Loop detected on write (x3)"));
+    assert!(
+        outcomes[2].content.starts_with("Loop guard:"),
+        "the first tier answers in the gentle register: {}",
+        outcomes[2].content
+    );
+    assert!(
+        !outcomes[2].content.contains("same"),
+        "the gentle register quotes no argument: {}",
+        outcomes[2].content
+    );
     assert_eq!(tools.seen().len(), 2, "the third effect never executes");
+}
+
+/// US-062. The nested site carries the same ladder as the outer one, and its
+/// last tier LOCKS: a cell is JavaScript, so it can catch an error and call
+/// again, which is precisely the loop the guard exists to break.
+#[tokio::test]
+async fn the_nested_ladder_escalates_then_locks_the_dispatch_for_the_turn() {
+    let tools = Arc::new(RecordingTools::default());
+    let loop_guard = NestedLoopGuard::default();
+    let specs = vec![function_spec("write"), function_spec("read")];
+    let dispatcher = dispatcher_with_guard(Arc::clone(&tools), specs.clone(), loop_guard.clone());
+    let same = || {
+        call(
+            "write",
+            NestedToolInput::Json(serde_json::json!({"value": "same"})),
+        )
+    };
+
+    let outcomes = dispatch_off_runtime(
+        Arc::clone(&dispatcher),
+        (0..8).map(|_| same()).collect::<Vec<_>>(),
+    );
+
+    assert!(!outcomes[0].is_error, "1st runs");
+    assert!(!outcomes[1].is_error, "2nd runs");
+    for gentle in &outcomes[2..4] {
+        assert!(!gentle.content.contains("same"), "gentle at 3 and 4");
+    }
+    for detailed in &outcomes[4..7] {
+        assert!(
+            detailed.content.contains("write") && detailed.content.contains("\"same\""),
+            "detailed at 5, 6 and 7: {}",
+            detailed.content
+        );
+    }
+    assert!(
+        outcomes[7].content.contains("Dispatch is stopped"),
+        "the last tier is terminal: {}",
+        outcomes[7].content
+    );
+    assert_eq!(tools.seen().len(), 2, "only the first two ever executed");
+
+    // Unhappy path: the lock is not scoped to the tool that looped, and a cell
+    // ending does not shed it.
+    loop_guard.finish_cell(&CellId::new(&SessionId::new("thread-a"), 0));
+    let after_lock = dispatch_off_runtime(
+        dispatcher_with_guard(Arc::clone(&tools), specs.clone(), loop_guard.clone()),
+        vec![call(
+            "read",
+            NestedToolInput::Json(serde_json::json!({"value": "unrelated"})),
+        )],
+    );
+    assert!(after_lock[0].is_error, "a locked turn refuses every tool");
+    assert_eq!(
+        tools.seen().len(),
+        2,
+        "no call reaches the dispatcher once the lock is down"
+    );
+
+    loop_guard.reset();
+    let next_turn = dispatch_off_runtime(
+        dispatcher_with_guard(Arc::clone(&tools), specs, loop_guard.clone()),
+        vec![call(
+            "read",
+            NestedToolInput::Json(serde_json::json!({"value": "unrelated"})),
+        )],
+    );
+    assert!(!next_turn[0].is_error, "a new turn starts free of the lock");
+    assert_eq!(tools.seen().len(), 3);
 }
 
 #[tokio::test]

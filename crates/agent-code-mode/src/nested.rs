@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use agent_core::event::{ToolCallView, ToolResultView};
 use agent_core::guardrail::{
-    DEFAULT_LOOP_GUARD_THRESHOLD, LoopDecision, LoopGuard, guarded_batch_signature,
+    LOOP_GUARD_THRESHOLDS, LoopDecision, LoopGuard, LoopRegister, guarded_batch_signature,
+    loop_guard_message,
 };
 use agent_core::message::{ToolCallFormat, ToolErrorKind};
 use agent_core::provider::ToolSpec;
@@ -79,9 +80,23 @@ impl NestedToolOutcome {
     }
 }
 
+/// What the nested guard tells the dispatcher to do with one call.
+///
+/// Distinct from `LoopDecision` because the nested site owns one thing the
+/// outer one does not: once the ladder is exhausted it LOCKS, and a locked
+/// guard answers without ever consulting the ladder again.
+enum NestedLoopVerdict {
+    Proceed,
+    /// A reminder tier was reached: refuse this call, in this register.
+    Reminder(LoopRegister, u32),
+    /// The lock is down. Carries the terminal message, built once when the last
+    /// tier was crossed and repeated verbatim afterwards.
+    Locked(String),
+}
+
 /// Loop state shared by the successive step dispatchers of one agent turn.
 /// Polling controls and terminal pure cells reset it; identical nested effects
-/// are stopped at the same threshold as direct tool calls.
+/// escalate over the same ladder as direct tool calls.
 #[derive(Clone)]
 pub struct NestedLoopGuard {
     inner: Arc<Mutex<NestedLoopState>>,
@@ -90,14 +105,20 @@ pub struct NestedLoopGuard {
 struct NestedLoopState {
     guard: LoopGuard,
     effect_cells: HashSet<CellId>,
+    /// Terminal message, once the last tier was crossed. `Some` locks the whole
+    /// nested dispatch for the rest of the turn: a cell is JavaScript, it can
+    /// catch the error the way the outer model cannot ignore `Exhausted`, and
+    /// retrying past the last tier is exactly the loop being broken.
+    locked: Option<String>,
 }
 
 impl Default for NestedLoopGuard {
     fn default() -> Self {
         Self {
             inner: Arc::new(Mutex::new(NestedLoopState {
-                guard: LoopGuard::new(DEFAULT_LOOP_GUARD_THRESHOLD),
+                guard: LoopGuard::new(LOOP_GUARD_THRESHOLDS),
                 effect_cells: HashSet::new(),
+                locked: None,
             })),
         }
     }
@@ -109,8 +130,14 @@ impl NestedLoopGuard {
         cell_id: &CellId,
         invocation: &ToolInvocation,
         dispatch: &dyn ToolDispatch,
-    ) -> (LoopDecision, u32) {
+    ) -> NestedLoopVerdict {
         let mut state = lock(&self.inner);
+        // Checked BEFORE the ladder, and whatever the tool is: a locked turn
+        // reaches no dispatcher at all, otherwise a cell would only have to
+        // alternate tools to keep producing effects.
+        if let Some(message) = &state.locked {
+            return NestedLoopVerdict::Locked(message.clone());
+        }
         let decision = match guarded_batch_signature(std::slice::from_ref(invocation), dispatch) {
             Some(signature) => {
                 state.effect_cells.insert(cell_id.clone());
@@ -121,9 +148,25 @@ impl NestedLoopGuard {
                 LoopDecision::Proceed
             }
         };
-        (decision, state.guard.count())
+        let count = state.guard.count();
+        match decision {
+            LoopDecision::Proceed => NestedLoopVerdict::Proceed,
+            LoopDecision::Signal(register) => NestedLoopVerdict::Reminder(register, count),
+            LoopDecision::Abort => {
+                let message = loop_guard_message(
+                    LoopRegister::Terminal,
+                    &invocation.name,
+                    count,
+                    &invocation.input,
+                );
+                state.locked = Some(message.clone());
+                NestedLoopVerdict::Locked(message)
+            }
+        }
     }
 
+    /// End of a cell. Does NOT lift the lock: the lock belongs to the turn, and
+    /// a cell that ends is exactly what a looping model would use to shed it.
     pub fn finish_cell(&self, cell_id: &CellId) {
         let mut state = lock(&self.inner);
         if !state.effect_cells.remove(cell_id) {
@@ -135,6 +178,7 @@ impl NestedLoopGuard {
         let mut state = lock(&self.inner);
         state.guard.reset();
         state.effect_cells.clear();
+        state.locked = None;
     }
 }
 
@@ -294,18 +338,21 @@ impl NestedToolDispatcher for PlanDispatcher {
         };
         let invocation_id = invocation.id.clone();
         let dispatch = self.plan.dispatcher();
-        let (loop_decision, loop_count) =
-            self.loop_guard
-                .observe(&call.cell_id, &invocation, dispatch.as_ref());
-        if loop_decision != LoopDecision::Proceed {
-            return NestedToolOutcome::error(
-                &call,
-                ToolErrorKind::Semantic.label(),
-                format!(
-                    "Loop detected on {} (x{loop_count}). Stopping nested dispatch. Reframe the approach.",
-                    invocation.name
-                ),
-            );
+        match self
+            .loop_guard
+            .observe(&call.cell_id, &invocation, dispatch.as_ref())
+        {
+            NestedLoopVerdict::Proceed => {}
+            NestedLoopVerdict::Reminder(register, count) => {
+                return NestedToolOutcome::error(
+                    &call,
+                    ToolErrorKind::Semantic.label(),
+                    loop_guard_message(register, &invocation.name, count, &invocation.input),
+                );
+            }
+            NestedLoopVerdict::Locked(message) => {
+                return NestedToolOutcome::error(&call, ToolErrorKind::Semantic.label(), message);
+            }
         }
         let kind = dispatch.call_kind(&invocation);
         self.events

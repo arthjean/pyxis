@@ -18,43 +18,97 @@ mod common;
 
 use common::{
     MockTurn, drive, freeform_tool_turn, harness, harness_with_summary_usage, has_compacted,
-    text_turn, tool_turn, tool_turn_usage,
+    text_turn, tool_turn, tool_turn_n, tool_turn_usage,
 };
 
-// US-014 AC1: same tool + same args repeated -> explicit signal to the agent
-// (batch not executed), then deterministic stop if the loop persists.
+// US-014 AC1 / US-061: same tool + same args repeated -> the ladder of
+// LOOP_GUARD_THRESHOLDS. Executed twice, gentle reminder at 3 and 4, detailed
+// reminder at 5, 6 and 7, deterministic stop at 8. The batch is executed at no
+// tier, so the extra cost of the ladder is in model round-trips, never effects.
 #[tokio::test]
-async fn loop_guardrail_signals_then_aborts() {
+async fn the_loop_guardrail_gives_two_reminders_before_it_stops_the_turn() {
     // The model keeps asking for the same `bash {cmd:ls}` forever.
+    let h = harness((0..9).map(|_| tool_turn("c1")).collect(), false, 100_000);
+    let ctx = AgentContext::new("mock").push(Message::user("boucle"));
+    let events = drive(ctx, h.deps).await;
+
+    let reminders: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolResult(v) if v.is_error => Some(v.content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reminders.len(), 5, "3, 4, 5, 6 and 7: {events:?}");
+    for gentle in &reminders[..2] {
+        assert!(gentle.starts_with("Loop guard:"), "{gentle}");
+        assert!(
+            !gentle.contains("bash") && !gentle.contains("ls"),
+            "the gentle register quotes nothing: {gentle}"
+        );
+    }
+    for detailed in &reminders[2..] {
+        assert!(
+            detailed.contains("bash") && detailed.contains("ls"),
+            "the detailed register names the tool and the arguments: {detailed}"
+        );
+    }
+
+    // NFR-02: the ladder costs round-trips, not effects. Only the two batches
+    // below the first tier were ever dispatched.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolCall(_)))
+            .count(),
+        2,
+        "no tier executes the offending batch: {events:?}"
+    );
+
+    // Deterministic stop at the last tier, carrying the real count.
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Exhausted(ExhaustReason::ToolLoop { count: 8 }))
+        ),
+        "ToolLoop {{ count: 8 }} ending expected: {events:?}"
+    );
+}
+
+/// US-061 unhappy path + invariant 11: a batch of three calls dying at the last
+/// tier produces exactly ONE terminal state, not one per `tool_use`.
+#[tokio::test]
+async fn a_multi_call_batch_at_the_last_tier_produces_a_single_terminal_state() {
     let h = harness(
-        vec![
-            tool_turn("c1"),
-            tool_turn("c1"),
-            tool_turn("c1"),
-            tool_turn("c1"),
-            tool_turn("c1"),
-        ],
+        (0..9).map(|_| tool_turn_n(&["a", "b", "c"])).collect(),
         false,
         100_000,
     );
     let ctx = AgentContext::new("mock").push(Message::user("boucle"));
     let events = drive(ctx, h.deps).await;
 
-    // Explicit signal sent back to the agent (edge case #2).
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::ToolResult(v) if v.content.contains("Loop detected") && v.is_error
-        )),
-        "explicit loop signal expected: {events:?}"
-    );
-    // Deterministic stop beyond the signal.
-    assert!(
-        matches!(
-            events.last(),
-            Some(AgentEvent::Exhausted(ExhaustReason::ToolLoop { .. }))
-        ),
-        "ToolLoop ending expected: {events:?}"
+    let terminal = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::Exhausted(_) | AgentEvent::EndTurn | AgentEvent::Error(_)
+            )
+        })
+        .count();
+    assert_eq!(terminal, 1, "exactly one terminal state: {events:?}");
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Exhausted(ExhaustReason::ToolLoop { count: 8 }))
+    ));
+    // Every signalled batch still answered each of its three `tool_use`.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolResult(v) if v.is_error))
+            .count(),
+        15,
+        "one tool_result per tool_use, on each of the five signalled batches: {events:?}"
     );
 }
 
@@ -116,7 +170,7 @@ async fn loop_guardrail_allows_repeated_code_mode_cells() {
     assert!(
         !events.iter().any(|event| matches!(
             event,
-            AgentEvent::ToolResult(result) if result.content.contains("Loop detected")
+            AgentEvent::ToolResult(result) if result.content.starts_with("Loop guard:")
         )),
         "Code Mode cells are orchestration, not a semantic loop: {events:?}"
     );
