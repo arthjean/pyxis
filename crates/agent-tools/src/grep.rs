@@ -14,8 +14,15 @@ use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{Tool, ToolCtx, ToolOutput};
 
 const MAX_MATCHES: usize = 500;
-/// Files larger than this are skipped (most likely artifacts).
+/// Files larger than this are not searched (most likely artifacts). Skipping is
+/// REPORTED, never silent (US-078): a spilled 10 MiB output sits above this
+/// bound, and answering "no matches" for a file that was never opened is a
+/// false negative the model cannot tell from a real absence.
 const MAX_FILE_BYTES: u64 = 5_000_000;
+/// Skipped files named individually before the report aggregates. A directory
+/// full of artifacts must cost a line or two, not one line per file: the report
+/// exists to prevent a wrong conclusion, not to become the output.
+const MAX_SKIP_REPORTS: usize = 5;
 /// Display bound of a match line (avoids flooding on a minified
 /// line). Cuts on a character boundary (see `truncate_line`).
 const MAX_LINE_BYTES: usize = 300;
@@ -102,8 +109,9 @@ impl Tool for Grep {
         ensure_existing_path_no_links(&ctx.workspace, &base, input.path.as_deref().unwrap_or("."))?;
         let workspace = ctx.workspace.clone();
 
-        let (lines, truncated) = tokio::task::spawn_blocking(move || {
+        let (lines, truncated, skipped) = tokio::task::spawn_blocking(move || {
             let mut out: Vec<String> = Vec::new();
+            let mut skipped: Vec<(String, u64)> = Vec::new();
             let mut truncated = false;
             'walk: for entry in WalkDir::new(&base).into_iter().flatten() {
                 if !entry.file_type().is_file() {
@@ -115,7 +123,15 @@ impl Tool for Grep {
                         continue;
                     }
                 }
-                if entry.metadata().map(|m| m.len()).unwrap_or(0) > MAX_FILE_BYTES {
+                let rel = entry
+                    .path()
+                    .strip_prefix(&workspace)
+                    .unwrap_or(entry.path())
+                    .to_string_lossy()
+                    .into_owned();
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                if size > MAX_FILE_BYTES {
+                    skipped.push((rel, size));
                     continue;
                 }
                 let bytes = match std::fs::read(entry.path()) {
@@ -126,12 +142,6 @@ impl Tool for Grep {
                     continue; // binary
                 }
                 let text = String::from_utf8_lossy(&bytes);
-                let rel = entry
-                    .path()
-                    .strip_prefix(&workspace)
-                    .unwrap_or(entry.path())
-                    .to_string_lossy()
-                    .into_owned();
                 for (idx, line) in text.lines().enumerate() {
                     if re.is_match(line) {
                         let trimmed = truncate_line(line, MAX_LINE_BYTES);
@@ -143,18 +153,16 @@ impl Tool for Grep {
                     }
                 }
             }
-            (out, truncated)
+            (out, truncated, skipped)
         })
         .await
         .map_err(|e| ToolError::Io(format!("walk: {e}")))?;
 
-        if lines.is_empty() {
-            return Ok(ToolOutput::text(format!(
-                "(no matches for \"{}\")",
-                input.pattern
-            )));
-        }
-        let mut body = lines.join("\n");
+        let mut body = if lines.is_empty() {
+            format!("(no matches for \"{}\")", input.pattern)
+        } else {
+            lines.join("\n")
+        };
         if truncated {
             // US-026: report the truncation AND how to paginate (grep has no
             // offset -> we point toward narrowing the search).
@@ -163,8 +171,35 @@ impl Tool for Grep {
                  pattern, glob, or path to see the rest]"
             ));
         }
+        // A search that skipped nothing produces exactly what it produced
+        // before US-078, byte for byte.
+        for line in skip_report(&skipped) {
+            body.push('\n');
+            body.push_str(&line);
+        }
         Ok(ToolOutput::text(body))
     }
+}
+
+/// Turns the files left unsearched into a bounded report naming the only
+/// recovery this batch actually made complete: `read` with `offset` and
+/// `limit`, which pages a file of any size since US-077.
+fn skip_report(skipped: &[(String, u64)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (rel, size) in skipped.iter().take(MAX_SKIP_REPORTS) {
+        out.push(format!(
+            "[skipped {rel}: {size} bytes, over the {MAX_FILE_BYTES}-byte search limit; \
+             read it with `read` using offset and limit]"
+        ));
+    }
+    if skipped.len() > MAX_SKIP_REPORTS {
+        out.push(format!(
+            "[skipped {} more files over the {MAX_FILE_BYTES}-byte search limit; read them \
+             with `read` using offset and limit]",
+            skipped.len() - MAX_SKIP_REPORTS
+        ));
+    }
+    out
 }
 
 /// Truncates a display line to `max` BYTES on a UTF-8 character
@@ -185,6 +220,42 @@ fn truncate_line(line: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_skipped_file_produces_no_report_line() {
+        assert!(skip_report(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_skipped_file_is_named_with_its_size_and_the_recovery() {
+        let report = skip_report(&[("build.log".to_string(), 10_485_760)]);
+        assert_eq!(report.len(), 1);
+        assert!(report[0].contains("build.log"), "{}", report[0]);
+        assert!(report[0].contains("10485760"), "{}", report[0]);
+        assert!(
+            report[0].contains("offset and limit"),
+            "the recovery must be named: {}",
+            report[0]
+        );
+    }
+
+    #[test]
+    fn many_skipped_files_collapse_into_one_aggregate_line() {
+        let skipped: Vec<(String, u64)> = (0..12)
+            .map(|i| (format!("artifact-{i}.log"), MAX_FILE_BYTES + 1))
+            .collect();
+        let report = skip_report(&skipped);
+        assert_eq!(
+            report.len(),
+            MAX_SKIP_REPORTS + 1,
+            "named files then one aggregate: {report:?}"
+        );
+        assert!(
+            report[MAX_SKIP_REPORTS].contains(&format!("{} more files", 12 - MAX_SKIP_REPORTS)),
+            "{}",
+            report[MAX_SKIP_REPORTS]
+        );
+    }
 
     #[test]
     fn short_line_is_untouched() {

@@ -1039,6 +1039,52 @@ async fn read_beyond_the_last_line_names_the_real_line_count() {
         o.content
     );
 }
+
+#[tokio::test]
+async fn grep_reports_the_file_it_did_not_search() {
+    // US-078 AC1/AC3: an oversized file is named with the reason and the
+    // recovery instead of producing an indistinguishable "no matches".
+    let ws = TempWs::new("grep-skip");
+    oversized_file(&ws, "huge.log", 6 * 1024 * 1024, "NEEDLE");
+    ws.write("small.txt", "NEEDLE here\n");
+    let reg = read_registry(&ws);
+    let out = reg
+        .dispatch(vec![call(
+            "a",
+            "grep",
+            serde_json::json!({"pattern": "NEEDLE"}),
+        )])
+        .await;
+    let o = by_id(&out, "a");
+    assert!(!o.is_error, "{}", o.content);
+    assert!(o.content.contains("small.txt:1:"), "{}", o.content);
+    assert!(
+        o.content.contains("[skipped huge.log:"),
+        "the skipped file must be named: {}",
+        o.content
+    );
+    assert!(
+        o.content.contains("offset and limit"),
+        "the recovery must be named: {}",
+        o.content
+    );
+}
+
+#[tokio::test]
+async fn grep_without_an_oversized_file_says_nothing_more_than_before() {
+    // US-078 unhappy path: no skip, no extra line, matches or not.
+    let ws = TempWs::new("grep-no-skip");
+    ws.write("a.txt", "hit\n");
+    let reg = read_registry(&ws);
+    let out = reg
+        .dispatch(vec![
+            call("a", "grep", serde_json::json!({"pattern": "hit"})),
+            call("b", "grep", serde_json::json!({"pattern": "absent"})),
+        ])
+        .await;
+    assert_eq!(by_id(&out, "a").content, "a.txt:1: hit");
+    assert_eq!(by_id(&out, "b").content, "(no matches for \"absent\")");
+}
 // ══════════════════════════ US-012 ══════════════════════════
 
 fn mut_registry(ws: &TempWs, mode: PermissionMode) -> Registry {
