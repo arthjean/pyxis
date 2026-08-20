@@ -153,6 +153,19 @@ fn the_specification_states_every_value_and_section_the_gate_enforces() {
     }
 }
 
+/// The specification is what a writer reads instead of this crate, and a
+/// specification nobody finishes reading is one more document to grep. The cap
+/// is the one written in the PRD; it stops depending on whoever last edited the
+/// file counting lines by hand.
+#[test]
+fn the_specification_stays_short_enough_to_be_read_in_full() {
+    let lines = readme().lines().count();
+    assert!(
+        lines <= 150,
+        "docs/notes/README.md fait {lines} lignes, plafond 150"
+    );
+}
+
 #[test]
 fn a_conforming_note_is_accepted() {
     let violations = check_format("implemented", "note.md", AFTER_ADOPTION, VALID_IMPLEMENTED);
