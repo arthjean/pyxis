@@ -99,6 +99,11 @@ pub struct ToolCtx {
     /// Programs the user declared side-effect free, on top of the built-in
     /// table (US-007). Empty by default, which is the historical behavior.
     pub command_policy: Arc<crate::command::CommandPolicy>,
+    /// Where a tool output too large to be returned whole is written (US-070).
+    /// `None` = no storage, which means NO spill at all rather than an implicit
+    /// default: outside the binary nobody created a root, and a tool that
+    /// cannot spill must behave exactly as it did before EP-022.
+    pub spill: Option<Arc<crate::spill::SpillStore>>,
 }
 
 impl std::fmt::Debug for ToolCtx {
@@ -140,6 +145,7 @@ impl ToolCtx {
             context_window: agent_core::budget::ContextWindowState::new(),
             user_notice: None,
             command_policy: Arc::new(crate::command::CommandPolicy::new()),
+            spill: None,
         }
     }
     pub fn with_timeout(mut self, timeout: Duration) -> Self {

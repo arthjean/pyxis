@@ -87,7 +87,9 @@ pub struct Registry {
     /// safe point it breaks the outer one (US-064): the core signals the
     /// dispatcher, and only the dispatcher knows a second guard exists.
     nested_loop_guard: Option<NestedLoopGuard>,
-    ctx: ToolCtx,
+    /// Crate-visible so a sibling module can prove what the builder wired into
+    /// the context without a public accessor nothing else would use.
+    pub(crate) ctx: ToolCtx,
 }
 
 /// A change to the exposed tool set, waiting for the next turn boundary.
@@ -1286,6 +1288,13 @@ impl RegistryBuilder {
     /// global settings by the binary.
     pub fn command_policy(mut self, policy: Arc<crate::command::CommandPolicy>) -> Self {
         self.ctx.command_policy = policy;
+        self
+    }
+    /// Spill storage of the run (US-070/US-072), created by the binary BEFORE
+    /// the sandbox so its root already opens when Landlock is applied. Never
+    /// set outside the binary, where the absence keeps the pre-EP-022 behavior.
+    pub fn spill(mut self, store: Arc<crate::spill::SpillStore>) -> Self {
+        self.ctx.spill = Some(store);
         self
     }
     /// Declares that the provider can encode `ToolKind::Namespace`. Read from

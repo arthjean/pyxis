@@ -34,6 +34,7 @@ pub mod read;
 pub mod registry;
 pub mod sandbox;
 pub mod shell;
+pub mod spill;
 pub mod taint;
 pub mod time;
 pub mod tool;
@@ -78,6 +79,7 @@ pub use sandbox::{
     EscalationGuard, SandboxDenial, SandboxEscalator, SandboxObserver, classify_failure,
 };
 pub use shell::ShellChoice;
+pub use spill::{SpillError, SpillRef, SpillStore};
 pub use time::{CurrentTime, Sleep};
 pub use tool::{CommandHardener, DynTool, DynToolAdapter, Tool, ToolCtx, ToolOutput, into_dyn};
 pub use tool_search::{DEFER_THRESHOLD, DeferredEntry, DeferredTools, ToolSearch};

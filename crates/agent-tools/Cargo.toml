@@ -39,6 +39,14 @@ similar.workspace = true
 # `view_image` (US-011): the provider wire format for an image block is base64.
 # Already in the workspace graph (agent-auth), no new dependency.
 base64.workspace = true
+# US-070: the spill file name carries a random prefix so it cannot be
+# pre-created, and the per-thread directory is a short digest of the thread
+# identifier rather than the identifier itself. `rand`, `hex` and `sha2` are all
+# already in the workspace graph (`agent-runtime` uses the three), so this adds
+# no new dependency to the build.
+rand.workspace = true
+hex.workspace = true
+sha2.workspace = true
 tracing.workspace = true
 
 # EP-004/US-014: PTY sessions. Unix-only by construction (`openpty`), which is
