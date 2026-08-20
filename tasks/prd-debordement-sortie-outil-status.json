@@ -1,0 +1,218 @@
+{
+  "prd": {
+    "file": "tasks/prd-debordement-sortie-outil.md",
+    "title": "Débordement de sortie d'outil",
+    "created_at": "2026-08-20",
+    "status": "IN_PROGRESS"
+  },
+  "epics": [
+    {
+      "id": "EP-022",
+      "title": "Le stockage",
+      "status": "DONE",
+      "priority": "P0",
+      "stories_total": 3,
+      "stories_done": 3
+    },
+    {
+      "id": "EP-023",
+      "title": "La politique de déversement",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 3,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-024",
+      "title": "La sortie que la politique ne peut pas atteindre",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 1,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-025",
+      "title": "La relecture",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 3,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-026",
+      "title": "Enregistrement et bornes",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 2,
+      "stories_done": 0
+    }
+  ],
+  "stories": [
+    {
+      "id": "US-070",
+      "title": "Module de stockage du déversement",
+      "epic": "EP-022",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [],
+      "started_at": "2026-08-20",
+      "completed_at": "2026-08-20",
+      "reviewed_at": "2026-08-20"
+    },
+    {
+      "id": "US-071",
+      "title": "Encodage injectif du nom de fichier",
+      "epic": "EP-022",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-070"
+      ],
+      "started_at": "2026-08-20",
+      "completed_at": "2026-08-20",
+      "reviewed_at": "2026-08-20"
+    },
+    {
+      "id": "US-072",
+      "title": "Racine créée avant l'enfermement et déclarée au sandbox",
+      "epic": "EP-022",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-070"
+      ],
+      "started_at": "2026-08-20",
+      "completed_at": "2026-08-20",
+      "reviewed_at": "2026-08-20"
+    },
+    {
+      "id": "US-073",
+      "title": "Point de déversement et règles d'exclusion",
+      "epic": "EP-023",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-070",
+        "US-072"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-074",
+      "title": "Remplacement borné, notice réservée",
+      "epic": "EP-023",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-073"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-075",
+      "title": "Localisateur porté par le contrat existant",
+      "epic": "EP-023",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-074"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-076",
+      "title": "bash déverse au fil de l'acquisition",
+      "epic": "EP-024",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "L",
+      "blocked_by": [
+        "US-070",
+        "US-072"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-077",
+      "title": "read adresse réellement un fichier au-delà de son plafond",
+      "epic": "EP-025",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-078",
+      "title": "grep dit qu'il a sauté un fichier",
+      "epic": "EP-025",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "S",
+      "blocked_by": [],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-079",
+      "title": "La racine de déversement sort du parcours de recherche",
+      "epic": "EP-025",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-072"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-080",
+      "title": "ADR-15, déversement de sortie d'outil",
+      "epic": "EP-026",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-073",
+        "US-076",
+        "US-079"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-081",
+      "title": "Plafond de la racine de déversement",
+      "epic": "EP-026",
+      "status": "TODO",
+      "priority": "P2",
+      "size": "S",
+      "blocked_by": [
+        "US-072"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    }
+  ]
+}
