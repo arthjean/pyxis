@@ -3,7 +3,7 @@
     "file": "tasks/prd-debordement-sortie-outil.md",
     "title": "Débordement de sortie d'outil",
     "created_at": "2026-08-20",
-    "status": "IN_PROGRESS"
+    "status": "DONE"
   },
   "epics": [
     {
@@ -41,10 +41,10 @@
     {
       "id": "EP-026",
       "title": "Enregistrement et bornes",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 2,
-      "stories_done": 0
+      "stories_done": 2
     }
   ],
   "stories": [
@@ -188,7 +188,7 @@
       "id": "US-080",
       "title": "ADR-15, déversement de sortie d'outil",
       "epic": "EP-026",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
@@ -196,23 +196,23 @@
         "US-076",
         "US-079"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-081",
       "title": "Plafond de la racine de déversement",
       "epic": "EP-026",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P2",
       "size": "S",
       "blocked_by": [
         "US-072"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     }
   ]
 }
