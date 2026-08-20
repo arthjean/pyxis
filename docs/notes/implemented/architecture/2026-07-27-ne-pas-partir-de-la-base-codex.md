@@ -1,23 +1,27 @@
-# Atteindre une parité Codex CLI réelle : audit profond et plan
+# Note: ne pas partir de la base Codex CLI
 
-> **Statut : contexte historique, non normatif.** La cible de parité est
-> `docs/parity/codex-baseline-matrix.json`, générée depuis le clone Codex figé
-> au commit `fa1d4c40d0e63eef2e0ba8a9e004ccd0a80b77f5`
-> (`cargo run -p agent-parity -- check`). Ce document décrit un instantané
-> antérieur : il informe, il n'arbitre plus un écart. L'état réellement livré
-> est dans `docs/CURRENT_STATUS.md`, et la preuve qui l'accompagne dans
-> `docs/parity/offline-suite.md`.
+Statut: implemented
 
-Document de décision, 2026-07-27. Complète
-[`docs/parity/audits/parity-audit-2026-07-27.md`](./parity/audits/parity-audit-2026-07-27.md), qui
-énumère les écarts. Celui-ci répond à une question différente : **par quel chemin**.
+## Problème
 
-Mesures prises sur les dépôts réels : Pyxis à `0c1cf17`, Codex à `95637f7056`, tous deux clonés
-localement. Aucune ligne de code modifiée.
+Pyxis visait la parité avec Codex CLI, et la question ouverte le 2026-07-27 était celle du chemin :
+repartir de la base Codex, mûre et réellement dogfoodée, ou continuer sur une base propre. La
+prémisse du fork tenait, Codex est mûr et Pyxis ne l'était pas, et rien dans le dépôt ne disait
+pourquoi ce chemin n'avait pas été pris. Une option écartée sans trace se repropose.
 
----
+Ce document complète [l'audit du 2026-07-27](../../../parity/audits/parity-audit-2026-07-27.md), qui énumère les
+écarts ; celui-ci répond à une question différente : **par quel chemin**. Mesures prises sur les
+dépôts réels, Pyxis à `0c1cf17` et Codex à `95637f7056`, tous deux clonés localement, sans modifier
+une ligne de code.
 
-## Réponse directe
+La cible de parité n'est plus ce document : elle est `docs/parity/codex-baseline-matrix.json`,
+générée depuis le clone Codex figé au commit `fa1d4c40d0e63eef2e0ba8a9e004ccd0a80b77f5`
+(`cargo run -p agent-parity -- check`). L'état réellement livré est dans
+[`docs/CURRENT_STATUS.md`](../../../CURRENT_STATUS.md), et la preuve qui l'accompagne dans
+[`docs/parity/offline-suite.md`](../../../parity/offline-suite.md). Ce qui survit ici est la
+décision, pas l'instantané de mesures qui l'a portée.
+
+## Décision
 
 **Ne pars pas de la base Codex CLI. La prémisse est juste, la conclusion ne suit pas.**
 
@@ -130,9 +134,18 @@ laquelle Pyxis existe plutôt que d'être un alias de Codex.
 
 ---
 
-## 2. Pourquoi partir de la base Codex ne tient pas
+## Alternatives écartées
 
-Quatre obstacles, du plus décisif au moins.
+**Partir de la base Codex CLI, par fork.** C'est l'option principale, et c'est celle que cette
+section démonte : cinq obstacles, du plus décisif au moins. Elle est écartée.
+
+**Réécrire sans rien prendre de Codex.** Écartée aussi, et par le même audit : trois crates Codex
+sont autonomes, mûrs et adoptables à la granularité du crate, ce que la section suivante détaille.
+Refuser le fork n'oblige pas à refuser le composant.
+
+**Continuer à piloter par le décompte d'écarts de parité.** Écartée : sur 82 écarts, environ 40
+sont hors d'un périmètre défendable, et aucun des cinq points qui décident si l'outil se garde
+après une semaine n'y figure. La source de priorité devient le journal d'usage réel.
 
 ### 2.1 La vélocité amont rend le fork ingérable en solo
 
@@ -377,6 +390,22 @@ périmètre défendable, et il n'a fait remonter aucun des cinq points de la sec
 palier 1, la source de priorité est le journal d'usage.
 
 ---
+
+## Conséquences
+
+Le trait `Provider` générique de Pyxis est conservé plutôt qu'échangé contre une base mono-wire :
+c'est ce qui rend le dépôt survivable si le canal d'abonnement OpenAI se ferme, et cet argument est
+indépendant du chemin choisi. Ce que Pyxis prend de Codex entre crate par crate, sous
+[`NOTICE-CODEX.md`](../../../../NOTICE-CODEX.md) et avec inscription dans
+[`docs/codex-port-inventory.md`](../../../codex-port-inventory.md), jamais par suivi de branche
+amont : le workspace Codex n'est pas publié, donc un vendoring figé est la seule voie honnête.
+
+Le coût assumé est de ne pas hériter du dogfood de Codex. Il se paie en construisant la boucle
+d'usage soi-même, et c'est pour cela que l'installabilité passe avant la parité de comportement.
+La parité, elle, cesse d'être pilotée par ce document : elle l'est par
+[`docs/parity/codex-baseline-matrix.json`](../../../parity/codex-baseline-matrix.json), générée et
+empreintée, dont la commande de vérification est décrite dans
+[`docs/parity/README.md`](../../../parity/README.md).
 
 ## Confiance et limites
 

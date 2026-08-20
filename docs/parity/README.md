@@ -7,10 +7,11 @@ en lecture seule figé au commit
 
 Les audits d'`audits/` ([24](./audits/parity-audit-2026-07-24.md),
 [25](./audits/parity-audit-2026-07-25.md),
-[27](./audits/parity-audit-2026-07-27.md) juillet 2026) et
-[`docs/parity-strategy-2026-07-27.md`](../parity-strategy-2026-07-27.md) restent du
-**contexte historique** : ils décrivent des instantanés antérieurs et n'arbitrent
-plus une divergence.
+[27](./audits/parity-audit-2026-07-27.md) juillet 2026) restent du **contexte
+historique** : ce sont des instantanés antérieurs, ils n'arbitrent plus une
+divergence, et ils sont des mesures, non des décisions. La décision de chemin
+qu'ils ont portée vit dans
+[l'arbre des notes](../notes/implemented/architecture/2026-07-27-ne-pas-partir-de-la-base-codex.md).
 
 ## Commandes
 
