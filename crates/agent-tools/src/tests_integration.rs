@@ -967,6 +967,78 @@ async fn grep_rejects_symlink_base_escape() {
     let _ = std::fs::remove_dir_all(&outside);
 }
 
+// ─────────────────── US-077 / US-078 / US-079 ───────────────────
+
+/// A file of at least `bytes`, made of fixed-width lines plus a last line
+/// carrying `marker`. Sized like a spilled `bash` output, which is the case the
+/// batch exists for. Returns the marker's line number.
+fn oversized_file(ws: &TempWs, rel: &str, bytes: usize, marker: &str) -> usize {
+    let line = format!("{}\n", "x".repeat(1023));
+    let count = bytes / line.len();
+    let mut content = String::with_capacity(bytes + marker.len() + 1);
+    for _ in 0..count {
+        content.push_str(&line);
+    }
+    content.push_str(marker);
+    content.push('\n');
+    ws.write(rel, &content);
+    count + 1
+}
+
+#[tokio::test]
+async fn read_reaches_the_last_line_of_a_ten_mebibyte_file() {
+    // US-077 AC2: the offset addressing the last line of a 10 MiB artifact
+    // returns THAT line, where the old prefix read stopped at 2 MB from byte 0.
+    let ws = TempWs::new("read-10mib");
+    let last = oversized_file(&ws, "spilled.log", 10 * 1024 * 1024, "LAST_LINE_MARKER");
+    let size = std::fs::metadata(ws.path().join("spilled.log"))
+        .expect("the artifact")
+        .len();
+    assert!(size >= 10 * 1024 * 1024, "a real 10 MiB file: {size}");
+
+    let reg = read_registry(&ws);
+    let out = reg
+        .dispatch(vec![call(
+            "a",
+            "read",
+            serde_json::json!({"path": "spilled.log", "offset": last}),
+        )])
+        .await;
+    let o = by_id(&out, "a");
+    assert!(!o.is_error, "{}", o.content);
+    assert!(
+        o.content.contains("LAST_LINE_MARKER"),
+        "the last line must be reachable: {}",
+        o.content
+    );
+    assert!(
+        !o.content.contains("xxxx"),
+        "no earlier line is carried along: {} bytes",
+        o.content.len()
+    );
+}
+
+#[tokio::test]
+async fn read_beyond_the_last_line_names_the_real_line_count() {
+    // US-077 unhappy path: a stale hint gets a line count, not a silent void.
+    let ws = TempWs::new("read-past-end");
+    ws.write("small.txt", "a\nb\nc\n");
+    let reg = read_registry(&ws);
+    let out = reg
+        .dispatch(vec![call(
+            "a",
+            "read",
+            serde_json::json!({"path": "small.txt", "offset": 40}),
+        )])
+        .await;
+    let o = by_id(&out, "a");
+    assert!(!o.is_error, "{}", o.content);
+    assert!(
+        o.content.contains("offset=40 > 3 lines"),
+        "the real line count must be named: {}",
+        o.content
+    );
+}
 // ══════════════════════════ US-012 ══════════════════════════
 
 fn mut_registry(ws: &TempWs, mode: PermissionMode) -> Registry {
