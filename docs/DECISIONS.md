@@ -18,6 +18,7 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/CURRENT_S
 | ADR-10 | Auth abonnement ChatGPT = `ProviderKind::OpenAiChatGpt` (Responses backend ChatGPT, WebSocket borné avec repli SSE) | Accepté (2026-06-15), transport amendé (2026-08-01) |
 | ADR-11 | Scope MVP recentré : abonnement ChatGPT d'abord, Ollama retiré, autres providers différés | Accepté (2026-06-15) |
 | ADR-12 | Runtime de thread `agent-runtime` au-dessus de `run_agent` | Accepté (2026-07-27) |
+| ADR-13 | Sous-agent mutateur en worktree Git : NO-GO v1 | Accepté (2026-07-28) |
 
 ---
 
@@ -205,6 +206,13 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/CURRENT_S
 
 **Justification.** Concentrer ces risques en un seul ADR force la roadmap à attaquer le risqué d'abord (Phase 0 de de-risquage) et donne un point go/no-go explicite (R1) avant d'investir dans l'implémentation complète.
 
+**Alternatives écartées.**
+
+| Option | Pourquoi écartée |
+|---|---|
+| Laisser chaque risque dans le document qui le porte (`docs/ROADMAP.md`, `docs/PROVIDERS.md` §6) | Dispersés, les risques n'ordonnent plus rien : c'est leur concentration en un seul ADR qui force la roadmap à attaquer le risqué d'abord et qui donne un point go/no-go explicite sur R1. |
+| Ouvrir un document de risques ad hoc hors du registre | Écartée par la conséquence méta ci-dessous : tout nouveau risque structurant s'ajoute ici. Un document ad hoc sort du champ de vision et le registre cesse d'être vivant. |
+
 **Conséquences & risques (méta).**
 - **R1 reste structurant** : après ADR-11, le MVP dépend volontairement du canal ChatGPT subscription pour accélérer le dogfood, mais le positionnement model-agnostic reste l'assurance. Si un canal subscription tombe, le plan de sortie est un adapter BYOK isolé, pas une refonte du cœur.
 - Ce registre est **vivant** : tout nouveau risque structurant (ex. évolution de la politique d'un provider, breaking change wire format) s'ajoute ici, pas dans un document ad hoc.
@@ -284,6 +292,14 @@ Règles de retry associées (détail `docs/PROVIDERS.md` §5.1) : `Retryable` �
 - `Auth(AuthError)` paramétré est indispensable pour distinguer le **refresh** (`Expired`) du **blocage produit R1** (`ThirdPartyBlocked`) — ce dernier est le cœur du risque N°1, il ne peut pas être noyé dans un `Auth` opaque.
 - Un nom unique (`ErrorClass`) supprime la divergence `ErrClass`/`ErrorClass` entre ARCHITECTURE et PROVIDERS.
 
+**Alternatives écartées.** Les trois formulations concurrentes du contexte, chacune pesée puis abandonnée.
+
+| Option | Pourquoi écartée |
+|---|---|
+| Les 4 classes de la rédaction initiale (BRIEF + ADR-4), sans `RateLimited` | 429 et 529 ont des politiques de backoff distinctes (`Retry-After` contre backoff agressif) ; les fusionner perd la sémantique. |
+| `Auth` non paramétrée | Le blocage produit R1 (`ThirdPartyBlocked`) serait noyé dans un `Auth` opaque, alors qu'il ne se traite pas comme un `Expired`, qui déclenche un refresh OAuth. |
+| Le nom `ErrClass` de `docs/ARCHITECTURE.md` §3.4 | Un seul nom supprime la divergence entre ARCHITECTURE et PROVIDERS ; celui du document canonique gagne, la taxonomie retenue étant la sienne. |
+
 **Conséquence sur les autres documents.** `docs/ARCHITECTURE.md` §3.4 (renommer `ErrClass` → `ErrorClass`, passer à 5 variantes), `docs/PROVIDERS.md` (déjà canonique, sert de référence) et toute mention dans `docs/ROADMAP.md` doivent référencer cette taxonomie. ADR-4 ci-dessus est aligné.
 
 **Précision withholding (ne pas confondre avec le retry transverse).** Le mécanisme de **withholding** (`Option<PendingError>`) retient **uniquement** une erreur PTL (prompt-too-long) / max-tokens jusqu'à échec confirmé du recovery (tentative de **compaction réactive** avant propagation). Il ne s'applique **pas** aux `Overloaded`/`Retryable`/`RateLimited`, qui relèvent du **backoff transverse** de la couche provider (`docs/PROVIDERS.md` §5.1). Mettre un `PendingError` sur un 529 mélangerait les deux mécanismes : `docs/ARCHITECTURE.md` §3.4 doit ne charger `PendingError` que sur PTL/max-tokens.
@@ -348,6 +364,14 @@ Cela entre en conflit frontal avec le cadrage antérieur (« cible Chat Completi
 4. **L'architecture reste multi-provider** : le trait `Provider` est inchangé, les autres adapters (Anthropic, OpenAI Chat, Gemini…) s'ajoutent ensuite, chacun comme un module d'`agent-provider`, sans toucher le cœur.
 
 **Justification.** Levier dogfood maximal et immédiat (Arthur orchestre des agents toute la journée ; il veut SON modèle, tout de suite). La valeur produit se prouve par l'usage quotidien réel, pas par un tableau de 6 providers vides. Le coût d'opportunité (pas de BYOK Chat Completions au MVP) est assumé : c'est de la séquence, pas de l'abandon.
+
+**Alternatives écartées.**
+
+| Option | Pourquoi écartée |
+|---|---|
+| Livrer le multi-provider de front (Anthropic, OpenAI Chat, Gemini…) avant le dogfood | La valeur produit se prouve par l'usage quotidien réel, pas par un tableau de six providers vides. C'est de la séquence, pas de l'abandon : le trait `Provider` reste l'invariant. |
+| Garder Ollama comme provider non bloqué du MVP | Retiré sur directive explicite (« trop instable, je ne l'implémenterai certainement jamais »). Le fallback tokenizer survit, provider-agnostique ; sa justification n'est simplement plus Ollama. |
+| OpenAI Chat Completions BYOK comme cible MVP | Le dogfooder veut son abonnement, pas une clé au token. Différé au rang de provider futur, le trait provider et l'auth keyring restant satisfaits. |
 
 **Risque accepté (explicite).** Faire d'un canal subscription tiers **révocable** la fondation *du MVP* contredit temporairement **FR-11** et le **risque R1** (OpenAI peut couper le `client_id` Codex comme Anthropic l'a fait sur Pro/Max le 4 avril 2026 — cf. [[research-subscription-auth-pyxis]]). **Mitigation structurelle** : le pari n'est pas architectural mais de *séquencement*. Le trait `Provider` garde la porte ouverte ; le jour où OpenAI coupe, ajouter un adapter BYOK (Chat Completions ou Anthropic) est un module isolé, pas une refonte. La thèse model-agnostic survit comme **assurance**, même si le premier (et seul) adapter livré est l'abonnement.
 
@@ -455,6 +479,14 @@ Cas dégradés, chacun avec sa procédure :
 **Justification.** La mécanique n'est pas le blocage : elle passe intégralement, sans élargir Landlock d'un octet. Le blocage est structurel. Les sous-agents de Pyxis sont des **tâches du même process** que leur parent (ADR-12 : un `ThreadHandle` par enfant, pas un process par enfant), or `landlock::restrict_self` est **process-wide et irréversible**. Un enfant mutateur partagerait donc exactement le périmètre d'écriture de son parent : son isolation ne serait qu'une **convention d'outillage**, pas une garantie du noyau. Le spike le mesure directement, en écrivant depuis l'enfant dans le worktree parent avec succès.
 
 Deuxième raison, subordonnée à la première : créer puis nettoyer un worktree exige d'écrire dans `<dépôt>/.git/worktrees/`, c'est-à-dire précisément ce que `PROTECTED_SUBPATHS` soustrait au niveau des outils. C'est tenable **si le runtime le fait lui-même** et que le modèle ne reçoit jamais cette capacité, mais cela ne vaut d'être construit qu'une fois l'isolation réelle acquise.
+
+**Alternatives écartées.**
+
+| Option | Pourquoi écartée |
+|---|---|
+| Livrer l'enfant mutateur avec l'isolation telle qu'elle est mesurée | `landlock::restrict_self` est process-wide et irréversible, et un enfant est une tâche du même process (ADR-12) : son isolation ne serait qu'une convention d'outillage. Le spike l'écrit noir sur blanc en modifiant le worktree parent depuis l'enfant. |
+| Exposer la capacité worktree au modèle plutôt qu'au runtime | Créer puis nettoyer un worktree écrit dans `<dépôt>/.git/worktrees/`, précisément ce que `PROTECTED_SUBPATHS` soustrait au niveau des outils. Tenable si le runtime le fait lui-même, jamais si le modèle reçoit la capacité. |
+| Un process OS par enfant mutateur, avec son propre `restrict_self` | Non écartée sur le fond : c'est la seule voie qui donne une isolation du noyau, et c'est une autre architecture que celle retenue ici. Elle est consignée ci-dessous comme condition d'un go ultérieur, aucune n'étant engagée. |
 
 **Conditions d'un go ultérieur** (aucune n'est engagée ici) : un **process OS par enfant mutateur**, avec son propre `restrict_self` restreint à son worktree et une frontière d'événements entre parent et enfant. C'est une autre architecture que celle retenue ici, et les non-goals en vigueur (pas d'app-server, pas de merge/commit automatique) restent applicables.
 
