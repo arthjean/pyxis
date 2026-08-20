@@ -1,0 +1,23 @@
+[package]
+name = "agent-doc-gates"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Documentation gates (EP-014). This crate has ONE responsibility: reading the
+# repository's own documentation and reporting what does not conform. It is
+# consumed by its integration tests only, which `cargo test --workspace` already
+# runs, and it must never enter the graph of a shipped binary.
+#
+# The table below stays empty on purpose. `docs/notes/README.md` is parsed by
+# hand, line by line, the way `agent-parity`'s `offline_suite.rs` parses a
+# markdown table: a Markdown crate would buy robustness on pathological input
+# that a repository's own documents never produce, at the price of a dependency
+# this lot forbids. Nothing here may import a Pyxis crate either, so
+# `cargo tree -p agent-doc-gates` shows no other `agent-*` crate.
+[dependencies]

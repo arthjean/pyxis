@@ -127,6 +127,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-doc-gates"
+version = "0.0.0"
+
+[[package]]
 name = "agent-mcp"
 version = "0.0.0"
 dependencies = [
