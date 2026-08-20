@@ -136,12 +136,6 @@ impl CodeModeHandle {
         self.loop_guard.reset();
     }
 
-    fn finish_cell_if_terminal(&self, response: &RuntimeResponse) {
-        if response.state().is_terminal() {
-            self.loop_guard.finish_cell(response.cell_id());
-        }
-    }
-
     fn code_mode_only(&self) -> bool {
         self.code_mode_only.load(Ordering::Acquire)
     }
@@ -258,7 +252,6 @@ impl Tool for ExecTool {
             .execute(request)
             .await
             .map_err(session_error)?;
-        self.handle.finish_cell_if_terminal(&response);
         Ok(render(response))
     }
 }
@@ -348,7 +341,6 @@ impl Tool for WaitTool {
             .wait(request)
             .await
             .map_err(session_error)?;
-        self.handle.finish_cell_if_terminal(&response);
         Ok(render(response))
     }
 }

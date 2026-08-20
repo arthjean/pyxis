@@ -18,7 +18,7 @@ mod common;
 
 use common::{
     MockTurn, drive, freeform_tool_turn, harness, harness_with_summary_usage, has_compacted,
-    text_turn, tool_turn, tool_turn_n, tool_turn_usage,
+    named_tool_turn, text_turn, tool_turn, tool_turn_n, tool_turn_usage,
 };
 
 // US-014 AC1 / US-061: same tool + same args repeated -> the ladder of
@@ -334,5 +334,254 @@ async fn pre_turn_estimate_stops_before_expensive_turn() {
         !h.log.lock().unwrap().contains(&"stream"),
         "provider should not be called: {:?}",
         h.log.lock().unwrap()
+    );
+}
+
+/// The guardrail's own refusals, told apart from any other tool error by the
+/// prefix the three registers share.
+fn loop_guard_reminders(events: &[AgentEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolResult(view) if view.content.starts_with("Loop guard:") => {
+                Some(view.content.as_str())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The exempt poll of a Code Mode cell, as the step must expose it for the call
+/// to reach the pipeline at all.
+fn poll_spec() -> ToolSpec {
+    ToolSpec::function(
+        "wait",
+        "poll a code mode cell",
+        serde_json::json!({
+            "type": "object",
+            "properties": { "cell_id": { "type": "string" } },
+            "required": ["cell_id"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+/// Steering queue scripted by the test: one interjection, delivered at the
+/// `nth` safe point the loop reaches, and nothing at any other.
+struct ScriptedSteering {
+    nth: usize,
+    takes: std::sync::atomic::AtomicUsize,
+}
+
+impl ScriptedSteering {
+    fn at(nth: usize) -> Arc<Self> {
+        Arc::new(Self {
+            nth,
+            takes: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Never delivers anything: the queue the unhappy path drains in vain.
+    fn silent() -> Arc<Self> {
+        Self::at(usize::MAX)
+    }
+
+    fn takes(&self) -> usize {
+        self.takes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl agent_core::input::InputQueue for ScriptedSteering {
+    fn take(&self) -> Vec<Message> {
+        let seen = self.takes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if seen == self.nth {
+            vec![Message::user("attends, redemande le même appel")]
+        } else {
+            Vec::new()
+        }
+    }
+
+    async fn ready(&self) {
+        // The interjection is taken at the safe point, not mid-stream: this
+        // test drives the drain, not the sampling cut.
+        std::future::pending().await
+    }
+}
+
+/// US-063 AC3: two identical batches, a human interjection, two identical
+/// batches. A repetition on either side of an interjection is a user asking
+/// for the call again, so the run breaks and no tier is crossed.
+#[tokio::test]
+async fn a_steering_input_breaks_the_loop_guardrail_run() {
+    let h = harness(
+        vec![
+            tool_turn("c1"),
+            tool_turn("c2"),
+            tool_turn("c3"),
+            tool_turn("c4"),
+            text_turn("done"),
+        ],
+        false,
+        100_000,
+    );
+    // The third safe point, so the interjection lands between the second and
+    // the third identical batch.
+    let steering = ScriptedSteering::at(2);
+    let ctx = AgentContext::new("mock")
+        .with_inputs(Arc::clone(&steering) as Arc<dyn agent_core::input::InputQueue>)
+        .push(Message::user("boucle"));
+    let events = drive(ctx, h.deps).await;
+
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolResult(result) if result.content.starts_with("Loop guard:")
+        )),
+        "the interjection breaks the run before any tier: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolCall(_)))
+            .count(),
+        4,
+        "every batch runs, none is refused: {events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(AgentEvent::EndTurn)),
+        "expected normal end: {events:?}"
+    );
+    assert!(steering.takes() >= 3, "the safe point drained the queue");
+    let requests = h.requests.lock().unwrap();
+    assert!(
+        requests.iter().any(|messages| messages
+            .iter()
+            .any(|message| format!("{message:?}").contains("redemande le même appel"))),
+        "the interjection actually entered the transcript"
+    );
+}
+
+/// US-063 AC4 unhappy path: the same turn, with a queue that stays empty at
+/// every pass, crosses the tiers exactly as before. A `take()` returning zero
+/// message resets nothing, otherwise steering would disable the guardrail.
+#[tokio::test]
+async fn an_empty_steering_queue_resets_nothing() {
+    let h = harness(
+        vec![
+            tool_turn("c1"),
+            tool_turn("c2"),
+            tool_turn("c3"),
+            tool_turn("c4"),
+            text_turn("done"),
+        ],
+        false,
+        100_000,
+    );
+    let steering = ScriptedSteering::silent();
+    let ctx = AgentContext::new("mock")
+        .with_inputs(Arc::clone(&steering) as Arc<dyn agent_core::input::InputQueue>)
+        .push(Message::user("boucle"));
+    let events = drive(ctx, h.deps).await;
+
+    let reminders = loop_guard_reminders(&events);
+    assert_eq!(
+        reminders.len(),
+        2,
+        "the third and fourth occurrences still reach the first tier: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolCall(_)))
+            .count(),
+        2,
+        "only the two batches below the first tier ran: {events:?}"
+    );
+    assert!(steering.takes() >= 5, "the queue was drained at every pass");
+}
+
+/// US-065 AC4: `bash`, `wait`, `bash`, `wait`, `bash`. The exempt poll is
+/// TRANSPARENT, so the three `bash` occurrences are counted and the first tier
+/// is reached on the third: a `wait` between two identical calls is part of the
+/// loop, not a break in it.
+#[tokio::test]
+async fn an_exempt_call_between_two_identical_calls_does_not_break_the_run() {
+    let h = harness(
+        vec![
+            tool_turn("c1"),
+            named_tool_turn("w1", "wait", "{\"cell_id\":\"cell-1\"}"),
+            tool_turn("c2"),
+            named_tool_turn("w2", "wait", "{\"cell_id\":\"cell-1\"}"),
+            tool_turn("c3"),
+            text_turn("done"),
+        ],
+        false,
+        100_000,
+    );
+    let mut ctx = AgentContext::new("mock").push(Message::user("boucle en polling"));
+    ctx.tools.push(poll_spec());
+    let events = drive(ctx, h.deps).await;
+
+    let reminders = loop_guard_reminders(&events);
+    assert_eq!(
+        reminders.len(),
+        1,
+        "one tier, reached by the third `bash`: {events:?}"
+    );
+    assert!(
+        reminders[0].starts_with("Loop guard:"),
+        "{:?}",
+        reminders[0]
+    );
+    // Four calls ran: two `bash` under the tier and the two polls between them.
+    // The third `bash` is the only one refused, which is where the count of
+    // three lands.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolCall(_)))
+            .count(),
+        4,
+        "the polls ran, the third `bash` did not: {events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(AgentEvent::EndTurn)),
+        "expected normal end: {events:?}"
+    );
+}
+
+/// US-065 AC6 unhappy path: a run of pure `wait` calls crosses no tier and
+/// leaves the count unchanged, which the three `bash` calls that follow prove
+/// by reaching the first tier exactly on the third, not sooner.
+#[tokio::test]
+async fn a_run_of_exempt_calls_crosses_no_tier_and_leaves_the_count_unchanged() {
+    let mut turns: Vec<MockTurn> = (0..5)
+        .map(|i| named_tool_turn(&format!("w{i}"), "wait", "{\"cell_id\":\"cell-1\"}"))
+        .collect();
+    turns.extend([tool_turn("c1"), tool_turn("c2"), tool_turn("c3")]);
+    turns.push(text_turn("done"));
+    let h = harness(turns, false, 100_000);
+    let mut ctx = AgentContext::new("mock").push(Message::user("poll puis boucle"));
+    ctx.tools.push(poll_spec());
+    let events = drive(ctx, h.deps).await;
+
+    let reminders = loop_guard_reminders(&events);
+    assert_eq!(
+        reminders.len(),
+        1,
+        "no tier during the polls, one on the third `bash`: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ToolCall(_)))
+            .count(),
+        7,
+        "five polls and two `bash` ran: {events:?}"
+    );
+    assert!(
+        matches!(events.last(), Some(AgentEvent::EndTurn)),
+        "expected normal end: {events:?}"
     );
 }

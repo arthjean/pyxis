@@ -7,7 +7,7 @@ use agent_code_mode::nested::{NestedToolCall, NestedToolOutcome};
 use agent_code_mode::protocol::{CellFailure, CellFailureKind, SessionId, ShutdownReport};
 use agent_code_mode::session::{CellEngine, CellSink};
 use agent_core::provider::ToolSpec;
-use agent_core::tools::ToolInvocation;
+use agent_core::tools::{ToolDispatch, ToolInvocation};
 
 use super::*;
 use crate::registry::Registry;
@@ -302,5 +302,120 @@ fn code_mode_declares_which_calls_repeat_by_design() {
     assert!(
         !wait.loop_guard_exempt(&serde_json::json!({ "cell_id": "cell-1", "terminate": true })),
         "terminating a cell happens once"
+    );
+}
+
+/// Builds the nested view of `registry`, the way a cell reaches its own step's
+/// pipeline: same `NestedLoopGuard` on both sides, because that sharing is
+/// exactly what US-064 wires.
+fn nested_view(
+    registry: &Registry,
+    loop_guard: NestedLoopGuard,
+) -> Arc<agent_code_mode::nested::PlanDispatcher> {
+    Arc::new(agent_code_mode::nested::PlanDispatcher::new(
+        &registry.step_snapshot(),
+        &[EXEC_TOOL_NAME, WAIT_TOOL_NAME],
+        loop_guard,
+        agent_core::tools::ToolEventSink::forwarding(|_| {}),
+        tokio::runtime::Handle::current(),
+    ))
+}
+
+/// One identical guarded nested effect, repeated: `current_time` takes no
+/// argument, so every occurrence carries the very same signature.
+fn nested_clock_call(ordinal: u64) -> NestedToolCall {
+    NestedToolCall {
+        cell_id: CellId::new(&SessionId::new("thread-a"), ordinal),
+        call_id: format!("nested-{ordinal}"),
+        tool: "current_time".to_string(),
+        input: agent_code_mode::nested::NestedToolInput::Json(serde_json::json!({})),
+    }
+}
+
+/// `PlanDispatcher::dispatch` blocks like a cell thread does, so it is driven
+/// from a plain OS thread rather than from a Tokio worker.
+fn dispatch_off_runtime(
+    dispatcher: Arc<agent_code_mode::nested::PlanDispatcher>,
+    calls: Vec<NestedToolCall>,
+) -> Vec<NestedToolOutcome> {
+    std::thread::spawn(move || {
+        calls
+            .into_iter()
+            .map(|call| dispatcher.dispatch(call))
+            .collect()
+    })
+    .join()
+    .expect("the dispatch thread must not panic")
+}
+
+/// US-064. The interjection accepted at the outer safe point reaches the nested
+/// run through the Registry, because the binary hands both the SAME handle.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_steering_input_breaks_the_nested_run_through_the_registry() {
+    let (handle, _engine) = handle().await;
+    let registry = Registry::builder(std::env::temp_dir())
+        .register(ExecTool::new(Arc::clone(&handle)))
+        .register(WaitTool::new(Arc::clone(&handle)))
+        .register(crate::CurrentTime)
+        .nested_loop_guard(handle.loop_guard())
+        .build();
+    let nested = nested_view(&registry, handle.loop_guard());
+
+    let before = dispatch_off_runtime(
+        Arc::clone(&nested),
+        vec![nested_clock_call(0), nested_clock_call(1)],
+    );
+    assert!(
+        before.iter().all(|outcome| !outcome.is_error),
+        "the first two occurrences are under the first tier: {before:?}"
+    );
+
+    // The outer loop's safe point, reached through the trait method
+    // `run_agent` calls on its dispatcher.
+    registry.steering_input_accepted();
+
+    let after = dispatch_off_runtime(
+        Arc::clone(&nested),
+        vec![nested_clock_call(2), nested_clock_call(3)],
+    );
+    assert!(
+        after.iter().all(|outcome| !outcome.is_error),
+        "the run restarted at the interjection, so these are occurrences 1 and 2: {after:?}"
+    );
+
+    let third = dispatch_off_runtime(nested, vec![nested_clock_call(4)]);
+    assert_eq!(
+        third[0].error_kind,
+        Some("semantic"),
+        "the ladder still exists after the reset: {third:?}"
+    );
+}
+
+/// US-064 unhappy path. A dispatcher that does not forward the interjection
+/// keeps its count: not resetting is the strict answer, so the no-op default
+/// never makes a guardrail silently more permissive.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registry_without_a_nested_guard_keeps_the_nested_count() {
+    let (handle, _engine) = handle().await;
+    let registry = Registry::builder(std::env::temp_dir())
+        .register(ExecTool::new(Arc::clone(&handle)))
+        .register(WaitTool::new(Arc::clone(&handle)))
+        .register(crate::CurrentTime)
+        .build();
+    let nested = nested_view(&registry, handle.loop_guard());
+
+    let before = dispatch_off_runtime(
+        Arc::clone(&nested),
+        vec![nested_clock_call(0), nested_clock_call(1)],
+    );
+    assert!(before.iter().all(|outcome| !outcome.is_error));
+
+    registry.steering_input_accepted();
+
+    let third = dispatch_off_runtime(nested, vec![nested_clock_call(2)]);
+    assert_eq!(
+        third[0].error_kind,
+        Some("semantic"),
+        "no guard was wired, so nothing was reset: {third:?}"
     );
 }

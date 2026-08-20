@@ -407,7 +407,6 @@ async fn repeated_nested_effects_are_guarded_across_outer_cells() {
                 NestedToolInput::Json(serde_json::json!({"value": "same"})),
             )],
         ));
-        loop_guard.finish_cell(&CellId::new(&SessionId::new("thread-a"), ordinal));
     }
 
     assert!(!outcomes[0].is_error);
@@ -466,9 +465,7 @@ async fn the_nested_ladder_escalates_then_locks_the_dispatch_for_the_turn() {
     );
     assert_eq!(tools.seen().len(), 2, "only the first two ever executed");
 
-    // Unhappy path: the lock is not scoped to the tool that looped, and a cell
-    // ending does not shed it.
-    loop_guard.finish_cell(&CellId::new(&SessionId::new("thread-a"), 0));
+    // Unhappy path: the lock is not scoped to the tool that looped.
     let after_lock = dispatch_off_runtime(
         dispatcher_with_guard(Arc::clone(&tools), specs.clone(), loop_guard.clone()),
         vec![call(
@@ -495,92 +492,108 @@ async fn the_nested_ladder_escalates_then_locks_the_dispatch_for_the_turn() {
     assert_eq!(tools.seen().len(), 3);
 }
 
+/// US-065. A cell that produces no guarded effect used to break the run when it
+/// ended; it no longer does. Inside a turn only a human interjection breaks it,
+/// which is `reset`, so the run survives every cell boundary until then.
 #[tokio::test]
-async fn pure_cells_and_turn_boundaries_break_nested_effect_repetition() {
+async fn only_a_reset_breaks_nested_effect_repetition_across_cells() {
     let tools = Arc::new(RecordingTools::default());
     let loop_guard = NestedLoopGuard::default();
+    let same = |ordinal: u64| {
+        call_in_cell(
+            ordinal,
+            "write",
+            NestedToolInput::Json(serde_json::json!({"value": "same"})),
+        )
+    };
+    let dispatcher = |guard: NestedLoopGuard| {
+        dispatcher_with_guard(Arc::clone(&tools), vec![function_spec("write")], guard)
+    };
 
     for ordinal in 0..2 {
-        let dispatcher = dispatcher_with_guard(
-            Arc::clone(&tools),
-            vec![function_spec("write")],
-            loop_guard.clone(),
-        );
-        let outcome = dispatch_off_runtime(
-            dispatcher,
-            vec![call_in_cell(
-                ordinal,
-                "write",
-                NestedToolInput::Json(serde_json::json!({"value": "same"})),
-            )],
-        );
-        assert!(!outcome[0].is_error);
-        loop_guard.finish_cell(&CellId::new(&SessionId::new("thread-a"), ordinal));
+        let outcome = dispatch_off_runtime(dispatcher(loop_guard.clone()), vec![same(ordinal)]);
+        assert!(!outcome[0].is_error, "below the first tier the effect runs");
     }
 
-    let pure_cell = CellId::new(&SessionId::new("thread-a"), 2);
-    loop_guard.finish_cell(&pure_cell);
-    let after_pure = dispatcher_with_guard(
-        Arc::clone(&tools),
-        vec![function_spec("write")],
-        loop_guard.clone(),
+    // A cell in between produced nothing guarded. That is not a break: the run
+    // is three long and the first tier is reached.
+    let outcome = dispatch_off_runtime(dispatcher(loop_guard.clone()), vec![same(3)]);
+    assert_eq!(
+        outcome[0].error_kind,
+        Some("semantic"),
+        "a cell boundary is not a break in the run: {}",
+        outcome[0].content
     );
-    let outcome = dispatch_off_runtime(
-        after_pure,
-        vec![call_in_cell(
-            3,
-            "write",
-            NestedToolInput::Json(serde_json::json!({"value": "same"})),
-        )],
-    );
-    assert!(!outcome[0].is_error, "a pure cell resets the run");
+    assert_eq!(tools.seen().len(), 2, "the third effect never executes");
 
+    // US-063 / US-064: the steering input is what breaks it.
     loop_guard.reset();
-    let next_turn = dispatcher_with_guard(
-        Arc::clone(&tools),
-        vec![function_spec("write")],
-        loop_guard.clone(),
-    );
-    let outcome = dispatch_off_runtime(
-        next_turn,
-        vec![call_in_cell(
-            4,
-            "write",
-            NestedToolInput::Json(serde_json::json!({"value": "same"})),
-        )],
-    );
-    assert!(!outcome[0].is_error, "a new turn starts a fresh guard");
+    let outcome = dispatch_off_runtime(dispatcher(loop_guard.clone()), vec![same(4)]);
+    assert!(!outcome[0].is_error, "an interjection starts a fresh run");
+    assert_eq!(tools.seen().len(), 3);
 }
 
+/// US-065. An exempt call is TRANSPARENT: it neither counts nor breaks the run.
+/// The old rule reset on it, which let `read(x)`, `wait`, `read(x)`, `wait`
+/// launder a loop forever, and a poll is exactly what a model stuck on an
+/// execution session interleaves.
 #[tokio::test]
-async fn nested_terminal_polls_reset_the_effect_loop_guard() {
+async fn nested_terminal_polls_are_transparent_to_the_effect_loop_guard() {
     let tools = Arc::new(RecordingTools {
         repeatable: HashSet::from(["write_stdin".to_string()]),
         ..RecordingTools::default()
     });
     let loop_guard = NestedLoopGuard::default();
+    let specs = vec![function_spec("write_stdin"), function_spec("read")];
+    let poll = || {
+        call(
+            "write_stdin",
+            NestedToolInput::Json(serde_json::json!({
+                "session_id": 7,
+                "chars": "",
+                "terminate": false
+            })),
+        )
+    };
+    let guarded = || {
+        call(
+            "read",
+            NestedToolInput::Json(serde_json::json!({"path": "x"})),
+        )
+    };
 
-    for _ in 0..4 {
-        let dispatcher = dispatcher_with_guard(
-            Arc::clone(&tools),
-            vec![function_spec("write_stdin")],
-            loop_guard.clone(),
-        );
-        let outcome = dispatch_off_runtime(
-            dispatcher,
-            vec![call(
-                "write_stdin",
-                NestedToolInput::Json(serde_json::json!({
-                    "session_id": 7,
-                    "chars": "",
-                    "terminate": false
-                })),
-            )],
-        );
-        assert!(!outcome[0].is_error, "polls must stay repeatable");
-    }
+    // Unhappy path first: polls alone cross no tier and leave the count where
+    // it was, which is what protects a legitimate terminal poll.
+    let polls = dispatch_off_runtime(
+        dispatcher_with_guard(Arc::clone(&tools), specs.clone(), loop_guard.clone()),
+        (0..8).map(|_| poll()).collect::<Vec<_>>(),
+    );
+    assert!(
+        polls.iter().all(|outcome| !outcome.is_error),
+        "a pure poll run must stay repeatable: {polls:?}"
+    );
+    assert_eq!(tools.seen().len(), 8);
 
-    assert_eq!(tools.seen().len(), 4);
+    // Interleaved, the three `read` still form a run of three.
+    let mixed = dispatch_off_runtime(
+        dispatcher_with_guard(Arc::clone(&tools), specs, loop_guard.clone()),
+        vec![guarded(), poll(), guarded(), poll(), guarded()],
+    );
+    assert!(!mixed[0].is_error);
+    assert!(!mixed[1].is_error, "the poll itself is never refused");
+    assert!(!mixed[2].is_error);
+    assert!(!mixed[3].is_error);
+    assert_eq!(
+        mixed[4].error_kind,
+        Some("semantic"),
+        "three guarded calls reach the first tier whatever is interleaved: {}",
+        mixed[4].content
+    );
+    assert_eq!(
+        tools.seen().len(),
+        12,
+        "8 polls + 2 reads + 2 polls: the refused read never executes"
+    );
 }
 
 /// Retention exists to bridge `exec` and a later `wait`, not to buffer a whole

@@ -1806,7 +1806,10 @@ async fn run(
     if let Some(handle) = &code_mode {
         builder = builder
             .register(agent_tools::ExecTool::new(Arc::clone(handle)))
-            .register(agent_tools::WaitTool::new(Arc::clone(handle)));
+            .register(agent_tools::WaitTool::new(Arc::clone(handle)))
+            // US-064: the run the nested dispatch counts on, so a steering
+            // input breaks it at the same safe point it breaks the outer one.
+            .nested_loop_guard(handle.loop_guard());
     }
     // US-011 AC1: the six baseline v2 tools, pointing at a real supervisor and a
     // real spawner. Which models actually SEE them is decided per step from the

@@ -155,9 +155,11 @@ impl LoopGuard {
         self.count
     }
 
-    /// Breaks the consecutive run when a batch is intentionally outside loop
-    /// detection. Without this, two guarded calls separated by a legitimate
-    /// poll would still be counted as consecutive.
+    /// Breaks the consecutive run. Two callers, and only two: a steering input
+    /// entering the transcript, and a fresh turn building a new guard. A batch
+    /// the dispatcher declares exempt used to reset here and no longer does
+    /// (US-065): it is transparent, because a `wait` between two identical
+    /// calls is part of the loop, not a break in it.
     pub fn reset(&mut self) {
         self.last_sig = None;
         self.count = 0;
@@ -197,7 +199,8 @@ impl LoopGuard {
 /// protocol for making progress, not a symptom of a loop. The core asks rather
 /// than guesses, because a name and a JSON value cannot tell an orchestration
 /// cell from a tool that merely shares its name. `None` when nothing guardable
-/// remains, which is what makes a batch of pure control calls reset the run.
+/// remains: the call sites then proceed WITHOUT touching the run, so an exempt
+/// batch is transparent rather than a reset (US-065).
 pub fn guarded_batch_signature(
     calls: &[ToolInvocation],
     dispatch: &dyn ToolDispatch,
@@ -492,8 +495,10 @@ mod tests {
         );
     }
 
+    /// US-063. The only thing that still breaks a run inside a turn is a human
+    /// interjection, and this is the mechanism it uses.
     #[test]
-    fn an_ignored_batch_breaks_a_repetition_run() {
+    fn a_reset_breaks_a_repetition_run() {
         let mut guard = LoopGuard::new(LOOP_GUARD_THRESHOLDS);
         assert_eq!(guard.observe("same".into()), LoopDecision::Proceed);
         assert_eq!(guard.observe("same".into()), LoopDecision::Proceed);

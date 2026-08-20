@@ -95,8 +95,10 @@ enum NestedLoopVerdict {
 }
 
 /// Loop state shared by the successive step dispatchers of one agent turn.
-/// Polling controls and terminal pure cells reset it; identical nested effects
-/// escalate over the same ladder as direct tool calls.
+/// Identical nested effects escalate over the same ladder as direct tool calls.
+/// Only a new turn and a human interjection break the run: a call the
+/// dispatcher declares exempt is TRANSPARENT (US-065), so a cell alternating a
+/// repeated effect with a poll cannot launder it.
 #[derive(Clone)]
 pub struct NestedLoopGuard {
     inner: Arc<Mutex<NestedLoopState>>,
@@ -104,7 +106,6 @@ pub struct NestedLoopGuard {
 
 struct NestedLoopState {
     guard: LoopGuard,
-    effect_cells: HashSet<CellId>,
     /// Terminal message, once the last tier was crossed. `Some` locks the whole
     /// nested dispatch for the rest of the turn: a cell is JavaScript, it can
     /// catch the error the way the outer model cannot ignore `Exhausted`, and
@@ -117,7 +118,6 @@ impl Default for NestedLoopGuard {
         Self {
             inner: Arc::new(Mutex::new(NestedLoopState {
                 guard: LoopGuard::new(LOOP_GUARD_THRESHOLDS),
-                effect_cells: HashSet::new(),
                 locked: None,
             })),
         }
@@ -127,7 +127,6 @@ impl Default for NestedLoopGuard {
 impl NestedLoopGuard {
     fn observe(
         &self,
-        cell_id: &CellId,
         invocation: &ToolInvocation,
         dispatch: &dyn ToolDispatch,
     ) -> NestedLoopVerdict {
@@ -139,14 +138,11 @@ impl NestedLoopGuard {
             return NestedLoopVerdict::Locked(message.clone());
         }
         let decision = match guarded_batch_signature(std::slice::from_ref(invocation), dispatch) {
-            Some(signature) => {
-                state.effect_cells.insert(cell_id.clone());
-                state.guard.observe(signature)
-            }
-            None => {
-                state.guard.reset();
-                LoopDecision::Proceed
-            }
+            Some(signature) => state.guard.observe(signature),
+            // Transparent, NOT a reset (US-065): an exempt call neither counts
+            // nor breaks the run, otherwise a `wait` between two identical
+            // effects would launder the loop it is part of.
+            None => LoopDecision::Proceed,
         };
         let count = state.guard.count();
         match decision {
@@ -165,19 +161,13 @@ impl NestedLoopGuard {
         }
     }
 
-    /// End of a cell. Does NOT lift the lock: the lock belongs to the turn, and
-    /// a cell that ends is exactly what a looping model would use to shed it.
-    pub fn finish_cell(&self, cell_id: &CellId) {
-        let mut state = lock(&self.inner);
-        if !state.effect_cells.remove(cell_id) {
-            state.guard.reset();
-        }
-    }
-
+    /// Breaks the run and lifts the lock. Two callers, and only two: a new
+    /// turn, and a steering input entering the transcript (US-063). The end of
+    /// a cell is NOT one of them, because a cell that ends is exactly what a
+    /// looping model would use to shed the lock.
     pub fn reset(&self) {
         let mut state = lock(&self.inner);
         state.guard.reset();
-        state.effect_cells.clear();
         state.locked = None;
     }
 }
@@ -338,10 +328,7 @@ impl NestedToolDispatcher for PlanDispatcher {
         };
         let invocation_id = invocation.id.clone();
         let dispatch = self.plan.dispatcher();
-        match self
-            .loop_guard
-            .observe(&call.cell_id, &invocation, dispatch.as_ref())
-        {
+        match self.loop_guard.observe(&invocation, dispatch.as_ref()) {
             NestedLoopVerdict::Proceed => {}
             NestedLoopVerdict::Reminder(register, count) => {
                 return NestedToolOutcome::error(

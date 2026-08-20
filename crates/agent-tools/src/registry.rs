@@ -35,6 +35,7 @@ use crate::permission::{
 use crate::sandbox::{SandboxDenial, SandboxEscalator};
 use crate::taint::TaintTracker;
 use crate::tool::{DynTool, ToolCtx, into_dyn};
+use agent_code_mode::nested::NestedLoopGuard;
 
 /// Tool description capped at exposure time (a tool does not pollute the prompt).
 const MAX_DESCRIPTION: usize = 2048;
@@ -81,6 +82,11 @@ pub struct Registry {
     /// Bounded record of what was attempted this session. Written on every
     /// outcome, refusals included; carries no call content.
     log: crate::dispatch_log::DispatchLog,
+    /// Loop-guard run of the Code Mode nested dispatch, when this session has
+    /// one. Held so a human interjection breaks the nested run at the same
+    /// safe point it breaks the outer one (US-064): the core signals the
+    /// dispatcher, and only the dispatcher knows a second guard exists.
+    nested_loop_guard: Option<NestedLoopGuard>,
     ctx: ToolCtx,
 }
 
@@ -104,6 +110,7 @@ impl Registry {
             deferred: crate::tool_search::DeferredTools::new(),
             namespace_tools: false,
             log: crate::dispatch_log::DispatchLog::new(),
+            nested_loop_guard: None,
             ctx: ToolCtx::new(workspace),
         }
     }
@@ -371,6 +378,7 @@ impl Registry {
             deferred: self.deferred.clone(),
             namespace_tools: self.namespace_tools,
             log: self.log.clone(),
+            nested_loop_guard: self.nested_loop_guard.clone(),
             ctx: self.ctx.clone(),
         };
         ToolDispatchSnapshot::new(generation, specs, Arc::new(frozen))
@@ -949,6 +957,15 @@ impl ToolDispatch for Registry {
             .is_some_and(|tool| tool.loop_guard_exempt(&call.input))
     }
 
+    /// Forwards the interjection to the nested run (US-064). Without a Code
+    /// Mode session there is no second guard, and the no-op default is what
+    /// applies.
+    fn steering_input_accepted(&self) {
+        if let Some(guard) = &self.nested_loop_guard {
+            guard.reset();
+        }
+    }
+
     async fn dispatch(
         &self,
         calls: Vec<ToolInvocation>,
@@ -1173,6 +1190,7 @@ pub struct RegistryBuilder {
     deferred: crate::tool_search::DeferredTools,
     namespace_tools: bool,
     log: crate::dispatch_log::DispatchLog,
+    nested_loop_guard: Option<NestedLoopGuard>,
     ctx: ToolCtx,
 }
 
@@ -1197,6 +1215,13 @@ impl RegistryBuilder {
     }
     pub fn taint_window(mut self, window: u64) -> Self {
         self.taint_window = window;
+        self
+    }
+    /// Loop-guard run of the Code Mode session, set by whoever registers `exec`
+    /// and `wait`: the same handle, so a steering input breaks one run and not
+    /// a copy of it. Absent when the session has no Code Mode runtime.
+    pub fn nested_loop_guard(mut self, guard: NestedLoopGuard) -> Self {
+        self.nested_loop_guard = Some(guard);
         self
     }
     pub fn initial_taint_recent(mut self, recent: bool) -> Self {
@@ -1321,6 +1346,7 @@ impl RegistryBuilder {
             deferred: self.deferred,
             namespace_tools: self.namespace_tools,
             log: self.log,
+            nested_loop_guard: self.nested_loop_guard,
             ctx: self.ctx,
         };
         registry.seed_taint(self.initial_taint_recent);

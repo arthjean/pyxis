@@ -920,9 +920,20 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     // sampling nor between a `tool_use` and its result. Taking is
                     // what removes it from the queue, so it enters exactly once
                     // and in acceptance order.
+                    // US-063: it is also where the loop guardrail run breaks, on
+                    // BOTH sites, because a repetition on either side of a human
+                    // interjection is a user asking for the call again, not a
+                    // model spinning. Only an input that actually entered counts:
+                    // an empty drain resets nothing.
                     if let Some(queue) = &inputs {
-                        for input in queue.take() {
+                        let steered = queue.take();
+                        let interjected = !steered.is_empty();
+                        for input in steered {
                             messages.push(input);
+                        }
+                        if interjected {
+                            loop_guard.reset();
+                            turn.tool_plan.dispatcher().steering_input_accepted();
                         }
                     }
 
@@ -1461,10 +1472,10 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         active_tool_plan.dispatcher().as_ref(),
                     ) {
                         Some(signature) => loop_guard.observe(signature),
-                        None => {
-                            loop_guard.reset();
-                            LoopDecision::Proceed
-                        }
+                        // Transparent, NOT a reset (US-065): a wholly exempt
+                        // batch neither counts nor breaks the run, so an
+                        // interleaved poll cannot launder the loop around it.
+                        None => LoopDecision::Proceed,
                     };
                     match loop_decision {
                         LoopDecision::Abort => {

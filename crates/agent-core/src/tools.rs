@@ -752,6 +752,16 @@ pub trait ToolDispatch: Send + Sync {
         false
     }
 
+    /// A steering input entered the transcript at the loop's safe point
+    /// (US-007). Dispatchers holding a loop-guard run of their own break it
+    /// here, so the invariant "a human interjection is not a loop" holds on
+    /// every counting site and not only on the outer one.
+    ///
+    /// Default no-op: the conservative choice. Not resetting is STRICTER than
+    /// resetting, so a dispatcher that says nothing keeps its count instead of
+    /// silently becoming more permissive.
+    fn steering_input_accepted(&self) {}
+
     /// Runs a batch of calls and returns their results (order not guaranteed;
     /// each result is correlated by `id`).
     async fn dispatch(

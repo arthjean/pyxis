@@ -289,9 +289,10 @@ pub struct EchoTools;
 #[async_trait::async_trait]
 impl ToolDispatch for EchoTools {
     /// Stands in for the real registry, which asks the tool itself: an `exec`
-    /// cell is orchestration and is MEANT to be submitted again unchanged.
+    /// cell and the `wait` that polls it are orchestration and are MEANT to be
+    /// submitted again unchanged.
     fn loop_guard_exempt(&self, call: &ToolInvocation) -> bool {
-        call.name == "exec"
+        call.name == "exec" || call.name == "wait"
     }
 
     async fn dispatch(
