@@ -639,4 +639,124 @@ mod tests {
         })
         .expect("the summary serializes")
     }
+
+    /// US-075 AC3: a spilled result serialized to JSONL carries the locator
+    /// exactly as the store produced it, workspace-relative, and the line holds
+    /// no absolute path. Built from the real policy rather than a hand-written
+    /// struct: the string under test is the one a run would actually emit.
+    #[test]
+    fn a_spilled_result_serializes_a_relative_locator_and_no_absolute_path() {
+        let workspace = std::env::temp_dir().join(format!(
+            "pyxis-jsonl-spill-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(&workspace).unwrap();
+        let store = agent_tools::spill::SpillStore::create(&workspace, "thread-jsonl")
+            .expect("a spill root");
+
+        let content = "une ligne de sortie\n".repeat(60_000);
+        let spilled =
+            agent_tools::spill_policy::replace_with_spill(&store, "grep", "call_1", &content)
+                .expect("an oversized output is replaced");
+
+        let value = line_of(&AgentEvent::ToolResult(ToolResultView {
+            id: "call_1".to_string(),
+            content: spilled.content,
+            status: None,
+            structured_content: None,
+            is_error: false,
+            error_kind: None,
+            untrusted: true,
+            duration_ms: None,
+            truncation: Some(spilled.truncation),
+            execution: None,
+        }));
+
+        let hint = value["data"]["truncation"]["continuation_hint"]
+            .as_str()
+            .expect("the locator rides `truncation`");
+        assert!(
+            hint.starts_with(".pyxis/spill/"),
+            "le localisateur doit rester relatif au workspace: {hint}"
+        );
+
+        let line = serde_json::to_string(&value).unwrap();
+        for absolute in [
+            workspace.to_str().expect("a utf8 temp path"),
+            store.root().to_str().expect("a utf8 root"),
+        ] {
+            assert!(
+                !line.contains(absolute),
+                "aucun chemin absolu ne doit fuir dans la ligne: {absolute}"
+            );
+        }
+        // The notice the model reads quotes the very same relative locator.
+        assert!(
+            value["data"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(hint),
+            "la note doit citer le localisateur sérialisé"
+        );
+        assert_eq!(
+            value["data"]["truncation"]["original_bytes"]
+                .as_u64()
+                .unwrap_or_default(),
+            content.len() as u64
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// US-075 AC4: the clients carry the locator, they never parse it. A split,
+    /// a join or a re-rooting in the TUI or in the app-server would tie the two
+    /// crates to the storage layout that EP-022 owns, so the scan denies any
+    /// mention of the field outside the core that produces it.
+    #[test]
+    fn no_client_crate_takes_the_continuation_hint_apart() {
+        fn rust_sources(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    rust_sources(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && let Ok(source) = std::fs::read_to_string(&path)
+                {
+                    out.push((path, source));
+                }
+            }
+        }
+
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let roots = [
+            manifest.join("..").join("agent-tui").join("src"),
+            manifest.join("..").join("agent-app-server").join("src"),
+        ];
+        let mut sources = Vec::new();
+        for root in &roots {
+            assert!(root.is_dir(), "source root introuvable: {}", root.display());
+            rust_sources(root, &mut sources);
+        }
+        assert!(
+            sources.len() >= 10,
+            "seulement {} fichiers scannés: le scan n'atteint pas les sources",
+            sources.len()
+        );
+
+        let offenders: Vec<String> = sources
+            .iter()
+            .filter(|(_, source)| source.contains("continuation_hint"))
+            .map(|(path, _)| path.display().to_string())
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "un client ne doit ni découper ni reconstruire le localisateur:\n{}",
+            offenders.join("\n")
+        );
+    }
 }

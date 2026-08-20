@@ -64,7 +64,7 @@ contrat que consomme aussi la TUI.
 | `credential_refresh` | `{turn_id?, step, attempt_ordinal, outcome}` | Cycle de récupération OAuth borné. `outcome` vaut `started`, `succeeded`, `rejected` ou `cancelled`. |
 | `tool_call` | `{id, name, input}` | Un outil va s'exécuter. `input` est le JSON d'arguments réassemblé. |
 | `tool_output_delta` | `{id, chunk}` | Fragment de sortie d'un outil encore en cours. Informatif : le transcript ne retient que `tool_result`. |
-| `tool_result` | `{id, content, is_error, error_kind?, untrusted}` | Résultat d'outil. `untrusted` vaut `true` pour tout contenu externe. |
+| `tool_result` | `{id, content, is_error, error_kind?, untrusted, truncation?}` | Résultat d'outil. `untrusted` vaut `true` pour tout contenu externe. `truncation` n'apparaît que si le contenu servi au modèle n'est pas la sortie entière. Voir plus bas. |
 | `compacted` | `"micro"` \| `"auto"` \| `"reactive"` | Une compaction de contexte a eu lieu. |
 | `model_turn` | `{index, input_tokens, output_tokens, context_tokens?, context_window?, estimated_context_tokens?}` | Un aller-retour modèle vient de finir. `index` est 1-based ; `input_tokens` et `output_tokens` sont **cumulés depuis le début du run**, réels quand le provider rapporte son usage, estimés localement sinon. Voir plus bas. |
 | `quota` | `{primary?, secondary?}` | État de quota d'abonnement rapporté par le backend. Émis seulement quand le backend en sert un. Voir plus bas. |
@@ -80,6 +80,41 @@ contrat que consomme aussi la TUI.
 avec `run_summary.data.end = "error"` et un `exit_code` non nul. `operation`
 nomme la frontière (`create`, `append`, `commit_recovery`, `flush`, `read`,
 `fork` ou `close`) sans inclure le contenu du prompt.
+
+### `tool_result` et `truncation`
+
+```json
+{"schema":1,"type":"tool_result","data":{"id":"call_1","content":"…","is_error":false,"untrusted":true,"truncation":{"original_bytes":10485760,"kept_bytes":29873,"strategy":"head","continuation_hint":".pyxis/spill/0123456789ab/fedcba987654-grep-call_1.txt"}}}
+```
+
+`truncation` est omis quand le modèle reçoit la sortie complète. Quand il est
+présent, `original_bytes` est la taille de la sortie produite par l'outil,
+`kept_bytes` celle du contenu réellement servi, et `strategy` (`head` ou `tail`)
+dit quelle extrémité a été conservée en priorité. Un résultat déversé vaut
+`head` et montre pourtant ses deux extrémités : la notice qui suit l'aperçu dit
+la forme exacte, à l'endroit où le modèle la lit.
+
+`continuation_hint` dit quoi faire des octets manquants. Deux formes existent et
+un consommateur ne doit pas les distinguer par analyse :
+
+- une consigne en clair quand rien n'a été mis de côté, par exemple relancer
+  l'outil avec une requête plus étroite ;
+- un **chemin relatif au workspace** quand la sortie a été déversée sur disque,
+  sous `.pyxis/spill/`. Le fichier contient la sortie entière, telle que l'outil
+  l'a produite ; le modèle la relit avec `read` (`offset`, `limit`) ou la cherche
+  avec `grep`.
+
+Aucun chemin absolu n'est jamais sérialisé : le localisateur reste relatif à la
+racine du workspace, donc partageable et stable d'une machine à l'autre. Un
+client transporte et affiche cette chaîne, il ne la découpe ni ne la reconstruit :
+la disposition du stockage appartient au binaire et peut changer sans préavis.
+Le déversement est best-effort. Quand il échoue, ou quand aucun stockage
+n'existe, le résultat servi reste celui que l'outil a produit et `is_error`
+n'est jamais levé pour autant : la sortie est alors simplement bornée comme
+avant, donc `truncation` est absent si elle tient sous la limite du modèle, et
+présent avec une consigne en clair si elle ne tient pas. Un chemin dans
+`continuation_hint` prouve donc qu'un fichier existe ; son absence ne prouve
+rien sur la cause.
 
 ### `retry_scheduled` et `credential_refresh`
 
