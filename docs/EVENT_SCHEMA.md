@@ -104,6 +104,14 @@ un consommateur ne doit pas les distinguer par analyse :
   l'a produite ; le modèle la relit avec `read` (`offset`, `limit`) ou la cherche
   avec `grep`.
 
+`bash` déverse chaque flux dans son propre fichier, parce que ses deux lecteurs
+tournent en parallèle et qu'un entrelacement des deux serait un ordre qu'aucun
+d'eux ne pourrait énoncer. Quand les deux flux débordent, `original_bytes` compte
+les octets des deux et `continuation_hint` n'en nomme qu'un, la sortie standard
+d'abord. La notice qui suit l'aperçu, elle, nomme chaque fichier : c'est elle qui
+fait autorité sur ce qui a été déversé, et un consommateur qui veut tous les
+chemins la lit plutôt que de déduire du seul localisateur.
+
 Aucun chemin absolu n'est jamais sérialisé : le localisateur reste relatif à la
 racine du workspace, donc partageable et stable d'une machine à l'autre. Un
 client transporte et affiche cette chaîne, il ne la découpe ni ne la reconstruit :
