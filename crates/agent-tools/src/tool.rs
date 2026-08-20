@@ -236,6 +236,11 @@ pub struct ToolOutput {
     /// The call asked the loop for a fresh context window. Forwarded by the
     /// Registry into the outcome; the loop decides what to do with it.
     pub requests_compaction: bool,
+    /// Set by a tool that spilled its own output (US-076). Only `bash` does:
+    /// it bounds its streams AS IT READS THEM, so by the time the generic
+    /// policy sees a result the bytes it would have written are already gone.
+    /// The Registry forwards this record instead of taking its own decision.
+    pub truncation: Option<agent_core::tools::ToolResultTruncation>,
 }
 
 impl ToolOutput {
@@ -250,6 +255,7 @@ impl ToolOutput {
             images: Vec::new(),
             execution: None,
             requests_compaction: false,
+            truncation: None,
         }
     }
     /// Output marked as a semantic error (the content is kept for the model).
@@ -263,6 +269,7 @@ impl ToolOutput {
             images: Vec::new(),
             execution: None,
             requests_compaction: false,
+            truncation: None,
         }
     }
     /// Asks the loop for a fresh context window at its next safe point.
@@ -291,6 +298,22 @@ impl ToolOutput {
     }
     pub fn with_execution(mut self, execution: ToolExecution) -> Self {
         self.execution = Some(execution);
+        self
+    }
+    /// Declares that the tool spilled its own output before this result existed
+    /// (US-076), and where the full bytes went.
+    ///
+    /// `original_bytes` is what the tool PRODUCED, not what it kept: the point
+    /// of the record is to state how much is only on disk. The strategy is
+    /// `Tail` because a tool that spills while reading keeps the end of its
+    /// stream, which is where a command puts its verdict.
+    pub fn with_spill(mut self, original_bytes: usize, locator: String) -> Self {
+        self.truncation = Some(agent_core::tools::ToolResultTruncation {
+            original_bytes,
+            kept_bytes: self.content.len(),
+            strategy: agent_core::tools::TruncationStrategy::Tail,
+            continuation_hint: locator,
+        });
         self
     }
 }

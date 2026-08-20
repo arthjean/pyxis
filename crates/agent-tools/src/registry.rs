@@ -921,6 +921,13 @@ impl Registry {
         call_id: &agent_core::message::ToolCallId,
         out: &mut crate::tool::ToolOutput,
     ) -> Option<agent_core::tools::ToolResultTruncation> {
+        // US-076: a tool that spilled ITSELF hands back a result already
+        // bounded and a record already pointing at the file. Deciding again
+        // here would spill the preview and lose the locator of the bytes that
+        // actually went missing, so the tool's record is forwarded as is.
+        if let Some(truncation) = out.truncation.take() {
+            return Some(truncation);
+        }
         // The trigger is the size the tools already agree on. No new constant:
         // a second threshold would let a result be "too large" for one of them
         // and not for the other.

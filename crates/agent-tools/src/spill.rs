@@ -93,6 +93,44 @@ pub struct SpillRef {
     pub bytes: usize,
 }
 
+/// A spill file open while its content is still being produced.
+///
+/// Nothing buffers in front of the file: every [`write`](Self::write) reaches
+/// the disk. The file must match what was actually read at any instant,
+/// including when a cancelled turn drops the writer between two reads, and a
+/// buffer dropped on that path would silently lose its last kilobytes.
+#[derive(Debug)]
+pub struct SpillWriter {
+    file: std::fs::File,
+    /// Kept for the error message only: the locator is what the caller uses.
+    path: PathBuf,
+    locator: String,
+    bytes: usize,
+}
+
+impl SpillWriter {
+    /// Appends `chunk`. An error leaves the caller to decide the degradation,
+    /// exactly like [`SpillStore::save`]: this type never absorbs a failure.
+    pub fn write(&mut self, chunk: &[u8]) -> Result<(), SpillError> {
+        self.file
+            .write_all(chunk)
+            .map_err(|source| SpillError::File {
+                path: self.path.display().to_string(),
+                source,
+            })?;
+        self.bytes += chunk.len();
+        Ok(())
+    }
+
+    /// Closes the file and reports what was written.
+    pub fn finish(self) -> SpillRef {
+        SpillRef {
+            locator: self.locator,
+            bytes: self.bytes,
+        }
+    }
+}
+
 /// The storage itself: a resolved root, and the ability to write into it.
 #[derive(Debug)]
 pub struct SpillStore {
@@ -150,9 +188,23 @@ impl SpillStore {
         call_id: &str,
         content: &str,
     ) -> Result<SpillRef, SpillError> {
+        let mut writer = self.open(tool_name, call_id)?;
+        writer.write(content.as_bytes())?;
+        Ok(writer.finish())
+    }
+
+    /// Creates the same file [`save`](Self::save) creates, but hands it back
+    /// open so bytes can be written as they arrive.
+    ///
+    /// A producer whose stream is bounded AS IT IS READ never holds its own
+    /// output: `bash` drops the head of a chatty command minutes before the
+    /// command ends, so there is no `content` to hand to `save`. The creation
+    /// rules are the same one for one, exclusive open included; only the moment
+    /// the bytes arrive differs.
+    pub fn open(&self, tool_name: &str, call_id: &str) -> Result<SpillWriter, SpillError> {
         let file_name = self.file_name(tool_name, call_id);
         let path = self.root.join(&file_name);
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(FILE_MODE)
@@ -161,14 +213,11 @@ impl SpillStore {
                 path: path.display().to_string(),
                 source,
             })?;
-        file.write_all(content.as_bytes())
-            .map_err(|source| SpillError::File {
-                path: path.display().to_string(),
-                source,
-            })?;
-        Ok(SpillRef {
+        Ok(SpillWriter {
+            file,
+            path,
             locator: format!("{}/{}", self.locator_prefix, file_name),
-            bytes: content.len(),
+            bytes: 0,
         })
     }
 

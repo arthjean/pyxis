@@ -13,11 +13,20 @@ use agent_core::tools::ToolExecution;
 
 use crate::error::{ToolError, ValidationError};
 use crate::permission::{PermCtx, PermissionDecision};
+use crate::spill::{SpillError, SpillStore, SpillWriter};
 use crate::tool::{MAX_COMMAND_BYTES, Tool, ToolCtx, ToolOutput, truncate_tail};
 
+/// The tool name, in one place: it also names the spill files, and a rename
+/// that moved only one of the two would leave artifacts nobody can attribute.
+const NAME: &str = "bash";
 /// Capture bound (avoids flooding the prompt with a giant output). Shared with
 /// the other tool outputs.
 const MAX_OUTPUT: usize = crate::tool::MAX_TOOL_OUTPUT_BYTES;
+/// Worst-case cost of the marker [`truncate_tail`] prepends to what it keeps.
+/// The sentence is fixed and the count it carries cannot exceed the twenty
+/// digits of a `usize`, so reserving this much alongside the spill notice makes
+/// the bounded body fit the cap instead of overshooting it by the marker.
+const TAIL_MARKER_BYTES: usize = "[... output truncated,  bytes, beginning omitted]\n".len() + 20;
 /// Output streaming (US-015): size and coalescing delay of the fragments,
 /// and cap of a published fragment.
 const STREAM_FLUSH_BYTES: usize = 4_096;
@@ -37,7 +46,7 @@ impl Tool for Bash {
     type Input = BashInput;
 
     fn name(&self) -> &str {
-        "bash"
+        NAME
     }
     /// Runs a command: the clients get the command itself, not a JSON blob to
     /// re-parse.
@@ -175,15 +184,20 @@ impl Tool for Bash {
         // of being captured for the final result.
         let stdout_sink = ctx.output.clone();
         let stderr_sink = ctx.output.clone();
+        // US-076: both readers can write what they are about to drop. One file
+        // per stream, because the two tasks run concurrently and an
+        // interleaving of them is an order neither could state.
+        let stdout_spill = stream_spill(ctx, "stdout");
+        let stderr_spill = stream_spill(ctx, "stderr");
         let stdout_task = tokio::spawn(async move {
             match stdout {
-                Some(out) => read_tail(out, stdout_sink, OutputStream::Stdout).await,
+                Some(out) => read_tail(out, stdout_sink, OutputStream::Stdout, stdout_spill).await,
                 None => Capture::default(),
             }
         });
         let stderr_task = tokio::spawn(async move {
             match stderr {
-                Some(err) => read_tail(err, stderr_sink, OutputStream::Stderr).await,
+                Some(err) => read_tail(err, stderr_sink, OutputStream::Stderr, stderr_spill).await,
                 None => Capture::default(),
             }
         });
@@ -250,9 +264,29 @@ impl Tool for Bash {
             }
             body.push_str(&stderr_text);
         }
-        if body.len() > MAX_OUTPUT {
-            body = truncate_tail(&body, MAX_OUTPUT);
+        // US-076: the notice is reserved INSIDE the cap and appended LAST.
+        // This bounding keeps the TAIL, so a locator sitting at the head of the
+        // body is precisely what it would cut, and the model would be told
+        // bytes are missing without being told where they went.
+        let notice = spill_notice(&stdout, &stderr);
+        let notice_cost = notice.as_ref().map_or(0, |line| line.len() + 1);
+        if body.len() + notice_cost > MAX_OUTPUT {
+            body = truncate_tail(
+                &body,
+                MAX_OUTPUT.saturating_sub(notice_cost + TAIL_MARKER_BYTES),
+            );
         }
+        if let Some(notice) = notice {
+            if !body.is_empty() && !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push_str(&notice);
+        }
+        let produced = stdout.produced() + stderr.produced();
+        // The record carries ONE handle and the notice names every file: stdout
+        // comes first, a command flooding both streams being one whose stdout
+        // is the flood.
+        let spill_locator = stdout.locator.clone().or_else(|| stderr.locator.clone());
 
         let code = status.as_ref().and_then(std::process::ExitStatus::code);
         let execution = ToolExecution {
@@ -290,6 +324,13 @@ impl Tool for Bash {
                     finish_failure(body, ctx, sandbox_mark)
                 }
             }
+        };
+        // The record is what carries the locator past this crate: `bound_feedback`
+        // preserves it and re-states it in its marker when the model profile
+        // bounds the result a second time.
+        let output = match spill_locator {
+            Some(locator) => output.with_spill(produced, locator),
+            None => output,
         };
         Ok(output.with_execution(execution))
     }
@@ -366,12 +407,130 @@ fn build_command(
 struct Capture {
     bytes: Vec<u8>,
     omitted: usize,
+    /// Where the whole stream was written, when it overflowed and the spill
+    /// worked. `None` covers all three of: it fit, no storage, a failed write.
+    locator: Option<String>,
 }
 
 impl Capture {
     fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
+    /// What the stream produced: what is still in memory plus what left it.
+    /// The property `omitted + kept == produced` is what makes the omission
+    /// count exact rather than an estimate.
+    fn produced(&self) -> usize {
+        self.bytes.len() + self.omitted
+    }
+}
+
+/// Where a stream's overflow goes instead of being dropped (US-076).
+///
+/// `bash` owns its spill because nothing downstream can. The generic policy
+/// (`crate::spill_policy`) only ever sees the FINAL result, and the head of a
+/// chatty command left memory long before that result existed: a compilation
+/// producing ten mebibytes leaves thirty kilobytes of tail and an exact count
+/// of what was destroyed. The reference classes this case as deferred work;
+/// Pyxis cannot defer it, `bash` being the one producer of that quantity.
+struct StreamSpill {
+    store: std::sync::Arc<SpillStore>,
+    /// Descriptive only, and it names the STREAM as well as the call, since
+    /// each stream gets its own file.
+    call_id: String,
+    /// Opened at the FIRST overflow and never before: a command that stays
+    /// under the cap must leave nothing behind.
+    writer: Option<SpillWriter>,
+    /// A failed write disables the spill for the rest of the call.
+    broken: bool,
+}
+
+impl StreamSpill {
+    fn new(store: std::sync::Arc<SpillStore>, call_id: String) -> Self {
+        Self {
+            store,
+            call_id,
+            writer: None,
+            broken: false,
+        }
+    }
+
+    /// Writes bytes that are about to leave memory.
+    ///
+    /// Best effort, like the policy's: a failure costs the spill, never the
+    /// command, which keeps running and ends exactly as it did before EP-024.
+    /// What was already written stays on disk as an orphan the model is never
+    /// told about, the same trade the policy makes when its notice does not fit.
+    fn push(&mut self, bytes: &[u8]) {
+        if self.broken {
+            return;
+        }
+        if self.writer.is_none() {
+            match self.store.open(NAME, &self.call_id) {
+                Ok(writer) => self.writer = Some(writer),
+                Err(error) => return self.fail(error),
+            }
+        }
+        let Some(writer) = self.writer.as_mut() else {
+            return;
+        };
+        if let Err(error) = writer.write(bytes) {
+            self.fail(error);
+        }
+    }
+
+    fn fail(&mut self, error: SpillError) {
+        tracing::warn!(
+            target: "pyxis::tools",
+            tool = NAME,
+            error = %error,
+            "spill write failed; the command output stays truncated"
+        );
+        self.broken = true;
+        // Dropping the writer closes the file AND drops the locator: a partial
+        // spill must never be announced as the full output.
+        self.writer = None;
+    }
+
+    /// Appends what never overflowed and hands back the locator, so the file is
+    /// the WHOLE stream and not only the part the cap pushed out of it.
+    fn finish(mut self, tail: &[u8]) -> Option<String> {
+        let mut writer = self.writer.take()?;
+        if let Err(error) = writer.write(tail) {
+            self.fail(error);
+            return None;
+        }
+        Some(writer.finish().locator)
+    }
+}
+
+/// One spill per stream, or `None` when the run has no storage at all, which
+/// means no spill rather than an implicit root (US-072).
+fn stream_spill(ctx: &ToolCtx, stream: &str) -> Option<StreamSpill> {
+    let store = ctx.spill.clone()?;
+    // The identifier only makes the file inspectable; a call dispatched outside
+    // the loop has none and gets a fixed word instead.
+    let call_id = ctx.call_id.clone().unwrap_or_else(|| "no-call".to_string());
+    Some(StreamSpill::new(store, format!("{call_id}-{stream}")))
+}
+
+/// The one line the model reads about the bytes that left its context.
+///
+/// Same shape as the generic policy's notice: omission counted, locator,
+/// recovery, one parenthesized line. One line per stream, so a command that
+/// flooded both is told about both.
+fn spill_notice(stdout: &Capture, stderr: &Capture) -> Option<String> {
+    let lines: Vec<String> = [("stdout", stdout), ("stderr", stderr)]
+        .into_iter()
+        .filter_map(|(name, capture)| {
+            let locator = capture.locator.as_ref()?;
+            Some(format!(
+                "(Omitted {} bytes from the start of {name}. Full {name} saved to {locator}. \
+                 Read it with `read` using `offset` and `limit`, or search it with `grep`.)",
+                capture.omitted
+            ))
+        })
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// Reads a stream until EOF: captures the TAIL for the final result (truncation
@@ -381,6 +540,7 @@ async fn read_tail(
     mut reader: impl tokio::io::AsyncRead + Unpin,
     sink: Option<crate::tool::OutputSink>,
     stream: OutputStream,
+    mut spill: Option<StreamSpill>,
 ) -> Capture {
     let mut out = Capture::default();
     let mut buf = [0_u8; 8192];
@@ -406,11 +566,18 @@ async fn read_tail(
         }
         if out.bytes.len() > MAX_OUTPUT {
             let overflow = out.bytes.len() - MAX_OUTPUT;
+            // US-076: the bytes leaving memory are written BEFORE they are
+            // dropped, which is the whole difference between bounding an output
+            // and destroying it.
+            if let Some(spill) = spill.as_mut() {
+                spill.push(&out.bytes[..overflow]);
+            }
             out.bytes.drain(0..overflow);
             out.omitted = out.omitted.saturating_add(overflow);
         }
     }
     flush_stream(&mut pending, sink.as_ref(), stream);
+    out.locator = spill.and_then(|spill| spill.finish(&out.bytes));
     out
 }
 
@@ -641,6 +808,152 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Scoped workspace for the spill tests, same shape as the drop test's.
+    fn spill_workspace(tag: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("pyxis-bash-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A context wired exactly as the binary wires it: a workspace, a spill
+    /// root under it, and the identifier of the call in flight.
+    fn spill_ctx(dir: &std::path::Path, thread: &str) -> (ToolCtx, std::sync::Arc<SpillStore>) {
+        let store = std::sync::Arc::new(SpillStore::create(dir, thread).unwrap());
+        let mut ctx = ToolCtx::new(dir.to_path_buf());
+        ctx.spill = Some(std::sync::Arc::clone(&store));
+        ctx.call_id = Some("c1".to_string());
+        (ctx, store)
+    }
+
+    /// US-076 AC5: a spill that cannot be written costs the spill and nothing
+    /// else. The command still ends, still succeeds, and still returns the
+    /// bounded output it returned before EP-024, with no locator to a file that
+    /// does not exist.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_spill_write_failure_leaves_the_command_succeeding() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = spill_workspace("spill-broken");
+        let (ctx, store) = spill_ctx(&dir, "thread_broken");
+        // The root exists and stays readable: only creating a file in it fails,
+        // which is the failure that happens mid-drain rather than at startup.
+        let mut perms = std::fs::metadata(store.root()).unwrap().permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(store.root(), perms).unwrap();
+
+        let out = Bash
+            .call(
+                BashInput {
+                    command: "dd if=/dev/zero bs=64k count=1 status=none | tr '\\0' 'x'"
+                        .to_string(),
+                },
+                &ctx,
+            )
+            .await
+            .expect("a spill failure is not a pipeline error");
+
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.truncation.is_none(), "no locator may be advertised");
+        assert!(
+            out.content.contains("beginning omitted"),
+            "the omission must still be stated: {}",
+            &out.content[..120.min(out.content.len())]
+        );
+        assert!(!out.content.contains(".pyxis/spill"));
+        assert_eq!(std::fs::read_dir(store.root()).unwrap().count(), 0);
+
+        let mut perms = std::fs::metadata(store.root()).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(store.root(), perms).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// US-076 unhappy path: a command cancelled while it is still producing
+    /// leaves a partial file holding what was actually read, and leaves no file
+    /// descriptor open on it.
+    ///
+    /// The reader task is not aborted by the cancellation: the killed process
+    /// closes the pipe, the reader reaches EOF, writes the tail it still holds
+    /// and drops its writer. That is what makes the partial file match what was
+    /// read rather than stop at the last overflow.
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn a_cancelled_command_leaves_a_partial_file_and_no_open_descriptor() {
+        use std::time::{Duration, Instant};
+
+        let dir = spill_workspace("spill-cancel");
+        let (ctx, store) = spill_ctx(&dir, "thread_cancel");
+        let input = BashInput {
+            // Throttled on purpose: the file must exist while the command is
+            // still producing, which is the state the cancellation must find.
+            command: "for _ in $(seq 1 100); do dd if=/dev/zero bs=64k count=1 status=none \
+                      | tr '\\0' 'x'; sleep 0.05; done"
+                .to_string(),
+        };
+
+        // Poll the call just long enough for the spill file to appear, then let
+        // the scope drop the future: this is what an interrupted turn does.
+        {
+            let call = Bash.call(input, &ctx);
+            tokio::pin!(call);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut opened = false;
+            while Instant::now() < deadline && !opened {
+                tokio::select! {
+                    _ = &mut call => panic!("the command was supposed to still be running"),
+                    () = tokio::time::sleep(Duration::from_millis(25)) => {}
+                }
+                opened = std::fs::read_dir(store.root()).unwrap().count() > 0;
+            }
+            assert!(opened, "the spill file must exist before the cancellation");
+        }
+
+        // The kill is a signal, not a promise of immediacy: the reader drains
+        // what is left, writes its tail and closes.
+        let path = std::fs::read_dir(store.root())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && is_open(&path) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            !is_open(&path),
+            "the cancellation left {} open",
+            path.display()
+        );
+
+        let spilled = std::fs::read(&path).unwrap();
+        assert!(
+            !spilled.is_empty(),
+            "the partial file must hold what was read"
+        );
+        assert!(
+            spilled.iter().all(|byte| *byte == b'x'),
+            "the partial file must hold what the command actually produced"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Does this process still hold `path` open? `/proc/self/fd` is the only
+    /// answer that does not depend on the writer telling the truth about itself.
+    #[cfg(not(windows))]
+    fn is_open(path: &std::path::Path) -> bool {
+        let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+            return false;
+        };
+        entries
+            .filter_map(Result::ok)
+            .any(|entry| std::fs::read_link(entry.path()).is_ok_and(|target| target == path))
     }
 
     /// A pid is still running only if the kernel has a process behind it that

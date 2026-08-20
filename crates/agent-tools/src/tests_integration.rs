@@ -4036,3 +4036,140 @@ async fn a_real_tool_output_over_the_cap_is_spilled_through_the_registry() {
     assert_eq!(spilled.len(), truncation.original_bytes);
     assert!(spilled.starts_with("big.txt:1: needle"));
 }
+
+// ═══════════ EP-024: the output the policy cannot reach ════════════
+
+/// A registry holding the real `bash` and a spill root, which is what the
+/// binary builds.
+fn bash_spill_registry(ws: &TempWs, thread: &str) -> (Registry, Arc<crate::spill::SpillStore>) {
+    let store = Arc::new(crate::spill::SpillStore::create(ws.path(), thread).unwrap());
+    let reg = Registry::builder(ws.path())
+        .approver(allow_approver())
+        .spill(Arc::clone(&store))
+        .register(Bash)
+        .build();
+    (reg, store)
+}
+
+/// US-076 AC1/AC2/AC3, on the size the PRD measures: ten mebibytes on stdout
+/// used to leave thirty kilobytes of tail and an exact count of what had been
+/// destroyed. The count stays exact, and nothing is destroyed any more.
+#[tokio::test]
+async fn a_ten_mebibyte_command_leaves_its_whole_output_on_disk() {
+    const PRODUCED: usize = 10 * 1024 * 1024;
+    let ws = TempWs::new("spill-bash");
+    let (reg, _store) = bash_spill_registry(&ws, "thread_bash");
+
+    let out = reg
+        .dispatch(vec![call(
+            "c1",
+            "bash",
+            serde_json::json!({
+                "command": "dd if=/dev/zero bs=1M count=10 status=none | tr '\\0' 'x'"
+            }),
+        )])
+        .await;
+    let result = by_id(&out, "c1");
+
+    assert!(!result.is_error, "{}", result.content);
+    assert!(
+        result.content.len() <= crate::tool::MAX_TOOL_OUTPUT_BYTES,
+        "the model-facing result must fit the cap, got {}",
+        result.content.len()
+    );
+    let truncation = result.truncation.as_ref().expect("a truncation record");
+    assert_eq!(truncation.original_bytes, PRODUCED);
+    // US-076 AC2: the file holds every byte the command produced, in order.
+    let path = ws.path().join(&truncation.continuation_hint);
+    let spilled = std::fs::read(&path).expect("the locator addresses a readable file");
+    assert_eq!(spilled.len(), PRODUCED);
+    assert!(spilled.iter().all(|byte| *byte == b'x'));
+    // US-076 AC3: the locator reaches the model in the result itself, and the
+    // omission count still accounts for every byte produced.
+    let locator = &truncation.continuation_hint;
+    assert!(
+        locator.starts_with(".pyxis/spill/"),
+        "locator must be workspace-relative: {locator}"
+    );
+    assert!(
+        result.content.contains(locator.as_str()),
+        "the model must be told where the bytes went: {}",
+        &result.content[result.content.len().saturating_sub(400)..]
+    );
+    let omitted = omitted_bytes(&result.content);
+    assert_eq!(
+        omitted + crate::tool::MAX_TOOL_OUTPUT_BYTES,
+        PRODUCED,
+        "omitted + kept must still equal produced"
+    );
+}
+
+/// US-076 AC4: the error stream follows the same rule, in its own file.
+#[tokio::test]
+async fn the_error_stream_is_spilled_like_the_standard_one() {
+    const PRODUCED: usize = 1024 * 1024;
+    let ws = TempWs::new("spill-bash-err");
+    let (reg, store) = bash_spill_registry(&ws, "thread_bash_err");
+
+    let out = reg
+        .dispatch(vec![call(
+            "c1",
+            "bash",
+            serde_json::json!({
+                "command": "dd if=/dev/zero bs=1M count=1 status=none | tr '\\0' 'e' 1>&2"
+            }),
+        )])
+        .await;
+    let result = by_id(&out, "c1");
+
+    assert!(!result.is_error, "{}", result.content);
+    let truncation = result.truncation.as_ref().expect("a truncation record");
+    assert_eq!(truncation.original_bytes, PRODUCED);
+    assert!(
+        result.content.contains("Full stderr saved to"),
+        "the notice must name the stream it is about: {}",
+        &result.content[result.content.len().saturating_sub(400)..]
+    );
+    let spilled = std::fs::read(ws.path().join(&truncation.continuation_hint)).unwrap();
+    assert_eq!(spilled.len(), PRODUCED);
+    assert!(spilled.iter().all(|byte| *byte == b'e'));
+    assert_eq!(
+        std::fs::read_dir(store.root()).unwrap().count(),
+        1,
+        "a stream that never overflowed must leave no file behind"
+    );
+}
+
+/// US-076 AC1: under the cap, nothing changes and nothing is written.
+#[tokio::test]
+async fn a_command_under_the_cap_writes_no_spill_file() {
+    let ws = TempWs::new("spill-bash-small");
+    let (reg, store) = bash_spill_registry(&ws, "thread_bash_small");
+
+    let out = reg
+        .dispatch(vec![call(
+            "c1",
+            "bash",
+            serde_json::json!({"command": "echo hello"}),
+        )])
+        .await;
+    let result = by_id(&out, "c1");
+
+    assert_eq!(result.content.trim_end(), "hello");
+    assert!(result.truncation.is_none());
+    assert_eq!(std::fs::read_dir(store.root()).unwrap().count(), 0);
+}
+
+/// The omission count the model reads, taken from the notice the tool appends.
+fn omitted_bytes(content: &str) -> usize {
+    let line = content
+        .lines()
+        .find(|line| line.starts_with("(Omitted "))
+        .expect("a spill notice");
+    line.trim_start_matches("(Omitted ")
+        .split_whitespace()
+        .next()
+        .expect("a byte count")
+        .parse()
+        .expect("a number")
+}
