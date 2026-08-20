@@ -1,0 +1,198 @@
+{
+  "prd": {
+    "file": "tasks/prd-escalade-garde-fou-boucle.md",
+    "title": "Escalade du garde-fou de boucle",
+    "created_at": "2026-08-20",
+    "status": "IN_PROGRESS"
+  },
+  "epics": [
+    {
+      "id": "EP-018",
+      "title": "Échelle d'escalade à trois crans",
+      "status": "IN_REVIEW",
+      "priority": "P0",
+      "stories_total": 4,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-019",
+      "title": "Frontières de la chaîne",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 3,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-020",
+      "title": "Preuves des propriétés déjà acquises",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 2,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-021",
+      "title": "Enregistrement de la décision",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 2,
+      "stories_done": 0
+    }
+  ],
+  "stories": [
+    {
+      "id": "US-059",
+      "title": "Échelle de seuils validée à la compilation",
+      "epic": "EP-018",
+      "status": "IN_REVIEW",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [],
+      "started_at": "2026-08-20",
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-060",
+      "title": "Deux registres de message, arguments bornés",
+      "epic": "EP-018",
+      "status": "IN_REVIEW",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-059"
+      ],
+      "started_at": "2026-08-20",
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-061",
+      "title": "Site externe sur l'échelle",
+      "epic": "EP-018",
+      "status": "IN_REVIEW",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-059",
+        "US-060"
+      ],
+      "started_at": "2026-08-20",
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-062",
+      "title": "Site imbriqué sur l'échelle, avec verrou terminal",
+      "epic": "EP-018",
+      "status": "IN_REVIEW",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-059",
+        "US-060"
+      ],
+      "started_at": "2026-08-20",
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-063",
+      "title": "Remise à zéro sur interjection utilisateur",
+      "epic": "EP-019",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-064",
+      "title": "Propagation de l'interjection au garde imbriqué",
+      "epic": "EP-019",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "S",
+      "blocked_by": [
+        "US-063"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-065",
+      "title": "Transparence des appels exempts",
+      "epic": "EP-019",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "M",
+      "blocked_by": [
+        "US-061",
+        "US-062"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-066",
+      "title": "Un appel refusé par permission compte",
+      "epic": "EP-020",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-061"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-067",
+      "title": "La clé est insensible à l'ordre des clés JSON",
+      "epic": "EP-020",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "XS",
+      "blocked_by": [],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-068",
+      "title": "ADR-14, échelle du garde-fou de boucle",
+      "epic": "EP-021",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-061",
+        "US-062",
+        "US-063",
+        "US-065"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-069",
+      "title": "Section garde-fou dans le document d'architecture",
+      "epic": "EP-021",
+      "status": "TODO",
+      "priority": "P2",
+      "size": "S",
+      "blocked_by": [
+        "US-068"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    }
+  ]
+}
