@@ -12,13 +12,23 @@
 //! path, so [`links`] pays that cost in the same crate: a relative link of `docs/`
 //! or of the repository root that no longer resolves fails the same suite.
 //!
-//! Every rule enforced here is written in `docs/notes/README.md`; no mechanical
-//! rule exists without its written counterpart. A violation is one line naming
-//! the offending path and the rule, and a run reports all of them: stopping at
-//! the first turns one misplaced file into several round trips.
+//! The tree does not replace `docs/DECISIONS.md`, it borders it, so [`decisions`]
+//! holds the register to the same standard: an ADR its own summary table never
+//! lists, or a decision that never says what it beat, fails the suite too.
+//!
+//! No mechanical rule exists here without its written counterpart: the rules of
+//! the tree are written in `docs/notes/README.md`, those of the register in the
+//! header of `docs/DECISIONS.md`, which announces its summary table and the
+//! per-decision format alike. A violation is one line naming the offending path
+//! and the rule, and a run reports all of them: stopping at the first turns one
+//! misplaced file into several round trips.
 
+mod decisions;
 mod links;
 
+pub use decisions::{
+    ADR_ALTERNATIVES_HEADING, DECISIONS_DOC, check_decisions, check_decisions_document,
+};
 pub use links::{DOCS_ROOT, check_links, markdown_documents, relative_links};
 
 use std::fs;
