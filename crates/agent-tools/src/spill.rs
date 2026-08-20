@@ -52,6 +52,18 @@ const NAME_PREFIX_BYTES: usize = 6;
 /// truncation and not an `ENAMETOOLONG` at write time.
 const MAX_FILE_NAME_BYTES: usize = 255;
 
+/// Cumulative size `.pyxis/spill/` may reach, every thread directory of the
+/// workspace included, before the oldest of them are evicted.
+///
+/// The unit of the problem is one oversized output, and the PRD sizes it at
+/// 10 MiB (a full build log). 256 MiB therefore holds about twenty-five of
+/// them, far more than one working session produces, while staying an order of
+/// magnitude below the `target/` directory the same workspace already carries:
+/// the bound trips long before the disk notices, and never inside the session
+/// that is producing the artifacts. A crate constant and not a configuration
+/// key, invariant 15.
+pub const MAX_SPILL_ROOT_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Owner-only directory and file modes: another local user must not be able to
 /// read spilled tool output (CWE-377).
 const DIR_MODE: u32 = 0o700;
@@ -151,7 +163,8 @@ impl SpillStore {
     pub fn create(workspace: &Path, thread_id: &str) -> Result<Self, SpillError> {
         let name = thread_dir_name(thread_id);
         let locator_prefix = format!("{PYXIS_DIR}/{SPILL_DIR}/{name}");
-        let root = workspace.join(PYXIS_DIR).join(SPILL_DIR).join(&name);
+        let parent = workspace.join(PYXIS_DIR).join(SPILL_DIR);
+        let root = parent.join(&name);
         DirBuilder::new()
             .recursive(true)
             .mode(DIR_MODE)
@@ -160,6 +173,11 @@ impl SpillStore {
                 path: root.display().to_string(),
                 source,
             })?;
+        // US-081: the sweep happens HERE, once, right after the directory of
+        // the starting thread exists and before anything writes into it. It
+        // never fails the caller: a spill root that cannot be swept is a disk
+        // that grows, not a thread that refuses to start.
+        evict_over_cap(&parent, &root, MAX_SPILL_ROOT_BYTES);
         Ok(Self {
             root,
             locator_prefix,
@@ -233,6 +251,133 @@ impl SpillStore {
         let encoded = encode_segment(&suggested);
         format!("{prefix}-{}", bound_segment(&encoded, budget))
     }
+}
+
+/// One thread directory as the sweep sees it.
+struct ThreadDir {
+    path: PathBuf,
+    bytes: u64,
+    /// Last modification of the DIRECTORY, which a spill file created inside it
+    /// bumps: the age of a thread is the age of its last artifact, not of its
+    /// first. An unreadable timestamp reads as the epoch, so a directory
+    /// nothing can date is evicted first rather than kept forever.
+    modified: std::time::SystemTime,
+}
+
+/// Brings the spill root back under `cap` by deleting whole thread directories,
+/// oldest first.
+///
+/// **Per thread, never per file.** A resumed session finds the artifacts of a
+/// thread whole or absent, and a locator that no longer resolves fails as a
+/// plain missing file, which is readable. Evicting file by file would leave a
+/// thread half readable, which nothing in the transcript could explain.
+///
+/// `current` is never a candidate: a run must not evict the directory it is
+/// about to write locators into.
+fn evict_over_cap(parent: &Path, current: &Path, cap: u64) {
+    let mut dirs = thread_dirs(parent);
+    let mut total: u64 = dirs.iter().map(|dir| dir.bytes).sum();
+    if total <= cap {
+        return;
+    }
+    dirs.sort_by_key(|dir| dir.modified);
+    for dir in dirs {
+        if total <= cap {
+            break;
+        }
+        if dir.path == current {
+            continue;
+        }
+        match remove_under(parent, &dir.path) {
+            Ok(()) => {
+                total = total.saturating_sub(dir.bytes);
+                // Information and not debug: a spilled file a transcript still
+                // references disappears here, and a silent deletion would make
+                // the missing-file error it later produces undiagnosable.
+                tracing::info!(
+                    target: "pyxis::tools",
+                    dir = %dir.path.display(),
+                    bytes = dir.bytes,
+                    remaining = total,
+                    cap,
+                    "spill root over cap: evicted the oldest thread directory"
+                );
+            }
+            Err(error) => tracing::warn!(
+                target: "pyxis::tools",
+                dir = %dir.path.display(),
+                error = %error,
+                "spill root over cap: eviction failed, the root stays over its bound"
+            ),
+        }
+    }
+}
+
+/// The thread directories of `parent`, with their size and their age.
+///
+/// The size is the sum of the DIRECT file entries: the store writes a flat
+/// directory per thread and nothing else can write under `.pyxis`, so a
+/// recursive walk would cost a syscall per entry to sum the same bytes. An
+/// entry whose metadata cannot be read counts as zero rather than aborting the
+/// sweep, since undercounting only delays an eviction.
+fn thread_dirs(parent: &Path) -> Vec<ThreadDir> {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| {
+            let path = entry.path();
+            ThreadDir {
+                bytes: directory_bytes(&path),
+                modified: entry
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH),
+                path,
+            }
+        })
+        .collect()
+}
+
+fn directory_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum()
+}
+
+/// Deletes `candidate`, and refuses BEFORE the syscall anything that is not a
+/// direct child of `root`.
+///
+/// The check is not defensive decoration: `remove_dir_all` is the one
+/// destructive call of the whole spill subsystem, and the only guarantee worth
+/// stating about it is that no argument outside `.pyxis/spill/` ever reaches
+/// it. A direct child is the exact shape the sweep produces, so a candidate
+/// that climbs out with `..`, names the root itself, or points deeper than one
+/// component is a bug and is reported as one.
+fn remove_under(root: &Path, candidate: &Path) -> std::io::Result<()> {
+    let inside = candidate.parent() == Some(root)
+        && candidate
+            .components()
+            .all(|component| !matches!(component, std::path::Component::ParentDir));
+    if !inside {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a thread directory of {}",
+                candidate.display(),
+                root.display()
+            ),
+        ));
+    }
+    std::fs::remove_dir_all(candidate)
 }
 
 /// A fresh opaque identifier for one run of the binary, 128 random bits.
@@ -618,5 +763,158 @@ mod tests {
         );
         let saved = store.save(&hostile, "call_1", "x").unwrap();
         assert!(ws.path().join(&saved.locator).is_file());
+    }
+
+    // ---- US-081: the bound on the spill root ----
+
+    /// The parent of every thread directory, which the sweep reads.
+    fn spill_parent(ws: &Workspace) -> PathBuf {
+        ws.path().join(PYXIS_DIR).join(SPILL_DIR)
+    }
+
+    /// A thread directory nothing wrote through the store: `bytes` are SPARSE,
+    /// so a directory can weigh hundreds of mebibytes without costing the disk
+    /// anything, and the cap under test stays the real constant.
+    fn fake_thread(parent: &Path, name: &str, bytes: u64, seconds_ago: i64) -> PathBuf {
+        let dir = parent.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::File::create(dir.join("artifact.txt"))
+            .unwrap()
+            .set_len(bytes)
+            .unwrap();
+        // Last, because creating the file inside bumps the timestamp again.
+        age(&dir, seconds_ago);
+        dir
+    }
+
+    /// Dates a directory explicitly: two directories created in the same
+    /// millisecond would otherwise carry the same timestamp, and "oldest first"
+    /// would be whatever the filesystem happened to return.
+    fn age(path: &Path, seconds_ago: i64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let when = nix::sys::time::TimeVal::new(now - seconds_ago, 0);
+        nix::sys::stat::utimes(path, &when, &when).unwrap();
+    }
+
+    #[test]
+    fn a_root_under_the_cap_evicts_nothing_when_a_thread_starts() {
+        let ws = Workspace::new();
+        let parent = spill_parent(&ws);
+        std::fs::create_dir_all(&parent).unwrap();
+        let old = fake_thread(&parent, "aaaaaaaaaaaa", MAX_SPILL_ROOT_BYTES / 2, 10_000);
+        let recent = fake_thread(&parent, "bbbbbbbbbbbb", 1024, 10);
+
+        let store = SpillStore::create(ws.path(), "thread_1").unwrap();
+
+        assert!(old.is_dir(), "nothing is evicted below the cap");
+        assert!(recent.is_dir());
+        assert!(store.root().is_dir());
+    }
+
+    /// US-081 AC2, from the entry point the binary really calls: creating the
+    /// store IS the start of a thread.
+    #[test]
+    fn a_root_over_the_cap_loses_its_oldest_thread_directory_first() {
+        let ws = Workspace::new();
+        let parent = spill_parent(&ws);
+        std::fs::create_dir_all(&parent).unwrap();
+        let oldest = fake_thread(&parent, "aaaaaaaaaaaa", MAX_SPILL_ROOT_BYTES, 10_000);
+        let newer = fake_thread(&parent, "bbbbbbbbbbbb", 1024, 10);
+
+        let store = SpillStore::create(ws.path(), "thread_1").unwrap();
+
+        assert!(!oldest.exists(), "the oldest thread directory is evicted");
+        assert!(
+            newer.is_dir(),
+            "eviction stops as soon as the root is back under the cap"
+        );
+        assert!(
+            store.root().is_dir(),
+            "the starting thread has its directory"
+        );
+    }
+
+    /// US-081 AC2, the exclusion: the directory of the thread starting right now
+    /// is never a candidate, even when it is both the oldest and the heaviest.
+    #[test]
+    fn the_directory_of_the_starting_thread_is_never_evicted() {
+        let ws = Workspace::new();
+        let parent = spill_parent(&ws);
+        std::fs::create_dir_all(&parent).unwrap();
+        // Pre-create the very directory `create` is about to adopt, over the cap
+        // on its own and older than everything else.
+        let mine = fake_thread(
+            &parent,
+            &thread_dir_name("thread_1"),
+            MAX_SPILL_ROOT_BYTES + 1,
+            10_000,
+        );
+        let other = fake_thread(&parent, "bbbbbbbbbbbb", 1024, 10);
+
+        let store = SpillStore::create(ws.path(), "thread_1").unwrap();
+
+        assert_eq!(store.root(), mine);
+        assert!(
+            mine.join("artifact.txt").is_file(),
+            "the current thread keeps its artifacts even over the cap"
+        );
+        assert!(
+            !other.exists(),
+            "the sweep frees what it can instead of giving up"
+        );
+    }
+
+    /// US-081 AC3: the one destructive call of the subsystem refuses anything
+    /// that is not a thread directory of the root, before the syscall.
+    #[test]
+    fn an_eviction_target_outside_the_root_is_refused_before_the_syscall() {
+        let ws = Workspace::new();
+        let parent = spill_parent(&ws);
+        std::fs::create_dir_all(&parent).unwrap();
+        let outside = ws.path().join("precious");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        for candidate in [
+            outside.clone(),
+            parent.join("..").join("precious"),
+            parent.join("a").join("b"),
+            parent.clone(),
+        ] {
+            let err = remove_under(&parent, &candidate).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{candidate:?}"
+            );
+        }
+        assert!(outside.is_dir(), "nothing outside the root is ever removed");
+    }
+
+    /// US-081 unhappy path: a directory the sweep cannot delete is reported and
+    /// the thread starts anyway.
+    #[test]
+    fn a_directory_that_cannot_be_removed_does_not_prevent_the_thread_from_starting() {
+        let ws = Workspace::new();
+        let parent = spill_parent(&ws);
+        std::fs::create_dir_all(&parent).unwrap();
+        let locked = fake_thread(&parent, "aaaaaaaaaaaa", MAX_SPILL_ROOT_BYTES + 1, 10_000);
+        // Readable, so the sweep still sizes it, but its entries cannot be
+        // unlinked: `remove_dir_all` fails halfway.
+        let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(&locked, perms).unwrap();
+
+        let created = SpillStore::create(ws.path(), "thread_1");
+
+        let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+        perms.set_mode(DIR_MODE);
+        std::fs::set_permissions(&locked, perms).unwrap();
+
+        let store = created.expect("an eviction failure never fails the start");
+        assert!(store.root().is_dir());
+        assert!(locked.join("artifact.txt").is_file());
     }
 }

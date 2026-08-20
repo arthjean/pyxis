@@ -261,3 +261,52 @@ async fn without_a_subscriber_the_dispatch_is_unchanged() {
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].content, "p ok");
 }
+
+/// US-081 AC4: the eviction of a spill directory is emitted at INFORMATION
+/// level and names what it deleted.
+///
+/// The level is the criterion, hence a test that installs a subscriber rather
+/// than one that reads a return value: a deletion visible only at debug would
+/// be, in a real run, a file a transcript still references vanishing in
+/// silence.
+#[test]
+fn the_eviction_of_a_spill_directory_is_reported_at_information_level() {
+    let _serialized = match TRACE_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let workspace = std::env::temp_dir().join(format!("pyxis-spill-trace-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&workspace);
+    let parent = workspace.join(".pyxis").join("spill");
+    let evicted = parent.join("aaaaaaaaaaaa");
+    std::fs::create_dir_all(&evicted).unwrap();
+    // Sparse, so the real constant is what the sweep is measured against.
+    std::fs::File::create(evicted.join("artifact.txt"))
+        .unwrap()
+        .set_len(agent_tools::spill::MAX_SPILL_ROOT_BYTES + 1)
+        .unwrap();
+
+    let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = Arc::clone(&buffer);
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_ansi(false)
+        .with_writer(move || SharedBuffer(Arc::clone(&sink)))
+        .finish();
+    let trace = {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        agent_tools::spill::SpillStore::create(&workspace, "thread_1").unwrap();
+        let bytes = buffer.lock().unwrap().clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let _ = std::fs::remove_dir_all(&workspace);
+
+    assert!(trace.contains("INFO"), "{trace}");
+    assert!(trace.contains("pyxis::tools"), "{trace}");
+    assert!(
+        trace.contains("evicted the oldest thread directory"),
+        "{trace}"
+    );
+    assert!(trace.contains("aaaaaaaaaaaa"), "{trace}");
+}
