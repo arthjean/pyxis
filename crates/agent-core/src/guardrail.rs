@@ -195,6 +195,13 @@ impl LoopGuard {
 /// without `preserve_order`) -> the signature is stable from one turn to the
 /// next, and the order of the calls inside the batch does not change it.
 ///
+/// Both halves of that sentence are assumptions about a dependency, so both are
+/// proved rather than asserted (US-067):
+/// `the_signature_is_blind_to_the_order_of_the_json_keys` for the keys inside
+/// one call, `batch_signature_is_order_independent_and_distinct` for the order
+/// of the calls. A transitive activation of `preserve_order` fails the first of
+/// them instead of breaking detection in silence.
+///
 /// Calls the dispatcher declares exempt are left out: repeating them is the
 /// protocol for making progress, not a symptom of a loop. The core asks rather
 /// than guesses, because a name and a JSON value cannot tell an orchestration
@@ -531,6 +538,41 @@ mod tests {
         let s3 =
             guarded_batch_signature(&[inv("bash", serde_json::json!({"cmd": "pwd"}))], &dispatch);
         assert_ne!(s1, s3);
+    }
+
+    /// The signature of a single `write` whose arguments are parsed from raw
+    /// text, the way a provider delta arrives. Going through `from_str` rather
+    /// than `json!` keeps the two tests below on the path the arguments really
+    /// take, key order included, instead of on a macro's expansion of it.
+    fn signature_of(raw_arguments: &str) -> Option<String> {
+        let input: serde_json::Value = serde_json::from_str(raw_arguments).unwrap();
+        guarded_batch_signature(&[ToolInvocation::json("x", "write", input)], &Exempting(""))
+    }
+
+    /// US-067 / FR-12. Two argument objects differing only by the order of their
+    /// keys, nested two levels down, are ONE signature, because a
+    /// `serde_json::Map` is a `BTreeMap` as long as `preserve_order` stays off.
+    /// This is the test that turns that assumption into a failure the day the
+    /// feature is switched on transitively.
+    #[test]
+    fn the_signature_is_blind_to_the_order_of_the_json_keys() {
+        assert_eq!(
+            signature_of(r#"{"a":1,"b":{"c":2,"d":3}}"#),
+            signature_of(r#"{"b":{"d":3,"c":2},"a":1}"#),
+            "the key order must not split one repetition run into two"
+        );
+    }
+
+    /// US-067 unhappy path: the blindness is to the ORDER of the keys and never
+    /// to the values under them, otherwise the test above would pass by accident
+    /// on a signature that has stopped discriminating anything.
+    #[test]
+    fn the_signature_tells_two_permuted_values_apart() {
+        assert_ne!(
+            signature_of(r#"{"a":1,"b":2}"#),
+            signature_of(r#"{"a":2,"b":1}"#),
+            "same keys, swapped values: two different calls"
+        );
     }
 
     #[test]
