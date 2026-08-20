@@ -54,6 +54,7 @@ Targeted verification signals:
 | Checking what moved upstream | `cargo run -p agent-parity -- drift` |
 | App-server protocol types | `PYXIS_UPDATE_SCHEMAS=1 cargo test -p agent-app-server --test schemas` |
 | TUI rendering | `cargo insta review` after `cargo test -p agent-tui` |
+| Decision records: note tree, internal links, ADR register | `cargo test -p agent-doc-gates` |
 
 Adding, renaming, or moving a test named in the table of
 `docs/parity/offline-suite.md` breaks `crates/agent-parity/tests/offline_suite.rs`,
