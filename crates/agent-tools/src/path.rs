@@ -113,6 +113,35 @@ pub fn guard_write_target(
         .map_err(|e| ValidationError::new(e.to_string()))
 }
 
+/// True when `path` sits inside one of [`PROTECTED_SUBPATHS`], relative to
+/// `workspace`. The workspace root itself is never protected.
+///
+/// **Traversal, not confinement (US-079).** This is the read-side use of the
+/// same list: the recursive walks of `grep` and `glob` must not descend into
+/// `.pyxis`, where the spill root lives, or a search at the workspace root
+/// would put back into the context exactly what the spill took out of it. The
+/// same filter also keeps the JSONL session files out of the walk, which the
+/// absence of any filter used to hand back match by match. Confinement is
+/// untouched: [`confine`] still accepts these paths, so a locator handed to
+/// `read`, or a base explicitly aimed at one, stays readable.
+pub fn is_in_protected_subpath(workspace: &Path, path: &Path) -> bool {
+    let root = lexical_normalize(workspace);
+    let normalized = if path.is_absolute() {
+        lexical_normalize(path)
+    } else {
+        match lexical_join(&root, path) {
+            Some(p) => p,
+            None => return false,
+        }
+    };
+    let Ok(rel) = normalized.strip_prefix(&root) else {
+        return false;
+    };
+    PROTECTED_SUBPATHS
+        .iter()
+        .any(|protected| rel.starts_with(protected))
+}
+
 /// Refuses a path that reaches a protected zone, directly or through a symlink.
 pub fn ensure_not_protected(
     workspace: &Path,

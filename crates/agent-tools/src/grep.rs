@@ -9,7 +9,7 @@ use serde::Deserialize;
 use walkdir::WalkDir;
 
 use crate::error::{ToolError, ValidationError};
-use crate::path::{confine, ensure_existing_path_no_links};
+use crate::path::{confine, ensure_existing_path_no_links, is_in_protected_subpath};
 use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{Tool, ToolCtx, ToolOutput};
 
@@ -109,11 +109,22 @@ impl Tool for Grep {
         ensure_existing_path_no_links(&ctx.workspace, &base, input.path.as_deref().unwrap_or("."))?;
         let workspace = ctx.workspace.clone();
 
+        // US-079: a base explicitly aimed inside a protected subpath is honored,
+        // so the spill locator the model was handed stays searchable; only the
+        // recursive descent into one is pruned.
+        let prune_protected = !is_in_protected_subpath(&workspace, &base);
+
         let (lines, truncated, skipped) = tokio::task::spawn_blocking(move || {
             let mut out: Vec<String> = Vec::new();
             let mut skipped: Vec<(String, u64)> = Vec::new();
             let mut truncated = false;
-            'walk: for entry in WalkDir::new(&base).into_iter().flatten() {
+            'walk: for entry in WalkDir::new(&base)
+                .into_iter()
+                .filter_entry(|e| {
+                    !prune_protected || !is_in_protected_subpath(&workspace, e.path())
+                })
+                .flatten()
+            {
                 if !entry.file_type().is_file() {
                     continue;
                 }

@@ -1085,6 +1085,94 @@ async fn grep_without_an_oversized_file_says_nothing_more_than_before() {
     assert_eq!(by_id(&out, "a").content, "a.txt:1: hit");
     assert_eq!(by_id(&out, "b").content, "(no matches for \"absent\")");
 }
+
+#[tokio::test]
+async fn a_recursive_search_skips_the_spill_root_but_a_direct_one_reads_it() {
+    // US-079 AC1/AC2/AC3: the walk stays out of `.pyxis`, while the locator the
+    // notice hands the model still resolves.
+    let ws = TempWs::new("spill-walk");
+    ws.write(".pyxis/spill/thread-a/bash-out.txt", "SPILL_MARKER\n");
+    ws.write("src/code.rs", "// SPILL_MARKER mentioned here\n");
+    let reg = read_registry(&ws);
+
+    let out = reg
+        .dispatch(vec![
+            call("a", "grep", serde_json::json!({"pattern": "SPILL_MARKER"})),
+            call(
+                "b",
+                "grep",
+                serde_json::json!({"pattern": "SPILL_MARKER", "path": ".pyxis/spill/thread-a/bash-out.txt"}),
+            ),
+            call("c", "glob", serde_json::json!({"pattern": "**/*.txt"})),
+            call(
+                "d",
+                "read",
+                serde_json::json!({"path": ".pyxis/spill/thread-a/bash-out.txt"}),
+            ),
+        ])
+        .await;
+
+    let walked = by_id(&out, "a");
+    assert!(!walked.is_error, "{}", walked.content);
+    assert!(
+        !walked.content.contains(".pyxis"),
+        "the spill root is out of the walk: {}",
+        walked.content
+    );
+    assert!(
+        walked.content.contains("src/code.rs:1:"),
+        "{}",
+        walked.content
+    );
+
+    let direct = by_id(&out, "b");
+    assert!(!direct.is_error, "{}", direct.content);
+    assert!(
+        direct.content.contains("bash-out.txt:1:"),
+        "an explicit path stays searchable: {}",
+        direct.content
+    );
+
+    let listed = by_id(&out, "c");
+    assert!(!listed.is_error, "{}", listed.content);
+    assert!(
+        !listed.content.contains(".pyxis"),
+        "glob does not list spilled artifacts: {}",
+        listed.content
+    );
+
+    let reread = by_id(&out, "d");
+    assert!(!reread.is_error, "{}", reread.content);
+    assert!(
+        reread.content.contains("SPILL_MARKER"),
+        "the locator must stay readable: {}",
+        reread.content
+    );
+}
+
+#[tokio::test]
+async fn a_workspace_without_a_spill_root_searches_exactly_as_before() {
+    // US-079 unhappy path: no `.pyxis`, no observable difference.
+    let ws = TempWs::new("no-spill-root");
+    ws.write("src/a.rs", "fn a() {}\n");
+    ws.write("src/b.rs", "fn b() {}\n");
+    let reg = read_registry(&ws);
+    let out = reg
+        .dispatch(vec![
+            call("a", "glob", serde_json::json!({"pattern": "**/*.rs"})),
+            call("b", "grep", serde_json::json!({"pattern": "fn "})),
+        ])
+        .await;
+    assert_eq!(by_id(&out, "a").content, "src/a.rs\nsrc/b.rs");
+
+    // Walk order is the filesystem's, so the two matches are checked by
+    // presence and count, not by their order.
+    let matches = by_id(&out, "b").content.clone();
+    assert!(matches.contains("src/a.rs:1: fn a() {}"), "{matches}");
+    assert!(matches.contains("src/b.rs:1: fn b() {}"), "{matches}");
+    assert_eq!(matches.lines().count(), 2, "{matches}");
+}
+
 // ══════════════════════════ US-012 ══════════════════════════
 
 fn mut_registry(ws: &TempWs, mode: PermissionMode) -> Registry {

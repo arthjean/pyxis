@@ -7,7 +7,7 @@ use serde::Deserialize;
 use walkdir::WalkDir;
 
 use crate::error::{ToolError, ValidationError};
-use crate::path::{confine, ensure_existing_path_no_links};
+use crate::path::{confine, ensure_existing_path_no_links, is_in_protected_subpath};
 use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{Tool, ToolCtx, ToolOutput};
 
@@ -79,10 +79,22 @@ impl Tool for Glob {
         let workspace = ctx.workspace.clone();
         let pattern = input.pattern.clone();
 
+        // US-079: the walk stays out of the protected subpaths (`.pyxis`, hence
+        // the spill root and the session files; `.git` internals too), unless
+        // the base explicitly names one, which keeps a spilled artifact
+        // listable when it is asked for by path.
+        let prune_protected = !is_in_protected_subpath(&workspace, &base);
+
         // Synchronous walk (blocking FS) moved off the async runtime.
         let matches = tokio::task::spawn_blocking(move || {
             let mut out: Vec<String> = Vec::new();
-            for entry in WalkDir::new(&base).into_iter().flatten() {
+            for entry in WalkDir::new(&base)
+                .into_iter()
+                .filter_entry(|e| {
+                    !prune_protected || !is_in_protected_subpath(&workspace, e.path())
+                })
+                .flatten()
+            {
                 if !entry.file_type().is_file() {
                     continue;
                 }
