@@ -19,6 +19,7 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/CURRENT_S
 | ADR-11 | Scope MVP recentré : abonnement ChatGPT d'abord, Ollama retiré, autres providers différés | Accepté (2026-06-15) |
 | ADR-12 | Runtime de thread `agent-runtime` au-dessus de `run_agent` | Accepté (2026-07-27) |
 | ADR-13 | Sous-agent mutateur en worktree Git : NO-GO v1 | Accepté (2026-07-28) |
+| ADR-14 | Garde-fou de boucle : échelle vétoiste `[3, 5, 8]`, rappel borné, clé intacte | Accepté (2026-08-20) |
 
 ---
 
@@ -491,3 +492,64 @@ Deuxième raison, subordonnée à la première : créer puis nettoyer un worktre
 **Conditions d'un go ultérieur** (aucune n'est engagée ici) : un **process OS par enfant mutateur**, avec son propre `restrict_self` restreint à son worktree et une frontière d'événements entre parent et enfant. C'est une autre architecture que celle retenue ici, et les non-goals en vigueur (pas d'app-server, pas de merge/commit automatique) restent applicables.
 
 **Ce qui est acquis malgré le no-go.** Le harnais de mesure reste dans l'arbre : il est ignoré par défaut pour sa moitié confinée, il ne crée aucune surface produit, et il rejoue le verdict en une commande le jour où l'architecture change. L'assertion `parent_writable` du spike est volontairement **positive** : si elle tombe, c'est que le modèle de confinement a changé et qu'ADR-13 doit être rejouée.
+
+---
+
+## ADR-14 : Garde-fou de boucle, échelle vétoiste `[3, 5, 8]`
+
+**Statut.** Accepté 2026-08-20. Lot #3 du plan de portage DeepSeek Harness ([`docs/deepseek-harness-porting-plan.md`](./deepseek-harness-porting-plan.md)). Aucune surface de configuration publique n'est ouverte, aucun type de protocole ne change. Décrit du côté architecture en [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md) §3.6.
+
+**Contexte.** `crates/agent-core/src/guardrail.rs` détectait déjà le batch d'outils identique répété, et refusait de l'exécuter au troisième. Le garde était donc **vétoiste**, plus strict que le rappel consultatif de l'implémentation de référence, mais il n'avait qu'un cran : `Signal` quand le compte atteignait le seuil, `Abort` au compte suivant. Cinq défauts mesurés sur cet état :
+
+1. **Le tour mourait au cran suivant.** Un modèle qui recevait le signal, ne le comprenait pas et retentait une fois tuait la session par `ExhaustReason::ToolLoop`. Un seul message, dans un registre unique, précédait la mort, alors que le cas courant est un modèle qui corrige au second rappel.
+2. **Le garde imbriqué de Code Mode écrasait les deux décisions.** `crates/agent-code-mode/src/nested.rs` testait `loop_decision != LoopDecision::Proceed` et rendait le même message dans les deux cas ; le cran terminal n'y faisait rien de plus que le cran de signal, l'appel suivant du même code de cellule repartant au dispatcher.
+3. **Une répétition de part et d'autre d'une intervention humaine comptait comme une boucle.** `LoopGuard::reset()` existait sans aucun appelant sur ce déclencheur : le point sûr de steering (US-007) vidait la file d'entrées utilisateur sans toucher le garde, donc un « oui, relance exactement ce test » était vétoé.
+4. **Un appel exempt blanchissait une boucle.** Un batch entièrement exempt remettait le compteur à zéro, si bien que la série `read(x)`, `wait`, `read(x)`, `wait` ne déclenchait jamais rien, alors que `wait` et `write_stdin` non terminant sont exactement les outils qu'un modèle bloqué sur une session d'exécution intercale.
+5. **Rien n'enregistrait ni ne bornait ces décisions.** `LoopGuard::new` remplaçait silencieusement un seuil de 0 par 1, aucun ADR ne gouvernait le garde-fou, et le commentaire de module renvoyait à une section d'architecture inexistante.
+
+**Décision.** Le garde reste vétoiste et devient une **échelle à trois crans**, portée par le type et non par les sites d'appel.
+
+- `LOOP_GUARD_THRESHOLDS: [u32; 3] = [3, 5, 8]` est une **constante de crate**, validée à la compilation par une `const fn` et un bloc `const _: () = { assert!(...) };`. Une échelle non strictement croissante, ou dont le premier cran est inférieur à 2, ne compile pas. `LoopGuard::new` ne répare plus rien : un `debug_assert!` remplace l'ancien `threshold.max(1)`, et le champ `RunConfig::loop_guard_threshold` est retiré, un `u32` ne pouvant pas porter une échelle.
+- **En dessous de 3, exécution normale. À partir de 3, le batch fautif n'est exécuté à aucun cran.** Ce qui escalade est le **registre** du message : `LoopRegister::Gentle` à 3 et 4, `LoopRegister::Detailed` à 5, 6 et 7, arrêt déterministe à 8. Le garde parle sur des **plages** et non sur des comptes exacts, parce qu'un garde qui n'exécute pas doit rendre un `tool_result` par `tool_use` à chaque batch et ne peut donc pas se taire entre deux crans.
+- Le rappel doux ne cite **aucun** argument, ce qui garde son coût constant. Le rappel détaillé nomme l'outil, la longueur de la série et les arguments canoniques, sous un plafond de `LOOP_GUARD_ARGS_PREVIEW_BYTES = 500` octets, coupé sur une **frontière de caractère**, avec un suffixe qui dit combien d'octets ont été retirés. C'est le premier message du cœur qui cite le contenu d'un appel d'outil.
+- **La clé de détection n'est jamais tronquée.** Elle reste la chaîne canonique complète `nom\0json`, triée puis jointe sur le batch.
+- **Deux déclencheurs de remise à zéro, et deux seulement** : un tour neuf, et une entrée de steering qui entre effectivement dans le transcript au point sûr de `run_agent`. L'interjection se propage au garde imbriqué par `ToolDispatch::steering_input_accepted`, méthode de trait à défaut no-op.
+- **Un appel exempt est transparent** : il ne compte pas et ne remet pas à zéro. C'est l'exact inverse du comportement précédent, et c'est ce qui ferme le blanchiment du défaut 4.
+- **Le site imbriqué se verrouille au cran terminal.** `NestedLoopGuard` retient le message terminal et le rend à tout appel ultérieur du tour, quel que soit l'outil, sans jamais atteindre le dispatcher. Le verrou survit à la fin d'une cellule et tombe au tour suivant ou sur interjection.
+
+**Justification.**
+
+- **Reculer l'arrêt de 4 à 8 ne coûte que des allers-retours modèle.** Le batch n'est exécuté à aucun cran, donc le surcoût de l'échelle est en jetons, jamais en effets. `iter_cap` et `UsageBudget` restent les bornes externes. Le faux positif, lui, est plus cher chez Pyxis que chez un garde consultatif puisqu'il remplace un résultat réel : c'est précisément pour cela que l'arrêt recule.
+- **Fail-loud plutôt que repli silencieux.** Un seuil invalide remplacé par un défaut n'efface pas la faute, il la déplace en aval. Les seuils étant des constantes, la validation remonte à la compilation, un cran plus tôt que la validation au chargement de la référence.
+- **Borner le rappel, jamais la clé.** Tronquer la clé transformerait le garde en générateur de faux positifs sur les gros arguments : deux corps de `write` d'un mégaoctet ne différant qu'au-delà du plafond deviendraient une boucle. Le bornage est fait **à la construction** du message plutôt que par `bound_feedback`, qui ne s'applique qu'aux sorties de dispatch : la construction sous plafond est strictement plus forte, aucun message non borné n'existant même transitoirement, et elle n'a pas besoin du tokenizer. 500 octets restent très en dessous de `MAX_MODEL_TOOL_RESULT_BYTES`, qui vaut 64 Kio.
+- **Une intervention humaine n'est pas la continuation d'une boucle.** Un utilisateur qui demande explicitement de refaire l'appel qui vient d'échouer exprime une intention, pas un spin. Le point sûr de steering est le seul endroit où cette information entre dans le tour, et rien n'y passe entre un `tool_use` et son résultat.
+- **Un appel exempt ne prouve aucun progrès.** L'exemption dit « répéter cet appel est le protocole », pas « la série précédente est close ». Remettre à zéro sur un `wait` donnait à un outil de bookkeeping le pouvoir d'annuler la détection, ce qui est exactement l'inverse de son rôle.
+- **Le verrou imbriqué existe parce qu'une cellule est du JavaScript.** Le modèle externe ne peut pas ignorer un `Exhausted` ; un code de cellule peut, lui, attraper l'erreur et retenter, et alterner les outils pour continuer à produire des effets. Le verrou est donc vérifié **avant** l'échelle et quel que soit l'outil.
+- **Une seule échelle pour les deux sites.** `NestedLoopGuard` partage `LoopGuard` : deux échelles divergentes seraient une seconde source de vérité pour la même décision.
+- **Un ADR, pas une note.** La règle de frontière d'`AGENTS.md` tranche seule : une pull request touchant `guardrail.rs` peut violer l'échelle, la transparence des exemptions et le bornage. Ce qui relève de l'arbre de notes est ce qu'aucun crate ne peut contredire, ce qui n'est pas le cas ici. Un ADR n'a pas de note miroir.
+
+**Alternatives écartées.**
+
+| Option | Pourquoi écartée |
+|---|---|
+| **Détection sensible au résultat** (triplet nom, arguments, résultat, stable sur toute la fenêtre) | C'est la réponse correcte au faux positif sur une sortie qui change, et c'est reconnu comme telle. Elle exige de replier le résultat du batch précédent dans l'observation suivante, donc un état et un chemin de données nouveaux dans le cœur, pour un défaut que le premier cran rend récupérable puisqu'il est un message et non une mort. Reportée, à rouvrir sur un seul faux positif reproductible. |
+| **Fenêtre glissante et détection non consécutive** (hachage des N derniers appels) | Détecte l'alternance A, B, A, B que le garde consécutif laisse passer, au prix d'un état par appel au lieu d'une signature et d'un compteur, et de faux positifs sur les séries légitimes. Le coût mémoire et le taux de faux positifs ne sont pas justifiés par un cas observé. |
+| **Clé de configuration publique exposant les seuils** | Interdite par l'invariant 15 : chaque limite d'orchestration est une constante de crate. C'est aussi ce que la référence configure par plugin et que Pyxis refuse, la configurabilité déplaçant la validation du compilateur vers l'exécution. |
+| **Garde consultatif : exécuter le batch puis rappeler** (la forme de toutes les implémentations relevées, dont celle de référence) | Rend le faux positif indolore, mais laisse un modèle en boucle produire N fois le même effet avant qu'on ne l'arrête. Le veto est la position plus stricte, assumée, et l'échelle est ce qui en paie le coût. |
+| **Tronquer aussi la clé de détection**, pour n'avoir qu'un seul chemin de bornage | Deux arguments d'un Mio ne différant qu'au-delà du plafond deviendraient une boucle. Borner la clé transforme le garde en générateur de faux positifs sur exactement le scénario où il compte. |
+| **Garder le repli silencieux `threshold.max(1)`** | Un seuil de 0 est une faute de programmation, pas une valeur à réparer. Le repli la déplace en aval, là où elle se lit comme un garde-fou hystérique et non comme un mauvais paramètre. |
+| **Garder la remise à zéro sur batch exempt** | C'est le défaut 4 : `read(x)`, `wait`, `read(x)`, `wait` ne déclenche alors jamais rien, et les outils qui blanchissent sont précisément ceux qu'un modèle bloqué sur une session d'exécution intercale. |
+| **Faire terminer le tour externe par le verrou imbriqué** | Une cellule verrouillée rend des erreurs et se termine ; le tour continue. Le site externe a sa propre échelle et arrêtera le tour si le modèle relance la même cellule. Laissée ouverte plutôt que tranchée par anticipation. |
+| **Un seizième invariant dans `docs/ARCHITECTURE.md`** | Un invariant redondant avec un ADR est une seconde source de vérité. La décision est portée ici, la partie 3 la décrit et la lie. |
+| **Une note miroir dans `docs/notes/`** | Interdite par la règle de frontière : une décision qu'une pull request sur `crates/` peut violer est un ADR, et un ADR n'a pas de miroir. |
+
+**Conséquences & risques.**
+
+- **Coût assumé.** Une série qui va jusqu'à l'arrêt dépense au plus cinq allers-retours modèle de plus qu'avant, et **zéro** exécution d'outil supplémentaire. Le message du garde reste sous `LOOP_GUARD_ARGS_PREVIEW_BYTES` plus un préambule constant, quelle que soit la taille des arguments.
+- **La transparence des exemptions peut vétoer une relecture légitime** d'un journal qui grossit. Mitigation : le premier cran est un message, pas une mort, et le modèle peut relire avec un décalage. La correction de principe est la détection sensible au résultat, écartée ci-dessus avec sa condition de réouverture.
+- **`ToolDispatch` s'élargit** d'une méthode `steering_input_accepted` à défaut no-op. Le défaut est le choix conservateur : ne pas remettre à zéro est plus strict que remettre à zéro, donc un dispatcher qui ignore la méthode ne devient jamais silencieusement plus permissif. L'alternative, un invariant valable sur un site sur deux, est pire.
+- **Le garde vit le temps d'un `run_agent`.** Un tour repris après compaction ou après redémarrage repart sur une chaîne neuve. C'est une limite héritée et assumée : la compaction ne remet pas la chaîne à zéro dans le tour courant, mais une reprise en crée une nouvelle.
+- **La détection reste une correspondance exacte** sur la chaîne canonique. Un argument qui change d'un octet à chaque itération n'est pas une boucle pour ce garde.
+- **La canonicalisation est une hypothèse sur une dépendance.** `serde_json::Map` sans `preserve_order` trie ses clés, ce qui rend la signature stable ; une activation transitive de la feature casserait la détection en silence. Convertie en test nommé (`the_signature_is_blind_to_the_order_of_the_json_keys`), donc en échec de suite plutôt qu'en dérive muette.
+- **L'ordre d'appel est ce qui rend le comptage des refus gratuit.** `observe` est invoqué **en amont** de la dispatch, et les refus de permission sont produits à l'intérieur de `Registry::dispatch` : un appel refusé compte donc comme un appel ordinaire, et un modèle qui martèle un appel refusé est arrêté. Un déplacement futur d'`observe` sous la dispatch casserait la propriété, ce qu'un test nommé rend impossible.
+- **`RunConfig::loop_guard_threshold` disparaît.** Aucun appelant hors du workspace ne le construisait, vérifié par recherche sur `crates/`.
