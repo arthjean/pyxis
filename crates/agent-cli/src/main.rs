@@ -21,6 +21,12 @@ mod session;
 mod settings;
 mod skills;
 mod subagents;
+// The tool catalog (EP-032) reads the wiring of this file and renders
+// `docs/tool-catalog.md`. Gated on `test` because it is a documentation
+// gate, and `agent-cli` has no `[lib]` target an integration test could
+// import the wiring from.
+#[cfg(test)]
+mod tool_catalog;
 
 use std::sync::Arc;
 
