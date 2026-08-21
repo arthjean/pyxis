@@ -63,6 +63,7 @@ the command, so no gate here is one nothing ever runs:
 | Tool catalog, after a tool is registered or one of its policy properties moves | `PYXIS_UPDATE_CATALOGS=1 cargo test -p agent-cli --bin pyxis tool_catalog` | a line of `just regen`; it writes, so the freshness assertion it feeds runs inside `just test` |
 | Configuration catalog, after a key, a flag, or a `PYXIS_*` variable moves | `PYXIS_UPDATE_CATALOGS=1 cargo test -p agent-cli --bin pyxis config_catalog` | a line of `just regen`; it writes, so the freshness assertion it feeds runs inside `just test` |
 | Decision records, and the gate inventory the `justfile`, `.github/workflows/ci.yml`, `AGENTS.md` and `CONTRIBUTING.md` describe | `cargo test -p agent-doc-gates` | runs inside `just test` |
+| Model experience, after a prompt, a tool description, an injected literal, or the list of crates moves | `cargo test -p agent-doc-gates` | runs inside `just test` |
 | Live parity against a real OpenAI endpoint | see `docs/parity/offline-suite.md` | outside every aggregate on purpose: it spends the maintainer's subscription, so no recipe may set `PYXIS_LIVE_PARITY` |
 
 Adding, renaming, or moving a test named in the table of
@@ -111,6 +112,7 @@ dependency bans; these are the ones nothing mechanical catches:
 | An app-server method | `crates/agent-app-server/src/protocol.rs`, then regenerate the schemas |
 | Turn or thread lifecycle | `crates/agent-runtime/src/` through `TurnRunner`. Never a second model-tool loop |
 | Rendering | `crates/agent-tui/`, proved by a reviewed snapshot |
+| A surface the model sees: a prompt, a tool description, an injected literal | the `## Model Experience` section of the README of the crate that composes it, in the shape `docs/model-experience.md` fixes |
 
 ## Source of truth
 
@@ -172,4 +174,5 @@ regeneration; the fix goes into the source the catalog reads.
 | Headless JSONL event contract | `docs/EVENT_SCHEMA.md` |
 | Parity baseline and offline proof recipe | `docs/parity/README.md` |
 | App-server protocol | `docs/app-server/README.md` |
+| Model experience: what each crate sends to the model, its token cost, its cache effect | [`docs/model-experience.md`](docs/model-experience.md) |
 | Decision notes: tree, format, and ADR boundary | [`docs/notes/README.md`](docs/notes/README.md) |
