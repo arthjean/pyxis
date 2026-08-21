@@ -1,0 +1,291 @@
+{
+  "prd": {
+    "file": "tasks/prd-registre-taches-de-fond.md",
+    "title": "Registre de tâches de fond",
+    "created_at": "2026-08-22",
+    "status": "IN_PROGRESS",
+    "updated_at": "2026-08-22"
+  },
+  "epics": [
+    {
+      "id": "EP-041",
+      "title": "Le registre et son écriture durable",
+      "status": "DONE",
+      "priority": "P0",
+      "stories_total": 4,
+      "stories_done": 4
+    },
+    {
+      "id": "EP-042",
+      "title": "Les terminaux entrent au registre",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 3,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-043",
+      "title": "Ce que le modèle voit",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 4,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-044",
+      "title": "La complétion qui revient d'elle-même",
+      "status": "TODO",
+      "priority": "P1",
+      "stories_total": 3,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-045",
+      "title": "Le redémarrage qui rapporte au lieu de ressusciter",
+      "status": "TODO",
+      "priority": "P1",
+      "stories_total": 3,
+      "stories_done": 0
+    }
+  ],
+  "stories": [
+    {
+      "id": "US-131",
+      "title": "Le vocabulaire d'un travail de fond est fermé et vérifié par le compilateur",
+      "epic": "EP-041",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [],
+      "started_at": "2026-08-22",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
+    },
+    {
+      "id": "US-132",
+      "title": "Le registre est borné, possédé par un fil, et règle au premier arrivé",
+      "epic": "EP-041",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-131"
+      ],
+      "started_at": "2026-08-22",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
+    },
+    {
+      "id": "US-133",
+      "title": "Un enregistrement est durable avant d'être acquitté",
+      "epic": "EP-041",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-131"
+      ],
+      "started_at": "2026-08-22",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
+    },
+    {
+      "id": "US-134",
+      "title": "L'annulation descend du fil au travail et ne remonte jamais",
+      "epic": "EP-041",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-132"
+      ],
+      "started_at": "2026-08-22",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
+    },
+    {
+      "id": "US-135",
+      "title": "Le lanceur est un trait du runtime, implémenté par le binaire",
+      "epic": "EP-042",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-132"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-136",
+      "title": "exec_command réserve puis enregistre, dans cet ordre",
+      "epic": "EP-042",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-135"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-137",
+      "title": "La fin d'un processus règle le travail une fois, avec son code de sortie",
+      "epic": "EP-042",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-136"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-138",
+      "title": "list_jobs dit ce qui tourne, sans effet et sans souillure supplémentaire",
+      "epic": "EP-043",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-136"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-139",
+      "title": "La relève finale est idempotente, la lecture incrémentale ne l'est pas",
+      "epic": "EP-043",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-138"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-140",
+      "title": "Un travail terminé n'est annoncé qu'une fois, et le drapeau survit au redémarrage",
+      "epic": "EP-043",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-137",
+        "US-139"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-141",
+      "title": "Les catalogues, le graphe de crates et l'expérience du modèle sont régénérés",
+      "epic": "EP-043",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "S",
+      "blocked_by": [
+        "US-138"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-142",
+      "title": "Une complétion non relevée ouvre un tour, dans un budget constant",
+      "epic": "EP-044",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "L",
+      "blocked_by": [
+        "US-140"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-143",
+      "title": "Le budget se réarme sur une entrée d'origine humaine",
+      "epic": "EP-044",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "S",
+      "blocked_by": [
+        "US-142"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-144",
+      "title": "En headless et en app-server, la livraison ne réveille personne",
+      "epic": "EP-044",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "M",
+      "blocked_by": [
+        "US-142"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-145",
+      "title": "Une reprise ferme tout travail actif avec sa cause durable",
+      "epic": "EP-045",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "M",
+      "blocked_by": [
+        "US-133"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-146",
+      "title": "La reprise, la fin de tour et /status nomment ce qui reste ouvert",
+      "epic": "EP-045",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "M",
+      "blocked_by": [
+        "US-145",
+        "US-138"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-147",
+      "title": "ADR-16 fixe la frontière de survie, et la note consigne l'écart au plan",
+      "epic": "EP-045",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "S",
+      "blocked_by": [
+        "US-145"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    }
+  ]
+}
