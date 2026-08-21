@@ -1,0 +1,185 @@
+{
+  "prd": {
+    "file": "tasks/prd-transcription-rejouable.md",
+    "title": "Transcription rejouable",
+    "created_at": "2026-08-21",
+    "status": "IN_PROGRESS"
+  },
+  "epics": [
+    {
+      "id": "EP-038",
+      "title": "La couture déterministe",
+      "status": "DONE",
+      "priority": "P0",
+      "stories_total": 4,
+      "stories_done": 4
+    },
+    {
+      "id": "EP-039",
+      "title": "La transcription gelée et la porte qui la compare",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 3,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-040",
+      "title": "Le contrat écrit rattrapé par sa preuve",
+      "status": "TODO",
+      "priority": "P1",
+      "stories_total": 4,
+      "stories_done": 0
+    }
+  ],
+  "stories": [
+    {
+      "id": "US-120",
+      "title": "Le rédacteur d'événements écrit dans un puits qu'on lui donne",
+      "epic": "EP-038",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
+    },
+    {
+      "id": "US-121",
+      "title": "La session accepte l'horloge et le générateur d'identifiants qu'on lui passe",
+      "epic": "EP-038",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
+    },
+    {
+      "id": "US-122",
+      "title": "Le fournisseur de rejeu refuse ce que le script n'a pas prévu, et le script est prouvé consommé",
+      "epic": "EP-038",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
+    },
+    {
+      "id": "US-123",
+      "title": "Le chemin headless réel tourne en test et rend une transcription sans octet volatile",
+      "epic": "EP-038",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "L",
+      "blocked_by": [
+        "US-120",
+        "US-121",
+        "US-122"
+      ],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
+    },
+    {
+      "id": "US-124",
+      "title": "La transcription est gelée dans un fichier et comparée octet à octet",
+      "epic": "EP-039",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-123"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-125",
+      "title": "La bascule d'écriture est isolée comme les deux autres",
+      "epic": "EP-039",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-124"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-126",
+      "title": "Quatre scénarios couvrent le tour nu, l'outil, l'interruption et l'erreur",
+      "epic": "EP-039",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "L",
+      "blocked_by": [
+        "US-124"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-127",
+      "title": "Le schéma d'événements documente les six types muets et corrige ses préfixes",
+      "epic": "EP-040",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "M",
+      "blocked_by": [
+        "US-126"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-128",
+      "title": "L'ordre garanti cesse d'être une prose et devient une assertion",
+      "epic": "EP-040",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "S",
+      "blocked_by": [
+        "US-126"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-129",
+      "title": "La note de décision consigne pourquoi ce n'est pas insta et où s'arrête le chemin réel",
+      "epic": "EP-040",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "S",
+      "blocked_by": [
+        "US-125",
+        "US-128"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-130",
+      "title": "La distance entre headless::run et le binaire publié est mesurée et nommée",
+      "epic": "EP-040",
+      "status": "TODO",
+      "priority": "P2",
+      "size": "S",
+      "blocked_by": [],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    }
+  ]
+}
