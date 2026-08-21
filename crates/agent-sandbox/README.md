@@ -6,8 +6,8 @@ allow-list. Nothing here composes a message; it decides what a process may reach
 
 ## Model Experience
 
-Indirectly, through the refusal body the network proxy returns, which travels
-inside the output of the tool that made the request.
+Indirectly, through the 403 body the network proxy returns, which travels inside
+the output of the execution tool that made the request.
 
 #### KV Cache effect
 
