@@ -153,7 +153,8 @@ fingerprinted, never hand-edited.
 
 | Topic | Document |
 |---|---|
-| Invariants, crate graph, agent loop, tools, MCP, sessions | `docs/ARCHITECTURE.md` |
+| Invariants, agent loop, tools, MCP, sessions | `docs/ARCHITECTURE.md` |
+| Crate graph: the sixteen crates, their role and their internal edges, generated | [`docs/crate-graph.md`](docs/crate-graph.md) |
 | ADRs and structural decisions | `docs/DECISIONS.md` |
 | Shipped scope, deferred work, live risks | `docs/CURRENT_STATUS.md` |
 | Provider contract and error taxonomy | `docs/PROVIDERS.md` |

@@ -136,18 +136,10 @@ Pyxis is a Cargo workspace. The crates are named `agent-*` internally; the publi
 
 The founding invariant: **`agent-core` depends on neither the TUI nor the provider layer** (only on `agent-tokenizer`, which is also headless). I/O is injected through traits, so the loop is testable without network, terminal, or a real model. The provider layer normalizes heterogeneous wire formats into one Anthropic-shaped canonical format, with divergences localized per adapter.
 
-| Crate | Role |
-|---|---|
-| `agent-core` | Agent loop, transition state machine, canonical message/transcript types (headless) |
-| `agent-provider` | `Provider` trait + adapters (WebSocket + HTTP/SSE), canonical `StreamEvent`, error taxonomy |
-| `agent-tools` | Tool registry, fail-closed trait, concurrent/serial dispatch, permissions, taint |
-| `agent-mcp` | `rmcp`-based MCP client (stdio + Streamable HTTP), config loading, server registry, per-server tool policy and bounds, per-server OAuth, MCP tools as `DynTool` |
-| `agent-tui` | Ratatui + crossterm frontend, decoupled from the core via channels |
-| `agent-session` | Append-only JSONL persistence, resume, compaction boundaries |
-| `agent-sandbox` | Landlock FS confinement + local network allow-list proxy |
-| `agent-auth` | Credential storage (keyring), OAuth PKCE, token refresh |
-| `agent-tokenizer` | Local token counting (fallback when a provider omits stream usage) |
-| `agent-cli` | The `pyxis` binary, the only crate that wires everything together |
+The diagram above is an orientation sketch, not the inventory: it draws the crates a reader
+meets first. The full list, the role of every crate and the edges between them are derived
+from the sixteen `Cargo.toml` of the workspace in [`docs/crate-graph.md`](docs/crate-graph.md),
+which a test rewrites rather than a hand.
 
 Full detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 

@@ -57,21 +57,24 @@ Règle d'or absolue, vérifiée à la compilation par le graphe de dépendances 
 
 ## 2. Workspace de crates
 
-Le projet est un workspace Cargo. Chaque crate a une responsabilité unique et un périmètre de dépendances contraint.
+Le projet est un workspace Cargo. Chaque crate a une responsabilité unique et un périmètre
+de dépendances contraint. La liste des crates, leur rôle et leurs arêtes sont dérivés de
+leurs manifestes dans [`crate-graph.md`](crate-graph.md) : ce document ne les recopie plus,
+il énonce ce qu'ils s'interdisent. Une dépendance absente du graphe n'est pas pour autant
+proscrite ; le tableau ci-dessous nomme les interdictions, qui sont des invariants et non
+des faits dérivables du code d'aujourd'hui.
 
-| Crate | Rôle | Dépendances interdites |
-|---|---|---|
-| `agent-core` | Boucle d'agent, state machine, types canoniques (messages, content blocks, transcript, budget). | Aucune dépendance TUI / HTTP. Ne connaît ni Ratatui ni reqwest. |
-| `agent-provider` | Trait `Provider` + adapters (`reqwest`, `eventsource-stream`, `tokio-tungstenite`). Normalisation vers le format canonique, émission de `StreamEvent`. | Ne dépend pas de `agent-tui`. |
-| `agent-tools` | `Registry`, trait `Tool`, dispatch concurrent/série, permissions, hooks, taint. | — |
-| `agent-mcp` | Wrapper autour de `rmcp` (SDK MCP Rust officiel). Charge la config, suit le lifecycle stdio, liste les outils et les expose au modèle comme `DynTool` (nommage sûr, schéma strict, taint intégral). | — |
-| `agent-tui` | Frontend Ratatui + crossterm. **Découplé du core via canaux.** | **Jamais importé par le core.** |
-| `agent-runtime` | Runtime de thread durable : identité (`ThreadId`/`TurnId`/`StepId`/`EventId`/`AgentId`), cycle de vie des tours, mailbox bornée, steering, annulation hiérarchique, forks, superviseur de sous-agents. Contrat `ThreadStore` + adapter mémoire. | Aucun accès disque, aucun HTTP, aucune TUI. Ne dépend jamais de `agent-tools` ni de `agent-session`. |
-| `agent-session` | Persistance JSONL append-only, compaction, resume. Porte l'adapter JSONL de `ThreadStore`, qui est AUSSI l'implémentation de `Session` : un thread a un fichier, un writer et un curseur. | — |
-| `agent-sandbox` | Landlock FS + proxy réseau local + `PolicyEngine`. | — |
-| `agent-auth` | Stockage de credentials (Secret Service / keyring), OAuth PKCE ChatGPT, refresh token. Les futurs flows BYOK/OAuth provider restent isolés ici. | — |
-| `agent-tokenizer` | Comptage de tokens local (tiktoken-rs / tokenizers). Indispensable pour la compaction sur les providers sans usage fiable en stream. Headless. | Aucune dépendance TUI / HTTP. |
-| `agent-cli` | Binaire `pyxis`, wiring. **Seul crate qui dépend de tout.** | — |
+| Crate | Dépendances interdites |
+|---|---|
+| `agent-core` | Aucune dépendance TUI / HTTP. Ne connaît ni Ratatui ni reqwest. Seule dépendance interne autorisée : `agent-tokenizer`. |
+| `agent-provider` | Ne dépend pas de `agent-tui`. |
+| `agent-tui` | **Jamais importé par le core.** |
+| `agent-runtime` | Aucun accès disque, aucun HTTP, aucune TUI. Ne dépend jamais de `agent-tools` ni de `agent-session`. |
+| `agent-tokenizer` | Aucune dépendance TUI / HTTP. |
+| `agent-parity`, `agent-doc-gates` | N'importent aucun crate Pyxis et n'entrent dans le graphe d'aucun binaire. |
+
+Les crates que ce tableau ne nomme pas ne s'interdisent rien de particulier : leur périmètre
+est celui que leur manifeste déclare, et le graphe généré le publie.
 
 Observabilité : les crates **émettent** via la façade `tracing`, jamais sur
 une sortie de processus. Le binaire est le seul à installer un souscripteur
@@ -79,6 +82,13 @@ une sortie de processus. Le binaire est le seul à installer un souscripteur
 n'est pas une I/O : l'invariant 1 (cœur headless) reste tenu.
 
 ### Graphe de dépendances (sens des flèches = « dépend de »)
+
+Le schéma ci-dessous est une simplification éditoriale : il aplatit le graphe en couches
+pour rendre lisible d'un coup d'œil qui dépend de qui, tait les arêtes qui n'éclairent pas
+ce propos et porte des annotations qu'aucun manifeste ne contient. Il n'est pas exhaustif,
+et ne prétend pas l'être ; le graphe complet des seize crates et de leurs arêtes est dérivé
+des manifestes dans [`crate-graph.md`](crate-graph.md). En cas de désaccord, c'est le graphe
+généré qui dit vrai.
 
 ```
                               ┌───────────┐
