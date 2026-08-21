@@ -20,17 +20,21 @@ schema.
 
 #### Token effect
 
-The catalog section rendering those descriptions is about 26 KB of Markdown,
-which puts the tool block in the low thousands of tokens on every single request
-of the session, before a word of conversation is counted.
+The `## Outils` section of the catalog renders 26 117 bytes, a measure of the
+generated Markdown and not a token count, which puts the tool block in the low
+thousands of tokens on every single request of the session, before a word of
+conversation is counted.
 
 #### KV Cache effect
 
 Préfixe stable répété: the tool array is assembled the same way on every request
-of a run, so it is the part of the prefix a provider can reuse for free.
-Rewording one `description()` moves bytes at the very front of that prefix and
-therefore invalidates the cache of every open session, not only the next request.
-That is why a description edit is a contract change and not a style change.
+of a run, so it is the part of the prefix a provider can reuse for free. It is
+also the first of the three levels the provider caches, `tools`, then `system`,
+then `messages`, and each level builds on the ones before it. Rewording one
+`description()` moves bytes at the very front of that prefix and therefore
+invalidates all three levels at once, for every open session and not only for the
+next request. That is why a description edit is a contract change and not a style
+change.
 
 ### Tool results
 
@@ -80,6 +84,30 @@ appended with it. The one loop it must not close is the reason
 `NEVER_SPILLED = &["read"]` exists: spilling a `read` would invite the model to
 read the spill file, which would spill again, and each round would add a result
 the provider has to bill.
+
+### Tool error messages
+
+#### What the model sees
+
+The `Display` of a `ToolError` (`crates/agent-tools/src/error.rs`), serialized
+into a `tool_result` carrying `is_error: true` rather than raised, so a failure
+is something the model reads and reacts to. The seven forms are fixed prefixes
+over a free tail: `invalid argument: {0}`, `validation: {0}`, `path outside
+workspace: {0}`, `io: {0}`, `timeout exceeded`, and the two that surface their
+payload alone, `SessionClosed` and `Rejected`.
+
+#### Token effect
+
+A line or two per failure, and the prefix is what earns them: `path outside
+workspace` tells the model the confinement refused the path, so it retries
+elsewhere instead of retrying identically and paying a second failed call.
+
+#### KV Cache effect
+
+Croissance en ajout seul: an error is a tool result like any other, appended
+after everything already sent. A failed call costs the tokens of its error and
+never rewrites the prefix, which is why a fail-closed default is cheap enough to
+be the default.
 
 ### The context budget notice
 
