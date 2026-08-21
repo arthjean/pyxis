@@ -30,6 +30,15 @@
 //! the list of crates and their edges is a rendered fact rather than two prose
 //! tables that went stale one line per new crate.
 //!
+//! The same standard reaches the most expensive surface of all, the one sent to
+//! the model: [`model_experience`] holds each of the sixteen crates to a written
+//! declaration of what it puts in front of the model and what that costs in
+//! cache. The prefix is ordered `tools`, `system`, `messages`, so rewording one
+//! tool description throws away the cache of every open session, and nothing in
+//! a diff said so. The gate refuses absence, order and paraphrase; it never
+//! claims the prose is true, and `docs/model-experience.md` says which of the
+//! two it is.
+//!
 //! No mechanical rule exists here without its written counterpart: the rules of
 //! the tree are written in `docs/notes/README.md`, those of the register in the
 //! header of `docs/DECISIONS.md`, which announces its summary table and the
@@ -41,6 +50,7 @@ mod crate_graph;
 mod decisions;
 mod gates;
 mod links;
+mod model_experience;
 
 pub use crate_graph::{
     CRATE_GRAPH_DOC, CRATES_ROOT, CrateManifest, GENERATOR, NO_DEPENDENCY, REGENERATE_COMMAND,
@@ -56,6 +66,12 @@ pub use gates::{
     compare_gates, justfile_gates, workflow_gates,
 };
 pub use links::{DOCS_ROOT, check_links, markdown_documents, relative_links};
+pub use model_experience::{
+    CLASSIFICATION, CONTRACT_DOC, Classified, FIELDS, INDIRECT_OPENING, MARKDOWN_FENCE,
+    NONE_OPENING, SECTION_HEADING, SYSTEM_PROMPT_MARKER, Shape, TOOL_CATALOG_DOC,
+    catalog_fragments, check_catalog_anchors, check_classification, check_model_experience,
+    check_readme, classification_of,
+};
 
 use std::fs;
 use std::path::{Path, PathBuf};

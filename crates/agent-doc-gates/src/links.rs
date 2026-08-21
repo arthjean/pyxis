@@ -10,18 +10,29 @@
 //! touched, so the gate reads the disk and nothing else, and a target that climbs
 //! out of the repository is a violation rather than a lookup somewhere else on the
 //! machine. Anchors are dropped before resolution: proving that `#un-titre` exists
-//! would need a full heading parser for a marginal gain.
+//! would need a full heading parser for a marginal gain. One anchor is proved
+//! anyway, elsewhere: [`crate::model_experience`] resolves the `#name` fragments
+//! aimed at `docs/tool-catalog.md`, whose headings are generated and therefore
+//! enumerable without a parser. The two do not overlap, the path being this
+//! module's business and the fragment the other's.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use crate::crate_graph::CRATES_ROOT;
+
 /// The documentation tree, relative to the repository root.
 pub const DOCS_ROOT: &str = "docs";
 
-/// Every Markdown document the gate reads: the repository's own root files plus
-/// the whole documentation tree. The root is in scope because that is where the
-/// links into `docs/notes/` start, `AGENTS.md` being the one file a fresh agent
-/// reads before touching anything.
+/// Every Markdown document the gate reads: the repository's own root files, the
+/// whole documentation tree, and the README of each crate. The root is in scope
+/// because that is where the links into `docs/notes/` start, `AGENTS.md` being
+/// the one file a fresh agent reads before touching anything. The crate READMEs
+/// joined it when they started carrying the model-experience sections, whose
+/// links climb back into `docs/`: a section pointing at a moved document is the
+/// same silent death as anywhere else, and it costs one directory read to refuse
+/// it. Only `README.md` is taken, so a crate's other Markdown, changelog or
+/// notes, stays out of a gate nobody asked it to enter.
 pub fn markdown_documents(repository_root: &Path) -> Vec<PathBuf> {
     let mut documents = Vec::new();
     if let Ok(entries) = fs::read_dir(repository_root) {
@@ -33,6 +44,14 @@ pub fn markdown_documents(repository_root: &Path) -> Vec<PathBuf> {
         }
     }
     collect_markdown(&repository_root.join(DOCS_ROOT), &mut documents);
+    if let Ok(entries) = fs::read_dir(repository_root.join(CRATES_ROOT)) {
+        for entry in entries.filter_map(Result::ok) {
+            let readme = entry.path().join("README.md");
+            if readme.is_file() {
+                documents.push(readme);
+            }
+        }
+    }
     documents.sort();
     documents
 }
@@ -93,7 +112,7 @@ pub fn relative_links(content: &str) -> Vec<(usize, String)> {
 /// The `(...)` destination of every inline link on a line. Parentheses are
 /// counted rather than searched for, a destination being allowed to carry a
 /// balanced pair of its own.
-fn inline_destinations(line: &str) -> Vec<String> {
+pub(crate) fn inline_destinations(line: &str) -> Vec<String> {
     let bytes = line.as_bytes();
     let mut destinations = Vec::new();
     let mut index = 0;
