@@ -16,6 +16,11 @@
 //! holds the register to the same standard: an ADR its own summary table never
 //! lists, or a decision that never says what it beat, fails the suite too.
 //!
+//! The same standard reaches the two descriptions the repository makes of its
+//! own gates: [`gates`] compares the `justfile` against `.github/workflows/ci.yml`
+//! so an aggregate that no longer runs what the CI runs fails the suite rather
+//! than quietly promising it.
+//!
 //! No mechanical rule exists here without its written counterpart: the rules of
 //! the tree are written in `docs/notes/README.md`, those of the register in the
 //! header of `docs/DECISIONS.md`, which announces its summary table and the
@@ -24,10 +29,15 @@
 //! misplaced file into several round trips.
 
 mod decisions;
+mod gates;
 mod links;
 
 pub use decisions::{
     ADR_ALTERNATIVES_HEADING, DECISIONS_DOC, check_decisions, check_decisions_document,
+};
+pub use gates::{
+    AGGREGATE_RECIPE, GATE_MARKER, Gate, JUSTFILE, WORKFLOW, check_gate_documents, check_gates,
+    compare_gates, justfile_gates, workflow_gates,
 };
 pub use links::{DOCS_ROOT, check_links, markdown_documents, relative_links};
 

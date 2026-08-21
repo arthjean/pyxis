@@ -6,6 +6,12 @@
 # because a job cancelled by `timeout-minutes` archives no log. Keeping the two
 # inventories identical is therefore a requirement on every edit to either file.
 #
+# `# ci-step: <name>` above a recipe pairs it with the workflow step of that
+# name. It sits above the documentation comment so `just --list` keeps showing
+# the line below it. `agent-doc-gates` reads both files and fails
+# `cargo test --workspace` when the marked recipes and the workflow steps stop
+# carrying the same commands in the same order.
+#
 # Only syntax available since `just` 1.0 is used here: no attribute, no
 # `set unstable`. The packaged versions this file is expected to run on go back
 # to 1.21.0 (Ubuntu 24.04 universe).
@@ -14,18 +20,22 @@
 default:
     @just --list
 
+# ci-step: Format
 # Check the formatting of the whole workspace, the cheapest gate.
 fmt:
     cargo fmt --all -- --check
 
+# ci-step: Clippy
 # Lint every target, tests included; no `-D warnings`, unwrap/expect are warn by decision.
 lint:
     cargo clippy --workspace --all-targets
 
+# ci-step: Build tests
 # Link the test binaries without running them, where the whole graph is codegened.
 build-tests:
     cargo test --workspace --no-run
 
+# ci-step: Tests
 # Run the whole suite, naming every failing test instead of stopping at the first.
 test:
     cargo test --workspace --no-fail-fast
