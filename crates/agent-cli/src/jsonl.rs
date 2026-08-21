@@ -195,17 +195,27 @@ struct RunSummary<'a> {
 /// Line writer. In `Text` mode, everything is inert: not a byte is written,
 /// which guarantees AC4 (default text output unchanged) by construction
 /// rather than by re-reading.
+///
+/// The sink is handed in rather than decided here (US-120). What a run really
+/// renders is the byte sequence this writer produces, and a test cannot read it
+/// while the destination is `stdout()` locked from inside a free function: it
+/// would have to parse the harness's own output. A trait object rather than a
+/// type parameter, because the writer is built once per run and never in a hot
+/// loop, and because a generic would propagate into `HeadlessRun` and from there
+/// into every caller of `headless::run`.
 pub struct EventWriter {
     format: OutputFormat,
+    sink: Box<dyn Write + Send>,
     model_turns: u32,
     input_tokens: u64,
     output_tokens: u64,
 }
 
 impl EventWriter {
-    pub fn new(format: OutputFormat) -> Self {
+    pub fn new(format: OutputFormat, sink: Box<dyn Write + Send>) -> Self {
         Self {
             format,
+            sink,
             model_turns: 0,
             input_tokens: 0,
             output_tokens: 0,
@@ -242,7 +252,7 @@ impl EventWriter {
         // A non-serializable event would be a contract bug, not a
         // runtime condition: we report it on stderr without cutting the stream.
         match serde_json::to_string(&line) {
-            Ok(json) => write_line(&json),
+            Ok(json) => self.write_line(&json),
             Err(err) => eprintln!("[jsonl] event not serializable: {err}"),
         }
     }
@@ -269,7 +279,7 @@ impl EventWriter {
             },
         };
         match serde_json::to_string(&line) {
-            Ok(json) => write_line(&json),
+            Ok(json) => self.write_line(&json),
             Err(err) => eprintln!("[jsonl] store failure not serializable: {err}"),
         }
     }
@@ -299,19 +309,75 @@ impl EventWriter {
             },
         };
         match serde_json::to_string(&line) {
-            Ok(json) => write_line(&json),
+            Ok(json) => self.write_line(&json),
             Err(err) => eprintln!("[jsonl] summary not serializable: {err}"),
+        }
+    }
+
+    /// One line, flushed immediately: an orchestrator following the stream must
+    /// not wait for the end of the run to see the first event.
+    ///
+    /// A sink that refuses the write is swallowed, as it was when the sink was
+    /// `stdout()`: a consumer that closed the pipe ends the stream, not the
+    /// turn, whose terminal state is durable elsewhere.
+    fn write_line(&mut self, json: &str) {
+        if writeln!(self.sink, "{json}").is_ok() {
+            let _ = self.sink.flush();
         }
     }
 }
 
-/// One line, flushed immediately: an orchestrator following the stream must not
-/// wait for the end of the run to see the first event.
-fn write_line(json: &str) {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    if writeln!(out, "{json}").is_ok() {
-        let _ = out.flush();
+/// Sink that keeps every byte written to it, shared with the test that reads
+/// them back (US-120). The contract is the byte sequence, so the harness asserts
+/// on bytes and never on a `serde_json::Value` rebuilt from the same struct the
+/// writer serialized.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub struct CapturedSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl CapturedSink {
+    pub fn bytes(&self) -> Vec<u8> {
+        self.0.lock().map(|held| held.clone()).unwrap_or_default()
+    }
+
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes()).into_owned()
+    }
+}
+
+#[cfg(test)]
+impl Write for CapturedSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Ok(mut held) = self.0.lock() {
+            held.extend_from_slice(buf);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Sink that refuses every write, the way a closed pipe does.
+#[cfg(test)]
+pub struct FailingSink;
+
+#[cfg(test)]
+impl Write for FailingSink {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "sink closed",
+        ))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "sink closed",
+        ))
     }
 }
 
@@ -450,7 +516,7 @@ mod tests {
     /// `model_turn` observed, without adding them twice (they are cumulated).
     #[test]
     fn summary_tracks_the_last_cumulative_counters() {
-        let mut writer = EventWriter::new(OutputFormat::Text);
+        let mut writer = EventWriter::new(OutputFormat::Text, Box::new(CapturedSink::default()));
         for index in 1..=3 {
             writer.identified_event(
                 &AgentEvent::ModelTurn(ModelTurnView {
@@ -501,12 +567,75 @@ mod tests {
 
     #[test]
     fn text_format_writes_nothing() {
-        let mut writer = EventWriter::new(OutputFormat::Text);
+        let sink = CapturedSink::default();
+        let mut writer = EventWriter::new(OutputFormat::Text, Box::new(sink.clone()));
         assert!(!writer.is_json());
-        // Nothing to observe on stdout: the absence of a write is structural
-        // (early return on the format), not a property of this test.
         writer.identified_event(&AgentEvent::Text("x".into()), &EventIdentity::default());
         writer.run_summary("s.jsonl", &RunEnd::EndTurn, &EventIdentity::default());
+        // The absence of a write is structural (early return on the format);
+        // now that the sink is given, the test reads it instead of asserting it.
+        assert!(sink.bytes().is_empty(), "text mode must not write a byte");
+    }
+
+    /// US-120 AC3/AC5: the harness reads the BYTES the writer renders, not a
+    /// `Value` rebuilt from the same struct. `\n` separates the records, so its
+    /// presence at the end of every line and the absence of `\r` are the two
+    /// halves of the JSONL contract that a `to_value` round trip cannot see.
+    #[test]
+    fn a_written_line_ends_with_a_bare_newline_and_carries_no_carriage_return() {
+        let sink = CapturedSink::default();
+        let mut writer = EventWriter::new(OutputFormat::Json, Box::new(sink.clone()));
+        writer.identified_event(
+            &AgentEvent::Text("bonjour".into()),
+            &EventIdentity::default(),
+        );
+        writer.identified_event(&AgentEvent::EndTurn, &EventIdentity::default());
+        writer.run_summary("s.jsonl", &RunEnd::EndTurn, &EventIdentity::default());
+
+        let bytes = sink.bytes();
+        assert_eq!(bytes.last(), Some(&b'\n'), "the last byte is the separator");
+        assert!(
+            !bytes.contains(&b'\r'),
+            "a CRLF would break the record split: {}",
+            sink.text()
+        );
+        let text = sink.text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "one line per event plus the summary");
+        for line in &lines {
+            serde_json::from_str::<serde_json::Value>(line).expect("each line parses on its own");
+        }
+        assert!(
+            lines[0].starts_with("{\"schema\":1,\"type\":\"text\""),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[2].contains("\"type\":\"run_summary\""),
+            "{}",
+            lines[2]
+        );
+    }
+
+    /// US-120 AC4: a sink that refuses every write is what a closed pipe is. The
+    /// error was ignored when the sink was `stdout()` and stays ignored: the
+    /// terminal state of the turn is durable in the thread log, not in the
+    /// stream, so losing the stream must not end the run.
+    #[test]
+    fn a_sink_that_always_fails_does_not_stop_the_writer() {
+        let mut writer = EventWriter::new(OutputFormat::Json, Box::new(FailingSink));
+        writer.identified_event(
+            &AgentEvent::Text("bonjour".into()),
+            &EventIdentity::default(),
+        );
+        writer.thread_store_failed(
+            agent_runtime::StoreOperation::Append,
+            "writer poisoned",
+            &EventIdentity::default(),
+        );
+        writer.run_summary("s.jsonl", &RunEnd::EndTurn, &EventIdentity::default());
+        // Reached: not a single write panicked or short-circuited the caller.
+        assert!(writer.is_json());
     }
 
     /// US-018 AC2/AC3: the identity is added NEXT TO the existing fields. A line

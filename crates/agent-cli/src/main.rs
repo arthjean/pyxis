@@ -1981,6 +1981,7 @@ async fn run(
                 session_id: session_id.clone(),
                 workspace: workspace.clone(),
                 output_format: args.output_format,
+                output: Box::new(std::io::stdout()),
                 output_last_message,
                 hooks: Arc::clone(&hooks),
                 skills: &skills,

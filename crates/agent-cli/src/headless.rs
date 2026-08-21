@@ -28,6 +28,11 @@ pub struct HeadlessRun<'a> {
     pub session_id: String,
     pub workspace: PathBuf,
     pub output_format: jsonl::OutputFormat,
+    /// Where the JSONL stream lands. `stdout()` on the production path; a buffer
+    /// the caller keeps a handle on when a test wants to read the bytes a run
+    /// really renders (US-120). Given here rather than decided inside
+    /// `EventWriter`, so `run` stays reachable from a harness.
+    pub output: Box<dyn std::io::Write + Send>,
     pub output_last_message: Option<String>,
     pub hooks: Arc<dyn agent_tools::hooks::Hooks>,
     pub skills: &'a crate::skills::Catalog,
@@ -48,6 +53,7 @@ pub async fn run(run: HeadlessRun<'_>) -> anyhow::Result<()> {
         session_id,
         workspace,
         output_format,
+        output,
         output_last_message,
         hooks,
         skills,
@@ -96,7 +102,7 @@ pub async fn run(run: HeadlessRun<'_>) -> anyhow::Result<()> {
 
     let thread_id = runtime.thread_id().to_string();
     let mut events = runtime.subscribe();
-    let mut writer = jsonl::EventWriter::new(output_format);
+    let mut writer = jsonl::EventWriter::new(output_format, output);
     // Reference taken BEFORE the turn, on the workspace as it is. Machine output
     // only: the text format must stay identical to the character, so it has no
     // consumer for this diff and must not pay for a `git status` per run.
