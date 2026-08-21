@@ -9,6 +9,12 @@
 mod app_server;
 mod approver;
 mod code_mode;
+// The configuration catalog (EP-033) reads the key constants of `settings.rs`
+// and the flag wiring of this file, then renders `docs/config-catalog.md`.
+// Gated on `test` for the same reason as `tool_catalog`: it is a documentation
+// gate, and the constants it confronts are crate-private.
+#[cfg(test)]
+mod config_catalog;
 mod context;
 mod failure_line;
 mod headless;

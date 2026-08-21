@@ -22,17 +22,17 @@ use agent_tools::hooks::{HookEvent, HookSpec};
 const SETTINGS_FILE: &str = "settings.toml";
 const PROJECT_CONFIG_FILE: &str = "config.toml";
 pub const PERMISSION_MODE_KEY: &str = "permission_mode";
-const REASONING_EFFORT_KEY: &str = "reasoning_effort";
-const MODEL_KEY: &str = "model";
-const WRITABLE_ROOTS_KEY: &str = "writable_roots";
-const SANDBOX_MODE_KEY: &str = "sandbox_mode";
-const HOOKS_KEY: &str = "hooks";
+pub(crate) const REASONING_EFFORT_KEY: &str = "reasoning_effort";
+pub(crate) const MODEL_KEY: &str = "model";
+pub(crate) const WRITABLE_ROOTS_KEY: &str = "writable_roots";
+pub(crate) const SANDBOX_MODE_KEY: &str = "sandbox_mode";
+pub(crate) const HOOKS_KEY: &str = "hooks";
 /// Name of the profile applied to this session (US-006). A security key: the
 /// selected table may carry `permission_mode`, so a workspace file that could
 /// pick a profile would widen a perimeter by proxy.
-const PROFILE_KEY: &str = "profile";
+pub(crate) const PROFILE_KEY: &str = "profile";
 /// Table of the declared profiles: `[profiles.<name>]`.
-const PROFILES_KEY: &str = "profiles";
+pub(crate) const PROFILES_KEY: &str = "profiles";
 pub const TOKEN_BUDGET_KEY: &str = "token_budget";
 pub const COST_BUDGET_KEY: &str = "cost_budget_micro_usd";
 pub const INPUT_COST_KEY: &str = "input_cost_micro_per_ktok";
@@ -51,7 +51,7 @@ pub const SAFE_COMMANDS_KEY: &str = "safe_commands";
 /// Recognized keys. A key absent from this list is reported without failing
 /// the startup (AC5): a file written for a newer version
 /// must stay usable.
-const KNOWN_KEYS: &[&str] = &[
+pub(crate) const KNOWN_KEYS: &[&str] = &[
     MODEL_KEY,
     REASONING_EFFORT_KEY,
     PERMISSION_MODE_KEY,
@@ -75,7 +75,7 @@ const KNOWN_KEYS: &[&str] = &[
 /// execution outside the sandbox. `hooks` was listed here before existing as a
 /// capability: the door was closed before it had a lock, and US-017 now puts the
 /// lock behind it.
-const SECURITY_KEYS: &[&str] = &[
+pub(crate) const SECURITY_KEYS: &[&str] = &[
     PERMISSION_MODE_KEY,
     SANDBOX_MODE_KEY,
     WRITABLE_ROOTS_KEY,
@@ -134,11 +134,13 @@ impl ConfigLayer {
         }
     }
 
-    /// Declared layers, weakest first. Only used to prove the ordering: the
+    /// Declared layers, weakest first. Used to prove the ordering, and read by
+    /// the configuration catalog (US-102), which renders one row per layer from
+    /// `precedence()` and `label()` rather than spelling the five out again. The
     /// guarantee that a NEW layer carries a precedence comes from the exhaustive
     /// matches above, not from this list.
     #[cfg(test)]
-    const ALL: &'static [Self] = &[
+    pub(crate) const ALL: &'static [Self] = &[
         Self::GlobalFile,
         Self::Profile,
         Self::ProjectFile,
