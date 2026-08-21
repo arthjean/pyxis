@@ -1,5 +1,6 @@
 [package]
 name = "agent-code-mode-v8"
+description = "V8 engine behind the `CellEngine` contract, the only crate in the workspace that costs a statically linked V8."
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true

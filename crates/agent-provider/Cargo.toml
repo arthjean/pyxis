@@ -1,5 +1,6 @@
 [package]
 name = "agent-provider"
+description = "The `Provider` trait and its adapters, normalizing heterogeneous wire formats into one canonical `StreamEvent`."
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true

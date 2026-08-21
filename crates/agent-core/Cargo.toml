@@ -1,5 +1,6 @@
 [package]
 name = "agent-core"
+description = "Agent loop, transition state machine and the canonical message, transcript and budget types, headless by construction."
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true

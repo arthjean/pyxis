@@ -1,5 +1,6 @@
 [package]
 name = "agent-runtime"
+description = "Durable thread runtime: turn lifecycle, bounded mailbox, steering, hierarchical cancellation, forks and the `ThreadStore` contract."
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true

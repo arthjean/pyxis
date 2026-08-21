@@ -1,5 +1,6 @@
 [package]
 name = "agent-parity"
+description = "Baseline verifier: derives the frozen contract matrices from the read-only Codex clone pinned at its baseline commit."
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true

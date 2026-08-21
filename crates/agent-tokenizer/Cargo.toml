@@ -1,5 +1,6 @@
 [package]
 name = "agent-tokenizer"
+description = "Local token counting, the fallback used for compaction when a provider omits stream usage."
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true

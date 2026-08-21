@@ -1,5 +1,6 @@
 [package]
 name = "agent-sandbox"
+description = "Execution sandbox: Landlock filesystem confinement and the local network allow-list proxy."
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true

@@ -1,5 +1,6 @@
 [package]
 name = "agent-session"
+description = "Append-only JSONL persistence, resume, compaction boundaries, and the JSONL adapter of `ThreadStore`."
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true

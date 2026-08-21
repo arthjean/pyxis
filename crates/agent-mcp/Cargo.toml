@@ -1,5 +1,6 @@
 [package]
 name = "agent-mcp"
+description = "MCP client over `rmcp` (stdio and Streamable HTTP) exposing the tools of a configured server as `DynTool`."
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true

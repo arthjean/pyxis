@@ -1,5 +1,6 @@
 [package]
 name = "agent-cli"
+description = "The published `pyxis` binary, the only crate that wires everything together."
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true

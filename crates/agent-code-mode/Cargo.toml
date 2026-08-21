@@ -1,5 +1,6 @@
 [package]
 name = "agent-code-mode"
+description = "Code Mode session protocol and cell state machine, deliberately free of any JavaScript engine."
 version = "0.0.0"
 edition.workspace = true
 rust-version.workspace = true
