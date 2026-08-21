@@ -18,7 +18,7 @@ use crate::error::ToolError;
 use crate::permission::{
     Approver, PermCtx, PermissionDecision, PermissionMode, PermissionModeState, PermissionRequest,
 };
-use crate::registry::Registry;
+use crate::registry::{Registry, ToolPolicy};
 use crate::tool::{
     MAX_COMMAND_BYTES, MAX_EDIT_FILE_BYTES, MAX_WRITE_BYTES, Tool, ToolCtx, ToolOutput,
 };
@@ -4378,4 +4378,185 @@ fn omitted_bytes(content: &str) -> usize {
         .expect("a byte count")
         .parse()
         .expect("a number")
+}
+
+// ─────────── US-096: the policy metadata the catalog is derived from ───────────
+
+/// Leaves every fail-closed default of the trait in place, and counts its calls
+/// so a test can prove the enumeration reads it without ever running it. Its
+/// description is deliberately longer than `MAX_DESCRIPTION`.
+struct PolicyProbe(Arc<AtomicUsize>);
+
+#[async_trait]
+impl Tool for PolicyProbe {
+    type Input = serde_json::Value;
+    fn name(&self) -> &str {
+        "policy_probe"
+    }
+    fn description(&self) -> String {
+        format!("{}fin", "b".repeat(3000))
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        empty_schema()
+    }
+    async fn call(&self, _i: Self::Input, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutput::text("ok"))
+    }
+}
+
+/// The other side of every flag: a tool that widens all of them, including the
+/// one this catalog exists for.
+struct WidenedProbe;
+
+#[async_trait]
+impl Tool for WidenedProbe {
+    type Input = serde_json::Value;
+    fn name(&self) -> &str {
+        "widened_probe"
+    }
+    fn description(&self) -> String {
+        "Élargit tous ses défauts.".to_string()
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        empty_schema()
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    fn is_sensitive(&self) -> bool {
+        false
+    }
+    fn returns_untrusted(&self) -> bool {
+        false
+    }
+    fn is_deferrable(&self) -> bool {
+        true
+    }
+    fn namespace(&self) -> Option<&str> {
+        Some("serveur")
+    }
+    async fn call(&self, _i: Self::Input, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("ok"))
+    }
+}
+
+fn policy<'a>(policies: &'a [ToolPolicy], name: &str) -> &'a ToolPolicy {
+    policies
+        .iter()
+        .find(|policy| policy.name == name)
+        .expect("la politique de l'outil est énumérée")
+}
+
+#[test]
+fn the_policy_of_a_tool_carries_the_description_the_spec_truncates() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reg = Registry::builder("/tmp")
+        .register(PolicyProbe(Arc::clone(&calls)))
+        .build();
+
+    let policies = reg.tool_policies();
+    let full = &policy(&policies, "policy_probe").description;
+    assert_eq!(full.len(), 3003);
+    assert!(full.ends_with("fin"));
+
+    let spec = reg
+        .tool_specs()
+        .into_iter()
+        .find(|spec| spec.name == "policy_probe")
+        .expect("le spec du modèle est composé");
+    assert!(spec.description.len() <= 2048);
+}
+
+#[test]
+fn every_fail_closed_default_of_the_trait_is_read_back_closed() {
+    let reg = Registry::builder("/tmp")
+        .register(PolicyProbe(Arc::new(AtomicUsize::new(0))))
+        .build();
+    let policies = reg.tool_policies();
+    let closed = policy(&policies, "policy_probe");
+
+    assert!(!closed.is_concurrency_safe);
+    assert!(!closed.is_read_only);
+    assert!(closed.is_sensitive);
+    assert!(closed.is_taint_sensitive);
+    assert!(closed.returns_untrusted);
+    assert!(!closed.is_deferrable);
+    assert_eq!(closed.namespace, None);
+    assert!(matches!(
+        closed.kind,
+        agent_core::provider::ToolKind::Function { .. }
+    ));
+    assert_eq!(closed.input_schema, empty_schema());
+}
+
+#[test]
+fn a_tool_that_widens_its_defaults_is_read_back_widened() {
+    let reg = Registry::builder("/tmp").register(WidenedProbe).build();
+    let policies = reg.tool_policies();
+    let widened = policy(&policies, "widened_probe");
+
+    assert!(widened.is_concurrency_safe);
+    assert!(widened.is_read_only);
+    assert!(!widened.is_sensitive);
+    assert!(!widened.is_taint_sensitive);
+    assert!(!widened.returns_untrusted);
+    assert!(widened.is_deferrable);
+    assert_eq!(widened.namespace.as_deref(), Some("serveur"));
+}
+
+#[test]
+fn enumerating_the_policies_never_calls_a_tool() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let reg = Registry::builder("/tmp")
+        .register(PolicyProbe(Arc::clone(&calls)))
+        .build();
+
+    let policies = reg.tool_policies();
+
+    assert!(!policies.is_empty());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn the_policies_are_sorted_by_name_whatever_the_registration_order() {
+    let one = Registry::builder("/tmp")
+        .register(WidenedProbe)
+        .register(PolicyProbe(Arc::new(AtomicUsize::new(0))))
+        .build();
+    let other = Registry::builder("/tmp")
+        .register(PolicyProbe(Arc::new(AtomicUsize::new(0))))
+        .register(WidenedProbe)
+        .build();
+
+    let names = |registry: &Registry| -> Vec<String> {
+        registry
+            .tool_policies()
+            .into_iter()
+            .map(|policy| policy.name)
+            .collect()
+    };
+    assert_eq!(names(&one), names(&other));
+    assert_eq!(
+        names(&one),
+        vec![
+            "policy_probe".to_string(),
+            "tool_search".to_string(),
+            "widened_probe".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn a_registry_holding_no_tool_enumerates_an_empty_collection_without_panicking() {
+    let reg = Registry::builder("/tmp").build();
+    // `build` registers `tool_search` unconditionally, so emptying the registry
+    // goes through the staged removal a disconnecting MCP server uses.
+    reg.stage_removal(vec!["tool_search".to_string()]);
+    assert!(reg.commit_staged());
+
+    assert!(reg.tool_policies().is_empty());
 }

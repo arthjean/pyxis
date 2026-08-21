@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_core::event::PermissionReq;
 use agent_core::message::ToolErrorKind;
-use agent_core::provider::ToolSpec;
+use agent_core::provider::{ToolKind, ToolSpec};
 use agent_core::tools::{
     ModelToolResult, ToolDispatch, ToolDispatchEvent, ToolDispatchSnapshot, ToolEventSink,
     ToolExecution, ToolInvocation, ToolResultStatus,
@@ -231,6 +231,36 @@ impl Registry {
             self.publish_deferred();
         }
         changed
+    }
+
+    /// Policy metadata of every exposed tool, name-sorted (US-096).
+    ///
+    /// This is the documentation surface, and it exists because `tool_specs()`
+    /// cannot serve it: that one caps the description at `MAX_DESCRIPTION` and
+    /// carries no policy flag at all, because the model needs neither. A
+    /// catalog that showed a truncated description would document something no
+    /// tool ever sends, so the two coexist and the model's wire keeps its shape.
+    ///
+    /// What comes back is DATA. A `ToolPolicy` holds no handle on the tool, so
+    /// reading the registry's metadata never widens what its reader can do:
+    /// dispatch stays the strict pipeline, and there is no second way in.
+    ///
+    /// `timeout` and `loop_guard_exempt` are absent on purpose rather than
+    /// rendered with a placeholder. `DynTool::timeout` is a function of a
+    /// `ToolCtx` the session owns and `DynTool::loop_guard_exempt` a function of
+    /// one raw input; publishing either would mean inventing the context it was
+    /// evaluated under, and a value that only holds under a fabricated context
+    /// is worse than an absent one, because a reader cannot tell the two apart.
+    /// The tools that bend them argue it where they implement them.
+    ///
+    /// The order is an explicit sort by name, never the iteration order of the
+    /// `HashMap` this reads: the catalog derived from it is compared byte for
+    /// byte, and a map order would make that comparison a coin toss.
+    pub fn tool_policies(&self) -> Vec<ToolPolicy> {
+        let tools = self.tools_read();
+        let mut policies: Vec<ToolPolicy> = tools.values().map(policy_of).collect();
+        policies.sort_by(|left, right| left.name.cmp(&right.name));
+        policies
     }
 
     /// Specs exposed to the model (capped descriptions), for `AgentContext.tools`.
@@ -1239,6 +1269,58 @@ fn sanitize_namespace(name: &str) -> String {
 
 /// Same cap as a tool name (`ToolSpec::validate`).
 const MAX_NAMESPACE_BYTES: usize = 64;
+
+/// What one exposed tool declares about itself, for a documentation surface
+/// (US-096). Every field is a read of the `DynTool` behind it, and none of them
+/// can reach back to it: see [`Registry::tool_policies`] for what is left out
+/// and why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolPolicy {
+    /// The name the registry dispatches on.
+    pub name: String,
+    /// The description as the model receives it, NOT capped at
+    /// `MAX_DESCRIPTION`: the cap serves the prompt budget, and a catalog
+    /// showing a truncated text would describe a message nobody sends.
+    pub description: String,
+    /// The input schema the tool publishes.
+    pub input_schema: serde_json::Value,
+    /// How the tool takes its input on the wire.
+    pub kind: ToolKind,
+    /// Fail-closed default `false`: can it run alongside another call?
+    pub is_concurrency_safe: bool,
+    /// Fail-closed default `false`: does it mutate nothing?
+    pub is_read_only: bool,
+    /// Fail-closed default `true`: destructive or network action.
+    pub is_sensitive: bool,
+    /// Fail-closed default: does a recent untrusted read force a confirmation?
+    pub is_taint_sensitive: bool,
+    /// Fail-closed default `true`: is its output tainted (OWASP LLM01)? The
+    /// field this catalog exists for: every implementation that lowers it to
+    /// `false` becomes a line a reviewer can count.
+    pub returns_untrusted: bool,
+    /// May the tool be held out of the request until a `tool_search` asks?
+    pub is_deferrable: bool,
+    /// The group it is exposed under, when the provider can encode one.
+    pub namespace: Option<String>,
+}
+
+/// Reads one tool's metadata. Never calls it: `DynTool::invoke` is not reachable
+/// from here and nothing in [`ToolPolicy`] carries the tool along.
+fn policy_of(tool: &Arc<dyn DynTool>) -> ToolPolicy {
+    ToolPolicy {
+        name: tool.name().to_string(),
+        description: tool.description(),
+        input_schema: tool.input_schema(),
+        kind: tool.kind(),
+        is_concurrency_safe: tool.is_concurrency_safe(),
+        is_read_only: tool.is_read_only(),
+        is_sensitive: tool.is_sensitive(),
+        is_taint_sensitive: tool.is_taint_sensitive(),
+        returns_untrusted: tool.returns_untrusted(),
+        is_deferrable: tool.is_deferrable(),
+        namespace: tool.namespace().map(str::to_string),
+    }
+}
 
 fn specs_from_tools(tools: &HashMap<String, Arc<dyn DynTool>>) -> Vec<ToolSpec> {
     let mut specs: Vec<ToolSpec> = tools

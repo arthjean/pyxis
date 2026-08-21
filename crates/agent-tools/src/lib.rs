@@ -75,7 +75,7 @@ pub use permission::{
 };
 pub use plan::UpdatePlan;
 pub use read::Read;
-pub use registry::{Registry, RegistryBuilder};
+pub use registry::{Registry, RegistryBuilder, ToolPolicy};
 pub use sandbox::{
     EscalationGuard, SandboxDenial, SandboxEscalator, SandboxObserver, classify_failure,
 };
