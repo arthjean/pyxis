@@ -3,7 +3,7 @@
     "file": "tasks/prd-graphe-de-portes.md",
     "title": "Graphe de portes",
     "created_at": "2026-08-21",
-    "status": "IN_PROGRESS"
+    "status": "DONE"
   },
   "epics": [
     {
@@ -33,10 +33,10 @@
     {
       "id": "EP-030",
       "title": "Preuve du critère de succès",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 2,
-      "stories_done": 0
+      "stories_done": 2
     }
   ],
   "stories": [
@@ -155,21 +155,21 @@
       "id": "US-090",
       "title": "L'arrêt sur fmt et le budget de temps sont mesurés",
       "epic": "EP-030",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "S",
       "blocked_by": [
         "US-082"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-091",
       "title": "Le CI est constaté inchangé et les portes orphelines rattachées",
       "epic": "EP-030",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "S",
       "blocked_by": [
@@ -177,9 +177,9 @@
         "US-086",
         "US-087"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     }
   ]
 }
