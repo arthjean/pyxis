@@ -3,7 +3,7 @@
     "file": "tasks/prd-experience-du-modele.md",
     "title": "Expérience du modèle documentée",
     "created_at": "2026-08-21",
-    "status": "IN_PROGRESS",
+    "status": "DONE",
     "updated_at": "2026-08-21"
   },
   "epics": [
@@ -28,10 +28,10 @@
     {
       "id": "EP-037",
       "title": "Les surfaces auditées et l'intégration",
-      "status": "IN_PROGRESS",
+      "status": "DONE",
       "priority": "P1",
       "stories_total": 3,
-      "stories_done": 1,
+      "stories_done": 3,
       "updated_at": "2026-08-21"
     }
   ],
@@ -168,34 +168,40 @@
       "id": "US-117",
       "title": "Les huit crates restants se prononcent",
       "epic": "EP-037",
-      "status": "IN_REVIEW",
+      "status": "DONE",
       "priority": "P1",
       "size": "M",
       "blocked_by": [
         "US-110"
-      ]
+      ],
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-118",
       "title": "Les documents d'entrée nomment le contrat et sa commande",
       "epic": "EP-037",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "S",
       "blocked_by": [
         "US-117"
-      ]
+      ],
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-119",
       "title": "La note de décision consigne la mesure et la frontière",
       "epic": "EP-037",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "S",
       "blocked_by": [
         "US-118"
-      ]
+      ],
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     }
   ]
 }
