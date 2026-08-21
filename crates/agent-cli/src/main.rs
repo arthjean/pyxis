@@ -1903,6 +1903,9 @@ async fn run(
         provider: Arc::clone(&provider),
         tokenizer: Arc::new(HeuristicCounter),
         clock: Arc::new(SystemClock),
+        // The production generator. It is named here, once, rather than inside
+        // `SessionRuntime::open`, so a caller can hand a seeded one instead.
+        ids: Arc::new(agent_runtime::id::RandomIds),
         tools: Arc::clone(&registry) as Arc<dyn agent_core::tools::ToolDispatch>,
         // Same handle on both sides: the loop publishes its budget into it, the
         // registry hands it to `get_context_remaining`. Two handles here would

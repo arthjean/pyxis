@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use agent_core::clock::{Clock, SystemClock};
+use agent_core::clock::Clock;
 use agent_core::message::Message;
 use agent_core::model::{ModelToolMode, MultiAgentVersion};
 use agent_core::provider::{Provider, ToolSpec};
@@ -30,7 +30,7 @@ use agent_runtime::context::{
     CapturedTurnContext, StepContexts, StepSection, StepSnapshot, StepSource, TurnContext,
     TurnContextError, TurnContextSource, TurnLimits,
 };
-use agent_runtime::id::{IdGenerator, RandomIds, ThreadId, TurnId};
+use agent_runtime::id::{IdGenerator, ThreadId, TurnId};
 use agent_runtime::runner::{RunAgentRunner, TurnRequest};
 use agent_runtime::store::{MemoryThreadStore, ThreadStore};
 use agent_runtime::thread::{
@@ -547,6 +547,14 @@ pub struct EngineDeps {
     pub provider: Arc<dyn agent_core::provider::Provider>,
     pub tokenizer: Arc<dyn agent_tokenizer::TokenCounter>,
     pub clock: Arc<dyn Clock>,
+    /// The source of every `thr_`, `trn_`, `stp_`, `evt_` and `agt_` a run
+    /// emits. Given by the caller rather than built inside `open` (US-121):
+    /// `RandomIds` is what the binary wires, and a harness seeding
+    /// `SequentialIds` gets the same transcript twice. It sits next to `clock`
+    /// because the two are the same kind of dependency, an ambient source the
+    /// run must be able to freeze, and because a struct field cannot be
+    /// forgotten the way a defaulted argument can.
+    pub ids: Arc<dyn IdGenerator>,
     pub tools: Arc<dyn agent_core::tools::ToolDispatch>,
     /// Shared with the tool registry: the loop publishes its context budget
     /// here, `get_context_remaining` reads it. Default = a handle nobody else
@@ -652,8 +660,12 @@ impl SessionRuntime {
         parent_cancel: &CancellationToken,
         agents: Option<&AgentWiring>,
     ) -> anyhow::Result<Self> {
-        let ids: Arc<dyn IdGenerator> = Arc::new(RandomIds);
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let ids = Arc::clone(&engine.ids);
+        // US-121 AC4: the thread handle and the engine now read the SAME clock.
+        // Two instances were built here before, so freezing one still left the
+        // other on wall time and the `*_ms` fields disagreed between the event
+        // stream and the thread log.
+        let clock = Arc::clone(&engine.clock);
 
         let (store, session, conversation, thread_id) = match path {
             Some(path) => {
@@ -975,7 +987,8 @@ mod tests {
                 },
             }),
             tokenizer: Arc::new(agent_tokenizer::HeuristicCounter),
-            clock: Arc::new(SystemClock),
+            clock: Arc::new(agent_core::clock::SystemClock),
+            ids: Arc::new(agent_runtime::id::RandomIds),
             tools: Arc::clone(registry) as Arc<dyn agent_core::tools::ToolDispatch>,
             context_window: Default::default(),
         }
