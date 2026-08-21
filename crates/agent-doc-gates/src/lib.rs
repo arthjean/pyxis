@@ -22,6 +22,11 @@
 //! than quietly promising it, and holds `AGENTS.md` and `CONTRIBUTING.md` to the
 //! recipe names so a third formulation of a gate cannot reappear in prose.
 //!
+//! The same standard reaches the structure of the workspace itself:
+//! [`crate_graph`] derives `docs/crate-graph.md` from the sixteen manifests, so
+//! the list of crates and their edges is a rendered fact rather than two prose
+//! tables that went stale one line per new crate.
+//!
 //! No mechanical rule exists here without its written counterpart: the rules of
 //! the tree are written in `docs/notes/README.md`, those of the register in the
 //! header of `docs/DECISIONS.md`, which announces its summary table and the
@@ -29,10 +34,16 @@
 //! and the rule, and a run reports all of them: stopping at the first turns one
 //! misplaced file into several round trips.
 
+mod crate_graph;
 mod decisions;
 mod gates;
 mod links;
 
+pub use crate_graph::{
+    CRATE_GRAPH_DOC, CRATES_ROOT, CrateManifest, GENERATOR, NO_DEPENDENCY, REGENERATE_COMMAND,
+    UPDATE_VARIABLE, check_crate_graph, check_crate_graph_completeness, collect_manifests,
+    crate_directories, crate_graph_document, parse_manifest, render_crate_graph, rendered_crates,
+};
 pub use decisions::{
     ADR_ALTERNATIVES_HEADING, DECISIONS_DOC, check_decisions, check_decisions_document,
 };
