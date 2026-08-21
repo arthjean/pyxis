@@ -30,21 +30,25 @@ Rust 1.95 / edition 2024. The published binary is `pyxis` and it is produced by
 ## Build and verify
 
 System prerequisites: `mold` (forced for the whole workspace by
-`.cargo/config.toml`), `libdbus-1-dev`, `pkg-config`.
+`.cargo/config.toml`), `libdbus-1-dev`, `pkg-config`, plus `just`, which names
+the gates below. `just` is a local runner only: the CI does not install it and
+keeps its own `cargo` steps.
 
 ```bash
 cargo build --workspace
 cargo test --workspace
 ```
 
-The CI gates, in the order and the exact form `.github/workflows/ci.yml` runs
-them:
+The gates of this repository are recipes, and `just --list` is their inventory.
+The `justfile` carries the commands; `.github/workflows/ci.yml` runs the same
+ones in the same order, and `cargo test -p agent-doc-gates` fails when the two
+inventories drift apart.
 
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets   # no -D warnings: unwrap/expect are warn by decision
-cargo test --workspace --no-fail-fast
-```
+| Aggregate | What it runs |
+|---|---|
+| `just check` | The verdict: the four gates of the CI, in order, stopping at the first failure |
+| `just check-local` | `just check` plus both parity gates; needs the pinned Codex clone, never runs in CI, and upstream drift stays non-blocking |
+| `just regen` | WRITES to the repository: schemas, snapshots, parity matrix. Read `git diff` afterwards, and never call it from a verification |
 
 Targeted verification signals:
 
@@ -54,7 +58,7 @@ Targeted verification signals:
 | Checking what moved upstream | `cargo run -p agent-parity -- drift` |
 | App-server protocol types | `PYXIS_UPDATE_SCHEMAS=1 cargo test -p agent-app-server --test schemas` |
 | TUI rendering | `cargo insta review` after `cargo test -p agent-tui` |
-| Decision records: note tree, internal links, ADR register | `cargo test -p agent-doc-gates` |
+| Decision records, and the gate inventory the `justfile`, `.github/workflows/ci.yml`, `AGENTS.md` and `CONTRIBUTING.md` describe | `cargo test -p agent-doc-gates` |
 
 Adding, renaming, or moving a test named in the table of
 `docs/parity/offline-suite.md` breaks `crates/agent-parity/tests/offline_suite.rs`,

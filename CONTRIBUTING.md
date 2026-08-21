@@ -14,7 +14,8 @@ Pyxis is early and moving fast. Issues, bug reports, and focused pull requests a
   cargo build --workspace
   cargo test --workspace
   ```
-- The workspace enforces clippy lints: `panic`, `unimplemented`, and `dbg!` are denied; `unwrap`/`expect` are warnings. Avoid them in non-test code (prefer `?`, `ok_or(...)`, `match`). Run `cargo clippy --workspace --no-deps` and `cargo fmt` before pushing.
+- The workspace enforces clippy lints: `panic`, `unimplemented`, and `dbg!` are denied; `unwrap`/`expect` are warnings. Avoid them in non-test code (prefer `?`, `ok_or(...)`, `match`).
+- Run `just check` before pushing. It runs the four gates the CI runs, in the same order, and stops at the first one that fails; `just --list` names every other recipe. `just` is optional: the CI runs plain cargo commands and never installs it, so if you would rather not add the tool, `cargo build --workspace` and `cargo test --workspace` above stay a complete path and [`.github/workflows/ci.yml`](.github/workflows/ci.yml) is the authoritative list.
 - Respect the architecture invariants in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). In particular, `agent-core` stays headless: it must not depend on `agent-tui` or `agent-provider`, and it must never emit ANSI.
 
 ## Licensing of contributions
