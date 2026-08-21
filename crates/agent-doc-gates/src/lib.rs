@@ -16,10 +16,11 @@
 //! holds the register to the same standard: an ADR its own summary table never
 //! lists, or a decision that never says what it beat, fails the suite too.
 //!
-//! The same standard reaches the two descriptions the repository makes of its
-//! own gates: [`gates`] compares the `justfile` against `.github/workflows/ci.yml`
+//! The same standard reaches the descriptions the repository makes of its own
+//! gates: [`gates`] compares the `justfile` against `.github/workflows/ci.yml`
 //! so an aggregate that no longer runs what the CI runs fails the suite rather
-//! than quietly promising it.
+//! than quietly promising it, and holds `AGENTS.md` and `CONTRIBUTING.md` to the
+//! recipe names so a third formulation of a gate cannot reappear in prose.
 //!
 //! No mechanical rule exists here without its written counterpart: the rules of
 //! the tree are written in `docs/notes/README.md`, those of the register in the
@@ -36,8 +37,9 @@ pub use decisions::{
     ADR_ALTERNATIVES_HEADING, DECISIONS_DOC, check_decisions, check_decisions_document,
 };
 pub use gates::{
-    AGGREGATE_RECIPE, GATE_MARKER, Gate, JUSTFILE, WORKFLOW, check_gate_documents, check_gates,
-    compare_gates, justfile_gates, workflow_gates,
+    AGGREGATE_RECIPE, GATE_MARKER, Gate, JUSTFILE, PROSE_DOCUMENTS, WORKFLOW, check_gate_documents,
+    check_gates, check_prose_documents, check_prose_gates, compare_gates, justfile_gates,
+    workflow_gates,
 };
 pub use links::{DOCS_ROOT, check_links, markdown_documents, relative_links};
 

@@ -1,5 +1,6 @@
 //! The non-drift gate: the `justfile` and `.github/workflows/ci.yml` carry the
-//! same `cargo` invocations, in the same order.
+//! same `cargo` invocations, in the same order, and the prescriptive documents
+//! name the recipes instead of writing a third formulation of their own.
 //!
 //! The repository keeps two inventories of its own gates on purpose. The
 //! workflow keeps its steps verbatim, with their per-step `timeout`, their
@@ -25,6 +26,14 @@
 //! removed, everything from the first shell operator dropped. Anything else
 //! wrapping `cargo` fails loudly and names itself, because a gate that silently
 //! skips what it does not understand is not a gate.
+//!
+//! The prose half holds `AGENTS.md` and `CONTRIBUTING.md` to those same
+//! invocations. The divergence it forbids is the one that actually happened:
+//! `CONTRIBUTING.md` prescribed `cargo clippy --workspace --no-deps` while the
+//! workflow ran `--all-targets`, so a contributor could run the gate green and
+//! still be refused, `--no-deps` never compiling the test targets. A document is
+//! therefore refused an invocation that shares a gate's head and diverges from
+//! it, and the message says which recipe to write instead.
 
 use std::fs;
 use std::path::Path;
@@ -243,6 +252,12 @@ fn aggregate_violations(recipes: &[Recipe]) -> Vec<String> {
 }
 
 fn gates_of_recipes(recipes: &[Recipe]) -> Result<Vec<Gate>, Vec<String>> {
+    gates_with_recipes(recipes).map(|gates| gates.into_iter().map(|(_, gate)| gate).collect())
+}
+
+/// The same gates, each kept next to the recipe that carries it, which is what a
+/// prose document is told to write instead of the invocation.
+fn gates_with_recipes(recipes: &[Recipe]) -> Result<Vec<(String, Gate)>, Vec<String>> {
     let mut gates = Vec::new();
     let mut errors = Vec::new();
     for recipe in recipes {
@@ -284,10 +299,13 @@ fn gates_of_recipes(recipes: &[Recipe]) -> Result<Vec<Gate>, Vec<String>> {
                 let Some(argv) = found.into_iter().next() else {
                     continue;
                 };
-                gates.push(Gate {
-                    step: step.clone(),
-                    argv,
-                });
+                gates.push((
+                    name.clone(),
+                    Gate {
+                        step: step.clone(),
+                        argv,
+                    },
+                ));
             }
             0 => errors.push(format!(
                 "gates: {JUSTFILE} : recette « {name} » : marquée « {step} » mais n'exécute aucune commande cargo"
@@ -540,4 +558,152 @@ fn is_shell_operator(token: &str) -> bool {
     token
         .trim_start_matches(|character: char| character.is_ascii_digit())
         .starts_with(['|', '&', ';', '>', '<'])
+}
+
+/// The prescriptive documents held to the recipe names, and only those. The scope
+/// is closed on purpose: `docs/parity/offline-suite.md` publishes a normative
+/// three-line recipe a reader is meant to copy, and `README.md` shows session
+/// transcripts, so a rule wide enough to cover them would forbid the two places
+/// where an invocation is the point.
+pub const PROSE_DOCUMENTS: &[&str] = &["AGENTS.md", "CONTRIBUTING.md"];
+
+/// The aggregate a document cites when it has no reason to name a single gate.
+const AGGREGATE_CITATION: &str = "just check";
+
+/// How many leading tokens identify a gate: `cargo`, its subcommand, and the
+/// argument that scopes it. Two invocations sharing that head are two
+/// formulations of the same gate, which is exactly how `CONTRIBUTING.md` came to
+/// prescribe `cargo clippy --workspace --no-deps` against the workflow's
+/// `--all-targets`. The head itself stays allowed: `cargo test --workspace` is
+/// the shorter path `CONTRIBUTING.md` offers to a contributor without `just`, and
+/// it contradicts no gate.
+const HEAD_LENGTH: usize = 3;
+
+/// Read the prescriptive documents and report every gate invocation they write
+/// out instead of naming its recipe.
+pub fn check_prose_gates(repository_root: &Path) -> Vec<String> {
+    let justfile = match fs::read_to_string(repository_root.join(JUSTFILE)) {
+        Ok(content) => content,
+        Err(error) => return vec![format!("gates: {JUSTFILE} : illisible ({error})")],
+    };
+    let mut documents = Vec::new();
+    for name in PROSE_DOCUMENTS {
+        match fs::read_to_string(repository_root.join(name)) {
+            Ok(content) => documents.push(((*name).to_string(), content)),
+            Err(error) => return vec![format!("gates: {name} : illisible ({error})")],
+        }
+    }
+    let borrowed: Vec<(&str, &str)> = documents
+        .iter()
+        .map(|(name, content)| (name.as_str(), content.as_str()))
+        .collect();
+    check_prose_documents(&justfile, &borrowed)
+}
+
+/// The same check over documents held in memory, so a fixture can reproduce a
+/// divergence without touching a real document.
+pub fn check_prose_documents(justfile: &str, documents: &[(&str, &str)]) -> Vec<String> {
+    let gates = match gates_with_recipes(&parse_recipes(justfile)) {
+        Ok(gates) => gates,
+        Err(errors) => return errors,
+    };
+    let mut violations = Vec::new();
+    for (name, content) in documents {
+        for (line, candidate) in prose_invocations(content) {
+            let Some(argv) = cargo_argv(&candidate) else {
+                continue;
+            };
+            violations.extend(prose_violation(name, line, &argv, &gates));
+        }
+    }
+    violations
+}
+
+/// The one violation an invocation carries, if it is a formulation of a gate.
+fn prose_violation(
+    document: &str,
+    line: usize,
+    argv: &[String],
+    gates: &[(String, Gate)],
+) -> Option<String> {
+    let head = argv.get(..HEAD_LENGTH)?;
+    let matching: Vec<&(String, Gate)> = gates
+        .iter()
+        .filter(|(_, gate)| gate.argv.get(..HEAD_LENGTH) == Some(head))
+        .collect();
+    if matching.is_empty() || argv.len() <= HEAD_LENGTH {
+        return None;
+    }
+    // Two gates can share a head, `cargo test --workspace` carrying both the
+    // build and the run. The one whose invocation is written verbatim names
+    // itself; short of that the reader gets every candidate, because the
+    // aggregate is the honest citation either way.
+    let named = matching
+        .iter()
+        .find(|(_, gate)| gate.argv == argv)
+        .or_else(|| matching.first())?;
+    let citation = matching
+        .iter()
+        .map(|(recipe, _)| format!("just {recipe}"))
+        .collect::<Vec<String>>()
+        .join(" ou ");
+    let written = argv.join(" ");
+    let gate = &named.1;
+    if gate.argv == argv {
+        Some(format!(
+            "gates: {document}:{line} : « {written} » est l'invocation brute de la porte « {} » ; écrire « {citation} », ou « {AGGREGATE_CITATION} » qui compose les portes du CI",
+            gate.step
+        ))
+    } else {
+        Some(format!(
+            "gates: {document}:{line} : « {written} » est une formulation divergente de la porte « {} », que le CI exécute « {} » ; écrire « {citation} », ou « {AGGREGATE_CITATION} » qui compose les portes du CI",
+            gate.step,
+            gate.command()
+        ))
+    }
+}
+
+/// Every invocation a prose document offers a reader to copy: the lines of its
+/// fenced blocks and the inline code spans of its prose. Text outside those two
+/// is not something anyone runs, so it is not held to the recipe names.
+fn prose_invocations(content: &str) -> Vec<(usize, String)> {
+    let mut invocations = Vec::new();
+    let mut inside_fence = false;
+    for (index, line) in content.lines().enumerate() {
+        let number = index + 1;
+        if line.trim_start().starts_with("```") {
+            inside_fence = !inside_fence;
+            continue;
+        }
+        if inside_fence {
+            invocations.push((number, line.trim().to_string()));
+            continue;
+        }
+        for (position, span) in line.split('`').enumerate() {
+            if position % 2 == 1 {
+                invocations.push((number, span.trim().to_string()));
+            }
+        }
+    }
+    invocations
+}
+
+/// The `cargo` invocation of one candidate, environment prefix dropped and shell
+/// plumbing cut. Unlike the two inventories, an unknown prefix is not an error
+/// here: prose legitimately writes `PYXIS_UPDATE_SCHEMAS=1 cargo test ...`, and a
+/// document is held to what it prescribes, not to a normalization.
+fn cargo_argv(candidate: &str) -> Option<Vec<String>> {
+    let tokens: Vec<&str> = candidate.split_whitespace().collect();
+    let start = tokens.iter().position(|token| *token == CARGO)?;
+    let rest = tokens.get(start..)?;
+    let end = rest
+        .iter()
+        .position(|token| is_shell_operator(token))
+        .unwrap_or(rest.len());
+    Some(
+        rest.get(..end)?
+            .iter()
+            .map(|token| (*token).to_string())
+            .collect(),
+    )
 }
