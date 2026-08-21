@@ -36,8 +36,9 @@ the head.
 #### What the model sees
 
 The previously resolved text of a section whose source became unreadable, reused
-verbatim under the trace `section "{}" unreadable, reused`. The model sees no gap
-and no error, because a transient read failure is not information it can act on.
+verbatim under the diagnostic `` section `{}` unreadable, reused ``. The model
+sees no gap and no error, because a transient read failure is not information it
+can act on.
 
 #### Token effect
 

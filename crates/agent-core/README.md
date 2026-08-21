@@ -7,6 +7,10 @@ and it composes a great deal for the model.
 
 ## Model Experience
 
+Every constant quoted below is transcribed as the code declared it on the day of
+writing, never rounded into an approximation. The code arbitrates: when a figure
+here and the constant it names disagree, this section is what is wrong.
+
 ### The compaction summary system prompt
 
 #### What the model sees

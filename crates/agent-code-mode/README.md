@@ -37,7 +37,10 @@ editing any other description does.
 
 Every nested tool as a TypeScript declaration inside a fenced block, sorted by
 binding, each preceded by at most `CATALOG_DESCRIPTION_LINES = 4` comment lines
-of its own description:
+of its own description. This block is what the model reads in place of the native
+tool entries when `runtime.tool_mode.hides_nested_tools()` is true: those tools
+leave the `tools` array entirely and survive only as declarations inside the
+`exec` description.
 
 ```ts
 // Read a file from the filesystem.
