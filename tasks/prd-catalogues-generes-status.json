@@ -1,0 +1,217 @@
+{
+  "prd": {
+    "file": "tasks/prd-catalogues-generes.md",
+    "title": "Catalogues générés",
+    "created_at": "2026-08-21",
+    "status": "IN_PROGRESS"
+  },
+  "epics": [
+    {
+      "id": "EP-031",
+      "title": "Le graphe de crates dérivé du workspace",
+      "status": "DONE",
+      "priority": "P0",
+      "stories_total": 4,
+      "stories_done": 4
+    },
+    {
+      "id": "EP-032",
+      "title": "Le catalogue d'outils et l'invariant de souillure rendu inspectable",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 4,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-033",
+      "title": "Le catalogue de configuration et le triplet déclaré",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 4,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-034",
+      "title": "L'intégration et la preuve du critère de succès",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 3,
+      "stories_done": 0
+    }
+  ],
+  "stories": [
+    {
+      "id": "US-092",
+      "title": "Le rôle de chaque crate vit dans son manifeste",
+      "epic": "EP-031",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
+    },
+    {
+      "id": "US-093",
+      "title": "Le graphe de crates est rendu par une fonction pure",
+      "epic": "EP-031",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-092"
+      ],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
+    },
+    {
+      "id": "US-094",
+      "title": "La fraîcheur du graphe est une assertion, et rien n'y échappe",
+      "epic": "EP-031",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-093"
+      ],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
+    },
+    {
+      "id": "US-095",
+      "title": "Les tableaux rédigés cessent de prétendre à l'exhaustivité",
+      "epic": "EP-031",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-094"
+      ],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
+    },
+    {
+      "id": "US-096",
+      "title": "Les métadonnées de politique des outils sortent du registre",
+      "epic": "EP-032",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": []
+    },
+    {
+      "id": "US-097",
+      "title": "Le catalogue d'outils est rendu depuis les outils que le binaire enregistre",
+      "epic": "EP-032",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "L",
+      "blocked_by": [
+        "US-096"
+      ]
+    },
+    {
+      "id": "US-098",
+      "title": "Le manifeste des outils est confronté au câblage et à sa récolte",
+      "epic": "EP-032",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "L",
+      "blocked_by": [
+        "US-097"
+      ]
+    },
+    {
+      "id": "US-099",
+      "title": "La fraîcheur du catalogue d'outils est une assertion",
+      "epic": "EP-032",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-098"
+      ]
+    },
+    {
+      "id": "US-100",
+      "title": "Le triplet clé, drapeau, variable d'environnement est déclaré une fois",
+      "epic": "EP-033",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": []
+    },
+    {
+      "id": "US-101",
+      "title": "Aucune clé acceptée par le binaire ne peut manquer au catalogue",
+      "epic": "EP-033",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-100"
+      ]
+    },
+    {
+      "id": "US-102",
+      "title": "Le catalogue de configuration est rendu et prouvé frais",
+      "epic": "EP-033",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-101"
+      ]
+    },
+    {
+      "id": "US-103",
+      "title": "La dérive de sécurité mesurée dans le README est fermée",
+      "epic": "EP-033",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-102"
+      ]
+    },
+    {
+      "id": "US-104",
+      "title": "Les trois régénérations entrent dans le niveau qui écrit",
+      "epic": "EP-034",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-094",
+        "US-099",
+        "US-102"
+      ]
+    },
+    {
+      "id": "US-105",
+      "title": "Les documents d'entrée nomment les catalogues",
+      "epic": "EP-034",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-104"
+      ]
+    },
+    {
+      "id": "US-106",
+      "title": "La note de décision consigne la mesure",
+      "epic": "EP-034",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-105"
+      ]
+    }
+  ]
+}
