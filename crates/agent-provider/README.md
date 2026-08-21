@@ -52,6 +52,33 @@ the requests of one session as sharing a prefix. Rotating it mid-run would keep
 the bytes identical and lose the cache anyway, which is why nothing rotates it
 outside `set_prompt_cache_key`.
 
+### The embedded instructions fallback
+
+#### What the model sees
+
+One of the two prompts of `crates/agent-cli/prompts/`, compiled into this crate
+by `include_str!` as `GENERIC_INSTRUCTIONS` and `CODEX_INSTRUCTIONS`
+(`crates/agent-provider/src/models/embedded.rs`) and carried as the
+`instructions` of an embedded `ModelDescriptor`. They answer only when the remote
+catalog at `https://chatgpt.com/backend-api/codex/models` is unreachable, so an
+offline start has a prompt rather than none. What this crate owns is the
+fallback; how the text is composed with the harness contract belongs to
+`agent-cli` and is written in
+[`crates/agent-cli/README.md`](../agent-cli/README.md), not duplicated here.
+
+#### Token effect
+
+3 449 bytes for the two files together, of which exactly one is ever resolved in
+a given run. A remote catalog that answers replaces them entirely, so the
+fallback adds nothing on the normal path.
+
+#### KV Cache effect
+
+Préfixe stable répété: the descriptor is resolved once and its `instructions` do
+not change during the run. The two starts that differ, one reaching the catalog
+and one falling back, produce two different prefixes, which is a cache miss
+between runs and never inside one.
+
 ### The repaired tool-call pairing
 
 #### What the model sees
