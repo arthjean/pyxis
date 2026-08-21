@@ -118,6 +118,19 @@ impl ReplayProvider {
     fn bodies(&self) -> Vec<serde_json::Value> {
         self.bodies.lock().unwrap().clone()
     }
+
+    /// US-122: a script the scenario never finished playing is a scenario that
+    /// stopped early, and every assertion made before this point was made on
+    /// half a run. Called at the end of each test, it turns that silence into a
+    /// failure naming what stayed in the queue.
+    fn assert_consumed(&self) {
+        let left = self.turns.lock().unwrap();
+        assert!(
+            left.is_empty(),
+            "{} scripted turn(s) never played: the scenario stopped early",
+            left.len()
+        );
+    }
 }
 
 #[async_trait::async_trait]
@@ -381,6 +394,7 @@ async fn full_turn_with_tool_call_runs_without_network() {
         messages.iter().any(|m| m.role == Role::User),
         "le prompt utilisateur doit être persisté"
     );
+    h.provider.assert_consumed();
 }
 
 /// AC2: a turn interrupted halfway leaves a valid and resumable
@@ -467,6 +481,8 @@ async fn interrupted_turn_leaves_a_resumable_session() {
         calls, outputs,
         "la requête de reprise ne doit porter aucun appel d'outil orphelin : {body}"
     );
+    h.provider.assert_consumed();
+    replay.assert_consumed();
 }
 
 /// AC4: a malformed SSE stream surfaces as a provider contract failure, never
@@ -490,6 +506,7 @@ async fn malformed_sse_surfaces_as_a_provider_contract_error() {
         "un flux malformé doit remonter comme erreur de decode provider nommée mais expurgée, \
          obtenu : {outcome}"
     );
+    h.provider.assert_consumed();
 }
 
 #[tokio::test]
@@ -538,6 +555,7 @@ async fn retry_after_real_sse_delta_resets_and_preserves_correlated_fingerprints
         ],
         "the abandoned delta never enters the canonical transcript"
     );
+    h.provider.assert_consumed();
 }
 
 /// AC3: the harness depends neither on a keyring, nor on a terminal, nor
@@ -565,6 +583,7 @@ async fn harness_needs_no_credentials_terminal_or_keyring() {
             "aucune credential ne doit transiter par le corps de requête"
         );
     }
+    h.provider.assert_consumed();
 }
 
 // ─────────────────────── US-017: machine event stream ───────────────────────
@@ -630,6 +649,7 @@ async fn every_event_of_a_full_turn_serializes_to_one_json_line() {
         second_in >= first_in && second_in > 0,
         "les compteurs sont cumulés : {first_in} puis {second_in}"
     );
+    h.provider.assert_consumed();
 }
 
 /// US-017 AC4: the observer does not alter the run. The aggregated text, the number
@@ -641,11 +661,13 @@ async fn observing_events_does_not_change_the_textual_result() {
         let workspace = TempWorkspace::new("observe-plain");
         workspace.write("note.txt", "la phrase attendue\n");
         let h = harness(&workspace, [TOOL_CALL_TURN, FINAL_TURN], None);
-        run_headless(
+        let result = run_headless(
             context("Lis note.txt", h.tool_specs.clone()),
             h.deps.clone(),
         )
-        .await
+        .await;
+        h.provider.assert_consumed();
+        result
     };
     let observed = {
         let workspace = TempWorkspace::new("observe-json");
@@ -660,6 +682,7 @@ async fn observing_events_does_not_change_the_textual_result() {
         )
         .await;
         assert_eq!(*seen.lock().unwrap(), result.events);
+        h.provider.assert_consumed();
         result
     };
 
@@ -726,4 +749,5 @@ async fn a_hook_vetoes_a_tool_call_without_breaking_the_session() {
         orphan_tool_calls(&messages).is_empty(),
         "un appel refusé doit rester apparié à son résultat"
     );
+    h.provider.assert_consumed();
 }
