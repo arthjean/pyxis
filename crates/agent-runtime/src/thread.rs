@@ -26,7 +26,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::agent::AgentState;
 use crate::context::TurnContextSource;
-use crate::event::{ThreadEvent, ThreadEventPayload};
+use crate::event::{ThreadEvent, ThreadEventPayload, ThreadJournal};
 use crate::id::{EventId, IdGenerator, ThreadId, TurnId};
 use crate::inputs::TurnInputs;
 use crate::lifecycle::{TurnLifecycle, TurnState};
@@ -35,7 +35,7 @@ use crate::runner::{TurnOutcome, TurnRequest, TurnRunner};
 use crate::store::{
     ForkPoint, RecoveryCommit, StoreError, StoreOperation, ThreadSnapshot, ThreadStore,
 };
-use crate::supervisor::{AgentJournal, AgentSupervisor};
+use crate::supervisor::AgentSupervisor;
 
 /// Control mailbox depth. A producer that finds it full is refused, never
 /// blocked (edge case #2).
@@ -297,7 +297,7 @@ impl Command {
     }
 }
 
-/// [`AgentJournal`] served by the thread's own mailbox.
+/// [`ThreadJournal`] served by the thread's own mailbox.
 ///
 /// A sub-agent tool runs inside a turn task, never inside the actor, so it
 /// reaches the durable log the same way a client does: through a bounded
@@ -312,7 +312,7 @@ struct MailboxJournal {
 }
 
 #[async_trait::async_trait]
-impl AgentJournal for MailboxJournal {
+impl ThreadJournal for MailboxJournal {
     async fn record(&self, payload: ThreadEventPayload) -> Result<EventId, SubmitError> {
         let Some(commands) = self.commands.upgrade() else {
             return Err(SubmitError::Stopped);

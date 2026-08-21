@@ -41,7 +41,7 @@ pub use context::{
 };
 pub use event::{
     ForkOrigin, RECOVERY_COMMIT_ENTRY, THREAD_EVENT_ENTRY, THREAD_META_ENTRY,
-    THREAD_RUNTIME_VERSION, ThreadEvent, ThreadEventPayload,
+    THREAD_RUNTIME_VERSION, ThreadEvent, ThreadEventPayload, ThreadJournal,
 };
 pub use failure::{FailureCategory, TurnFailure};
 pub use handoff::{AgentHandoff, HandoffDraft, MAX_HANDOFF_SUMMARY, UNTRUSTED_BANNER};
@@ -58,8 +58,8 @@ pub use store::{
     StoreCall, StoreError, StoreOperation, ThreadSnapshot, ThreadStore,
 };
 pub use supervisor::{
-    AgentJournal, AgentSent, AgentSpawned, AgentSpawner, AgentSupervisor, AgentView, ChildParts,
-    ChildRequest, MAX_AGENT_TASK, WaitOutcome,
+    AgentSent, AgentSpawned, AgentSpawner, AgentSupervisor, AgentView, ChildParts, ChildRequest,
+    MAX_AGENT_TASK, WaitOutcome,
 };
 pub use thread::{
     Accepted, COMMAND_MAILBOX, Fork, ForkError, LIVE_EVENT_BUFFER, MAX_PENDING_INPUTS,

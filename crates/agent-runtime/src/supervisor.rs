@@ -12,7 +12,7 @@
 //! - [`AgentSpawner`] builds the store, the engine and the context source of a
 //!   child. The client implements it, because only the client knows how to
 //!   build a tool registry restricted to an [`AgentAuthority`].
-//! - [`AgentJournal`] records the filiation in the PARENT's log. A tool runs
+//! - [`ThreadJournal`] records the filiation in the PARENT's log. A tool runs
 //!   inside a turn task, not inside the actor, and the actor is the single
 //!   writer of its log, so the record goes through the mailbox like any other
 //!   operation.
@@ -33,7 +33,7 @@ use crate::agent::{
     AgentState,
 };
 use crate::context::TurnContextSource;
-use crate::event::ThreadEventPayload;
+use crate::event::{ThreadEventPayload, ThreadJournal};
 use crate::handoff::{AgentHandoff, HandoffDraft};
 use crate::id::{AgentId, EventId, IdGenerator, ThreadId};
 use crate::lifecycle::TurnState;
@@ -41,8 +41,7 @@ use crate::path::AgentPath;
 use crate::runner::TurnRunner;
 use crate::store::ThreadStore;
 use crate::thread::{
-    RuntimeEventPayload, Submission, SubmitError, ThreadHandle, ThreadOptions, ThreadStatus,
-    TurnStatus,
+    RuntimeEventPayload, Submission, ThreadHandle, ThreadOptions, ThreadStatus, TurnStatus,
 };
 
 /// Characters a spawn task may carry. A task is a brief, not a transcript.
@@ -51,15 +50,6 @@ pub const MAX_AGENT_TASK: usize = 4_000;
 /// budget for the whole tree, drained CONCURRENTLY with the parent's own tasks,
 /// so sub-agents cost the thread no extra shutdown time (3 s NFR).
 const CHILD_DRAIN: Duration = Duration::from_millis(1_000);
-
-/// Durable sink of the parent's log.
-///
-/// Implemented by the thread actor: an agent event is persisted BEFORE the
-/// spawn is acknowledged, like every other accepted operation (FR-05).
-#[async_trait::async_trait]
-pub trait AgentJournal: Send + Sync {
-    async fn record(&self, payload: ThreadEventPayload) -> Result<EventId, SubmitError>;
-}
 
 /// Everything a client needs to build a child. Carries the GRANTED authority,
 /// already intersected with the parent's: an implementation applies it, it never
@@ -174,7 +164,7 @@ pub enum WaitOutcome {
 /// Parent link, bound once the thread actor exists.
 struct ParentLink {
     thread_id: ThreadId,
-    journal: Arc<dyn AgentJournal>,
+    journal: Arc<dyn ThreadJournal>,
     /// Cancellation node the children hang from. A child of the PARENT thread's
     /// token: cancelling the parent reaches every child, and cancelling one
     /// child reaches neither its parent nor a sibling (FR-10).
@@ -258,7 +248,7 @@ impl AgentSupervisor {
     pub(crate) fn attach(
         &self,
         thread_id: ThreadId,
-        journal: Arc<dyn AgentJournal>,
+        journal: Arc<dyn ThreadJournal>,
         cancel: CancellationToken,
     ) {
         if self

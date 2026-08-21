@@ -18,6 +18,7 @@ use crate::agent::{AgentAuthority, AgentState};
 use crate::context::TurnContext;
 use crate::id::{AgentId, EventId, ThreadId, TurnId};
 use crate::lifecycle::TurnState;
+use crate::thread::SubmitError;
 
 /// `entry` tag of a thread binding line in the JSONL log.
 pub const THREAD_META_ENTRY: &str = "thread_meta";
@@ -27,6 +28,19 @@ pub const THREAD_EVENT_ENTRY: &str = "thread_event";
 pub const RECOVERY_COMMIT_ENTRY: &str = "recovery_commit";
 /// Version of the orchestration layer written in the binding line.
 pub const THREAD_RUNTIME_VERSION: u32 = 1;
+
+/// Durable sink of a thread's log.
+///
+/// Implemented by the thread actor, which stays the single writer of its own
+/// file: an orchestration event is persisted BEFORE the operation it describes
+/// is acknowledged, like every other accepted operation (FR-05).
+///
+/// The sub-agent supervisor writes through it, because it runs inside a turn
+/// task rather than inside the actor.
+#[async_trait::async_trait]
+pub trait ThreadJournal: Send + Sync {
+    async fn record(&self, payload: ThreadEventPayload) -> Result<EventId, SubmitError>;
+}
 
 /// Provenance of a materialized branch (US-010 AC2).
 ///
