@@ -33,6 +33,14 @@ mod subagents;
 // import the wiring from.
 #[cfg(test)]
 mod tool_catalog;
+// The transcript harness (EP-038) drives `headless::run` with a scripted
+// provider, a frozen clock and a seeded id generator, and compares the bytes it
+// renders. Gated on `test` for the same reason as `tool_catalog` and
+// `config_catalog`: `agent-cli` has no `[lib]` target an integration test could
+// import the published headless path from, so the only place that can call it
+// is a module of the binary itself.
+#[cfg(test)]
+mod transcript;
 
 use std::sync::Arc;
 

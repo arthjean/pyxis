@@ -1012,6 +1012,78 @@ mod tests {
         })
     }
 
+    /// US-121 AC3: the identifiers of a session are a function of the seed and
+    /// of nothing else. Two runtimes opened with the same `SequentialIds` and
+    /// the same frozen clock name their thread, their turn and their events
+    /// identically, which is what makes a transcript comparable across runs.
+    ///
+    /// AC5 is structural and has no assertion here: `ids` and `clock` are
+    /// fields of `EngineDeps`, which carries no `Default`, so a caller that
+    /// forgets one does not get a random generator, it fails to compile.
+    #[tokio::test]
+    async fn two_sessions_seeded_the_same_way_name_their_ids_the_same_way() {
+        let dir = std::env::temp_dir().join(format!("pyxis-rt-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        async fn seeded_ids(dir: &Path) -> (String, String, Vec<String>) {
+            let registry = Arc::new(agent_tools::Registry::builder(dir).build());
+            let steps = CliStepSource::new(Arc::clone(&registry), Vec::new());
+            let root = CancellationToken::new();
+            let runtime = SessionRuntime::open(
+                None,
+                EngineDeps {
+                    ids: Arc::new(agent_runtime::id::SequentialIds::starting_at(7)),
+                    clock: Arc::new(crate::transcript::FrozenClock(1_700_000_000_000)),
+                    ..engine(&registry)
+                },
+                Arc::clone(&registry),
+                settings(dir),
+                steps,
+                &root,
+                None,
+            )
+            .await
+            .expect("an in-memory thread opens");
+
+            let mut events = runtime.subscribe();
+            let accepted = runtime
+                .submit(Submission::new("bonjour"))
+                .await
+                .expect("the input is accepted");
+            let mut event_ids = Vec::new();
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let event = events.recv().await.expect("the live stream stays open");
+                    event_ids.push(event.event_id.to_string());
+                    if let agent_runtime::thread::RuntimeEventPayload::TurnStateChanged {
+                        to, ..
+                    } = event.payload
+                        && to.is_terminal()
+                        && event.turn_id == Some(accepted.turn_id)
+                    {
+                        return;
+                    }
+                }
+            })
+            .await;
+            let thread_id = runtime.thread_id().to_string();
+            runtime.shutdown().await;
+            (thread_id, accepted.turn_id.to_string(), event_ids)
+        }
+
+        let first = seeded_ids(&dir).await;
+        let second = seeded_ids(&dir).await;
+
+        assert!(
+            first.0.starts_with("thr_") && first.1.starts_with("trn_"),
+            "the seeded generator still emits the production shapes: {first:?}"
+        );
+        assert!(!first.2.is_empty(), "a turn publishes events");
+        assert_eq!(first, second, "the same seed names the same session");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// US-018 AC1/AC4: an ephemeral run creates or resumes a thread through the
     /// same `ThreadHandle` as any other client, waits for its terminal state,
     /// and leaves NO file behind. Not a file that is cleaned up afterwards: one
