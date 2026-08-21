@@ -103,6 +103,42 @@ fn agents_names_the_three_aggregates_and_sends_the_reader_to_the_inventory() {
     }
 }
 
+#[test]
+fn agents_names_the_regeneration_command_of_each_catalog_and_the_gate_stays_green() {
+    let agents = std::fs::read_to_string(repository_root().join("AGENTS.md"))
+        .expect("AGENTS.md is readable");
+    for command in [
+        "PYXIS_UPDATE_CATALOGS=1 cargo test -p agent-doc-gates --test crate_graph",
+        "PYXIS_UPDATE_CATALOGS=1 cargo test -p agent-cli --bin pyxis tool_catalog",
+        "PYXIS_UPDATE_CATALOGS=1 cargo test -p agent-cli --bin pyxis config_catalog",
+    ] {
+        assert!(
+            agents.contains(command),
+            "AGENTS.md never names `{command}`"
+        );
+    }
+    // A targeted `cargo test -p …` shares no head with `cargo test --workspace`,
+    // which is the only reason a regeneration command can be written out here.
+    assert!(check_prose_gates(&repository_root()).is_empty());
+}
+
+#[test]
+fn a_regeneration_command_colliding_with_a_gate_names_the_line_of_agents_and_the_recipes() {
+    let violations = check_prose_documents(
+        RECIPES,
+        &[(
+            "AGENTS.md",
+            "# Pyxis\n\nRégénérer par `PYXIS_UPDATE_CATALOGS=1 cargo test --workspace --catalogs`.\n",
+        )],
+    );
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    let reported = violations.first().expect("one violation");
+    assert!(reported.contains("AGENTS.md:3"), "{reported}");
+    assert!(reported.contains("--catalogs"), "{reported}");
+    assert!(reported.contains("just build-tests"), "{reported}");
+    assert!(reported.contains("just test"), "{reported}");
+}
+
 // What the rule accepts.
 
 #[test]

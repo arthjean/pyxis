@@ -16,6 +16,7 @@ Pyxis is early and moving fast. Issues, bug reports, and focused pull requests a
   ```
 - The workspace enforces clippy lints: `panic`, `unimplemented`, and `dbg!` are denied; `unwrap`/`expect` are warnings. Avoid them in non-test code (prefer `?`, `ok_or(...)`, `match`).
 - Run `just check` before pushing. It runs the four gates the CI runs, in the same order, and stops at the first one that fails; `just --list` names every other recipe. `just` is optional: the CI runs plain cargo commands and never installs it, so if you would rather not add the tool, `cargo build --workspace` and `cargo test --workspace` above stay a complete path and [`.github/workflows/ci.yml`](.github/workflows/ci.yml) is the authoritative list.
+- A generated document is regenerated, never edited by hand: `docs/crate-graph.md`, `docs/tool-catalog.md`, `docs/config-catalog.md` and the app-server schemas each name their regeneration command in their own header, `just regen` runs all of them, and the test suite compares the result byte for byte, so a manual edit is lost at the next regeneration.
 - Respect the architecture invariants in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). In particular, `agent-core` stays headless: it must not depend on `agent-tui` or `agent-provider`, and it must never emit ANSI.
 
 ## Licensing of contributions
