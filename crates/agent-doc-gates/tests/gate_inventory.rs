@@ -432,23 +432,46 @@ fn the_three_catalogs_are_regenerated_by_the_recipe_that_announces_it_writes() {
     }
 }
 
+/// Every switch, not one of them: a set that grows is a set whose newest member
+/// is the one nothing proved. US-125 added the third and this is what says so.
 #[test]
 fn a_verification_recipe_that_sets_a_write_switch_is_reported_by_name() {
-    let recipes = format!(
-        "{}{WRITING_RECIPE}",
-        RECIPES.replace(
-            "test:\n    cargo test --workspace --no-fail-fast",
-            "test:\n    PYXIS_UPDATE_CATALOGS=1 cargo test --workspace --no-fail-fast",
-        )
-    );
-    let violations = check_gate_documents(&recipes, WORKFLOW_YAML);
-    let reported = violations
-        .iter()
-        .find(|violation| violation.contains("PYXIS_UPDATE_CATALOGS=1"))
-        .expect("the verification that writes is reported");
-    assert!(reported.contains("« test »"), "{reported}");
-    assert!(reported.contains(WRITE_RECIPE), "{reported}");
-    assert_eq!(reported.lines().count(), 1, "{reported}");
+    for switch in WRITE_SWITCHES {
+        let recipes = format!(
+            "{}{WRITING_RECIPE}",
+            RECIPES.replace(
+                "test:\n    cargo test --workspace --no-fail-fast",
+                &format!("test:\n    {switch}=1 cargo test --workspace --no-fail-fast"),
+            )
+        );
+        let violations = check_gate_documents(&recipes, WORKFLOW_YAML);
+        let reported = violations
+            .iter()
+            .find(|violation| violation.contains(&format!("{switch}=1")))
+            .unwrap_or_else(|| unreachable!("the verification that writes {switch} is reported"));
+        assert!(reported.contains("« test »"), "{reported}");
+        assert!(reported.contains(WRITE_RECIPE), "{reported}");
+        assert_eq!(reported.lines().count(), 1, "{reported}");
+    }
+}
+
+/// The reciprocal: a switch declared and wired nowhere would let a gate write
+/// with no way to ask it to. The regeneration recipe is that way, and it is the
+/// only one.
+#[test]
+fn every_write_switch_has_a_line_in_the_regeneration_recipe() {
+    let justfile = std::fs::read_to_string(repository_root().join(JUSTFILE))
+        .expect("the justfile is readable");
+    let body = justfile
+        .split_once(&format!("\n{WRITE_RECIPE}:\n"))
+        .map(|(_, tail)| tail.to_string())
+        .expect("the writing recipe exists");
+    for switch in WRITE_SWITCHES {
+        assert!(
+            body.contains(&format!("{switch}=1 ")),
+            "`just {WRITE_RECIPE}` is how {switch} is turned on"
+        );
+    }
 }
 
 #[test]

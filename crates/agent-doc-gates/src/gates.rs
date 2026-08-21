@@ -258,12 +258,16 @@ fn aggregate_violations(recipes: &[Recipe]) -> Vec<String> {
 pub const WRITE_RECIPE: &str = "regen";
 
 /// The environment switches that turn a comparison gate into a writer. The set
-/// is closed and both members belong to the write recipe: one regenerates the
-/// app-server schemas, the other the three catalogs. A third switch joins this
-/// list in the change that introduces it, which is where a reader looks for
-/// what may rewrite the tree; matching a prefix instead would spare that edit
-/// and cost the inventory.
-pub const WRITE_SWITCHES: &[&str] = &["PYXIS_UPDATE_SCHEMAS", "PYXIS_UPDATE_CATALOGS"];
+/// is closed and every member belongs to the write recipe: one regenerates the
+/// app-server schemas, one the three catalogs, one the frozen transcripts. A
+/// further switch joins this list in the change that introduces it, which is
+/// where a reader looks for what may rewrite the tree; matching a prefix
+/// instead would spare that edit and cost the inventory.
+pub const WRITE_SWITCHES: &[&str] = &[
+    "PYXIS_UPDATE_SCHEMAS",
+    "PYXIS_UPDATE_CATALOGS",
+    "PYXIS_UPDATE_TRANSCRIPTS",
+];
 
 /// Report every way the recipe file lets a verification write to the repository.
 ///

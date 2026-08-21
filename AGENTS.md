@@ -48,7 +48,7 @@ inventories drift apart.
 |---|---|
 | `just check` | The verdict: the four gates of the CI, in order, stopping at the first failure |
 | `just check-local` | `just check` plus both parity gates; needs the pinned Codex clone, never runs in CI, and upstream drift stays non-blocking |
-| `just regen` | WRITES to the repository: schemas, snapshots, parity matrix, the three catalogs. Read `git diff` afterwards, and never call it from a verification |
+| `just regen` | WRITES to the repository: schemas, snapshots, parity matrix, the three catalogs, the frozen transcripts. Read `git diff` afterwards, and never call it from a verification |
 
 Targeted verification signals. The third column says which aggregate carries
 the command, so no gate here is one nothing ever runs:
@@ -62,6 +62,7 @@ the command, so no gate here is one nothing ever runs:
 | Crate graph, after a crate is added, renamed, or its `description` edited | `PYXIS_UPDATE_CATALOGS=1 cargo test -p agent-doc-gates --test crate_graph` | a line of `just regen`; it writes, so the freshness assertion it feeds runs inside `just test` |
 | Tool catalog, after a tool is registered or one of its policy properties moves | `PYXIS_UPDATE_CATALOGS=1 cargo test -p agent-cli --bin pyxis tool_catalog` | a line of `just regen`; it writes, so the freshness assertion it feeds runs inside `just test` |
 | Configuration catalog, after a key, a flag, or a `PYXIS_*` variable moves | `PYXIS_UPDATE_CATALOGS=1 cargo test -p agent-cli --bin pyxis config_catalog` | a line of `just regen`; it writes, so the freshness assertion it feeds runs inside `just test` |
+| Frozen transcripts, after anything the headless JSONL stream renders moves | `PYXIS_UPDATE_TRANSCRIPTS=1 cargo test -p agent-cli --bin pyxis transcript` | a line of `just regen`; it writes, so the byte comparison it feeds runs inside `just test` |
 | Decision records, and the gate inventory the `justfile`, `.github/workflows/ci.yml`, `AGENTS.md` and `CONTRIBUTING.md` describe | `cargo test -p agent-doc-gates` | runs inside `just test` |
 | Model experience, after a prompt, a tool description, an injected literal, or the list of crates moves | `cargo test -p agent-doc-gates` | runs inside `just test` |
 | Live parity against a real OpenAI endpoint | see `docs/parity/offline-suite.md` | outside every aggregate on purpose: it spends the maintainer's subscription, so no recipe may set `PYXIS_LIVE_PARITY` |

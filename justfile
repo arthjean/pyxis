@@ -56,7 +56,7 @@ check-local: check parity
     # `-`: upstream moving is a report, not a verdict, so `drift` cannot turn this red.
     -just drift
 
-# WRITES to the repository: regenerates schemas, snapshots, the parity matrix and the three catalogs; read `git diff` after.
+# WRITES to the repository: regenerates schemas, snapshots, the parity matrix, the three catalogs and the frozen transcripts; read `git diff` after.
 regen:
     PYXIS_UPDATE_SCHEMAS=1 cargo test -p agent-app-server --test schemas
     cargo insta review
@@ -64,3 +64,4 @@ regen:
     PYXIS_UPDATE_CATALOGS=1 cargo test -p agent-doc-gates --test crate_graph
     PYXIS_UPDATE_CATALOGS=1 cargo test -p agent-cli --bin pyxis tool_catalog
     PYXIS_UPDATE_CATALOGS=1 cargo test -p agent-cli --bin pyxis config_catalog
+    PYXIS_UPDATE_TRANSCRIPTS=1 cargo test -p agent-cli --bin pyxis transcript
