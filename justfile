@@ -43,11 +43,18 @@ test:
 # Run the four CI gates in order, stopping at the first one that fails.
 check: fmt lint build-tests test
 
-# `check` plus both parity gates; needs the pinned Codex clone, never runs in CI.
-check-local: check
+# Compare the frozen parity matrices to the pinned Codex clone; reads it, never writes.
+parity:
     cargo run -p agent-parity -- check
+
+# Report what moved upstream since the pinned commit; exits non-zero by design when it did.
+drift:
+    cargo run -p agent-parity -- drift
+
+# `check` plus both parity gates; needs the pinned Codex clone, never runs in CI.
+check-local: check parity
     # `-`: upstream moving is a report, not a verdict, so `drift` cannot turn this red.
-    -cargo run -p agent-parity -- drift
+    -just drift
 
 # WRITES to the repository: regenerates schemas, snapshots and the parity matrix; read `git diff` after.
 regen:

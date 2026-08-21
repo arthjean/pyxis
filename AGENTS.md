@@ -50,15 +50,17 @@ inventories drift apart.
 | `just check-local` | `just check` plus both parity gates; needs the pinned Codex clone, never runs in CI, and upstream drift stays non-blocking |
 | `just regen` | WRITES to the repository: schemas, snapshots, parity matrix. Read `git diff` afterwards, and never call it from a verification |
 
-Targeted verification signals:
+Targeted verification signals. The third column says which aggregate carries
+the command, so no gate here is one nothing ever runs:
 
-| Change | Command |
-|---|---|
-| Anything touching Codex contract surface | `cargo run -p agent-parity -- check` |
-| Checking what moved upstream | `cargo run -p agent-parity -- drift` |
-| App-server protocol types | `PYXIS_UPDATE_SCHEMAS=1 cargo test -p agent-app-server --test schemas` |
-| TUI rendering | `cargo insta review` after `cargo test -p agent-tui` |
-| Decision records, and the gate inventory the `justfile`, `.github/workflows/ci.yml`, `AGENTS.md` and `CONTRIBUTING.md` describe | `cargo test -p agent-doc-gates` |
+| Change | Command | In the aggregates |
+|---|---|---|
+| Anything touching Codex contract surface | `just parity` | `just check-local`, blocking |
+| Checking what moved upstream | `just drift` | `just check-local`, kept non-blocking by the `-` sigil |
+| App-server protocol types | `PYXIS_UPDATE_SCHEMAS=1 cargo test -p agent-app-server --test schemas` | a line of `just regen`; it writes, so no verification recipe may run it |
+| TUI rendering | `cargo insta review` after `cargo test -p agent-tui` | the review is a line of `just regen` and is interactive; the test it reviews runs inside `just test` |
+| Decision records, and the gate inventory the `justfile`, `.github/workflows/ci.yml`, `AGENTS.md` and `CONTRIBUTING.md` describe | `cargo test -p agent-doc-gates` | runs inside `just test` |
+| Live parity against a real OpenAI endpoint | see `docs/parity/offline-suite.md` | outside every aggregate on purpose: it spends the maintainer's subscription, so no recipe may set `PYXIS_LIVE_PARITY` |
 
 Adding, renaming, or moving a test named in the table of
 `docs/parity/offline-suite.md` breaks `crates/agent-parity/tests/offline_suite.rs`,
