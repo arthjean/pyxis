@@ -247,7 +247,7 @@ Pyxis reads and writes a few well-known paths:
 |------|---------|
 | `<workspace>/.pyxis/sessions/*.jsonl` | One append-only transcript per conversation; backs `/resume` |
 | `<workspace>/.pyxis/goal` | Persistent `/goal` objective (survives restarts) |
-| `~/.pyxis/settings.toml` | Global settings: model, reasoning effort, permission mode, `writable_roots`, `[[hooks]]` |
+| `~/.pyxis/settings.toml` | Global settings; the only layer that may set every key, listed in the [configuration catalog](docs/config-catalog.md) |
 | `~/.pyxis/logs/panic.log` | Panic reports (version, location, message), appended across runs |
 | `~/.pyxis/logs/trace-*.log` | Structured trace of one run, written only when `PYXIS_LOG` is set |
 | `<workspace>/.mcp.json` | Workspace MCP servers (highest priority) |
@@ -263,10 +263,10 @@ Configuration is resolved by named layers, each carrying an explicit precedence.
 | global settings | 10 | `~/.pyxis/settings.toml`, may set every key |
 | profile | 15 | the `[profiles.<name>]` table selected by `--profile` or by the `profile` key |
 | project config | 20 | `<workspace>/.pyxis/config.toml` |
-| environment | 25 | `PYXIS_*` variables |
+| environment | 25 | the `PYXIS_*` variables the [configuration catalog](docs/config-catalog.md) names, which cover part of the keys |
 | command line | 30 | `-c key=value` and the flags above |
 
-`permission_mode`, `sandbox_mode`, `writable_roots`, `hooks` and `profile` are security keys: the project file is refused on them with a warning, and so is `-c`, since an argument can come from a script of the repository. `--permission-mode` and `--sandbox` are the documented way to choose a perimeter for one session.
+A security key widens a security perimeter: the project file is refused on it with a warning, and so is `-c`, since an argument can come from a script of the repository. Typed flags such as `--permission-mode` and `--sandbox` remain the documented way to choose a perimeter for one session. The [configuration catalog](docs/config-catalog.md) carries the list, derived from the code rather than repeated here.
 
 ### MCP servers
 

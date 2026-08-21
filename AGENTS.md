@@ -155,6 +155,7 @@ fingerprinted, never hand-edited.
 |---|---|
 | Invariants, agent loop, tools, MCP, sessions | `docs/ARCHITECTURE.md` |
 | Crate graph: the sixteen crates, their role and their internal edges, generated | [`docs/crate-graph.md`](docs/crate-graph.md) |
+| Catalogue de configuration: the fifteen keys, their layer, flag, variable and security character, generated | [`docs/config-catalog.md`](docs/config-catalog.md) |
 | ADRs and structural decisions | `docs/DECISIONS.md` |
 | Shipped scope, deferred work, live risks | `docs/CURRENT_STATUS.md` |
 | Provider contract and error taxonomy | `docs/PROVIDERS.md` |
