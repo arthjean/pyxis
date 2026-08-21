@@ -737,6 +737,10 @@ impl SessionRuntime {
             wiring.handle.bind(Arc::clone(&supervisor));
             supervisor
         });
+        // One job registry per thread, for the same reason: a background process
+        // belongs to the conversation that started it, and reopening a thread
+        // must not make the previous one's processes reachable (EP-041).
+        let jobs = agent_runtime::jobs::JobRegistry::new(Arc::clone(&ids), Arc::clone(&clock));
         let handle = ThreadHandle::start(ThreadOptions {
             thread_id,
             store,
@@ -746,7 +750,7 @@ impl SessionRuntime {
             clock,
             parent_cancel: parent_cancel.clone(),
             agents: supervisor,
-            jobs: None,
+            jobs: Some(jobs),
         })
         .await
         .map_err(|err| anyhow::anyhow!("thread: {err}"))?;
