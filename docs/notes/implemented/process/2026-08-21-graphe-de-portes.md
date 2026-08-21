@@ -37,8 +37,11 @@ suffisante et ne rouvre pas le YAML avant de livrer.
 Les portes du dépôt sont des recettes d'un [`justfile`](../../../../justfile) racine. Quatre
 recettes feuilles portent les quatre commandes `cargo` du CI, dans le même ordre ; `check` les
 compose et s'arrête à la première qui échoue, ce que `just` fait nativement puisqu'une ligne
-sortant non nul avorte la recette. `check-local` ajoute les deux portes de parité, `drift`
-préfixée du sigil `-` pour qu'un amont qui a bougé s'affiche sans rendre le verdict rouge.
+sortant non nul avorte la recette. Les deux portes de parité sont elles aussi des recettes, `parity`
+et `drift`, que `check-local` compose : `drift` y est préfixée du sigil `-` pour qu'un amont qui a
+bougé s'affiche sans rendre le verdict rouge. Les nommer séparément est ce qui les rend lançables
+seules, sans payer les vingt secondes de `check`, et ce qui permet à la table des signaux ciblés
+d'`AGENTS.md` de citer une recette plutôt qu'une commande.
 `regen`, qui écrit dans le dépôt, n'est la dépendance d'aucune recette de vérification. La recette
 par défaut est `just --list` : la commande sans argument catalogue les portes au lieu d'en
 exécuter une.
@@ -146,9 +149,9 @@ d'inventaire, et il est payé à chaque édition de l'un des deux fichiers plut�
 rouge, sur la pull request d'un tiers.
 
 Le budget de temps est une contrainte tenue à la main, pas par une porte : `just check` doit rester
-sous 60 secondes sur cache chaud pour continuer d'être lancé. La mesure de départ, relevée à la
-rédaction du PRD, était de 20,2 secondes cumulées (fmt 0,69 s, clippy 0,26 s, compilation des
-tests 0,20 s, suite 19 s). Toute porte ajoutée par un lot ultérieur annonce son coût à chaud ici.
+sous 60 secondes sur cache chaud pour continuer d'être lancé. La section « Mesures » ci-dessous
+consigne le relevé de livraison et la mesure de départ qu'il confirme. Toute porte ajoutée par un
+lot ultérieur annonce son coût à chaud ici, à la suite de ce même tableau.
 
 `just` devient un prérequis local, jamais un prérequis du CI. `CONTRIBUTING.md` documente en toutes
 lettres que la voie `cargo` reste complète et suffisante pour un contributeur qui ne veut pas
@@ -157,3 +160,82 @@ l'installer, et le workflow n'a gagné aucune étape, aucune action tierce et au
 Le précédent que ce lot pose pour les suivants est explicite : tout ce que le CI peut exécuter
 entre dans `check`, tout ce qui exige un artefact local, comme le clone Codex épinglé, entre dans
 `check-local`, et tout ce qui écrit dans l'arbre entre dans `regen`.
+
+## Mesures
+
+Relevé du 2026-08-21 à la livraison du lot, sur la machine de référence : AMD Ryzen 7 7800X3D,
+16 fils, 30 Gio de mémoire, Fedora 44, noyau 7.1.8, `cargo` 1.97.1, `rustc` 1.97.1, `mold` forcé
+par `.cargo/config.toml`. Les mesures ci-dessous sont des relevés `/usr/bin/time` sur cache chaud,
+c'est-à-dire après un `just check` complet immédiatement précédent.
+
+| Porte | Départ, à la rédaction du PRD | Livraison, cache chaud |
+|---|---|---|
+| `just fmt` | 0,69 s | 0,69 s |
+| `just lint` | 0,26 s | 0,21 s |
+| `just build-tests` | 0,20 s | 0,19 s |
+| `just test` | 19 s | 18,54 s |
+| `just check` | 20,2 s cumulées | 19,66 s, 19,69 s, 19,62 s sur trois lancements |
+
+Le budget de 60 secondes est donc tenu avec une marge d'un facteur trois, et la mesure de départ
+est confirmée plutôt que corrigée. La suite pèse 94 % du total : c'est le seul poste qu'un lot
+ultérieur puisse faire dériver.
+
+**L'arrêt anticipé est mesuré, pas supposé.** Avec une fonction délibérément mal formatée ajoutée
+à `crates/agent-doc-gates/src/lib.rs`, `just check` sort en **0,69 s** avec le code 1, exactement
+le coût de `fmt` seul. La preuve que rien d'autre n'a démarré ne repose pas sur cette durée : un
+`cargo` factice placé en tête de `PATH`, qui journalise son argv avant de relayer au vrai binaire,
+n'a enregistré qu'une seule ligne, `cargo fmt --all -- --check`. Aucun `cargo clippy`, aucun
+`cargo test` n'a été lancé. Le relevé est identique sous les deux versions : même 0,69 s, même
+code 1 et même unique ligne journalisée sous 1.21.0 que sous 1.58.0, l'arrêt anticipé étant donc
+prouvé sur le plancher autant que sur la borne haute. Seul le libellé diffère,
+``error: recipe `fmt` failed on line 26 with exit code 1`` sous 1.58.0 contre
+``error: Recipe `fmt` failed on line 26 with exit code 1`` sous 1.21.0 : `just` a changé la casse
+d'un mot, pas la teneur de son diagnostic. Le PRD, lui, anticipait
+`error: Recipe 'fmt' failed with exit code 1`, sans le numéro de ligne que les deux versions
+donnent déjà.
+
+**Les deux versions de `just` rendent le même arbre.** `just --list` et `just --dry-run check-local`
+produisent une sortie identique octet pour octet sous 1.21.0, la version empaquetée par Ubuntu
+24.04 et le plancher que ce fichier vise, et sous la version installée localement. Le sigil `-` s'y
+comporte pareillement : sous les deux, une recette appelée par `-just` échoue bruyamment sans
+changer le verdict de celle qui l'appelle, ce qui est ce dont `check-local` dépend pour `drift`. Un écart au PRD
+est à consigner : celui-ci annonçait 1.57.0 pour Fedora 44, la machine de référence porte
+**1.58.0**, installée par `cargo install`. Le plancher testé reste 1.21.0, donc l'écart ne déplace
+que la borne haute, sur laquelle aucune contrainte ne pèse.
+
+**L'interruption ne laisse rien.** Un `SIGINT` envoyé au groupe de processus pendant la porte
+`test` fait sortir `just` en **130** avec
+``error: recipe `test` was terminated on line 41 by signal 2``. `git status --porcelain` est vide
+juste après, aucun `*.rs.bk`, `*.snap.new` ni `*.orig` n'apparaît dans l'arbre, et le `just check`
+suivant repasse vert sans reconstruire : `target/` survit à l'interruption.
+
+**La concurrence est sérialisée par cargo, pas par une recette.** Deux `just check` lancés
+simultanément sortent tous les deux en 0. Le second affiche
+`Blocking waiting for file lock on build directory` puis
+`Blocking waiting for file lock on package cache`, attend, et reprend. `git status` reste vide et
+le `just check` suivant repasse vert. Aucune exclusion mutuelle n'est donc à écrire dans le
+`justfile` : cargo la porte déjà, et l'ajouter masquerait le message qui explique l'attente.
+
+**Ce qui reste hors agrégat, et pourquoi.** Les trois commandes de la recette normative de
+[`docs/parity/offline-suite.md`](../../../parity/offline-suite.md) sont désormais toutes
+atteignables par une recette : `cargo test --workspace --no-fail-fast` est `just test`,
+`cargo run -p agent-parity -- check` est `just parity`, `-- drift` est `just drift`, et
+`check-local` compose les trois. Le compte de portes documentées que rien n'exécute tombe donc à
+zéro. Une seule commande de ce document reste volontairement sans recette, la recette live
+`PYXIS_LIVE_PARITY=1 cargo test -p agent-cli --test live_parity_sol` : elle dépense l'abonnement du
+mainteneur contre un point de terminaison OpenAI réel, et les limites d'autorisation d'`AGENTS.md`
+lui réservent une décision de session explicite. Une recette la rendrait lançable par
+autocomplétion, ce qui est précisément ce que cette limite interdit.
+
+Le workflow, lui, n'a pas bougé : le diff de
+[`.github/workflows/ci.yml`](../../../../.github/workflows/ci.yml) sur toute la durée du lot est
+vide. Aucune étape ajoutée, aucun `timeout` déplacé, aucun `tee`, aucun filtre, aucun bloc
+`GITHUB_STEP_SUMMARY` touché, et aucune installation de `just` sur le runner. L'appariement passe
+par le marqueur `# ci-step:` porté côté `justfile`, donc il n'a rien demandé au workflow.
+
+**L'état local du clone épinglé n'est pas celui du dépôt.** Au moment du relevé, `just parity` sort
+non nul sur un `CommitMismatch`, le clone résolu par `$PYXIS_CODEX_BASELINE` étant à un autre
+commit que `BASELINE_COMMIT`, et `just drift` rapporte 22 différences de contrat. Les deux sorties
+sont conformes aux cas 3 et 5 du tableau d'erreurs du PRD : la porte nomme le commit attendu et ne
+corrige rien. Elles constatent l'état d'une machine, pas un défaut du lot, et c'est bien pour cela
+que `check-local` ne tourne jamais en CI.
