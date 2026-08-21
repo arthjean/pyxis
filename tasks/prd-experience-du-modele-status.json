@@ -1,0 +1,191 @@
+{
+  "prd": {
+    "file": "tasks/prd-experience-du-modele.md",
+    "title": "Expérience du modèle documentée",
+    "created_at": "2026-08-21",
+    "status": "IN_PROGRESS",
+    "updated_at": "2026-08-21"
+  },
+  "epics": [
+    {
+      "id": "EP-035",
+      "title": "Le contrat écrit et la porte qui le tient",
+      "status": "DONE",
+      "priority": "P0",
+      "stories_total": 5,
+      "stories_done": 5,
+      "updated_at": "2026-08-21"
+    },
+    {
+      "id": "EP-036",
+      "title": "Les huit surfaces structurées",
+      "status": "IN_REVIEW",
+      "priority": "P0",
+      "stories_total": 5,
+      "stories_done": 5,
+      "updated_at": "2026-08-21"
+    },
+    {
+      "id": "EP-037",
+      "title": "Les surfaces auditées et l'intégration",
+      "status": "IN_PROGRESS",
+      "priority": "P1",
+      "stories_total": 3,
+      "stories_done": 1,
+      "updated_at": "2026-08-21"
+    }
+  ],
+  "stories": [
+    {
+      "id": "US-107",
+      "title": "Le contrat est écrit une fois, dans le document que la porte cite",
+      "epic": "EP-035",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [],
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
+    },
+    {
+      "id": "US-108",
+      "title": "Les seize crates sont classés, et la classification est confrontée au disque",
+      "epic": "EP-035",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-107"
+      ],
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
+    },
+    {
+      "id": "US-109",
+      "title": "La forme structurée est vérifiée dans son ordre et sa densité",
+      "epic": "EP-035",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-108"
+      ],
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
+    },
+    {
+      "id": "US-110",
+      "title": "La forme courte est bornée et l'omission reste sans fichier",
+      "epic": "EP-035",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-108"
+      ],
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
+    },
+    {
+      "id": "US-111",
+      "title": "L'ancrage vers le catalogue d'outils est prouvé par la porte qui en dépend",
+      "epic": "EP-035",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-109"
+      ],
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
+    },
+    {
+      "id": "US-112",
+      "title": "agent-tools déclare ses vingt-neuf descriptions et ses littéraux de troncature",
+      "epic": "EP-036",
+      "status": "IN_REVIEW",
+      "priority": "P0",
+      "size": "L",
+      "blocked_by": [
+        "US-111"
+      ]
+    },
+    {
+      "id": "US-113",
+      "title": "agent-cli cite verbatim les quatre textes système et dit lequel s'ajoute quand",
+      "epic": "EP-036",
+      "status": "IN_REVIEW",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-111"
+      ]
+    },
+    {
+      "id": "US-114",
+      "title": "agent-core déclare ses littéraux, ses seuils et ses opérations auxiliaires",
+      "epic": "EP-036",
+      "status": "IN_REVIEW",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-111"
+      ]
+    },
+    {
+      "id": "US-115",
+      "title": "agent-runtime et agent-provider déclarent l'assemblage du préfixe et son rendu",
+      "epic": "EP-036",
+      "status": "IN_REVIEW",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-111"
+      ]
+    },
+    {
+      "id": "US-116",
+      "title": "agent-mcp, agent-app-server et agent-code-mode déclarent les catalogues alimentés du dehors",
+      "epic": "EP-036",
+      "status": "IN_REVIEW",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-111"
+      ]
+    },
+    {
+      "id": "US-117",
+      "title": "Les huit crates restants se prononcent",
+      "epic": "EP-037",
+      "status": "IN_REVIEW",
+      "priority": "P1",
+      "size": "M",
+      "blocked_by": [
+        "US-110"
+      ]
+    },
+    {
+      "id": "US-118",
+      "title": "Les documents d'entrée nomment le contrat et sa commande",
+      "epic": "EP-037",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "S",
+      "blocked_by": [
+        "US-117"
+      ]
+    },
+    {
+      "id": "US-119",
+      "title": "La note de décision consigne la mesure et la frontière",
+      "epic": "EP-037",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "S",
+      "blocked_by": [
+        "US-118"
+      ]
+    }
+  ]
+}
