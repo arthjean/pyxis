@@ -12,14 +12,23 @@ are what they are.
 #### What the model sees
 
 One entry per tool a configured MCP server publishes, added to the same `tools`
-array as the built-in ones. The name and the input schema come from the server;
-the prose does not, because a server-supplied description would be untrusted text
-sitting in the highest-authority region of the request.
+array as the built-in ones. The description is the server's own, passed through
+unrewritten (`info.description.clone()` in `crates/agent-mcp/src/tool.rs`); only
+an empty one is replaced, by `Tool "{original_name}" exposed by the
+MCP server "{server}".`. What this repository does refuse is the server-level prose:
+`initialize.instructions` is deliberately not folded in, because a description
+reaches the model inside the tool definitions, a region no tool output ever
+taints, so smuggled prose would be injection the taint defense is structurally
+unable to see.
 
 #### Token effect
 
-Unbounded and outside this repository's control: a server publishing forty tools
-adds forty entries to the prefix of every request of the session.
+Unbounded and outside this repository's control, since the text is the server's:
+a server publishing forty tools adds forty entries to the prefix of every request
+of the session, bounded only by `MAX_SCHEMA_BYTES` per input schema. The
+countermeasure is not rewriting the prose but the fail-closed policy around it,
+baseline `Ask` and full taint propagation, which holds whatever the description
+claims about itself, `read_only` annotation included (CVE-2025-6514).
 
 #### KV Cache effect
 
@@ -40,8 +49,8 @@ and [`read_mcp_resource`](../../docs/tool-catalog.md#read_mcp_resource).
 
 #### Token effect
 
-Around 780 bytes of description across the three, present whenever at least one
-server is configured.
+592 bytes of description across the three, present whenever at least one server
+is configured.
 
 #### KV Cache effect
 
