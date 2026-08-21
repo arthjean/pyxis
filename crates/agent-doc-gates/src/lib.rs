@@ -39,6 +39,13 @@
 //! claims the prose is true, and `docs/model-experience.md` says which of the
 //! two it is.
 //!
+//! The same standard reaches the machine contract of the headless mode:
+//! [`event_schema`] compares the variants of `AgentEvent` to the types
+//! `docs/EVENT_SCHEMA.md` publishes, and holds every example of that document to
+//! a frozen transcript. Six variants had no row and three identifier prefixes
+//! were strings the binary never emitted, and both survived because nothing
+//! compared the document to what it describes.
+//!
 //! No mechanical rule exists here without its written counterpart: the rules of
 //! the tree are written in `docs/notes/README.md`, those of the register in the
 //! header of `docs/DECISIONS.md`, which announces its summary table and the
@@ -48,6 +55,7 @@
 
 mod crate_graph;
 mod decisions;
+mod event_schema;
 mod gates;
 mod links;
 mod model_experience;
@@ -59,6 +67,11 @@ pub use crate_graph::{
 };
 pub use decisions::{
     ADR_ALTERNATIVES_HEADING, DECISIONS_DOC, check_decisions, check_decisions_document,
+};
+pub use event_schema::{
+    ENUM_HEADER, EVENT_SCHEMA_DOC, EVENT_SOURCE, Example, JSON_FENCE, NON_VARIANT_ROWS,
+    TRANSCRIPT_ANCHOR, TYPES_HEADING, UNFROZEN_ANCHOR, check_event_schema, check_event_types,
+    check_examples, documented_types, examples, variant_names,
 };
 pub use gates::{
     AGGREGATE_RECIPE, GATE_MARKER, Gate, JUSTFILE, PROSE_DOCUMENTS, WORKFLOW, WRITE_RECIPE,

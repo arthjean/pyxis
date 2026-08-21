@@ -65,6 +65,7 @@ the command, so no gate here is one nothing ever runs:
 | Frozen transcripts, after anything the headless JSONL stream renders moves | `PYXIS_UPDATE_TRANSCRIPTS=1 cargo test -p agent-cli --bin pyxis transcript` | a line of `just regen`; it writes, so the byte comparison it feeds runs inside `just test` |
 | Decision records, and the gate inventory the `justfile`, `.github/workflows/ci.yml`, `AGENTS.md` and `CONTRIBUTING.md` describe | `cargo test -p agent-doc-gates` | runs inside `just test` |
 | Model experience, after a prompt, a tool description, an injected literal, or the list of crates moves | `cargo test -p agent-doc-gates` | runs inside `just test` |
+| Headless event contract, after a variant of `AgentEvent` moves or an example of `docs/EVENT_SCHEMA.md` is edited | `cargo test -p agent-doc-gates` | runs inside `just test` |
 | Live parity against a real OpenAI endpoint | see `docs/parity/offline-suite.md` | outside every aggregate on purpose: it spends the maintainer's subscription, so no recipe may set `PYXIS_LIVE_PARITY` |
 
 Adding, renaming, or moving a test named in the table of
