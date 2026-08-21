@@ -25,10 +25,10 @@
     {
       "id": "EP-033",
       "title": "Le catalogue de configuration et le triplet déclaré",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 4,
-      "stories_done": 0
+      "stories_done": 4
     },
     {
       "id": "EP-034",
@@ -152,43 +152,55 @@
       "id": "US-100",
       "title": "Le triplet clé, drapeau, variable d'environnement est déclaré une fois",
       "epic": "EP-033",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
-      "blocked_by": []
+      "blocked_by": [],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-101",
       "title": "Aucune clé acceptée par le binaire ne peut manquer au catalogue",
       "epic": "EP-033",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-100"
-      ]
+      ],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-102",
       "title": "Le catalogue de configuration est rendu et prouvé frais",
       "epic": "EP-033",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-101"
-      ]
+      ],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-103",
       "title": "La dérive de sécurité mesurée dans le README est fermée",
       "epic": "EP-033",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "S",
       "blocked_by": [
         "US-102"
-      ]
+      ],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-104",
