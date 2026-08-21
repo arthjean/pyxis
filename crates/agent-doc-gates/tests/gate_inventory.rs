@@ -20,8 +20,9 @@
 #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 
 use agent_doc_gates::{
-    AGGREGATE_RECIPE, GATE_MARKER, Gate, JUSTFILE, WORKFLOW, check_gate_documents, check_gates,
-    compare_gates, justfile_gates, repository_root, workflow_gates,
+    AGGREGATE_RECIPE, GATE_MARKER, Gate, JUSTFILE, WORKFLOW, WRITE_RECIPE, WRITE_SWITCHES,
+    check_gate_documents, check_gates, compare_gates, justfile_gates, repository_root,
+    workflow_gates,
 };
 
 /// A recipe file holding the four gates of the workflow below, used as the
@@ -376,4 +377,117 @@ fn a_recipe_file_without_its_aggregate_is_reported_because_nothing_composes_the_
         .find(|violation| violation.contains(AGGREGATE_RECIPE))
         .expect("the missing aggregate is reported");
     assert!(reported.contains(JUSTFILE), "{reported}");
+}
+
+// The writing level, kept apart from the verifications.
+
+/// The write recipe as the real file carries it: three regeneration switches,
+/// no marker, and nothing else composing it.
+const WRITING_RECIPE: &str = "
+# WRITES to the repository.
+regen:
+    PYXIS_UPDATE_SCHEMAS=1 cargo test -p agent-app-server --test schemas
+    PYXIS_UPDATE_CATALOGS=1 cargo test -p agent-doc-gates --test crate_graph
+";
+
+#[test]
+fn the_write_switches_of_this_repository_live_in_the_regeneration_recipe_alone() {
+    let justfile = std::fs::read_to_string(repository_root().join(JUSTFILE))
+        .expect("the justfile is readable");
+    for line in justfile.lines() {
+        let carries = WRITE_SWITCHES.iter().any(|switch| line.contains(switch));
+        if !carries || line.trim_start().starts_with('#') {
+            continue;
+        }
+        assert!(
+            line.starts_with("    "),
+            "a write switch only appears inside a recipe body: {line}"
+        );
+    }
+    assert!(
+        justfile.contains(&format!("\n{WRITE_RECIPE}:\n")),
+        "the writing level is a recipe of its own"
+    );
+    assert!(check_gates(&repository_root()).is_empty());
+}
+
+#[test]
+fn the_three_catalogs_are_regenerated_by_the_recipe_that_announces_it_writes() {
+    let justfile = std::fs::read_to_string(repository_root().join(JUSTFILE))
+        .expect("the justfile is readable");
+    let body = justfile
+        .split_once(&format!("\n{WRITE_RECIPE}:\n"))
+        .map(|(_, tail)| tail.to_string())
+        .expect("the writing recipe exists");
+    for catalog in [
+        "cargo test -p agent-doc-gates --test crate_graph",
+        "cargo test -p agent-cli --bin pyxis tool_catalog",
+        "cargo test -p agent-cli --bin pyxis config_catalog",
+    ] {
+        let expected = format!("PYXIS_UPDATE_CATALOGS=1 {catalog}");
+        assert!(
+            body.contains(&expected),
+            "`just {WRITE_RECIPE}` regenerates every catalog: {expected}"
+        );
+    }
+}
+
+#[test]
+fn a_verification_recipe_that_sets_a_write_switch_is_reported_by_name() {
+    let recipes = format!(
+        "{}{WRITING_RECIPE}",
+        RECIPES.replace(
+            "test:\n    cargo test --workspace --no-fail-fast",
+            "test:\n    PYXIS_UPDATE_CATALOGS=1 cargo test --workspace --no-fail-fast",
+        )
+    );
+    let violations = check_gate_documents(&recipes, WORKFLOW_YAML);
+    let reported = violations
+        .iter()
+        .find(|violation| violation.contains("PYXIS_UPDATE_CATALOGS=1"))
+        .expect("the verification that writes is reported");
+    assert!(reported.contains("« test »"), "{reported}");
+    assert!(reported.contains(WRITE_RECIPE), "{reported}");
+    assert_eq!(reported.lines().count(), 1, "{reported}");
+}
+
+#[test]
+fn an_aggregate_composing_the_writing_recipe_is_refused_because_it_would_rewrite_what_it_compares()
+{
+    let recipes = format!(
+        "{}{WRITING_RECIPE}",
+        RECIPES.replace(
+            "check: fmt lint build-tests test",
+            "check: fmt lint build-tests test\n\nverdict: check regen",
+        )
+    );
+    let reported = check_gate_documents(&recipes, WORKFLOW_YAML)
+        .into_iter()
+        .find(|violation| violation.contains("« verdict »"))
+        .expect("the aggregate reaching the writer is reported");
+    assert!(reported.contains(WRITE_RECIPE), "{reported}");
+}
+
+#[test]
+fn the_writing_recipe_carrying_a_ci_marker_is_refused_because_no_step_writes() {
+    let marked = WRITING_RECIPE.replace(
+        "# WRITES to the repository.\nregen:",
+        "# ci-step: Regen\n# WRITES to the repository.\nregen:",
+    );
+    let recipes = format!("{RECIPES}{marked}");
+    let reported = check_gate_documents(&recipes, WORKFLOW_YAML)
+        .into_iter()
+        .find(|violation| violation.contains(GATE_MARKER))
+        .expect("the marked writing recipe is reported");
+    assert!(reported.contains(WRITE_RECIPE), "{reported}");
+}
+
+#[test]
+fn the_writing_recipe_keeps_its_switches_without_raising_a_violation() {
+    let recipes = format!("{RECIPES}{WRITING_RECIPE}");
+    assert!(
+        check_gate_documents(&recipes, WORKFLOW_YAML).is_empty(),
+        "{:?}",
+        check_gate_documents(&recipes, WORKFLOW_YAML)
+    );
 }

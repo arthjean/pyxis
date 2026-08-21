@@ -96,6 +96,7 @@ pub fn check_gates(repository_root: &Path) -> Vec<String> {
 pub fn check_gate_documents(justfile: &str, workflow: &str) -> Vec<String> {
     let recipes = parse_recipes(justfile);
     let mut violations = aggregate_violations(&recipes);
+    violations.extend(write_isolation_violations(&recipes));
     match (gates_of_recipes(&recipes), workflow_gates(workflow)) {
         (Ok(left), Ok(right)) => violations.extend(compare_gates(&left, &right)),
         (left, right) => {
@@ -249,6 +250,74 @@ fn aggregate_violations(recipes: &[Recipe]) -> Vec<String> {
         aggregate.dependencies.join(" "),
         marked.join(" ")
     )]
+}
+
+/// The one recipe allowed to write to the repository. Everything else in the
+/// file answers a question; this one changes the tree, so it is never composed
+/// by a verification and never paired with a workflow step.
+pub const WRITE_RECIPE: &str = "regen";
+
+/// The environment switches that turn a comparison gate into a writer. The set
+/// is closed and both members belong to the write recipe: one regenerates the
+/// app-server schemas, the other the three catalogs. A third switch joins this
+/// list in the change that introduces it, which is where a reader looks for
+/// what may rewrite the tree; matching a prefix instead would spare that edit
+/// and cost the inventory.
+pub const WRITE_SWITCHES: &[&str] = &["PYXIS_UPDATE_SCHEMAS", "PYXIS_UPDATE_CATALOGS"];
+
+/// Report every way the recipe file lets a verification write to the repository.
+///
+/// The failure this refuses is silent by construction: a gate that regenerates
+/// what it is meant to compare passes on a stale tree, and the staleness only
+/// surfaces in someone else's `git status`. So the write switches stay inside
+/// the one recipe that announces it writes, that recipe stays out of every
+/// aggregate, and it carries no `# ci-step:` marker, the CI having no step that
+/// commits its own output.
+fn write_isolation_violations(recipes: &[Recipe]) -> Vec<String> {
+    let mut violations = Vec::new();
+    for recipe in recipes {
+        let name = &recipe.name;
+        if name != WRITE_RECIPE {
+            for line in &recipe.body {
+                if let Some(switch) = write_switch(line) {
+                    violations.push(format!(
+                        "gates: {JUSTFILE} : recette « {name} » : « {switch} » écrit dans le dépôt, il n'appartient qu'à « {WRITE_RECIPE} »"
+                    ));
+                }
+            }
+        }
+        let reaches = recipe.dependencies.iter().any(|dep| dep == WRITE_RECIPE)
+            || recipe.body.iter().any(|line| {
+                strip_sigils(line)
+                    .0
+                    .split_whitespace()
+                    .eq(["just", WRITE_RECIPE])
+            });
+        if reaches && name != WRITE_RECIPE {
+            violations.push(format!(
+                "gates: {JUSTFILE} : recette « {name} » : atteint « {WRITE_RECIPE} », donc une vérification réécrirait ce qu'elle compare"
+            ));
+        }
+        if name == WRITE_RECIPE && recipe.marker.is_some() {
+            violations.push(format!(
+                "gates: {JUSTFILE} : recette « {WRITE_RECIPE} » : marquée « {GATE_MARKER} » alors que le CI n'a aucune étape qui écrit"
+            ));
+        }
+    }
+    violations
+}
+
+/// The write switch a recipe line exports, if it opens on one. `just` lines
+/// carry the assignment in front of the command, the shape `regen` uses four
+/// times over.
+fn write_switch(line: &str) -> Option<&str> {
+    strip_sigils(line).0.split_whitespace().find(|token| {
+        WRITE_SWITCHES.iter().any(|switch| {
+            token
+                .strip_prefix(*switch)
+                .is_some_and(|rest| rest.starts_with('='))
+        })
+    })
 }
 
 fn gates_of_recipes(recipes: &[Recipe]) -> Result<Vec<Gate>, Vec<String>> {
