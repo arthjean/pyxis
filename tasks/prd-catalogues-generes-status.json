@@ -17,10 +17,10 @@
     {
       "id": "EP-032",
       "title": "Le catalogue d'outils et l'invariant de souillure rendu inspectable",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 4,
-      "stories_done": 0
+      "stories_done": 4
     },
     {
       "id": "EP-033",
@@ -98,43 +98,55 @@
       "id": "US-096",
       "title": "Les métadonnées de politique des outils sortent du registre",
       "epic": "EP-032",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
-      "blocked_by": []
+      "blocked_by": [],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-097",
       "title": "Le catalogue d'outils est rendu depuis les outils que le binaire enregistre",
       "epic": "EP-032",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-096"
-      ]
+      ],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-098",
       "title": "Le manifeste des outils est confronté au câblage et à sa récolte",
       "epic": "EP-032",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-097"
-      ]
+      ],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-099",
       "title": "La fraîcheur du catalogue d'outils est une assertion",
       "epic": "EP-032",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "S",
       "blocked_by": [
         "US-098"
-      ]
+      ],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-100",
