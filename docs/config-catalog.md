@@ -83,3 +83,4 @@ il n'y a pas de silence.
 | `PYXIS_TEST_ABSENT_VAR` | tests | nom volontairement absent, lu par le test de substitution d'`agent-mcp` |
 | `PYXIS_UPDATE_CATALOGS` | génération | bascule les portes de catalogue en écriture |
 | `PYXIS_UPDATE_SCHEMAS` | génération | bascule la porte des schémas d'app-server en écriture |
+| `PYXIS_UPDATE_TRANSCRIPTS` | génération | bascule la porte des transcriptions gelées en écriture |

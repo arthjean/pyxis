@@ -37,7 +37,11 @@ fn sse_payloads(raw: &str) -> Vec<String> {
 pub struct ScriptedProvider {
     /// Named in every failure this provider raises: a scenario that drifts is
     /// only useful to debug when the message says WHICH scenario drifted.
-    scenario: &'static str,
+    ///
+    /// Owned rather than `&'static str`: a scenario is discovered by scanning a
+    /// directory (US-126), so neither its name nor its recorded streams exist at
+    /// compile time.
+    scenario: String,
     remaining: Mutex<VecDeque<ScriptEntry>>,
     /// The composed outgoing bodies, kept for inspection. The only outgoing
     /// contract of a run, so what proves no credential travels is reading them.
@@ -50,17 +54,17 @@ pub struct ScriptedProvider {
 }
 
 struct ScriptEntry {
-    name: &'static str,
-    sse: &'static str,
+    name: String,
+    sse: String,
 }
 
 impl ScriptedProvider {
     pub fn new(
-        scenario: &'static str,
-        script: impl IntoIterator<Item = (&'static str, &'static str)>,
+        scenario: impl Into<String>,
+        script: impl IntoIterator<Item = (String, String)>,
     ) -> Self {
         Self {
-            scenario,
+            scenario: scenario.into(),
             remaining: Mutex::new(
                 script
                     .into_iter()
@@ -92,7 +96,7 @@ impl ScriptedProvider {
             .remaining
             .lock()
             .expect("the script lock is not poisoned");
-        let names: Vec<&str> = held.iter().map(|entry| entry.name).collect();
+        let names: Vec<&str> = held.iter().map(|entry| entry.name.as_str()).collect();
         assert!(
             names.is_empty(),
             "scenario `{}`: the script was not consumed, {} never played",
@@ -152,7 +156,7 @@ impl Provider for ScriptedProvider {
         let mut mapper = CodexEventMapper::new();
         let mut events: Vec<Result<StreamEvent, ProviderError>> = Vec::new();
         let mut saw_terminal = false;
-        for payload in sse_payloads(entry.sse) {
+        for payload in sse_payloads(&entry.sse) {
             match mapper.ingest(&payload) {
                 Ok(decoded) => {
                     for event in decoded {

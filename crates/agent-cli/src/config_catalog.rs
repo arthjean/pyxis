@@ -212,6 +212,11 @@ pub const OUT_OF_CONFIG: &[OutOfConfig] = &[
         category: "génération",
         role: "bascule la porte des schémas d'app-server en écriture",
     },
+    OutOfConfig {
+        name: "PYXIS_UPDATE_TRANSCRIPTS",
+        category: "génération",
+        role: "bascule la porte des transcriptions gelées en écriture",
+    },
 ];
 
 /// The declared table (US-100).

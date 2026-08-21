@@ -1,0 +1,6 @@
+{
+  "prompt": "Lis note.txt",
+  "files": {
+    "note.txt": "la phrase attendue\n"
+  }
+}

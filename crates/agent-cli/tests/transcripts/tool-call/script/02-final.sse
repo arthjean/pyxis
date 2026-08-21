@@ -1,0 +1,11 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_e2e_2"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Le fichier contient "}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"la phrase attendue."}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_e2e_2","status":"completed","usage":{"input_tokens":180,"output_tokens":9,"total_tokens":189}}}

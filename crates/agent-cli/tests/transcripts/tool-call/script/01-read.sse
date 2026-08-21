@@ -1,0 +1,23 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_e2e_1"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Je lis le fichier."}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"item_1","type":"function_call","call_id":"call_read_1","name":"read","arguments":""}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"item_1","delta":"{\"path\":\"note"}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","output_index":0,"item_id":"item_1","delta":".txt\"}"}
+
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","output_index":0,"item_id":"item_1","arguments":"{\"path\":\"note.txt\"}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"item_1","type":"function_call","call_id":"call_read_1","name":"read","arguments":"{\"path\":\"note.txt\"}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_e2e_1","status":"completed","usage":{"input_tokens":120,"output_tokens":18,"total_tokens":138}}}

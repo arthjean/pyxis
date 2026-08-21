@@ -1,0 +1,7 @@
+# The transcript tree is a byte contract (US-124): the gate compares raw bytes
+# with no `trim` and no line-ending normalization, so a checkout that rewrote a
+# `\n` into a `\r\n` would fail every scenario at once and blame the code. The
+# recorded streams are pinned with the transcripts they produce, because a `\r`
+# in an input travels into the output.
+crates/agent-cli/tests/transcripts/** -text
+crates/agent-cli/tests/fixtures/*.sse -text

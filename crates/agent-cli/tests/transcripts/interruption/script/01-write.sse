@@ -1,0 +1,11 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"resp_interruption_1"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"J'écris le fichier."}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"item_1","type":"function_call","call_id":"call_write_1","name":"write","arguments":"{\"path\":\"out.txt\",\"content\":\"une ligne\\n\"}"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_interruption_1","status":"completed","usage":{"input_tokens":110,"output_tokens":21,"total_tokens":131}}}

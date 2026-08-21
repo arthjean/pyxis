@@ -16,6 +16,7 @@
 //! transcript, so the byte comparison is also what proves it does not.
 
 mod replay;
+mod scenario;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,9 +30,13 @@ use agent_runtime::id::SequentialIds;
 use crate::jsonl::{CapturedSink, OutputFormat};
 use crate::runtime::{CliStepSource, EngineDeps, SettingsCell, TurnSettings};
 
-/// The one recorded turn EP-038 needs: a text answer with its usage, no tool
-/// call. The four scenario directories belong to EP-040; this scenario is what
-/// the definition of done of EP-038 names.
+use scenario::{Approval, Ending, Scenario};
+
+/// One recorded turn, compiled in, for the unit tests that exercise the
+/// scripted provider WITHOUT running a scenario: they assert on the provider's
+/// own failure modes, so they must not depend on a scenario directory being
+/// shaped a particular way. The scenarios themselves read their streams from
+/// disk (US-126) and share nothing with this constant.
 const FINAL_TURN: &str = include_str!("../../tests/fixtures/turn_final.sse");
 
 /// Epoch frozen on a value that is not the current one and never will be again.
@@ -119,8 +124,8 @@ struct Run {
 /// terminal is required. The provider answers from a recorded stream and the
 /// session is ephemeral, so the run touches the disk only through a temporary
 /// directory it creates and removes itself.
-async fn transcript_of(scenario: &'static str, seed: u64) -> Run {
-    let workspace = TempWorkspace::new(scenario);
+async fn transcript_of(scenario: &Scenario, seed: u64) -> Run {
+    let workspace = TempWorkspace::new(&scenario.name);
     // US-123 AC5, first half: the workspace is outside any repository, so
     // `TurnDiffTracker` has nothing to report. Asserted here rather than
     // assumed, because the second half (no `turn_diff` line in the stream) only
@@ -129,11 +134,34 @@ async fn transcript_of(scenario: &'static str, seed: u64) -> Run {
         !workspace.path.join(".git").exists(),
         "the scenario workspace must not be a git repository"
     );
-    let registry = Arc::new(agent_tools::Registry::builder(&workspace.path).build());
+    for (path, content) in &scenario.files {
+        std::fs::write(workspace.path.join(path), content).expect("a seeded file is writable");
+    }
+
+    // The sandbox is declared, not omitted: `write` validates its target
+    // against it BEFORE the permission decision, so a registry without a policy
+    // would refuse the call at validation and the interruption scenario would
+    // never reach the approver it exists to exercise. `settings()` already
+    // announces `enforced (workspace)`, so this is what it announces.
+    let mut builder = agent_tools::Registry::builder(&workspace.path)
+        .sandbox(
+            agent_core::sandbox::SandboxPolicy::workspace_write(
+                &workspace.path,
+                [],
+                [] as [&str; 0],
+            ),
+            false,
+        )
+        .register(agent_tools::Read)
+        .register(agent_tools::Write);
+    if let Some(approval) = scenario.approval {
+        builder = builder.approver(Arc::new(ScriptedApprover(approval)));
+    }
+    let registry = Arc::new(builder.build());
     let steps = CliStepSource::new(Arc::clone(&registry), Vec::new());
     let provider = Arc::new(replay::ScriptedProvider::new(
-        scenario,
-        [("turn_final.sse", FINAL_TURN)],
+        scenario.name.clone(),
+        scenario.script.clone(),
     ));
     let sink = CapturedSink::default();
     let skills = crate::skills::Catalog {
@@ -142,14 +170,14 @@ async fn transcript_of(scenario: &'static str, seed: u64) -> Run {
     };
 
     let outcome = crate::headless::run(crate::headless::HeadlessRun {
-        prompt: "Lis note.txt".to_string(),
+        prompt: scenario.prompt.clone(),
         // Ephemeral: no file is opened, so no absolute path can reach the
         // stream through a session locator (US-018 AC4).
         session_path: None,
         // Fixed rather than derived: in an ephemeral run the binary itself
         // decides this label, so the harness decides it too. Nothing about it
         // is observed from the environment, which is what US-123 AC6 asks for.
-        session_id: format!("{scenario}.jsonl"),
+        session_id: format!("{}.jsonl", scenario.name),
         workspace: workspace.path.clone(),
         output_format: OutputFormat::Json,
         output: Box::new(sink.clone()),
@@ -171,15 +199,65 @@ async fn transcript_of(scenario: &'static str, seed: u64) -> Run {
     })
     .await;
 
-    assert!(
-        outcome.is_ok(),
-        "the scenario must end its turn: {outcome:?}"
-    );
+    // An ending is asserted in BOTH directions: a scenario that recorded an
+    // interruption and started succeeding renders different bytes for a reason
+    // the byte comparison alone would not name.
+    match scenario.ending {
+        Ending::Ok => assert!(
+            outcome.is_ok(),
+            "scenario `{}` must end its turn: {outcome:?}",
+            scenario.name
+        ),
+        Ending::Err => assert!(
+            outcome.is_err(),
+            "scenario `{}` records a run that does not reach `end_turn`",
+            scenario.name
+        ),
+    }
     provider.assert_consumed();
     Run {
         bytes: sink.bytes(),
         bodies: provider.bodies(),
     }
+}
+
+/// The answer a scenario declared, given to every permission request of the run.
+///
+/// One answer rather than a queue: a scenario asks at most one question, and a
+/// queue would let a recorded run drift into asking a second one unnoticed.
+struct ScriptedApprover(Approval);
+
+#[async_trait::async_trait]
+impl agent_tools::permission::Approver for ScriptedApprover {
+    async fn approve(
+        &self,
+        _req: &agent_tools::permission::PermissionRequest,
+    ) -> agent_tools::permission::ApprovalResponse {
+        match self.0 {
+            Approval::Allow => agent_tools::permission::ApprovalResponse::ALLOW_ONCE,
+            Approval::Deny => agent_tools::permission::ApprovalResponse::DENY_ONCE,
+            Approval::Abort => agent_tools::permission::ApprovalResponse::Abort,
+        }
+    }
+}
+
+/// The scenario a US-123 assertion runs on when it needs a run rather than a
+/// particular shape of run: the bare turn, which is the smallest one.
+fn bare_turn() -> Scenario {
+    named_scenario("bare-turn")
+}
+
+/// One scenario by name, with the failure naming what the tree holds instead.
+fn named_scenario(name: &str) -> Scenario {
+    let mut found = scenario::discover().expect("the scenario tree is well formed");
+    let available: Vec<String> = found.iter().map(|s| s.name.clone()).collect();
+    let at = found
+        .iter()
+        .position(|s| s.name == name)
+        .unwrap_or_else(|| {
+            unreachable!("scenario `{name}` is missing, the tree holds {available:?}")
+        });
+    found.swap_remove(at)
 }
 
 /// The seed both runs of a comparison start from. Any value works; a fixed one
@@ -212,6 +290,12 @@ fn absolute_path_tokens(text: &str) -> Vec<String> {
 /// Integers of thirteen digits opening on `1`: every epoch in milliseconds
 /// between 2001 and 2033. A transcript that carries one carries the moment it
 /// was produced, which is the definition of a byte that varies per run.
+///
+/// The one the harness froze is excluded, and only that one: it has the shape
+/// of a wall clock because it IS an epoch, but it is the same epoch on every
+/// run, which is exactly what this scan looks for the absence of. An interrupted
+/// turn publishes it (`started_at_ms`), so the exclusion is load-bearing rather
+/// than defensive.
 fn epoch_millisecond_tokens(text: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut current = String::new();
@@ -219,16 +303,20 @@ fn epoch_millisecond_tokens(text: &str) -> Vec<String> {
         if ch.is_ascii_digit() {
             current.push(ch);
         } else {
-            if current.len() == 13 && current.starts_with('1') {
+            if is_wall_clock(&current) {
                 found.push(current.clone());
             }
             current.clear();
         }
     }
-    if current.len() == 13 && current.starts_with('1') {
+    if is_wall_clock(&current) {
         found.push(current);
     }
     found
+}
+
+fn is_wall_clock(token: &str) -> bool {
+    token.len() == 13 && token.starts_with('1') && token != FROZEN_EPOCH_MS.to_string()
 }
 
 #[cfg(test)]
@@ -237,6 +325,11 @@ mod tests {
 
     use agent_core::message::Message;
     use agent_core::provider::{CanonicalRequest, Provider};
+
+    /// One script entry, for the tests that build a provider by hand.
+    fn entry(name: &str, sse: &str) -> (String, String) {
+        (name.to_string(), sse.to_string())
+    }
 
     /// US-123 AC1/AC3, and the definition of done of EP-038: the function the
     /// binary really calls renders the same bytes twice.
@@ -247,8 +340,9 @@ mod tests {
     /// neither of those two varying things reached the stream.
     #[tokio::test(start_paused = true)]
     async fn two_runs_of_the_published_headless_path_render_the_same_bytes() {
-        let first = transcript_of("twice", SEED).await;
-        let second = transcript_of("twice", SEED).await;
+        let scenario = bare_turn();
+        let first = transcript_of(&scenario, SEED).await;
+        let second = transcript_of(&scenario, SEED).await;
 
         assert!(!first.bytes.is_empty(), "a run renders something");
         assert_eq!(
@@ -267,7 +361,7 @@ mod tests {
     /// moment of the run, and anything else that moves from one run to the next.
     #[tokio::test(start_paused = true)]
     async fn the_transcript_carries_no_absolute_path_and_no_wall_clock() {
-        let run = transcript_of("scan", SEED).await;
+        let run = transcript_of(&bare_turn(), SEED).await;
         let text = String::from_utf8_lossy(&run.bytes).into_owned();
 
         let paths = absolute_path_tokens(&text);
@@ -306,7 +400,7 @@ mod tests {
     /// carries file paths, so its silent appearance would be a leak.
     #[tokio::test(start_paused = true)]
     async fn a_workspace_outside_git_emits_no_turn_diff() {
-        let run = transcript_of("no-diff", SEED).await;
+        let run = transcript_of(&bare_turn(), SEED).await;
         let text = String::from_utf8_lossy(&run.bytes).into_owned();
         assert!(
             !text.contains("\"type\":\"turn_diff\""),
@@ -320,7 +414,7 @@ mod tests {
     /// writes.
     #[tokio::test(start_paused = true)]
     async fn the_harness_carries_no_credential_out_and_none_into_the_transcript() {
-        let run = transcript_of("no-creds", SEED).await;
+        let run = transcript_of(&bare_turn(), SEED).await;
         assert_eq!(run.bodies.len(), 1, "one model turn, one composed body");
         for body in &run.bodies {
             let rendered = serde_json::to_string(body).expect("a composed body serializes");
@@ -341,7 +435,8 @@ mod tests {
     /// scenario would go green one request beyond what it recorded.
     #[tokio::test]
     async fn a_request_beyond_the_script_names_the_scenario_and_the_rank() {
-        let provider = replay::ScriptedProvider::new("beyond", [("turn_final.sse", FINAL_TURN)]);
+        let provider =
+            replay::ScriptedProvider::new("beyond", [entry("turn_final.sse", FINAL_TURN)]);
         let request = || CanonicalRequest {
             model: "gpt-5".to_string(),
             messages: vec![Message::user("Réponds")],
@@ -374,7 +469,10 @@ mod tests {
 
         let half = replay::ScriptedProvider::new(
             "half",
-            [("turn_final.sse", FINAL_TURN), ("second.sse", FINAL_TURN)],
+            [
+                entry("turn_final.sse", FINAL_TURN),
+                entry("second.sse", FINAL_TURN),
+            ],
         );
         let failure =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| half.assert_consumed()))
@@ -386,6 +484,177 @@ mod tests {
         assert!(
             message.contains("turn_final.sse") && message.contains("second.sse"),
             "the failure must name the remaining entries: {message}"
+        );
+    }
+
+    /// US-124 AC1/AC2 and US-126: THE gate. Every scenario the tree holds is
+    /// run through the published headless path and its bytes are compared to
+    /// the transcript frozen beside it, raw against raw.
+    ///
+    /// The switch writes and returns, exactly like
+    /// `crates/agent-app-server/tests/schemas.rs`: a regeneration is not a
+    /// comparison that happens to pass, it is a comparison that did not
+    /// happen, and conflating the two is how a gate certifies its own output.
+    #[tokio::test(start_paused = true)]
+    async fn every_scenario_renders_the_transcript_frozen_beside_it() {
+        let update = std::env::var_os(scenario::UPDATE_VARIABLE).is_some();
+        let scenarios = scenario::discover().expect("the scenario tree is well formed");
+        assert!(!scenarios.is_empty(), "the scenario tree is not empty");
+
+        let mut drifts = Vec::new();
+        for scenario in &scenarios {
+            let run = transcript_of(scenario, SEED).await;
+            if update {
+                std::fs::write(&scenario.expected, &run.bytes)
+                    .expect("the frozen transcript is writable");
+                continue;
+            }
+            if let Err(drift) =
+                scenario::transcript_verdict(&scenario.name, &scenario.expected, &run.bytes)
+            {
+                drifts.push(drift);
+            }
+            // US-123 AC4, now on every scenario rather than on one: the two
+            // things a transcript leaks about the machine that produced it are
+            // where it ran and when.
+            let text = String::from_utf8_lossy(&run.bytes).into_owned();
+            let paths = absolute_path_tokens(&text);
+            assert!(
+                paths.is_empty(),
+                "scenario `{}`: an absolute path reached the transcript: {paths:?}",
+                scenario.name
+            );
+            let epochs = epoch_millisecond_tokens(&text);
+            assert!(
+                epochs.is_empty(),
+                "scenario `{}`: a wall-clock timestamp reached the transcript: {epochs:?}",
+                scenario.name
+            );
+        }
+        assert!(drifts.is_empty(), "{}", drifts.join("\n"));
+    }
+
+    /// US-126 AC1: the four behaviors the epic names are covered. Asserted on
+    /// the discovered names rather than on a count, because "four directories"
+    /// is satisfied by four copies of the same turn.
+    #[test]
+    fn the_tree_covers_the_bare_turn_the_tool_the_interruption_and_the_error() {
+        let found: Vec<String> = scenario::discover()
+            .expect("the scenario tree is well formed")
+            .into_iter()
+            .map(|scenario| scenario.name)
+            .collect();
+        for expected in ["bare-turn", "tool-call", "interruption", "stream-error"] {
+            assert!(
+                found.iter().any(|name| name == expected),
+                "scenario `{expected}` is missing, the tree holds {found:?}"
+            );
+        }
+    }
+
+    /// US-124 AC4: no `trim` anywhere means the last byte is part of the
+    /// contract, and a checkout that rewrote the line endings would break every
+    /// comparison at once. Read from the files themselves, so what is asserted
+    /// is what git handed over.
+    #[test]
+    fn the_frozen_transcripts_end_on_a_newline_and_carry_no_carriage_return() {
+        let scenarios = scenario::discover().expect("the scenario tree is well formed");
+        for scenario in &scenarios {
+            let frozen = std::fs::read(&scenario.expected).unwrap_or_else(|_| {
+                unreachable!("the transcript of `{}` is frozen", scenario.name)
+            });
+            scenario::line_ending_verdict(&scenario.name, &scenario.expected, &frozen)
+                .unwrap_or_else(|verdict| unreachable!("{verdict}"));
+        }
+    }
+
+    /// The NFR, as an assertion: a transcript is a proof a human reads in a
+    /// diff, so a scenario that grew past what a human reads stopped being one.
+    #[test]
+    fn the_frozen_tree_stays_inside_its_budget() {
+        let scenarios = scenario::discover().expect("the scenario tree is well formed");
+        let mut total = 0u64;
+        for scenario in &scenarios {
+            let mut size = 0u64;
+            for (_, sse) in &scenario.script {
+                size += sse.len() as u64;
+            }
+            size += std::fs::metadata(&scenario.expected)
+                .map(|meta| meta.len())
+                .unwrap_or_default();
+            assert!(
+                size <= scenario::SCENARIO_BUDGET_BYTES,
+                "scenario `{}` weighs {size} bytes, over the {} it is allowed",
+                scenario.name,
+                scenario::SCENARIO_BUDGET_BYTES
+            );
+            total += size;
+        }
+        assert!(
+            total <= scenario::TREE_BUDGET_BYTES,
+            "the frozen tree weighs {total} bytes, over the {} it is allowed",
+            scenario::TREE_BUDGET_BYTES
+        );
+    }
+
+    /// US-124 AC3: an absent transcript is a verdict, not a file the gate
+    /// creates for itself. Proved on a path that does not exist, and the
+    /// absence of a side effect is proved with it: a gate that writes what it
+    /// then compares always passes.
+    #[test]
+    fn an_absent_transcript_names_the_scenario_and_the_regeneration_command() {
+        let missing = std::env::temp_dir().join("pyxis-transcript-never-frozen/expected.jsonl");
+        let verdict = scenario::transcript_verdict("ghost", &missing, b"{}\n")
+            .expect_err("an absent transcript cannot pass");
+        assert!(
+            verdict.contains("`ghost`") && verdict.contains(scenario::UPDATE_COMMAND),
+            "the verdict must name the scenario and the command: {verdict}"
+        );
+        assert!(
+            !missing.exists(),
+            "comparing must not create the file it compares against"
+        );
+    }
+
+    /// US-124 AC2: one byte is enough, and the verdict says which path is stale
+    /// and what refreshes it.
+    #[test]
+    fn one_byte_of_difference_names_the_path_and_the_regeneration_command() {
+        let scenario = bare_turn();
+        let frozen = std::fs::read(&scenario.expected)
+            .unwrap_or_else(|_| unreachable!("the transcript of `{}` is frozen", scenario.name));
+        scenario::transcript_verdict(&scenario.name, &scenario.expected, &frozen)
+            .unwrap_or_else(|verdict| unreachable!("{verdict}"));
+
+        let mut drifted = frozen.clone();
+        let last = drifted.len() - 2;
+        drifted[last] ^= 0x01;
+        let verdict = scenario::transcript_verdict(&scenario.name, &scenario.expected, &drifted)
+            .expect_err("one byte of difference cannot pass");
+        assert!(
+            verdict.contains("expected.jsonl")
+                && verdict.contains("stale")
+                && verdict.contains(scenario::UPDATE_COMMAND),
+            "the verdict must name the path and the command: {verdict}"
+        );
+    }
+
+    /// US-124 AC4, on the verdict rather than on the tree: what the assertion
+    /// above would say if a checkout ever rewrote the line endings.
+    #[test]
+    fn a_carriage_return_in_a_transcript_points_at_the_gitattributes_entry() {
+        let path = Path::new("tests/transcripts/bare-turn/expected.jsonl");
+        let verdict = scenario::line_ending_verdict("bare-turn", path, b"{}\r\n")
+            .expect_err("a carriage return cannot pass");
+        assert!(
+            verdict.contains(".gitattributes"),
+            "the verdict must point at the pin: {verdict}"
+        );
+        let verdict = scenario::line_ending_verdict("bare-turn", path, b"{}")
+            .expect_err("a transcript without its final newline cannot pass");
+        assert!(
+            verdict.contains("newline"),
+            "the verdict must name the missing newline: {verdict}"
         );
     }
 }
