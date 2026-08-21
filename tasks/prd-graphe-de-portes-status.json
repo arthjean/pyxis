@@ -1,0 +1,185 @@
+{
+  "prd": {
+    "file": "tasks/prd-graphe-de-portes.md",
+    "title": "Graphe de portes",
+    "created_at": "2026-08-21",
+    "status": "IN_PROGRESS"
+  },
+  "epics": [
+    {
+      "id": "EP-027",
+      "title": "Agrégats de portes nommés",
+      "status": "DONE",
+      "priority": "P0",
+      "stories_total": 3,
+      "stories_done": 3
+    },
+    {
+      "id": "EP-028",
+      "title": "Porte de non-dérive entre le justfile et le CI",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 2,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-029",
+      "title": "Convergence documentaire",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 3,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-030",
+      "title": "Preuve du critère de succès",
+      "status": "TODO",
+      "priority": "P0",
+      "stories_total": 2,
+      "stories_done": 0
+    }
+  ],
+  "stories": [
+    {
+      "id": "US-082",
+      "title": "Les quatre portes du CI en recettes nommées",
+      "epic": "EP-027",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
+    },
+    {
+      "id": "US-083",
+      "title": "Le niveau local ajoute les deux portes de parité",
+      "epic": "EP-027",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-082"
+      ],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
+    },
+    {
+      "id": "US-084",
+      "title": "Les régénérations sont un niveau séparé",
+      "epic": "EP-027",
+      "status": "DONE",
+      "priority": "P1",
+      "size": "S",
+      "blocked_by": [
+        "US-082"
+      ],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
+    },
+    {
+      "id": "US-085",
+      "title": "Extraction des invocations de portes des deux fichiers",
+      "epic": "EP-028",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-082"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-086",
+      "title": "Le test d'égalité et d'ordre",
+      "epic": "EP-028",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-085"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-087",
+      "title": "Les documents prescriptifs nomment les recettes",
+      "epic": "EP-029",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-082"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-088",
+      "title": "Une porte empêche la divergence de revenir",
+      "epic": "EP-029",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "S",
+      "blocked_by": [
+        "US-086",
+        "US-087"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-089",
+      "title": "La décision est enregistrée",
+      "epic": "EP-029",
+      "status": "TODO",
+      "priority": "P1",
+      "size": "S",
+      "blocked_by": [
+        "US-086"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-090",
+      "title": "L'arrêt sur fmt et le budget de temps sont mesurés",
+      "epic": "EP-030",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-082"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-091",
+      "title": "Le CI est constaté inchangé et les portes orphelines rattachées",
+      "epic": "EP-030",
+      "status": "TODO",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-083",
+        "US-086",
+        "US-087"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    }
+  ]
+}
