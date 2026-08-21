@@ -3,7 +3,7 @@
     "file": "tasks/prd-catalogues-generes.md",
     "title": "Catalogues générés",
     "created_at": "2026-08-21",
-    "status": "IN_PROGRESS"
+    "status": "DONE"
   },
   "epics": [
     {
@@ -33,10 +33,10 @@
     {
       "id": "EP-034",
       "title": "L'intégration et la preuve du critère de succès",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 3,
-      "stories_done": 0
+      "stories_done": 3
     }
   ],
   "stories": [
@@ -206,36 +206,45 @@
       "id": "US-104",
       "title": "Les trois régénérations entrent dans le niveau qui écrit",
       "epic": "EP-034",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "S",
       "blocked_by": [
         "US-094",
         "US-099",
         "US-102"
-      ]
+      ],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-105",
       "title": "Les documents d'entrée nomment les catalogues",
       "epic": "EP-034",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "S",
       "blocked_by": [
         "US-104"
-      ]
+      ],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-106",
       "title": "La note de décision consigne la mesure",
       "epic": "EP-034",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "S",
       "blocked_by": [
         "US-105"
-      ]
+      ],
+      "started_at": "2026-08-21",
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     }
   ]
 }
