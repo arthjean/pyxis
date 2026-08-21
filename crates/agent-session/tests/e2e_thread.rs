@@ -311,6 +311,7 @@ async fn open(
         clock: Arc::new(InstantClock),
         parent_cancel: root.clone(),
         agents,
+        jobs: None,
     })
     .await
     .expect("the thread starts");

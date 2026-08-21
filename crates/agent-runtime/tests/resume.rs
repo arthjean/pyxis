@@ -303,6 +303,7 @@ fn options(
         clock: Arc::new(common::InstantClock),
         parent_cancel: CancellationToken::new(),
         agents: None,
+        jobs: None,
     }
 }
 

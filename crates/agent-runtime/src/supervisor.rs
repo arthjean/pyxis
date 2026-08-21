@@ -475,6 +475,7 @@ impl AgentSupervisor {
             clock: Arc::clone(&self.clock),
             parent_cancel: cancel.clone(),
             agents: None,
+            jobs: None,
         })
         .await
         {

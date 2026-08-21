@@ -193,6 +193,7 @@ async fn start_with_contexts(
         clock: Arc::new(FixedClock),
         parent_cancel: root.clone(),
         agents: None,
+        jobs: None,
     })
     .await
     .expect("the thread starts");

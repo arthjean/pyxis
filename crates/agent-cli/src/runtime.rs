@@ -746,6 +746,7 @@ impl SessionRuntime {
             clock,
             parent_cancel: parent_cancel.clone(),
             agents: supervisor,
+            jobs: None,
         })
         .await
         .map_err(|err| anyhow::anyhow!("thread: {err}"))?;

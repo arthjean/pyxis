@@ -22,6 +22,7 @@ pub mod failure;
 pub mod handoff;
 pub mod id;
 pub mod inputs;
+pub mod jobs;
 pub mod lifecycle;
 pub mod path;
 pub mod resume;
@@ -46,9 +47,14 @@ pub use event::{
 pub use failure::{FailureCategory, TurnFailure};
 pub use handoff::{AgentHandoff, HandoffDraft, MAX_HANDOFF_SUMMARY, UNTRUSTED_BANNER};
 pub use id::{
-    AgentId, EventId, IdError, IdGenerator, RandomIds, SequentialIds, StepId, ThreadId, TurnId,
+    AgentId, EventId, IdError, IdGenerator, JobId, RandomIds, SequentialIds, StepId, ThreadId,
+    TurnId,
 };
 pub use inputs::TurnInputs;
+pub use jobs::{
+    JobError, JobKind, JobOutcome, JobRecord, JobRegistry, JobSnapshot, JobStatus, MAX_ACTIVE_JOBS,
+    MAX_JOB_COMMAND, RegisteredJob, TEARDOWN_CAUSE,
+};
 pub use lifecycle::{LifecycleError, TurnLifecycle, TurnState};
 pub use path::{AgentPath, AgentPathError, MAX_AGENT_NAME, MAX_AGENT_PATH, ROOT_PATH};
 pub use resume::ResumedThread;

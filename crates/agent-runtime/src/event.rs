@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentAuthority, AgentState};
 use crate::context::TurnContext;
-use crate::id::{AgentId, EventId, ThreadId, TurnId};
+use crate::id::{AgentId, EventId, JobId, ThreadId, TurnId};
+use crate::jobs::{JobKind, JobStatus};
 use crate::lifecycle::TurnState;
 use crate::thread::SubmitError;
 
@@ -35,8 +36,8 @@ pub const THREAD_RUNTIME_VERSION: u32 = 1;
 /// file: an orchestration event is persisted BEFORE the operation it describes
 /// is acknowledged, like every other accepted operation (FR-05).
 ///
-/// The sub-agent supervisor writes through it, because it runs inside a turn
-/// task rather than inside the actor.
+/// Both the sub-agent supervisor and the background job registry write through
+/// it, because both run inside a turn task rather than inside the actor.
 #[async_trait::async_trait]
 pub trait ThreadJournal: Send + Sync {
     async fn record(&self, payload: ThreadEventPayload) -> Result<EventId, SubmitError>;
@@ -81,7 +82,10 @@ impl ThreadEvent {
             | ThreadEventPayload::AgentLinked { .. }
             | ThreadEventPayload::AgentStateChanged { .. }
             | ThreadEventPayload::AgentMessageQueued { .. }
-            | ThreadEventPayload::AgentMessageDelivered { .. } => None,
+            | ThreadEventPayload::AgentMessageDelivered { .. }
+            | ThreadEventPayload::JobRegistered { .. }
+            | ThreadEventPayload::JobStateChanged { .. }
+            | ThreadEventPayload::JobReported { .. } => None,
         }
     }
 }
@@ -170,6 +174,35 @@ pub enum ThreadEventPayload {
         agent_id: AgentId,
         message_id: String,
     },
+    /// A background job was registered (US-133).
+    ///
+    /// Durable BEFORE the registration is acknowledged and BEFORE anything is
+    /// launched: a process the log does not carry is a process nobody can
+    /// account for after a restart.
+    JobRegistered {
+        job_id: JobId,
+        /// Named `job_kind` and not `kind`: `kind` is the discriminant of the
+        /// durable line itself.
+        job_kind: JobKind,
+        /// Command line the job was registered for, bounded at registration.
+        command: String,
+    },
+    /// A background job changed state (US-134). The one place a terminal job,
+    /// its exit code and its cause become durable.
+    JobStateChanged {
+        job_id: JobId,
+        to: JobStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<String>,
+    },
+    /// The terminal state of a job was announced to the owner of the thread.
+    ///
+    /// Separate from the state itself on purpose: a finished job may still be
+    /// unreported, and re-announcing one after a restart would hand the model a
+    /// result it already read.
+    JobReported { job_id: JobId },
 }
 
 #[cfg(test)]
@@ -311,6 +344,63 @@ mod tests {
                 .payload,
             ThreadEventPayload::AgentLinked { name: None, .. }
         ));
+    }
+
+    /// US-133: what a job did survives the file, and the report flag travels
+    /// as an event of its own rather than as a sixth status.
+    #[test]
+    fn job_events_round_trip_and_own_no_turn() {
+        use crate::id::JobId;
+        use crate::jobs::{JobKind, JobStatus};
+
+        let ids = SequentialIds::new();
+        let thread_id = ThreadId::generate(&ids);
+        let job_id = JobId::generate(&ids);
+        for payload in [
+            ThreadEventPayload::JobRegistered {
+                job_id,
+                job_kind: JobKind::Terminal,
+                command: "npm run dev".into(),
+            },
+            ThreadEventPayload::JobStateChanged {
+                job_id,
+                to: JobStatus::Stopping,
+                exit_code: None,
+                cause: None,
+            },
+            ThreadEventPayload::JobStateChanged {
+                job_id,
+                to: JobStatus::Completed,
+                exit_code: Some(0),
+                cause: None,
+            },
+            ThreadEventPayload::JobReported { job_id },
+        ] {
+            let event = ThreadEvent {
+                event_id: EventId::generate(&ids),
+                thread_id,
+                seq: 1,
+                at_ms: 0,
+                payload,
+            };
+            let line = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<ThreadEvent>(&line).unwrap(), event);
+            assert_eq!(event.turn_id(), None, "a job event owns no turn");
+        }
+
+        // An absent option stays out of the durable line: a stop carries no exit
+        // code, and writing `null` would make it look like one.
+        let stopping = serde_json::to_string(&ThreadEventPayload::JobStateChanged {
+            job_id,
+            to: JobStatus::Stopping,
+            exit_code: None,
+            cause: None,
+        })
+        .unwrap();
+        assert_eq!(
+            stopping,
+            format!(r#"{{"kind":"job_state_changed","job_id":"{job_id}","to":"stopping"}}"#)
+        );
     }
 
     #[test]

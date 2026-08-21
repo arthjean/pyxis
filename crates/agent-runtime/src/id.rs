@@ -210,6 +210,11 @@ define_id!(
     AgentId,
     "agt_"
 );
+define_id!(
+    /// One background job of a thread (EP-041).
+    JobId,
+    "job_"
+);
 
 #[cfg(test)]
 mod tests {

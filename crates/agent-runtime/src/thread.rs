@@ -29,6 +29,7 @@ use crate::context::TurnContextSource;
 use crate::event::{ThreadEvent, ThreadEventPayload, ThreadJournal};
 use crate::id::{EventId, IdGenerator, ThreadId, TurnId};
 use crate::inputs::TurnInputs;
+use crate::jobs::JobRegistry;
 use crate::lifecycle::{TurnLifecycle, TurnState};
 use crate::resume::{self, ResumedThread};
 use crate::runner::{TurnOutcome, TurnRequest, TurnRunner};
@@ -248,6 +249,10 @@ pub struct ThreadOptions {
     /// Sub-agents this thread may own (EP-004). `None` = a thread that spawns
     /// nothing, which is what every child gets: depth stays at 1.
     pub agents: Option<Arc<AgentSupervisor>>,
+    /// Background jobs this thread may own (EP-041). `None` = a thread that
+    /// starts none, which is what every child gets: a job belongs to the thread
+    /// that registered it and to no other.
+    pub jobs: Option<Arc<JobRegistry>>,
 }
 
 enum Command {
@@ -375,6 +380,7 @@ impl ThreadHandle {
             clock,
             parent_cancel,
             agents,
+            jobs,
         } = options;
 
         store.create(&thread_id).await?;
@@ -449,6 +455,7 @@ impl ThreadHandle {
             ids,
             clock,
             agents: agents.clone(),
+            jobs: jobs.clone(),
             token: token.clone(),
             tracker: TaskTracker::new(),
             seq: snapshot.next_seq(),
@@ -522,6 +529,21 @@ impl ThreadHandle {
                 token.child_token(),
             );
             agents.restore(resumed.agents.clone(), resumed.agent_messages.clone());
+        }
+
+        // EP-041: the registry is rebuilt from the log EXACTLY as the log left
+        // it, and no process is restarted. A job the log left running belongs
+        // to a run that is gone; reconciling it is a decision of its own and it
+        // is not taken here.
+        if let Some(jobs) = &jobs {
+            jobs.attach(
+                thread_id,
+                Arc::new(MailboxJournal {
+                    commands: command_tx.downgrade(),
+                }),
+                token.child_token(),
+            );
+            jobs.restore(resumed.jobs.clone());
         }
 
         actor.start_next_turn().await;
@@ -654,6 +676,9 @@ struct ThreadActor {
     /// Children this thread owns. Held by the actor so a shutdown cancels and
     /// drains them BEFORE the thread writes its own terminal (US-013 AC5).
     agents: Option<Arc<AgentSupervisor>>,
+    /// Background jobs this thread owns. Held for the same reason: a process a
+    /// turn started must not outlive the thread that started it (US-134 AC2).
+    jobs: Option<Arc<JobRegistry>>,
     token: CancellationToken,
     tracker: TaskTracker,
     seq: u64,
@@ -1593,6 +1618,15 @@ impl ThreadActor {
             .await;
         }
 
+        // The token above already reached every background job. Stopping them
+        // HERE, once the mailbox is closed, is what keeps each transition out
+        // of a mailbox the actor itself is no longer serving: the writes are
+        // refused, deferred, and persisted a few lines below by the one task
+        // that still owns the log.
+        if let Some(jobs) = self.jobs.clone() {
+            jobs.cancel_all().await;
+        }
+
         // Children closed while the mailbox was shutting down could not go
         // through it. The actor is still the writer, so it persists them here
         // rather than leaving the next resume to repair the graph.
@@ -1600,6 +1634,13 @@ impl ThreadActor {
             for payload in agents.take_unrecorded() {
                 if let Err(err) = self.commit(payload).await {
                     tracing::warn!(thread_id = %self.thread_id, error = %err, "sub-agent terminal not persisted");
+                }
+            }
+        }
+        if let Some(jobs) = self.jobs.clone() {
+            for payload in jobs.take_unrecorded() {
+                if let Err(err) = self.commit(payload).await {
+                    tracing::warn!(thread_id = %self.thread_id, error = %err, "background job terminal not persisted");
                 }
             }
         }

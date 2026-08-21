@@ -413,6 +413,7 @@ pub async fn start_on(
         clock: Arc::new(InstantClock),
         parent_cancel: root.clone(),
         agents,
+        jobs: None,
     })
     .await
     .expect("the thread starts");

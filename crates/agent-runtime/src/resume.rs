@@ -21,6 +21,7 @@ use crate::agent::{AgentMessage, AgentRecord, AgentState};
 use crate::context::TurnContext;
 use crate::event::{ForkOrigin, ThreadEventPayload};
 use crate::id::{ThreadId, TurnId};
+use crate::jobs::{JobRecord, JobStatus};
 use crate::lifecycle::TurnState;
 use crate::store::ThreadSnapshot;
 use crate::thread::{Accepted, Submission, TurnStatus};
@@ -54,6 +55,11 @@ pub struct ResumedThread {
     /// Messages queued on a child and not delivered yet, in log order
     /// (US-012 AC1). A delivered one is absent: the log says it was taken.
     pub agent_messages: Vec<AgentMessage>,
+    /// Background jobs this thread registered, in log order, with the last
+    /// state and the report flag each one reached. Nothing is relaunched: the
+    /// plan describes the log, and a job whose process is gone stays what the
+    /// log says it was (EP-041).
+    pub jobs: Vec<JobRecord>,
 }
 
 impl ResumedThread {
@@ -87,6 +93,7 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
     let mut submitted: Vec<(TurnId, Submission)> = Vec::new();
     let mut agents: Vec<AgentRecord> = Vec::new();
     let mut agent_messages: Vec<AgentMessage> = Vec::new();
+    let mut jobs: Vec<JobRecord> = Vec::new();
     let mut turn_context: Option<TurnContext> = None;
     let mut thread_created = false;
 
@@ -183,6 +190,39 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
             ThreadEventPayload::AgentMessageDelivered { message_id, .. } => {
                 agent_messages.retain(|queued| queued.message_id != *message_id);
             }
+            ThreadEventPayload::JobRegistered {
+                job_id,
+                job_kind,
+                command,
+            } => jobs.push(JobRecord {
+                job_id: *job_id,
+                kind: *job_kind,
+                command: command.clone(),
+                status: JobStatus::Running,
+                reported: false,
+                exit_code: None,
+                cause: None,
+                started_at_ms: event.at_ms,
+                ended_at_ms: None,
+            }),
+            ThreadEventPayload::JobStateChanged {
+                job_id,
+                to,
+                exit_code,
+                cause,
+            } => {
+                if let Some(record) = jobs.iter_mut().find(|r| r.job_id == *job_id) {
+                    record.status = *to;
+                    record.exit_code = *exit_code;
+                    record.cause = cause.clone();
+                    record.ended_at_ms = to.is_terminal().then_some(event.at_ms);
+                }
+            }
+            ThreadEventPayload::JobReported { job_id } => {
+                if let Some(record) = jobs.iter_mut().find(|r| r.job_id == *job_id) {
+                    record.reported = true;
+                }
+            }
             ThreadEventPayload::Forked { .. } => {}
         }
     }
@@ -224,6 +264,7 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
             origin: snapshot.origin,
             agents,
             agent_messages,
+            jobs,
         },
         unfinished,
         queued,
