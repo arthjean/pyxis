@@ -1435,4 +1435,109 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// US-133 AC3: the three job entries are additive by construction. A v1
+    /// reader knows none of them, so each line deserializes to
+    /// `SessionEntry::Unknown` and the transcript resumes past them.
+    #[test]
+    fn a_v1_reader_maps_the_three_job_entries_to_unknown_and_resumes_past_them() {
+        use agent_runtime::event::ThreadEventPayload;
+        use agent_runtime::id::{EventId, JobId, SequentialIds};
+        use agent_runtime::jobs::{JobKind, JobStatus};
+
+        let ids = SequentialIds::new();
+        let thread_id = ThreadId::generate(&ids);
+        let job_id = JobId::generate(&ids);
+        let payloads = [
+            ThreadEventPayload::JobRegistered {
+                job_id,
+                job_kind: JobKind::Terminal,
+                command: "sleep 30".into(),
+            },
+            ThreadEventPayload::JobStateChanged {
+                job_id,
+                to: JobStatus::Completed,
+                exit_code: Some(0),
+                cause: None,
+            },
+            ThreadEventPayload::JobReported { job_id },
+        ];
+        let lines: Vec<String> = payloads
+            .into_iter()
+            .enumerate()
+            .map(|(i, payload)| {
+                serde_json::to_string(&ThreadLine::ThreadEvent(ThreadEvent {
+                    event_id: EventId::generate(&ids),
+                    thread_id,
+                    seq: i as u64 + 1,
+                    at_ms: 1_000 + i as u64,
+                    payload,
+                }))
+                .unwrap()
+            })
+            .collect();
+
+        for line in &lines {
+            assert!(
+                matches!(
+                    serde_json::from_str::<SessionEntry>(line).unwrap(),
+                    SessionEntry::Unknown
+                ),
+                "a v1 reader must map a job entry to Unknown, not fail on it: {line}"
+            );
+        }
+
+        let dir = tmp("job-entries");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SESSION_FILE);
+        let meta = format!("{{\"entry\":\"meta\",\"schema_version\":{SESSION_SCHEMA_VERSION}}}");
+        let user = serde_json::to_string(&SessionEntry::Message(Message::user("ok"))).unwrap();
+        let answer =
+            serde_json::to_string(&SessionEntry::Message(Message::assistant_text("done"))).unwrap();
+        let jobs = lines.join("\n");
+        std::fs::write(&path, format!("{meta}\n{user}\n{jobs}\n{answer}\n")).unwrap();
+
+        let resumed = resume_file(&path).unwrap();
+        assert_eq!(
+            resumed.messages.len(),
+            2,
+            "the three job entries are skipped, never counted as transcript"
+        );
+        assert_eq!(resumed.messages[0].text(), "ok");
+        assert_eq!(resumed.messages[1].text(), "done");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// US-133 AC2: the version stays at 1, so bytes written before this lot
+    /// reopen unchanged. The lines below are literal on purpose: they are what
+    /// an older binary wrote, not what the current types re-serialize.
+    #[test]
+    fn a_session_file_written_before_the_job_entries_still_resumes() {
+        assert_eq!(
+            SESSION_SCHEMA_VERSION, 1,
+            "bumping the version makes every new file unreadable by an older binary, which rejects schema_version > 1"
+        );
+        let dir = tmp("pre-lot");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SESSION_FILE);
+        let user = serde_json::to_string(&SessionEntry::Message(Message::user("avant"))).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                concat!(
+                    "{{\"entry\":\"meta\",\"schema_version\":1}}\n",
+                    "{{\"entry\":\"thread_meta\",\"thread_id\":\"thr_00000000000000000000000000000001\",\"runtime_version\":1}}\n",
+                    "{{\"entry\":\"thread_event\",\"event_id\":\"evt_00000000000000000000000000000002\",\"thread_id\":\"thr_00000000000000000000000000000001\",\"seq\":1,\"at_ms\":17,\"payload\":{{\"kind\":\"thread_created\"}}}}\n",
+                    "{user}\n",
+                ),
+                user = user
+            ),
+        )
+        .unwrap();
+
+        let resumed = resume_file(&path).unwrap();
+        assert_eq!(resumed.messages.len(), 1);
+        assert_eq!(resumed.messages[0].text(), "avant");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
