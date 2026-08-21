@@ -19,7 +19,7 @@
     {
       "id": "EP-036",
       "title": "Les huit surfaces structurées",
-      "status": "IN_REVIEW",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 5,
       "stories_done": 5,
@@ -103,56 +103,66 @@
       "id": "US-112",
       "title": "agent-tools déclare ses vingt-neuf descriptions et ses littéraux de troncature",
       "epic": "EP-036",
-      "status": "IN_REVIEW",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-111"
-      ]
+      ],
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-113",
       "title": "agent-cli cite verbatim les quatre textes système et dit lequel s'ajoute quand",
       "epic": "EP-036",
-      "status": "IN_REVIEW",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-111"
-      ]
+      ],
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-114",
       "title": "agent-core déclare ses littéraux, ses seuils et ses opérations auxiliaires",
       "epic": "EP-036",
-      "status": "IN_REVIEW",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-111"
-      ]
+      ],
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-115",
       "title": "agent-runtime et agent-provider déclarent l'assemblage du préfixe et son rendu",
       "epic": "EP-036",
-      "status": "IN_REVIEW",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-111"
-      ]
+      ],
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-116",
       "title": "agent-mcp, agent-app-server et agent-code-mode déclarent les catalogues alimentés du dehors",
       "epic": "EP-036",
-      "status": "IN_REVIEW",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-111"
-      ]
+      ],
+      "completed_at": "2026-08-21",
+      "reviewed_at": "2026-08-21"
     },
     {
       "id": "US-117",
