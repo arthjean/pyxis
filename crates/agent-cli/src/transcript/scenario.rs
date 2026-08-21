@@ -267,3 +267,119 @@ pub fn line_ending_verdict(name: &str, path: &Path, frozen: &[u8]) -> Result<(),
     }
     Ok(())
 }
+
+/// The last line of the run, whatever the scenario. Named here rather than
+/// spelled in each verdict, because it is the line a consumer stops on.
+const RUN_SUMMARY: &str = "run_summary";
+
+/// The one line allowed to follow `run_summary`, and only on a clean end.
+const HOOK: &str = "hook";
+
+/// The aggregated diff, which must precede the summary when it exists at all.
+const TURN_DIFF: &str = "turn_diff";
+
+/// The value of `run_summary.data.end` that makes the trailing hook mandatory.
+const END_TURN: &str = "end_turn";
+
+/// The terminal order `docs/EVENT_SCHEMA.md` publishes, as a verdict (US-128).
+///
+/// The document said `run_summary` was always last and that was false on half
+/// the tree: `headless::run` fires the `Stop` lifecycle hook AFTER the summary,
+/// because `Stop` reports something that only happens once the turn is really
+/// over. A prose rule nothing reads goes wrong that way and stays wrong, so the
+/// rule is here instead, and it is the observed one:
+///
+/// 1. exactly one `run_summary`;
+/// 2. nothing after it except at most one `hook`;
+/// 3. that trailing `hook` exists if and only if the run ended on `end_turn`;
+/// 4. `turn_diff`, when present, precedes `run_summary`.
+///
+/// Applied to the bytes the harness produces AND to the frozen files, so an
+/// inversion in `headless.rs` fails twice: once here on the produced order, once
+/// on the byte comparison. Reading the frozen files also catches the case the
+/// byte comparison cannot, a regeneration nobody reread.
+pub fn terminal_order_verdict(name: &str, transcript: &[u8]) -> Result<(), String> {
+    let text = std::str::from_utf8(transcript)
+        .map_err(|err| format!("the transcript of `{name}` is not UTF-8: {err}"))?;
+    let mut types = Vec::new();
+    let mut end = None;
+    for (rank, line) in text.lines().enumerate() {
+        let value: serde_json::Value = serde_json::from_str(line).map_err(|err| {
+            format!(
+                "the transcript of `{name}` is not JSONL at line {}: {err}",
+                rank + 1
+            )
+        })?;
+        let kind = value
+            .get("type")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| format!("line {} of `{name}` carries no `type`", rank + 1))?
+            .to_string();
+        if kind == RUN_SUMMARY {
+            end = value
+                .get("data")
+                .and_then(|data| data.get("end"))
+                .and_then(|end| end.as_str())
+                .map(str::to_string);
+        }
+        types.push(kind);
+    }
+
+    let summaries: Vec<usize> = types
+        .iter()
+        .enumerate()
+        .filter(|(_, kind)| *kind == RUN_SUMMARY)
+        .map(|(rank, _)| rank)
+        .collect();
+    let [summary] = summaries[..] else {
+        return Err(format!(
+            "`{name}` holds {} `{RUN_SUMMARY}` lines, the contract says exactly one",
+            summaries.len()
+        ));
+    };
+
+    let after = &types[summary + 1..];
+    match after {
+        [] => {}
+        [kind] if kind == HOOK => {}
+        _ => {
+            return Err(format!(
+                "`{name}` puts {after:?} after `{RUN_SUMMARY}`; only one `{HOOK}` line may follow it"
+            ));
+        }
+    }
+
+    let end = end.unwrap_or_default();
+    let closed = end == END_TURN;
+    if closed && after.is_empty() {
+        return Err(format!(
+            "`{name}` ended on `{END_TURN}` without the `{HOOK}` line the `Stop` lifecycle emits"
+        ));
+    }
+    if !closed && !after.is_empty() {
+        return Err(format!(
+            "`{name}` ended on `{end}` yet carries a `{HOOK}` line after `{RUN_SUMMARY}`; the `Stop` hook fires only when the agent stops by itself"
+        ));
+    }
+
+    for (rank, kind) in types.iter().enumerate() {
+        if kind == TURN_DIFF && rank > summary {
+            return Err(format!(
+                "`{name}` emits `{TURN_DIFF}` at line {} after `{RUN_SUMMARY}` at line {}",
+                rank + 1,
+                summary + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether the transcript carries an aggregated diff at all. Exists so the
+/// absence outside a git repository is CHECKED rather than skipped: a test that
+/// only verifies an order is satisfied by a stream that never emits the line.
+pub fn carries_turn_diff(transcript: &[u8]) -> bool {
+    std::str::from_utf8(transcript)
+        .unwrap_or_default()
+        .lines()
+        .any(|line| line.contains("\"type\":\"turn_diff\""))
+}

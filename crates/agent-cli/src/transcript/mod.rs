@@ -534,6 +534,146 @@ mod tests {
         assert!(drifts.is_empty(), "{}", drifts.join("\n"));
     }
 
+    /// US-128 AC4: the order rule applied to what a run PRODUCES, kept apart
+    /// from the byte comparison on purpose. Inverting the two terminals in
+    /// `headless.rs` fails this test AND the gate above, and it takes two
+    /// failures to read the change as a contract violation: one alone reads as
+    /// a stale file and gets regenerated away.
+    #[tokio::test(start_paused = true)]
+    async fn every_scenario_produces_the_terminal_order_the_document_publishes() {
+        let scenarios = scenario::discover().expect("the scenario tree is well formed");
+        let mut drifts = Vec::new();
+        for scenario in &scenarios {
+            let run = transcript_of(scenario, SEED).await;
+            if let Err(drift) = scenario::terminal_order_verdict(&scenario.name, &run.bytes) {
+                drifts.push(drift);
+            }
+        }
+        assert!(drifts.is_empty(), "{}", drifts.join("\n"));
+    }
+
+    /// US-128 AC1/AC2/AC5: the order the document publishes, read off the
+    /// FROZEN files. It holds without rerunning the harness, and it is the half
+    /// the byte comparison cannot provide: a transcript regenerated after an
+    /// inversion is byte-identical to itself and says nothing.
+    #[test]
+    fn the_frozen_transcripts_close_on_the_summary_and_at_most_one_stop_hook() {
+        let scenarios = scenario::discover().expect("the scenario tree is well formed");
+        for scenario in &scenarios {
+            let frozen = std::fs::read(&scenario.expected).unwrap_or_else(|_| {
+                unreachable!("the transcript of `{}` is frozen", scenario.name)
+            });
+            scenario::terminal_order_verdict(&scenario.name, &frozen)
+                .unwrap_or_else(|verdict| unreachable!("{verdict}"));
+        }
+    }
+
+    /// US-128 AC3: the absence is observed, not skipped. Every scenario runs in
+    /// a temporary workspace outside any repository, so `turn_diff` is never
+    /// emitted; a test that only checked the order would be satisfied by that
+    /// silence and would never notice the line reappearing after the summary.
+    #[test]
+    fn no_frozen_transcript_carries_a_turn_diff_because_every_scenario_runs_outside_git() {
+        let scenarios = scenario::discover().expect("the scenario tree is well formed");
+        for scenario in &scenarios {
+            let frozen = std::fs::read(&scenario.expected).unwrap_or_else(|_| {
+                unreachable!("the transcript of `{}` is frozen", scenario.name)
+            });
+            assert!(
+                !scenario::carries_turn_diff(&frozen),
+                "scenario `{}` froze a turn_diff, which no workspace outside git can produce",
+                scenario.name
+            );
+        }
+    }
+
+    /// US-128 AC4, on the verdict itself: swapping the two terminals is refused
+    /// rather than tolerated as "a hook came late".
+    #[test]
+    fn a_summary_written_after_the_stop_hook_is_refused() {
+        let inverted = concat!(
+            r#"{"type":"end_turn"}"#,
+            "
+",
+            r#"{"type":"hook","data":{"event":"Stop","status":"completed"}}"#,
+            "
+",
+            r#"{"type":"run_summary","data":{"end":"end_turn"}}"#,
+            "
+"
+        );
+        let verdict = scenario::terminal_order_verdict("inverted", inverted.as_bytes())
+            .expect_err("a run that ends on end_turn without its hook cannot pass");
+        assert!(verdict.contains("end_turn"), "{verdict}");
+        assert!(verdict.contains("hook"), "{verdict}");
+    }
+
+    /// The three other shapes the rule refuses, each for its own reason: a line
+    /// that is not the `Stop` hook after the summary, a hook on a run the agent
+    /// did not end itself, and a diff published after the summary.
+    #[test]
+    fn nothing_but_the_stop_hook_may_follow_the_summary() {
+        let trailing_text = concat!(
+            r#"{"type":"run_summary","data":{"end":"end_turn"}}"#,
+            "
+",
+            r#"{"type":"hook","data":{"event":"Stop","status":"completed"}}"#,
+            "
+",
+            r#"{"type":"text","data":"après coup"}"#,
+            "
+"
+        );
+        let verdict = scenario::terminal_order_verdict("trailing", trailing_text.as_bytes())
+            .expect_err("a text line after the summary cannot pass");
+        assert!(verdict.contains("run_summary"), "{verdict}");
+
+        let hook_on_failure = concat!(
+            r#"{"type":"run_summary","data":{"end":"error"}}"#,
+            "
+",
+            r#"{"type":"hook","data":{"event":"Stop","status":"completed"}}"#,
+            "
+"
+        );
+        let verdict = scenario::terminal_order_verdict("failed", hook_on_failure.as_bytes())
+            .expect_err("a Stop hook on a failed run cannot pass");
+        assert!(verdict.contains("error"), "{verdict}");
+
+        let late_diff = concat!(
+            r#"{"type":"run_summary","data":{"end":"interrupted"}}"#,
+            "
+",
+            r#"{"type":"turn_diff","data":{"files":[]}}"#,
+            "
+"
+        );
+        let verdict = scenario::terminal_order_verdict("late-diff", late_diff.as_bytes())
+            .expect_err("a diff after the summary cannot pass");
+        assert!(verdict.contains("turn_diff"), "{verdict}");
+    }
+
+    /// A run with no summary, or with two, is a malformed transcript rather than
+    /// an ordering question, and the verdict says which of the two it saw.
+    #[test]
+    fn a_transcript_without_exactly_one_summary_names_how_many_it_holds() {
+        let none = scenario::terminal_order_verdict("none", br#"{"type":"end_turn"}"# as &[u8])
+            .expect_err("a transcript with no summary cannot pass");
+        assert!(none.contains("0 `run_summary`"), "{none}");
+
+        let twice = concat!(
+            r#"{"type":"run_summary","data":{"end":"end_turn"}}"#,
+            "
+",
+            r#"{"type":"run_summary","data":{"end":"end_turn"}}"#,
+            "
+"
+        );
+        let verdict = scenario::terminal_order_verdict("twice", twice.as_bytes())
+            .expect_err("two summaries cannot pass");
+        assert!(verdict.contains("2 `run_summary`"), "{verdict}");
+    }
+
     /// US-126 AC1: the four behaviors the epic names are covered. Asserted on
     /// the discovered names rather than on a count, because "four directories"
     /// is satisfied by four copies of the same turn.
