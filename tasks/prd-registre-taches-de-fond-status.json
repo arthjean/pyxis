@@ -4,7 +4,7 @@
     "title": "Registre de tâches de fond",
     "created_at": "2026-08-22",
     "status": "IN_PROGRESS",
-    "updated_at": "2026-08-22T08:04:50Z"
+    "updated_at": "2026-08-22T15:40:00Z"
   },
   "epics": [
     {
@@ -34,10 +34,10 @@
     {
       "id": "EP-044",
       "title": "La complétion qui revient d'elle-même",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "stories_total": 3,
-      "stories_done": 0
+      "stories_done": 3
     },
     {
       "id": "EP-045",
@@ -206,43 +206,43 @@
       "id": "US-142",
       "title": "Une complétion non relevée ouvre un tour, dans un budget constant",
       "epic": "EP-044",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "L",
       "blocked_by": [
         "US-140"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-22T09:10:00Z",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
     },
     {
       "id": "US-143",
       "title": "Le budget se réarme sur une entrée d'origine humaine",
       "epic": "EP-044",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "S",
       "blocked_by": [
         "US-142"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-22T09:10:00Z",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
     },
     {
       "id": "US-144",
       "title": "En headless et en app-server, la livraison ne réveille personne",
       "epic": "EP-044",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "M",
       "blocked_by": [
         "US-142"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-22T09:10:00Z",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
     },
     {
       "id": "US-145",
