@@ -14,14 +14,17 @@ use std::sync::{Arc, Mutex};
 use agent_core::message::{ContentBlock, Message};
 use agent_runtime::context::{FixedTurnContext, TurnContextSource};
 use agent_runtime::event::{ThreadEvent, ThreadEventPayload};
-use agent_runtime::id::{EventId, IdGenerator, RandomIds, SequentialIds, ThreadId, TurnId};
+use agent_runtime::id::{
+    EventId, IdGenerator, RandomIds, ScheduleId, SequentialIds, ThreadId, TurnId,
+};
 use agent_runtime::lifecycle::TurnState;
 use agent_runtime::runner::{RunAgentRunner, TurnRunner};
+use agent_runtime::schedule::{ScheduleRule, ScheduleState};
 use agent_runtime::store::{
     FailingThreadStore, FailurePoint, ForkPoint, RecoveryCommit, StoreError, StoreOperation,
     ThreadSnapshot, ThreadStore,
 };
-use agent_runtime::thread::{Submission, ThreadHandle, ThreadOptions};
+use agent_runtime::thread::{Submission, SubmitError, ThreadHandle, ThreadOptions};
 use common::{FakeProvider, FakeSession, Scripted, done_end_turn, text, wait_for_terminal};
 use tokio_util::sync::CancellationToken;
 
@@ -679,4 +682,165 @@ async fn a_steer_carrying_a_replayed_identifier_is_not_queued_twice() {
     handle.interrupt(None).await.unwrap();
     wait_for_terminal(&handle).await;
     handle.shutdown().await;
+}
+
+// ───────── EP-047: reminders across a reopening ─────────
+
+/// The instant [`common::InstantClock`] answers with, so every due date below
+/// is a literal and no assertion depends on when the test runs.
+const NOW: u64 = 1_700_000_000_000;
+
+/// EP-047 Definition of Done: a reminder is created on a live thread, the
+/// thread is closed, the log is reopened, and the record comes back with the
+/// slot the fold recomputed. Nothing here is stored: `due_at_ms` on the way out
+/// is derived from the creation entry plus the acceptance instant.
+#[tokio::test]
+async fn a_reminder_created_on_a_live_thread_survives_the_reopening_with_its_slot_recomputed() {
+    let log = Log::default();
+    let ids = SequentialIds::starting_at(2_000);
+    let thread_id = ThreadId::generate(&ids);
+    let schedule_id = ScheduleId::generate(&ids);
+    let first_at = NOW - 600_000;
+
+    let live = open(&log, thread_id, echo_runner(1)).await;
+    let journal = live.journal();
+    // The identifier only comes back once the entry is durable: `record`
+    // resolves on the reply the actor sends AFTER `commit` returned.
+    let created = journal
+        .record(ThreadEventPayload::ScheduleCreated {
+            schedule_id,
+            rule: ScheduleRule::Every {
+                first_at_ms: first_at,
+                interval_seconds: 300,
+            },
+            prompt: "relire le journal".into(),
+            due_at_ms: first_at,
+        })
+        .await
+        .expect("a reminder is recorded");
+    assert!(
+        log.events().iter().any(|event| event.event_id == created),
+        "the entry is durable before its identifier is handed back"
+    );
+    journal
+        .record(ThreadEventPayload::ScheduleDispatched {
+            schedule_id,
+            accepted_at_ms: Some(first_at),
+        })
+        .await
+        .expect("a dispatch is recorded");
+    live.shutdown().await;
+
+    let reopened = open(&log, thread_id, echo_runner(1)).await;
+    let schedules = &reopened.resumed().schedules;
+    assert_eq!(schedules.active.len(), 1);
+    let view = &schedules.active[0];
+    assert_eq!(view.record.schedule_id, schedule_id);
+    assert_eq!(
+        view.record.due_at_ms,
+        first_at + 300_000,
+        "the reopened slot is recomputed, never read back from a stored field"
+    );
+    assert_eq!(view.state, ScheduleState::Overdue);
+    assert_eq!(
+        view.record.created_at_ms, NOW,
+        "the creation instant is the entry's"
+    );
+    assert_eq!(schedules.corrupt, 0);
+
+    // What the reopening did NOT do: resume reports, and opens nothing.
+    assert_eq!(reopened.resumed().turn, None);
+    assert!(reopened.resumed().messages.is_empty());
+    assert!(
+        !log.events().iter().any(|event| matches!(
+            event.payload,
+            ThreadEventPayload::InputSubmitted { .. } | ThreadEventPayload::TurnStateChanged { .. }
+        )),
+        "a resume submitted nothing and opened no turn for an overdue reminder"
+    );
+    reopened.shutdown().await;
+}
+
+/// US-152: a write failure at creation refuses with a named error, and the
+/// reopening that follows finds nothing to fold. Refusing late would leave a
+/// caller holding an identifier for a reminder no restart could rearm.
+#[tokio::test]
+async fn a_creation_refused_by_the_store_leaves_nothing_to_fold() {
+    let log = Log::default();
+    let ids = SequentialIds::starting_at(2_100);
+    let thread_id = ThreadId::generate(&ids);
+    let schedule_id = ScheduleId::generate(&ids);
+
+    // The first append is the `ThreadCreated` the actor writes at start, so the
+    // second is the creation entry itself.
+    let store = Arc::new(FailingThreadStore::new(
+        SharedStore::open(&log) as Arc<dyn ThreadStore>,
+        FailurePoint::before(StoreOperation::Append, 2, "creation entry refused"),
+    )) as Arc<dyn ThreadStore>;
+    let live = ThreadHandle::start(options(thread_id, store, echo_runner(1)))
+        .await
+        .expect("the thread opens");
+    let refused = live
+        .journal()
+        .record(ThreadEventPayload::ScheduleCreated {
+            schedule_id,
+            rule: ScheduleRule::After { seconds: 600 },
+            prompt: "jamais écrit".into(),
+            due_at_ms: NOW + 600_000,
+        })
+        .await;
+    assert!(
+        matches!(refused, Err(SubmitError::StoreFailed)),
+        "a refused creation names its failure, got {refused:?}"
+    );
+    live.shutdown().await;
+
+    let reopened = open(&log, thread_id, echo_runner(1)).await;
+    assert!(
+        reopened.resumed().schedules.active.is_empty(),
+        "a refused creation left nothing foldable"
+    );
+    assert_eq!(reopened.resumed().schedules.corrupt, 0);
+    reopened.shutdown().await;
+}
+
+/// US-153: a log written before this lot reopens with no reminder, no error,
+/// and no migration entry.
+#[tokio::test]
+async fn a_log_written_before_the_schedule_entries_reopens_with_no_reminder() {
+    let log = Log::default();
+    let ids = SequentialIds::starting_at(2_200);
+    let thread_id = ThreadId::generate(&ids);
+    let turn_id = TurnId::generate(&ids);
+    log.seed_with_ids(
+        thread_id,
+        vec![
+            ThreadEventPayload::ThreadCreated,
+            ThreadEventPayload::InputSubmitted {
+                turn_id,
+                client_message_id: None,
+                text: "un".into(),
+            },
+            ThreadEventPayload::TurnStateChanged {
+                turn_id,
+                from: Some(TurnState::Queued),
+                to: TurnState::Completed,
+                cause: None,
+                context: None,
+            },
+        ],
+        &ids,
+    );
+    let durable = log.events().len();
+
+    let reopened = open(&log, thread_id, echo_runner(1)).await;
+    assert!(reopened.resumed().schedules.active.is_empty());
+    assert_eq!(reopened.resumed().schedules.corrupt, 0);
+    assert!(reopened.resumed().recovered.is_empty());
+    assert_eq!(
+        log.events().len(),
+        durable,
+        "reopening an older log wrote no migration"
+    );
+    reopened.shutdown().await;
 }
