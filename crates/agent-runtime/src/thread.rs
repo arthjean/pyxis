@@ -456,7 +456,11 @@ impl ThreadHandle {
 
         store.create(&thread_id).await?;
         let mut snapshot = store.read().await?;
-        let mut plan = resume::plan(thread_id, &snapshot);
+        // Sampled ONCE: the fold turns a due date into `Scheduled` or `Overdue`
+        // against this instant, and reading the clock twice would let the
+        // pre-repair and post-repair reports disagree about the same log.
+        let resumed_at_ms = clock.now_ms();
+        let mut plan = resume::plan(thread_id, &snapshot, resumed_at_ms);
         let mut recovered = Vec::new();
         let mut reconciled_calls = 0;
         if !plan.tool_results.is_empty() || !plan.unfinished.is_empty() {
@@ -502,7 +506,7 @@ impl ThreadHandle {
                     operation: StoreOperation::Read,
                     source,
                 })?;
-            plan = resume::plan(thread_id, &snapshot);
+            plan = resume::plan(thread_id, &snapshot, resumed_at_ms);
         }
 
         let token = parent_cancel.child_token();
@@ -568,6 +572,27 @@ impl ThreadHandle {
                 recovered = resumed.recovered.len(),
                 reconciled_calls = resumed.reconciled_calls,
                 "turns closed by resume"
+            );
+        }
+
+        // US-153: what a resume does with a reminder, in full. It NAMES the
+        // ones the log holds and the ones already due, and it stops there: no
+        // submission, no turn, no wake spent. Delivering a late reminder is the
+        // live actor's job and its timer arm's (ADR-17), so this report is the
+        // only trace a reopening leaves.
+        if !resumed.schedules.active.is_empty() || resumed.schedules.corrupt > 0 {
+            tracing::debug!(
+                target: "pyxis::runtime",
+                thread_id = %thread_id,
+                schedules = resumed.schedules.active.len(),
+                overdue = resumed
+                    .schedules
+                    .active
+                    .iter()
+                    .filter(|view| view.state == crate::schedule::ScheduleState::Overdue)
+                    .count(),
+                corrupt = resumed.schedules.corrupt,
+                "reminders rebuilt by resume"
             );
         }
 
@@ -691,6 +716,25 @@ impl ThreadHandle {
     /// client chains its next turn on.
     pub fn resumed(&self) -> &ResumedThread {
         &self.resumed
+    }
+
+    /// The thread's own durable writer (US-152).
+    ///
+    /// Everything recorded through it goes to [`ThreadActor::commit`], the
+    /// single writer, and lands in the same ordered log as a turn: the call
+    /// returns only once the entry is durable, so a caller that hands back an
+    /// identifier can only do so after the log carries the entry that names it.
+    /// A store failure surfaces as a [`SubmitError`] and nothing is written,
+    /// which is what makes a refused creation leave nothing to fold.
+    ///
+    /// Handed out rather than kept private because a durable record can be
+    /// created from a tool task, off the actor: same weak sender and same
+    /// bounded mailbox as the ones the sub-agent supervisor and the job
+    /// registry already receive at `attach`.
+    pub fn journal(&self) -> Arc<dyn ThreadJournal> {
+        Arc::new(MailboxJournal {
+            commands: self.commands.downgrade(),
+        })
     }
 
     /// Submits an input that opens a turn of its own.

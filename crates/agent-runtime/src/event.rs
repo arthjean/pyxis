@@ -16,9 +16,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentAuthority, AgentState};
 use crate::context::TurnContext;
-use crate::id::{AgentId, EventId, JobId, ThreadId, TurnId};
+use crate::id::{AgentId, EventId, JobId, ScheduleId, ThreadId, TurnId};
 use crate::jobs::{JobKind, JobStatus};
 use crate::lifecycle::TurnState;
+use crate::schedule::ScheduleRule;
 use crate::thread::SubmitError;
 
 /// `entry` tag of a thread binding line in the JSONL log.
@@ -85,7 +86,10 @@ impl ThreadEvent {
             | ThreadEventPayload::AgentMessageDelivered { .. }
             | ThreadEventPayload::JobRegistered { .. }
             | ThreadEventPayload::JobStateChanged { .. }
-            | ThreadEventPayload::JobReported { .. } => None,
+            | ThreadEventPayload::JobReported { .. }
+            | ThreadEventPayload::ScheduleCreated { .. }
+            | ThreadEventPayload::ScheduleDispatched { .. }
+            | ThreadEventPayload::ScheduleDeleted { .. } => None,
         }
     }
 }
@@ -203,6 +207,41 @@ pub enum ThreadEventPayload {
     /// unreported, and re-announcing one after a restart would hand the model a
     /// result it already read.
     JobReported { job_id: JobId },
+    /// A reminder came into existence (US-152).
+    ///
+    /// Durable BEFORE the identifier is handed back, on the pattern of
+    /// [`Self::JobRegistered`]: a reminder the log does not carry is one no
+    /// restart can rearm, and one the caller would hold an identifier for that
+    /// names nothing.
+    ///
+    /// Carries what [`crate::schedule::ScheduleRecord`] needs minus its
+    /// creation instant, which is [`ThreadEvent::at_ms`] and would otherwise be
+    /// written twice and be free to disagree with itself.
+    ScheduleCreated {
+        schedule_id: ScheduleId,
+        rule: ScheduleRule,
+        /// Reminder text, already trimmed and bounded by
+        /// [`crate::schedule::ScheduleRecord::create`].
+        prompt: String,
+        /// First occurrence, resolved from the rule at creation.
+        due_at_ms: u64,
+    },
+    /// A reminder was delivered, or one occurrence of a recurring one was
+    /// (US-152). Durable BEFORE the input it produces is submitted, which is
+    /// what makes a delivery survivable exactly once.
+    ScheduleDispatched {
+        schedule_id: ScheduleId,
+        /// Wall-clock instant the dispatch was decided at. `Some` for a
+        /// recurring reminder, absent for a one-shot, and the asymmetry is
+        /// load-bearing: without this instant the fold cannot recompute which
+        /// slot the series reached, so the next target would have to be
+        /// persisted, which is the stored state
+        /// [`crate::schedule`] exists to avoid.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accepted_at_ms: Option<u64>,
+    },
+    /// A reminder was removed before it fired again (US-152).
+    ScheduleDeleted { schedule_id: ScheduleId },
 }
 
 #[cfg(test)]
@@ -400,6 +439,62 @@ mod tests {
         assert_eq!(
             stopping,
             format!(r#"{{"kind":"job_state_changed","job_id":"{job_id}","to":"stopping"}}"#)
+        );
+    }
+
+    /// US-152: the three additive entries survive the file, and the acceptance
+    /// instant is present for a recurring dispatch and absent for a one-shot.
+    #[test]
+    fn schedule_events_round_trip_and_own_no_turn() {
+        use crate::id::ScheduleId;
+        use crate::schedule::ScheduleRule;
+
+        let ids = SequentialIds::new();
+        let thread_id = ThreadId::generate(&ids);
+        let schedule_id = ScheduleId::generate(&ids);
+        for payload in [
+            ThreadEventPayload::ScheduleCreated {
+                schedule_id,
+                rule: ScheduleRule::Every {
+                    first_at_ms: 1_700_000_000_000,
+                    interval_seconds: 300,
+                },
+                prompt: "relire le journal".into(),
+                due_at_ms: 1_700_000_000_000,
+            },
+            ThreadEventPayload::ScheduleDispatched {
+                schedule_id,
+                accepted_at_ms: Some(1_700_000_300_000),
+            },
+            ThreadEventPayload::ScheduleDispatched {
+                schedule_id,
+                accepted_at_ms: None,
+            },
+            ThreadEventPayload::ScheduleDeleted { schedule_id },
+        ] {
+            let event = ThreadEvent {
+                event_id: EventId::generate(&ids),
+                thread_id,
+                seq: 1,
+                at_ms: 0,
+                payload,
+            };
+            let line = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<ThreadEvent>(&line).unwrap(), event);
+            assert_eq!(event.turn_id(), None, "a schedule event owns no turn");
+        }
+
+        // A one-shot dispatch carries NO acceptance instant, and writing `null`
+        // would make the fold read an instant where the format says there is
+        // none.
+        let one_shot = serde_json::to_string(&ThreadEventPayload::ScheduleDispatched {
+            schedule_id,
+            accepted_at_ms: None,
+        })
+        .unwrap();
+        assert_eq!(
+            one_shot,
+            format!(r#"{{"kind":"schedule_dispatched","schedule_id":"{schedule_id}"}}"#)
         );
     }
 
