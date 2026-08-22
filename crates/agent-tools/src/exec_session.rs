@@ -80,6 +80,24 @@ const DEFAULT_WRITE_YIELD: Duration = Duration::from_millis(250);
 const DEFAULT_POLL_YIELD: Duration = MIN_POLL_YIELD;
 /// Polling period of the output buffer during a yield.
 const POLL: Duration = Duration::from_millis(50);
+/// Cadence at which a session bound to a job is asked whether its process is
+/// gone (US-142). Nothing else asks: every other reader of the status is a call
+/// the model made, and the whole point of a background job is the stretch where
+/// the model made none. Four sessions at most, one `try_wait` each, so the cost
+/// of watching is a syscall per session per tick.
+///
+/// This is NOT the idle reaper the module docs rule out: the watch never ends a
+/// session, it only observes an exit that already happened.
+const EXIT_WATCH: Duration = Duration::from_millis(250);
+/// Grace between observing the exit and settling the job.
+///
+/// Two things need it. The reader tasks are still draining what the process
+/// wrote before it died, and the transcript retained at the settle is the last
+/// one anybody hands over (US-139 AC2). And a `write_stdin` already in flight
+/// notices the same exit within a [`POLL`], settles the job REPORTED and hands
+/// the model its exit code: the wake exists for a job nobody relieved, so the
+/// reader who is already looking is given the time to claim it first.
+const EXIT_DRAIN: Duration = Duration::from_millis(1_000);
 /// Cap of what one chunk hands back, and of what a session keeps between two
 /// reads. Well under the 10 MiB per-result ceiling: the bound is what makes the
 /// memory of a chatty process constant, and what is dropped is COUNTED.
@@ -331,24 +349,41 @@ impl Session {
     /// to return carries the exit code and the output; a teardown does not, and
     /// the job stays unreported so the notice still names it (US-140 AC4).
     async fn settle_job(&mut self, outcome: JobOutcome, reported: bool) {
-        let Some(tie) = self.job.take() else { return };
+        let Some(tie) = self.detach_job() else { return };
+        settle_tie(&tie, outcome, reported).await;
+    }
+
+    /// Takes the tie and hands the transcript over, so a caller holding the
+    /// store lock can settle the job once it has released it.
+    ///
+    /// Same "once" as [`Session::settle_job`], and the same reason the bytes go
+    /// first: after this the session no longer owes the registry anything, so
+    /// nothing else will hand them over.
+    fn detach_job(&mut self) -> Option<JobTie> {
+        let tie = self.job.take()?;
         tie.registry.retain_output(tie.job_id, self.transcript());
-        if reported && let Err(err) = tie.registry.mark_reported(tie.job_id).await {
-            tracing::debug!(
-                target: "pyxis::tools",
-                job_id = %tie.job_id,
-                error = %err,
-                "background job of a shell session was not marked reported"
-            );
-        }
-        if let Err(err) = tie.registry.settle(tie.job_id, outcome).await {
-            tracing::debug!(
-                target: "pyxis::tools",
-                job_id = %tie.job_id,
-                error = %err,
-                "background job of a shell session was not settled"
-            );
-        }
+        Some(tie)
+    }
+}
+
+/// Settles a detached tie. The transcript is already retained by whoever
+/// detached it.
+async fn settle_tie(tie: &JobTie, outcome: JobOutcome, reported: bool) {
+    if reported && let Err(err) = tie.registry.mark_reported(tie.job_id).await {
+        tracing::debug!(
+            target: "pyxis::tools",
+            job_id = %tie.job_id,
+            error = %err,
+            "background job of a shell session was not marked reported"
+        );
+    }
+    if let Err(err) = tie.registry.settle(tie.job_id, outcome).await {
+        tracing::debug!(
+            target: "pyxis::tools",
+            job_id = %tie.job_id,
+            error = %err,
+            "background job of a shell session was not settled"
+        );
     }
 }
 
@@ -645,8 +680,14 @@ impl ExecSessions {
                 .registry()
                 .map(|registry| JobTie { registry, job_id })
         });
+        let tied = job.is_some();
         let session = spawn_session(&staged, job)?;
         self.commit(token, session);
+        // Only a session that owes a registry an outcome is watched: without a
+        // tie there is no job to settle and nobody to wake.
+        if tied {
+            watch_exit(&self.inner, token);
+        }
         Ok(())
     }
 
@@ -693,6 +734,96 @@ impl ExecSessions {
         };
         Ok(f(session))
     }
+}
+
+/// What a tick of the watch found.
+enum ExitWatch {
+    /// The process is still there. Ask again next tick.
+    Running,
+    /// The process is gone and the job is still this session's to settle.
+    Exited,
+    /// Nothing left to watch: the session was closed, or someone else settled
+    /// its job first.
+    Over,
+}
+
+/// Watches one session's process for the exit nothing else observes (US-142).
+///
+/// The chain the epic needs is `process ends -> job settled unreported ->
+/// announce -> turn opened`, and every other producer of a settle already hands
+/// the result to the model in the same breath: `finish` settles REPORTED, the
+/// teardowns settle a thread that is dying. Between them sits the case the
+/// whole registry exists for, a job the model launched and stopped polling, and
+/// nobody was asking whether it had finished.
+///
+/// The watch settles the job and closes NOTHING. The session stays in the
+/// store, buffer intact, so `write_stdin` and its final `finish` answer exactly
+/// what they answered before; `finish` then finds the tie already taken and
+/// settles nothing twice.
+///
+/// The store is held WEAKLY: an `ExecSessions` dropped without a `shutdown`
+/// must still take its sessions down with it, and a detached task holding the
+/// last strong reference would keep the processes alive instead.
+fn watch_exit(store: &Arc<Mutex<Store>>, id: u64) {
+    let store = Arc::downgrade(store);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(EXIT_WATCH).await;
+            // The strong reference is taken per tick and released before the
+            // next sleep, so the watch never outlives what it watches.
+            let Some(strong) = store.upgrade() else {
+                return;
+            };
+            let seen = exit_watch(&strong, id);
+            drop(strong);
+            match seen {
+                ExitWatch::Running => continue,
+                ExitWatch::Over => return,
+                ExitWatch::Exited => break,
+            }
+        }
+        tokio::time::sleep(EXIT_DRAIN).await;
+        let Some(strong) = store.upgrade() else {
+            return;
+        };
+        let taken = detach_exited_job(&strong, id);
+        // The settle awaits a delivery that may open a turn, so the lock is
+        // released first: the thread it wakes reads this same store.
+        drop(strong);
+        if let Some((tie, outcome)) = taken {
+            settle_tie(&tie, outcome, false).await;
+        }
+    });
+}
+
+/// One tick: is the process of session `id` still running?
+fn exit_watch(store: &Arc<Mutex<Store>>, id: u64) -> ExitWatch {
+    let Ok(mut store) = store.lock() else {
+        return ExitWatch::Over;
+    };
+    let Some(session) = store.sessions.get_mut(&id) else {
+        return ExitWatch::Over;
+    };
+    if session.job.is_none() {
+        return ExitWatch::Over;
+    }
+    match session.status() {
+        SessionStatus::Running => ExitWatch::Running,
+        SessionStatus::Exited { .. } => ExitWatch::Exited,
+    }
+}
+
+/// Takes the job of a session whose process is gone, with the outcome its exit
+/// dictates. `None` when the session or its tie went away during the grace,
+/// which is the normal shape of a `finish` having won the race.
+fn detach_exited_job(store: &Arc<Mutex<Store>>, id: u64) -> Option<(JobTie, JobOutcome)> {
+    let mut store = store.lock().ok()?;
+    let session = store.sessions.get_mut(&id)?;
+    let SessionStatus::Exited { code, signal } = session.status() else {
+        return None;
+    };
+    let tie = session.detach_job()?;
+    Some((tie, session_outcome(code, signal, false)))
 }
 
 // ───────────────────────── exec_command ─────────────────────────
