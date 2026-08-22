@@ -213,6 +213,53 @@ mod tests {
         snapshots.remove(0)
     }
 
+    /// Calls `list_jobs` exactly as the binary registers it: on the job handle
+    /// the terminal tools already carry, which the thread above bound.
+    async fn list_jobs(w: &Wired, job_id: Option<&str>) -> Result<String, agent_tools::ToolError> {
+        agent_tools::ListJobs::new(w.ctx.sessions.job_handle())
+            .call(
+                agent_tools::jobs::ListJobsInput {
+                    job_id: job_id.map(str::to_string),
+                },
+                &w.ctx,
+            )
+            .await
+            .map(|out| out.content)
+    }
+
+    /// Polls a session through the REAL `write_stdin` empty poll, which is how
+    /// a model observes an exit: it is the call that reaches `finish`, settles
+    /// the job and hands the model its result.
+    async fn poll(w: &Wired, session_id: u64, yield_ms: u64) -> String {
+        agent_tools::WriteStdin
+            .call(
+                agent_tools::exec_session::WriteStdinInput {
+                    session_id,
+                    chars: String::new(),
+                    yield_time_ms: Some(yield_ms),
+                    max_output_tokens: None,
+                    terminate: None,
+                },
+                &w.ctx,
+            )
+            .await
+            .map(|out| out.content)
+            .unwrap_or_default()
+    }
+
+    /// Polls until the single job of the thread is terminal, or gives up.
+    async fn settle(w: &Wired, session_id: u64) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline && !only_job(&w.registry).status.is_terminal()
+        {
+            poll(w, session_id, 100).await;
+        }
+        assert!(
+            only_job(&w.registry).status.is_terminal(),
+            "the job never settled"
+        );
+    }
+
     /// US-136 AC1/AC2: a terminal that stays open is a job of the thread, and
     /// the log carries it. `open_sessions` reads the registry to say so.
     #[tokio::test]
@@ -502,5 +549,486 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         w.ctx.sessions.shutdown().await;
+    }
+
+    // ───────── EP-043: what the model sees ─────────
+
+    /// US-138 AC2 and edge case 18: an empty registry ANSWERS. A tool that
+    /// returned nothing would read like a broken call, and a model would either
+    /// retry it or conclude the feature does not exist.
+    #[tokio::test]
+    async fn list_jobs_on_a_thread_that_started_nothing_says_so() {
+        let w = wired().await;
+
+        let out = list_jobs(&w, None).await.expect("the tool answers");
+
+        assert_eq!(out, "no background job");
+        w.ctx.sessions.shutdown().await;
+    }
+
+    /// US-138 AC3 and the Technical Consideration on identifiers: one job, two
+    /// names. The opaque `job_...` is what the registry mints; the session id is
+    /// what `write_stdin` takes. A listing that carried only one of them would
+    /// leave the model holding a handle it cannot use.
+    #[tokio::test]
+    async fn a_listed_job_carries_both_of_its_identifiers_its_state_and_its_command() {
+        let w = wired().await;
+        agent_tools::ExecCommand
+            .call(exec("sleep 30", 120), &w.ctx)
+            .await
+            .expect("the session opens");
+        let job = only_job(&w.registry);
+
+        let out = list_jobs(&w, None).await.expect("the tool answers");
+
+        assert!(out.contains(&job.job_id.to_string()), "{out}");
+        assert!(out.contains("session=1"), "{out}");
+        assert!(out.contains("kind=terminal"), "{out}");
+        assert!(out.contains("[running]"), "{out}");
+        assert!(out.contains("command: sleep 30"), "{out}");
+        w.ctx.sessions.shutdown().await;
+    }
+
+    /// US-138 AC4 and edge case 19: the command is text the MODEL wrote, and a
+    /// listing renders it straight back to the model and to a terminal. An
+    /// escape sequence must not survive the trip, and a command longer than the
+    /// line budget must be cut without ever splitting a glyph.
+    #[tokio::test]
+    async fn a_listed_command_is_neutralized_and_bounded() {
+        let w = wired().await;
+        // A real escape sequence plus a multi-byte tail, so the cut lands
+        // inside a two-byte character if the boundary is ever ignored.
+        let command = format!("sleep 30 # \x1b[2J\x07 {}", "é".repeat(200));
+        agent_tools::ExecCommand
+            .call(exec(&command, 120), &w.ctx)
+            .await
+            .expect("the session opens");
+
+        let out = list_jobs(&w, None).await.expect("the tool answers");
+
+        assert!(!out.contains('\x1b'), "no escape survives: {out:?}");
+        assert!(!out.contains('\x07'), "no bell survives: {out:?}");
+        let rendered = out
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("command: "))
+            .expect("the listing carries a command line");
+        assert!(
+            rendered.ends_with("..."),
+            "the cut is announced: {rendered}"
+        );
+        assert!(
+            rendered.len() <= 163,
+            "the command stays within its byte budget, got {}",
+            rendered.len()
+        );
+        w.ctx.sessions.shutdown().await;
+    }
+
+    /// US-138 AC6: listing is an OBSERVATION. It settles nothing, marks
+    /// nothing, and frees no slot, so a model may call it between two turns
+    /// without changing what the next one sees.
+    #[tokio::test]
+    async fn listing_jobs_changes_nothing_about_them() {
+        let w = wired().await;
+        agent_tools::ExecCommand
+            .call(exec("sleep 30", 120), &w.ctx)
+            .await
+            .expect("the session opens");
+        let before = only_job(&w.registry);
+        let trace_before = job_trace(&w.store).await;
+
+        let first = list_jobs(&w, None).await.expect("the tool answers");
+        let second = list_jobs(&w, None).await.expect("the tool answers again");
+
+        assert_eq!(first, second, "a second listing sees the same world");
+        let after = only_job(&w.registry);
+        assert_eq!(after.status, before.status);
+        assert!(!after.reported, "listing is not reporting");
+        assert_eq!(w.registry.active(), 1, "no slot moved");
+        assert_eq!(
+            job_trace(&w.store).await,
+            trace_before,
+            "listing wrote nothing durable"
+        );
+        w.ctx.sessions.shutdown().await;
+    }
+
+    /// US-138 AC7: a thread with no registry gets a NAMED refusal. An empty
+    /// list would say "this thread runs nothing", which is a different fact and
+    /// the one a model would act on.
+    #[tokio::test]
+    async fn list_jobs_without_a_registry_refuses_by_name_instead_of_lying() {
+        let dir = std::env::temp_dir();
+        let sessions = agent_tools::ExecSessions::new();
+        let mut ctx = ToolCtx::new(dir);
+        ctx.sessions = sessions.clone();
+
+        let err = agent_tools::ListJobs::new(sessions.job_handle())
+            .call(agent_tools::jobs::ListJobsInput { job_id: None }, &ctx)
+            .await
+            .expect_err("nothing is bound");
+
+        assert!(
+            err.to_string()
+                .contains("no registry is bound to this thread"),
+            "the refusal names its cause: {err}"
+        );
+    }
+
+    /// US-138 AC5: waiting on a background job IS calling this twice, so the
+    /// loop guard must not count the repetition as a model going in circles.
+    #[test]
+    fn list_jobs_is_exempt_from_the_loop_guard() {
+        let tool = agent_tools::ListJobs::new(Arc::new(agent_tools::JobHandle::new()));
+        assert!(tool.loop_guard_exempt(&serde_json::json!({"job_id": null})));
+        assert!(tool.loop_guard_exempt(&serde_json::json!({"job_id": "job_00"})));
+    }
+
+    /// US-138 AC1: the policy properties are the ones `list_agents` declares.
+    /// They are what the catalog renders and what the parallel segment reads,
+    /// so they are asserted rather than described.
+    #[test]
+    fn list_jobs_declares_the_policy_of_a_reader() {
+        let tool = agent_tools::ListJobs::new(Arc::new(agent_tools::JobHandle::new()));
+        assert!(tool.is_read_only());
+        assert!(tool.is_concurrency_safe());
+        assert!(!tool.is_sensitive());
+        assert!(!tool.is_taint_sensitive());
+        assert!(
+            tool.returns_untrusted(),
+            "a command line and a process output are both untrusted text"
+        );
+    }
+
+    /// US-139 AC1/AC2, the split the whole story exists for: `write_stdin`
+    /// keeps its consuming cursor, and the final relève is idempotent. Two
+    /// readers on one stream that both consumed would divide it between them.
+    #[tokio::test]
+    async fn the_final_output_survives_the_consuming_cursor_and_is_the_same_bytes_twice() {
+        let w = wired().await;
+        agent_tools::ExecCommand
+            .call(exec("echo pyxis-marker; exit 0", 800), &w.ctx)
+            .await
+            .expect("the session opens");
+        settle(&w, 1).await;
+        let job = only_job(&w.registry);
+
+        let first = list_jobs(&w, Some(&job.job_id.to_string()))
+            .await
+            .expect("the result reads");
+        let second = list_jobs(&w, Some(&job.job_id.to_string()))
+            .await
+            .expect("the result reads again");
+
+        assert!(first.contains("pyxis-marker"), "{first}");
+        assert_eq!(first, second, "the same relève returns the same bytes");
+        w.ctx.sessions.shutdown().await;
+    }
+
+    /// US-139 AC1 from the other side: the incremental cursor still empties.
+    /// `exec_command` consumed the first chunk, and what it consumed is still
+    /// in the relève, so neither reader is stealing from the other.
+    #[tokio::test]
+    async fn the_consuming_cursor_of_write_stdin_keeps_its_own_behavior() {
+        let w = wired().await;
+        let opened = agent_tools::ExecCommand
+            .call(exec("echo first-chunk; sleep 30", 800), &w.ctx)
+            .await
+            .expect("the session opens");
+        assert!(
+            opened.content.contains("first-chunk"),
+            "the cursor delivered the chunk: {}",
+            opened.content
+        );
+
+        let polled = poll(&w, 1, 150).await;
+        let job = only_job(&w.registry);
+        let relieve = list_jobs(&w, Some(&job.job_id.to_string()))
+            .await
+            .expect("the result reads");
+
+        assert!(
+            !polled.contains("first-chunk"),
+            "a consumed chunk is not served twice by the cursor: {polled}"
+        );
+        assert!(
+            relieve.contains("first-chunk"),
+            "the transcript still carries it: {relieve}"
+        );
+        assert!(relieve.contains("still running"), "{relieve}");
+        w.ctx.sessions.shutdown().await;
+    }
+
+    /// US-139 AC5: a job still running answers with what it has, on the yield
+    /// bound that already exists. It must not block waiting for an exit.
+    #[tokio::test]
+    async fn a_running_job_answers_without_waiting_for_its_exit() {
+        let w = wired().await;
+        agent_tools::ExecCommand
+            .call(exec("sleep 30", 50), &w.ctx)
+            .await
+            .expect("the session opens");
+        let job = only_job(&w.registry);
+
+        let started = tokio::time::Instant::now();
+        let out = list_jobs(&w, Some(&job.job_id.to_string()))
+            .await
+            .expect("the result reads");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the relève returned promptly, took {:?}",
+            started.elapsed()
+        );
+        assert!(out.contains("[running]"), "{out}");
+        assert!(out.contains("still running"), "{out}");
+        assert!(!job.reported, "a poll is not a result");
+        w.ctx.sessions.shutdown().await;
+    }
+
+    /// US-139 AC6 and edge case 9: a process that writes bytes which are not
+    /// UTF-8 must not take the relève down with it. The replacement policy is
+    /// the one the terminals already apply, `from_utf8_lossy`, so an invalid
+    /// sequence becomes U+FFFD and the exit code still reaches the model.
+    #[tokio::test]
+    async fn non_utf8_output_is_replaced_rather_than_fatal() {
+        let w = wired().await;
+        agent_tools::ExecCommand
+            .call(exec("printf 'a\\377b'; exit 3", 800), &w.ctx)
+            .await
+            .expect("the session opens");
+        settle(&w, 1).await;
+        let job = only_job(&w.registry);
+
+        let out = list_jobs(&w, Some(&job.job_id.to_string()))
+            .await
+            .expect("the result reads");
+
+        assert!(
+            out.contains('\u{fffd}'),
+            "the invalid byte is replaced: {out:?}"
+        );
+        assert!(out.contains("exit_code=3"), "{out}");
+        w.ctx.sessions.shutdown().await;
+    }
+
+    /// Edge case 20: a job of ANOTHER thread reads as unknown, never as
+    /// refused. The two answers would let a probe tell a foreign thread's job
+    /// apart from an identifier that never existed.
+    #[tokio::test]
+    async fn a_job_of_another_thread_reads_as_unknown() {
+        let mine = wired().await;
+        let other = wired().await;
+        other
+            .ctx
+            .sessions
+            .job_handle()
+            .bind(Arc::clone(&other.registry));
+        agent_tools::ExecCommand
+            .call(exec("sleep 30", 120), &other.ctx)
+            .await
+            .expect("the session opens");
+        let foreign = only_job(&other.registry).job_id;
+
+        let err = list_jobs(&mine, Some(&foreign.to_string()))
+            .await
+            .expect_err("it is not reachable from here");
+
+        assert!(
+            err.to_string().contains("not reachable from this thread"),
+            "unknown, not forbidden: {err}"
+        );
+        mine.ctx.sessions.shutdown().await;
+        other.ctx.sessions.shutdown().await;
+    }
+
+    /// US-140 AC1 and AC5: the flag flips when the result REACHES the model,
+    /// and the durable `JobReported` line is written at the flip so a reopened
+    /// thread reads it back instead of re-deriving it.
+    #[tokio::test]
+    async fn a_collected_result_marks_the_job_reported_once_and_durably() {
+        let w = wired().await;
+        agent_tools::ExecCommand
+            .call(exec("sleep 30", 50), &w.ctx)
+            .await
+            .expect("the session opens");
+        // Settled by the teardown, which hands nothing to the model: the job is
+        // terminal and still unread, which is the only state the flag can flip
+        // from.
+        w.ctx.sessions.shutdown().await;
+        let job = only_job(&w.registry);
+        assert!(job.status.is_terminal(), "the teardown settled it");
+        assert!(!job.reported, "nothing collected yet");
+
+        list_jobs(&w, Some(&job.job_id.to_string()))
+            .await
+            .expect("the result reads");
+
+        assert!(only_job(&w.registry).reported, "the model got the result");
+        list_jobs(&w, Some(&job.job_id.to_string()))
+            .await
+            .expect("reading it twice is allowed");
+        let reported = job_trace(&w.store)
+            .await
+            .into_iter()
+            .filter(|line| line == "reported")
+            .count();
+        assert_eq!(reported, 1, "one durable line, written at the flip");
+        // What a reopened thread makes of that line is proved on the resume
+        // harness itself, in `crates/agent-runtime/tests/jobs.rs`.
+        w.ctx.sessions.shutdown().await;
+    }
+
+    /// US-140 AC7: the counting test. Fifty turns after a settle announce the
+    /// job exactly once, which is the regression Claude Code #12302 and #13249
+    /// describe in reverse.
+    #[tokio::test]
+    async fn over_fifty_turns_a_settled_job_is_announced_exactly_once() {
+        let w = wired().await;
+        agent_tools::ExecCommand
+            .call(exec("sleep 30", 50), &w.ctx)
+            .await
+            .expect("the session opens");
+        // Settled without any reader: the thread is torn down while the job
+        // runs, which is the case that owes the user an announcement.
+        w.ctx.sessions.shutdown().await;
+
+        let mut announcements = 0;
+        for _ in 0..50 {
+            if let Some(notice) = crate::interactive::finished_jobs_notice(&w.ctx.sessions) {
+                announcements += 1;
+                let job = only_job(&w.registry);
+                assert!(notice.contains(&job.job_id.to_string()), "{notice}");
+                // What a turn does with the notice: the result reaches its
+                // reader, so the job owes nobody a second announcement.
+                w.registry
+                    .mark_reported(job.job_id)
+                    .await
+                    .expect("the job is ours");
+            }
+        }
+
+        assert_eq!(announcements, 1, "announced once over fifty turns");
+    }
+
+    /// US-140 AC3 and AC4 together, through the notice the interactive loop
+    /// really composes: a job whose result reached the model is silent, and a
+    /// finished job nobody read is named. A result is never lost quietly, and a
+    /// collected one never repeats itself.
+    #[tokio::test]
+    async fn the_notice_names_the_unread_results_and_only_those() {
+        let collected = wired().await;
+        agent_tools::ExecCommand
+            .call(exec("echo done; exit 0", 800), &collected.ctx)
+            .await
+            .expect("the session opens");
+        settle(&collected, 1).await;
+
+        assert!(
+            only_job(&collected.registry).reported,
+            "finishing inside the call handed the model its result"
+        );
+        assert_eq!(
+            crate::interactive::finished_jobs_notice(&collected.ctx.sessions),
+            None,
+            "a reported job is not announced again"
+        );
+
+        let unread = wired().await;
+        agent_tools::ExecCommand
+            .call(exec("sleep 30", 50), &unread.ctx)
+            .await
+            .expect("the session opens");
+        unread.ctx.sessions.shutdown().await;
+
+        let notice = crate::interactive::finished_jobs_notice(&unread.ctx.sessions)
+            .expect("a finished job nobody read is announced");
+        assert!(notice.contains("finished unread"), "{notice}");
+        assert!(notice.contains("list_jobs"), "{notice}");
+        collected.ctx.sessions.shutdown().await;
+    }
+
+    /// US-140 AC6: a KILLED job counts as reported once the acknowledgment
+    /// reached the model, exactly like one that exited on its own. The stop
+    /// path already writes the flag before it attempts the kill.
+    #[tokio::test]
+    async fn a_killed_job_is_reported_like_a_finished_one() {
+        let w = wired().await;
+        agent_tools::ExecCommand
+            .call(exec("sleep 30", 120), &w.ctx)
+            .await
+            .expect("the session opens");
+        let job_id = only_job(&w.registry).job_id;
+
+        w.registry
+            .cancel(job_id, "stopped by the user")
+            .await
+            .expect("the job stops");
+
+        let job = only_job(&w.registry);
+        assert_eq!(job.status, JobStatus::Killed);
+        assert!(job.reported, "the acknowledgment reached its owner");
+        assert_eq!(
+            crate::interactive::finished_jobs_notice(&w.ctx.sessions),
+            None,
+            "a killed and acknowledged job is not announced a second time"
+        );
+        w.ctx.sessions.shutdown().await;
+    }
+
+    /// US-139 AC3: an output over the model cap goes through the EXISTING
+    /// spill of ADR-15 and reaches the model as a path, with no second bound of
+    /// its own. Dispatched through a real `Registry` with a real spill store,
+    /// because the decision point is there and nowhere in the tool.
+    #[tokio::test]
+    async fn an_oversized_relieve_goes_through_the_existing_spill() {
+        let w = wired().await;
+        // Comfortably over MAX_TOOL_OUTPUT_BYTES and well under MAX_JOB_OUTPUT,
+        // so what the model reads is decided by the spill and not by a cap of
+        // the registry.
+        agent_tools::ExecCommand
+            .call(exec("seq 1 12000; exit 0", 2000), &w.ctx)
+            .await
+            .expect("the session opens");
+        settle(&w, 1).await;
+        let job_id = only_job(&w.registry).job_id;
+
+        let spill_dir =
+            std::env::temp_dir().join(format!("pyxis-jobs-spill-{}", std::process::id()));
+        std::fs::create_dir_all(&spill_dir).expect("a spill root");
+        let store = Arc::new(
+            agent_tools::SpillStore::create(&spill_dir, "thread_jobs")
+                .expect("the spill store opens"),
+        );
+        let registry = agent_tools::Registry::builder(&spill_dir)
+            .spill(Arc::clone(&store))
+            .register(agent_tools::ListJobs::new(w.ctx.sessions.job_handle()))
+            .build();
+
+        let results = registry
+            .dispatch(vec![agent_core::tools::ToolInvocation::json(
+                "c1",
+                "list_jobs",
+                serde_json::json!({ "job_id": job_id.to_string() }),
+            )])
+            .await;
+
+        let result = results.first().expect("one result");
+        assert!(!result.is_error, "a spill is not a failure: {result:?}");
+        let truncation = result
+            .truncation
+            .as_ref()
+            .expect("the oversized relève was spilled");
+        assert!(
+            truncation.original_bytes > agent_tools::tool::MAX_TOOL_OUTPUT_BYTES,
+            "the spill fired on the size the tools already agree on"
+        );
+        assert!(
+            result.content.len() <= agent_tools::tool::MAX_TOOL_OUTPUT_BYTES,
+            "what the model reads fits the cap, got {}",
+            result.content.len()
+        );
+        w.ctx.sessions.shutdown().await;
+        let _ = std::fs::remove_dir_all(&spill_dir);
     }
 }

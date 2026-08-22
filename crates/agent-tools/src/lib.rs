@@ -68,7 +68,7 @@ pub use hooks::{
     CommandHooks, HOOK_EVENT_NAMES, HookDecision, HookEvent, HookSpec, Hooks, Lifecycle, NoHooks,
 };
 pub use image::ViewImage;
-pub use jobs::JobHandle;
+pub use jobs::{JobHandle, ListJobs};
 pub use patch::ApplyPatch;
 pub use permission::{
     ApprovalEntry, ApprovalKey, ApprovalMemo, ApprovalMemory, ApprovalResponse, Approver,

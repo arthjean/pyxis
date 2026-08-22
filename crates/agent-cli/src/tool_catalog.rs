@@ -335,6 +335,11 @@ const MANIFEST: &[CatalogEntry] = &[
         condition: Some(MULTI_AGENT_CONDITION),
         build: || one(agent_tools::InterruptAgent::new(agents())),
     },
+    CatalogEntry {
+        registration: "agent_tools::ListJobs",
+        condition: None,
+        build: || one(agent_tools::ListJobs::new(jobs())),
+    },
 ];
 
 /// The six multi-agent tools are registered unconditionally and EXPOSED per
@@ -353,6 +358,12 @@ fn catalog() -> agent_mcp::McpResourceCatalog {
 /// name, description and schema without one.
 fn agents() -> Arc<agent_tools::AgentHandle> {
     Arc::new(agent_tools::AgentHandle::new())
+}
+
+/// Same late binding as `agents`: the catalog renders a DESCRIPTION, and a
+/// description does not need a thread behind the handle.
+fn jobs() -> Arc<agent_tools::JobHandle> {
+    Arc::new(agent_tools::JobHandle::new())
 }
 
 // ─────────────────────────── harvest (US-097, US-098) ───────────────────────────

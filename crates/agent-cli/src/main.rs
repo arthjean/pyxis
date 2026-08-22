@@ -1905,6 +1905,10 @@ async fn run(
         .register(agent_tools::ListAgents::new(Arc::clone(&agent_handle)))
         .register(agent_tools::WaitAgent::new(Arc::clone(&agent_handle)))
         .register(agent_tools::InterruptAgent::new(Arc::clone(&agent_handle)));
+    // US-138: what the model sees of its own background jobs. The handle is the
+    // one the terminal tools already carry, so the tool reads the registry of
+    // whichever thread is open rather than a registry of its own.
+    builder = builder.register(agent_tools::ListJobs::new(exec_sessions.job_handle()));
     for tool in mcp_startup.tools {
         builder = builder.register_dyn(tool);
     }
