@@ -30,7 +30,7 @@ use crate::event::{ThreadEvent, ThreadEventPayload, ThreadJournal};
 use crate::id::{EventId, IdGenerator, ThreadId, TurnId};
 use crate::inputs::TurnInputs;
 use crate::jobs::{
-    CompletionDelivery, JobDelivery, JobRegistry, MAX_CONSECUTIVE_WAKES, WakeBudget,
+    CompletionDelivery, JobDelivery, JobRegistry, JobStatus, MAX_CONSECUTIVE_WAKES, WakeBudget,
 };
 use crate::lifecycle::{TurnLifecycle, TurnState};
 use crate::resume::{self, ResumedThread};
@@ -603,10 +603,51 @@ impl ThreadHandle {
             agents.restore(resumed.agents.clone(), resumed.agent_messages.clone());
         }
 
-        // EP-041: the registry is rebuilt from the log EXACTLY as the log left
-        // it, and no process is restarted. A job the log left running belongs
-        // to a run that is gone; reconciling it is a decision of its own and it
-        // is not taken here.
+        // US-145: a job the log left ACTIVE belongs to a process that died with
+        // the run that started it. Closing it here, once, is what keeps a
+        // restart from reading a `running` that lies, and it is written BEFORE
+        // the registry is rebuilt so what the registry loads is already
+        // reconciled. Nothing is relaunched and no pid is re-attached: the
+        // launcher is never reached from this loop.
+        //
+        // The report flag is deliberately left alone, which is where this
+        // parts ways with `AgentSupervisor::restore` marking a restored handoff
+        // `delivered: true`. A handoff is a message the parent already had a
+        // chance to read in the run that produced it; a job result is the
+        // opposite, since the whole point of the registry is that nobody was
+        // watching when it settled. Marking it reported here would be the one
+        // failure mode EP-044 exists to prevent, a result announced zero times.
+        let mut interrupted_jobs = Vec::new();
+        for record in &mut resumed.jobs {
+            if !record.status.is_active() {
+                continue;
+            }
+            let cause = crate::jobs::RESTART_CAUSE.to_string();
+            let event = actor
+                .commit(ThreadEventPayload::JobStateChanged {
+                    job_id: record.job_id,
+                    to: JobStatus::Killed,
+                    exit_code: None,
+                    cause: Some(cause.clone()),
+                })
+                .await?;
+            record.status = JobStatus::Killed;
+            record.cause = Some(cause);
+            // The end date is READ BACK from the event that was just written,
+            // not sampled a second time: the next resume rebuilds this record
+            // from that same event, so any other source would make the value in
+            // memory disagree with the value on disk.
+            record.ended_at_ms = Some(event.at_ms);
+            // Carried to the registry rather than re-derived from the cause:
+            // the reconciliation is durable, so a job an EARLIER restart closed
+            // is indistinguishable from this one by its record alone, and a
+            // surface reading the cause would announce the same interruption at
+            // every reopening (US-146 AC2).
+            interrupted_jobs.push(record.job_id);
+        }
+
+        // EP-041: the registry is then rebuilt from the log EXACTLY as the log
+        // leaves it, reconciliation included, and no process is restarted.
         if let Some(jobs) = &jobs {
             // EP-044: under `Quiet` the registry gets NO delivery half at all,
             // rather than a delivery that always refuses. A `-p` run then has
@@ -626,7 +667,7 @@ impl ThreadHandle {
                 token.child_token(),
                 delivery,
             );
-            jobs.restore(resumed.jobs.clone());
+            jobs.restore(resumed.jobs.clone(), interrupted_jobs);
         }
 
         actor.start_next_turn().await;

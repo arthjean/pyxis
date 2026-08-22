@@ -7,6 +7,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use agent_core::clock::Clock;
@@ -16,7 +17,7 @@ use agent_runtime::event::ThreadEventPayload;
 use agent_runtime::id::{JobId, SequentialIds, ThreadId, TurnId};
 use agent_runtime::jobs::{
     CompletionDelivery, JobError, JobKind, JobLaunch, JobLauncher, JobOutcome, JobProcess,
-    JobRegistry, JobStatus, MAX_ACTIVE_JOBS, MAX_CONSECUTIVE_WAKES, TEARDOWN_CAUSE,
+    JobRegistry, JobStatus, MAX_ACTIVE_JOBS, MAX_CONSECUTIVE_WAKES, RESTART_CAUSE, TEARDOWN_CAUSE,
 };
 use agent_runtime::runner::{TurnOutcome, TurnRequest, TurnRunner};
 use agent_runtime::store::{
@@ -55,17 +56,28 @@ impl Clock for FrozenClock {
 /// A launcher with nothing behind it. These tests assert the durable log, and a
 /// log does not care whether a process exists; what it needs is a registry that
 /// accepts registrations, which one without a launcher refuses.
-struct TestLauncher;
+///
+/// It counts its calls because US-145 AC5 is a NEGATIVE claim: a resume starts
+/// no process. The only way to prove that from the outside is to hold the one
+/// door a process can come through and read it as still shut.
+struct TestLauncher {
+    launches: Arc<AtomicUsize>,
+}
 
 impl TestLauncher {
     fn shared() -> Arc<dyn JobLauncher> {
-        Arc::new(Self) as Arc<dyn JobLauncher>
+        Self::counting(Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn counting(launches: Arc<AtomicUsize>) -> Arc<dyn JobLauncher> {
+        Arc::new(Self { launches }) as Arc<dyn JobLauncher>
     }
 }
 
 #[async_trait::async_trait]
 impl JobLauncher for TestLauncher {
     async fn launch(&self, _launch: JobLaunch) -> Result<Arc<dyn JobProcess>, String> {
+        self.launches.fetch_add(1, Ordering::SeqCst);
         Ok(Arc::new(TestProcess) as Arc<dyn JobProcess>)
     }
 }
@@ -121,6 +133,16 @@ async fn open_full(
     delivery: CompletionDelivery,
     runner: Arc<dyn TurnRunner>,
 ) -> Owner {
+    open_launched(store, seed, delivery, runner, TestLauncher::shared()).await
+}
+
+async fn open_launched(
+    store: Arc<dyn ThreadStore>,
+    seed: u64,
+    delivery: CompletionDelivery,
+    runner: Arc<dyn TurnRunner>,
+    launcher: Arc<dyn JobLauncher>,
+) -> Owner {
     let ids = Arc::new(SequentialIds::starting_at(seed));
     let thread_id = store
         .read()
@@ -131,7 +153,7 @@ async fn open_full(
     let jobs = JobRegistry::new(
         Arc::clone(&ids) as Arc<_>,
         Arc::new(FrozenClock),
-        Some(TestLauncher::shared()),
+        Some(launcher),
     );
     let root = CancellationToken::new();
     let handle = ThreadHandle::start(ThreadOptions {
@@ -240,6 +262,270 @@ async fn a_reopened_thread_finds_its_jobs_their_terminal_state_and_their_flag() 
         "nothing was relaunched"
     );
     assert_eq!(second.jobs.active(), 0);
+    second.handle.shutdown().await;
+}
+
+/// The undurable half of a restart: the process VANISHES.
+///
+/// Forgetting the handle is what makes this a crash and not a shutdown. Dropping
+/// it would close the mailbox, the actor would reach its teardown, and every
+/// active job would already carry `TEARDOWN_CAUSE` before the next run ever read
+/// the log. A crash writes nothing, and a log a crash left behind is exactly the
+/// one US-145 has to repair.
+fn crash(owner: Owner) {
+    std::mem::forget(owner.handle);
+}
+
+/// US-145 AC1, AC5, AC7: reopening a log that still says `running` closes every
+/// active job with a durable cause, and starts nothing.
+#[tokio::test]
+async fn a_resume_closes_every_active_job_with_a_durable_cause() {
+    let memory = Arc::new(MemoryThreadStore::new());
+    let store = Arc::clone(&memory) as Arc<dyn ThreadStore>;
+    let launched = Arc::new(AtomicUsize::new(0));
+    let first = open_launched(
+        Arc::clone(&store),
+        1,
+        CompletionDelivery::Quiet,
+        Arc::new(IdleRunner),
+        TestLauncher::counting(Arc::clone(&launched)),
+    )
+    .await;
+    let watched = first
+        .jobs
+        .register(JobKind::Terminal, "npm run dev", 7)
+        .await
+        .expect("the registration is accepted");
+    let building = first
+        .jobs
+        .register(JobKind::Terminal, "cargo build", 8)
+        .await
+        .expect("the registration is accepted");
+    assert_eq!(
+        launched.load(Ordering::SeqCst),
+        2,
+        "the first run really started both processes"
+    );
+    crash(first);
+
+    memory.reopen();
+    let relaunched = Arc::new(AtomicUsize::new(0));
+    let second = open_launched(
+        Arc::clone(&store),
+        500,
+        CompletionDelivery::Quiet,
+        Arc::new(IdleRunner),
+        TestLauncher::counting(Arc::clone(&relaunched)),
+    )
+    .await;
+
+    let rebuilt = second.jobs.snapshots();
+    assert_eq!(rebuilt.len(), 2, "both jobs came back");
+    for job in &rebuilt {
+        assert_eq!(job.status, JobStatus::Killed, "{} was closed", job.command);
+        assert_eq!(job.cause.as_deref(), Some(RESTART_CAUSE));
+        assert!(job.ended_at_ms.is_some(), "a closed job has an end date");
+        assert!(!job.attached, "nothing was re-attached");
+    }
+    assert!(
+        !rebuilt
+            .iter()
+            .any(|job| job.status == JobStatus::Running || job.status == JobStatus::Stopping),
+        "no active state survives a resume"
+    );
+    assert_eq!(second.jobs.active(), 0, "no slot is held by the dead run");
+    assert_eq!(
+        relaunched.load(Ordering::SeqCst),
+        0,
+        "a resume reports, it does not relaunch"
+    );
+    // US-146 AC2: what THIS resume closed, which is what the human is told.
+    let named: Vec<String> = second
+        .jobs
+        .interrupted_by_restart()
+        .into_iter()
+        .map(|job| job.command)
+        .collect();
+    assert_eq!(named, ["npm run dev", "cargo build"]);
+
+    // The repair is DURABLE, not a projection the next reader would have to
+    // redo: the log itself carries the closing transition.
+    let trace = job_trace(&store).await;
+    assert_eq!(steps(&trace, watched.job_id), vec!["registered", "killed"]);
+    assert_eq!(steps(&trace, building.job_id), vec!["registered", "killed"]);
+    second.handle.shutdown().await;
+}
+
+/// US-145 AC2: the reconciliation is written once. A second restart reads a
+/// terminal record and has nothing left to repair.
+#[tokio::test]
+async fn a_second_resume_does_not_rewrite_the_reconciliation() {
+    let memory = Arc::new(MemoryThreadStore::new());
+    let store = Arc::clone(&memory) as Arc<dyn ThreadStore>;
+    let first = open(Arc::clone(&store), 1).await;
+    let job = first
+        .jobs
+        .register(JobKind::Terminal, "npm run dev", 7)
+        .await
+        .expect("the registration is accepted");
+    crash(first);
+
+    memory.reopen();
+    let second = open(Arc::clone(&store), 500).await;
+    let after_first_resume = second.jobs.get(job.job_id).expect("the job came back");
+    // US-146 AC2: the resume that CLOSED the job is the one that names it.
+    assert_eq!(second.jobs.interrupted_by_restart().len(), 1);
+    crash(second);
+
+    memory.reopen();
+    let third = open(Arc::clone(&store), 900).await;
+    let after_second_resume = third.jobs.get(job.job_id).expect("the job came back");
+
+    assert_eq!(
+        after_second_resume, after_first_resume,
+        "the second resume read the repair, it did not redo it"
+    );
+    // US-146 AC2, the half the durable cause cannot answer: the SECOND resume
+    // interrupted nothing, so it names nothing. The record still carries
+    // `RESTART_CAUSE`, which is exactly why the selection is the registry's and
+    // not a filter a surface could rebuild from a snapshot.
+    assert_eq!(
+        after_second_resume.cause.as_deref(),
+        Some(RESTART_CAUSE),
+        "the durable cause outlives the resume that wrote it"
+    );
+    assert!(
+        third.jobs.interrupted_by_restart().is_empty(),
+        "a resume that closed nothing has nothing to announce"
+    );
+    let trace = job_trace(&store).await;
+    assert_eq!(
+        steps(&trace, job.job_id),
+        vec!["registered", "killed"],
+        "one reconciliation transition, not one per restart"
+    );
+    third.handle.shutdown().await;
+}
+
+/// US-145 AC3: a job the log already left terminal is re-read as it stands. No
+/// transition is written for it, and its report flag is not touched.
+#[tokio::test]
+async fn a_resume_writes_nothing_for_a_job_that_was_already_terminal() {
+    let memory = Arc::new(MemoryThreadStore::new());
+    let store = Arc::clone(&memory) as Arc<dyn ThreadStore>;
+    let first = open(Arc::clone(&store), 1).await;
+    let job = first
+        .jobs
+        .register(JobKind::Terminal, "npm test", 0)
+        .await
+        .expect("the registration is accepted");
+    first
+        .jobs
+        .settle(job.job_id, JobOutcome::Completed { exit_code: 0 })
+        .await
+        .expect("the job is known");
+    first
+        .jobs
+        .mark_reported(job.job_id)
+        .await
+        .expect("the job is known");
+    let before = job_trace(&store).await;
+    crash(first);
+
+    memory.reopen();
+    let second = open(Arc::clone(&store), 500).await;
+    let rebuilt = second.jobs.get(job.job_id).expect("the job came back");
+
+    assert_eq!(rebuilt.status, JobStatus::Completed, "the state is re-read");
+    assert_eq!(rebuilt.exit_code, Some(0));
+    assert_eq!(rebuilt.cause, None, "no restart cause was grafted onto it");
+    assert!(rebuilt.reported, "the flag is re-read too");
+    assert_eq!(
+        job_trace(&store).await,
+        before,
+        "a terminal job costs the resume no entry"
+    );
+    second.handle.shutdown().await;
+}
+
+/// US-145 AC4: a job that finished while nobody was reading stays owed an
+/// announcement across the restart, and is announced exactly once.
+///
+/// This is the deliberate divergence from `AgentSupervisor::restore`, which
+/// marks a restored handoff `delivered: true`. A handoff is a message the parent
+/// already had its chance to read in the run that produced it; a background job
+/// is the opposite case, since the whole reason the registry exists is that
+/// nobody was watching when the job settled.
+#[tokio::test]
+async fn a_job_finished_before_the_crash_is_still_owed_its_announcement() {
+    let memory = Arc::new(MemoryThreadStore::new());
+    let store = Arc::clone(&memory) as Arc<dyn ThreadStore>;
+    let first = open(Arc::clone(&store), 1).await;
+    let job = first
+        .jobs
+        .register(JobKind::Terminal, "npm test", 0)
+        .await
+        .expect("the registration is accepted");
+    first
+        .jobs
+        .settle(job.job_id, JobOutcome::Completed { exit_code: 0 })
+        .await
+        .expect("the job is known");
+    crash(first);
+
+    memory.reopen();
+    let second = open(Arc::clone(&store), 500).await;
+    let owed = second.jobs.unreported();
+    assert_eq!(owed.len(), 1, "the restart owes exactly one announcement");
+    assert_eq!(owed[0].job_id, job.job_id);
+    second
+        .jobs
+        .mark_reported(job.job_id)
+        .await
+        .expect("the job is known");
+    crash(second);
+
+    memory.reopen();
+    let third = open(Arc::clone(&store), 900).await;
+    assert!(
+        third.jobs.unreported().is_empty(),
+        "an announced job is never announced a second time"
+    );
+    assert_eq!(
+        steps(&job_trace(&store).await, job.job_id),
+        vec!["registered", "completed", "reported"],
+        "neither restart added a transition of its own"
+    );
+    third.handle.shutdown().await;
+}
+
+/// US-145 AC6, edge case #11: a log written before this lot names no job. It
+/// reopens empty, with no error and nothing to migrate.
+#[tokio::test]
+async fn a_log_that_predates_the_registry_reopens_with_no_job() {
+    let memory = Arc::new(MemoryThreadStore::new());
+    let store = Arc::clone(&memory) as Arc<dyn ThreadStore>;
+    let first = open(Arc::clone(&store), 1).await;
+    first
+        .handle
+        .submit(agent_runtime::thread::Submission::new("hello"))
+        .await
+        .expect("the submission is accepted");
+    first.handle.shutdown().await;
+    assert!(
+        job_trace(&store).await.is_empty(),
+        "this log knows nothing about jobs"
+    );
+
+    memory.reopen();
+    let second = open(Arc::clone(&store), 500).await;
+
+    assert!(second.jobs.snapshots().is_empty(), "no job was invented");
+    assert_eq!(second.jobs.active(), 0);
+    assert!(
+        job_trace(&store).await.is_empty(),
+        "and none was written to repair a history that has none"
+    );
     second.handle.shutdown().await;
 }
 

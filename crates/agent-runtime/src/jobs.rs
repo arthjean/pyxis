@@ -64,6 +64,23 @@ pub const MAX_JOB_OUTPUT: usize = 131_072;
 /// surface reports the same sentence for the same event.
 pub const TEARDOWN_CAUSE: &str = "interrupted: the thread stopped while the job was running";
 
+/// Cause persisted for a job a RESTART interrupted (US-145).
+///
+/// Distinct from [`TEARDOWN_CAUSE`] because the two are read at opposite ends
+/// of a process: a teardown is this run stopping a job it can still reach, a
+/// restart is the next run finding a record whose process died with the run
+/// that owned it. A single sentence for both would leave the human unable to
+/// tell an orderly shutdown from a crash, which is the one thing the resume
+/// notice is there to say.
+///
+/// The state that carries it is [`JobStatus::Killed`], not a sixth variant: the
+/// vocabulary is closed at five (FR-01), and `Killed` is already defined as
+/// "stopped by its owner, a shutdown OR A RESUME". What distinguishes the three
+/// is the durable cause, which is why the cause is a named constant rather than
+/// a sentence composed at the call site.
+pub const RESTART_CAUSE: &str =
+    "interrupted: the process restarted while the background job was running";
+
 /// Turns a completing background job may open IN A ROW without a human saying
 /// anything in between (FR-13).
 ///
@@ -563,6 +580,11 @@ struct RegistryState {
     /// write of the first buyer is still in flight.
     reserved: usize,
     jobs: Vec<Job>,
+    /// Jobs THIS restore closed, in the order the log carried them. Empty for a
+    /// registry that was never restored, and empty again on the next restart:
+    /// the durable cause says a restart closed the job at some point, this list
+    /// says the restart that just happened is the one that did it.
+    restart_interrupted: Vec<JobId>,
 }
 
 impl RegistryState {
@@ -655,6 +677,27 @@ impl JobRegistry {
     /// Every job of this thread, in registration order.
     pub fn snapshots(&self) -> Vec<JobSnapshot> {
         self.lock().jobs.iter().map(Job::snapshot).collect()
+    }
+
+    /// The jobs the resume that built this registry closed, and only those.
+    ///
+    /// A surface CANNOT derive this from the records: the reconciliation is
+    /// durable on purpose, so a job closed three restarts ago still carries
+    /// [`RESTART_CAUSE`] and reading the cause would make every reopening of
+    /// that log repeat news that is no longer news (US-146 AC2).
+    pub fn interrupted_by_restart(&self) -> Vec<JobSnapshot> {
+        let state = self.lock();
+        state
+            .restart_interrupted
+            .iter()
+            .filter_map(|job_id| {
+                state
+                    .jobs
+                    .iter()
+                    .find(|job| job.record.job_id == *job_id)
+                    .map(Job::snapshot)
+            })
+            .collect()
     }
 
     /// One job of THIS thread. A job of another thread is not in this registry,
@@ -1176,9 +1219,14 @@ impl JobRegistry {
     /// and report flag included, and no process is started: reopening a thread
     /// reads history, it does not replay it. A job the log left active is
     /// detached, so nothing here pretends it can still be stopped.
-    pub(crate) fn restore(&self, records: Vec<JobRecord>) {
+    ///
+    /// `interrupted` names the jobs the caller just closed to get here, which is
+    /// the one thing the records themselves no longer distinguish once the
+    /// reconciliation is durable.
+    pub(crate) fn restore(&self, records: Vec<JobRecord>, interrupted: Vec<JobId>) {
         let mut state = self.lock();
         state.reserved = 0;
+        state.restart_interrupted = interrupted;
         state.jobs = records
             .into_iter()
             .map(|record| Job {
@@ -1770,17 +1818,20 @@ mod tests {
         let registry =
             JobRegistry::new(Arc::new(SequentialIds::new()), Arc::new(FrozenClock), None);
         let job_id = JobId::generate(&SequentialIds::starting_at(70));
-        registry.restore(vec![JobRecord {
-            job_id,
-            kind: JobKind::Terminal,
-            command: "npm run dev".into(),
-            status: JobStatus::Completed,
-            reported: true,
-            exit_code: Some(0),
-            cause: None,
-            started_at_ms: 1,
-            ended_at_ms: Some(2),
-        }]);
+        registry.restore(
+            vec![JobRecord {
+                job_id,
+                kind: JobKind::Terminal,
+                command: "npm run dev".into(),
+                status: JobStatus::Completed,
+                reported: true,
+                exit_code: Some(0),
+                cause: None,
+                started_at_ms: 1,
+                ended_at_ms: Some(2),
+            }],
+            Vec::new(),
+        );
 
         let snapshot = registry.get(job_id).expect("the job came back");
         assert_eq!(snapshot.status, JobStatus::Completed);
@@ -1788,6 +1839,10 @@ mod tests {
         assert_eq!(snapshot.exit_code, Some(0));
         assert!(!snapshot.attached, "no process was restarted");
         assert_eq!(registry.active(), 0);
+        assert!(
+            registry.interrupted_by_restart().is_empty(),
+            "this restore closed nothing, so it names nothing"
+        );
     }
 
     /// A command longer than the bound is cut at a character boundary, so a
