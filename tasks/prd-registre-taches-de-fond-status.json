@@ -3,8 +3,8 @@
     "file": "tasks/prd-registre-taches-de-fond.md",
     "title": "Registre de tâches de fond",
     "created_at": "2026-08-22",
-    "status": "IN_PROGRESS",
-    "updated_at": "2026-08-22T15:40:00Z"
+    "status": "DONE",
+    "updated_at": "2026-08-22T19:40:00Z"
   },
   "epics": [
     {
@@ -42,10 +42,10 @@
     {
       "id": "EP-045",
       "title": "Le redémarrage qui rapporte au lieu de ressusciter",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "stories_total": 3,
-      "stories_done": 0
+      "stories_done": 3
     }
   ],
   "stories": [
@@ -248,44 +248,44 @@
       "id": "US-145",
       "title": "Une reprise ferme tout travail actif avec sa cause durable",
       "epic": "EP-045",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "M",
       "blocked_by": [
         "US-133"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-22T16:10:00Z",
+      "completed_at": "2026-08-22T19:40:00Z",
+      "reviewed_at": "2026-08-22T19:40:00Z"
     },
     {
       "id": "US-146",
       "title": "La reprise, la fin de tour et /status nomment ce qui reste ouvert",
       "epic": "EP-045",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "M",
       "blocked_by": [
         "US-145",
         "US-138"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-22T16:30:00Z",
+      "completed_at": "2026-08-22T19:40:00Z",
+      "reviewed_at": "2026-08-22T19:40:00Z"
     },
     {
       "id": "US-147",
       "title": "ADR-16 fixe la frontière de survie, et la note consigne l'écart au plan",
       "epic": "EP-045",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P1",
       "size": "S",
       "blocked_by": [
         "US-145"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-22T17:20:00Z",
+      "completed_at": "2026-08-22T19:40:00Z",
+      "reviewed_at": "2026-08-22T19:40:00Z"
     }
   ]
 }
