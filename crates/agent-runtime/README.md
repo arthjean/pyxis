@@ -95,3 +95,33 @@ human message, so it extends the prefix instead of rewriting it. This is why the
 announcement is an index into `list_jobs` rather than the process output: an
 unbounded transcript spliced into the thread would push every later turn past
 the cached window for a result the model may never read.
+
+### The scheduled reminder notice
+
+#### What the model sees
+
+One user-role message opening a turn nobody asked for, composed by
+`reminder_notice` in `crates/agent-runtime/src/thread.rs`: the identifier of the
+reminder that came due and the prompt its creation stored, verbatim. When several
+reminders fall due in the same wake, they arrive as a single message listing one
+line per occurrence, never as one message each. The model is not told the slot it
+is answering for, because the slot is a property of the log and not of the task.
+
+#### Token effect
+
+The prompt dominates, and it is bounded at creation by `MAX_SCHEDULE_PROMPT_CHARS` in
+`crates/agent-runtime/src/schedule.rs`; the frame around it costs around 25
+tokens for a single reminder and around 10 per line for a batch. The batch is
+what bounds the worst case: a thread holding many due reminders pays one frame,
+not one per reminder. At most three such messages can enter a thread without an
+intervening human input, and the budget is the SAME
+`MAX_CONSECUTIVE_WAKES` a job completion spends (ADR-17), so a thread cannot be
+woken three times by its jobs and three more times by its reminders.
+
+#### KV Cache effect
+
+Préfixe stable répété. The notice is appended like a human message, so it extends
+the prefix rather than rewriting it. A reminder that comes due while a turn is
+running is steered into that turn instead of opening a second one, which is also
+a cache decision: opening a turn would have restarted the prefix for text the
+running turn was about to read anyway.
