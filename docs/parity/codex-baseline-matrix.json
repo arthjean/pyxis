@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "baseline_commit": "fa1d4c40d0e63eef2e0ba8a9e004ccd0a80b77f5",
+  "baseline_commit": "343074d4207d572809bd8cea15f4be1d09d98e0b",
   "sources": [
     "codex-rs/app-server-protocol/src/protocol/common.rs",
     "codex-rs/core/src/config/mod.rs",
@@ -25,9 +25,9 @@
     {
       "slug": "codex-auto-review",
       "visibility": "hide",
-      "tool_mode": "direct",
-      "responses_lite": false,
-      "multi_agent_version": "disabled"
+      "tool_mode": "code_mode_only",
+      "responses_lite": true,
+      "multi_agent_version": "v1"
     },
     {
       "slug": "gpt-5.2",
@@ -77,6 +77,20 @@
       "tool_mode": "code_mode_only",
       "responses_lite": true,
       "multi_agent_version": "v2"
+    },
+    {
+      "slug": "gpt-daybreak-blue-latest",
+      "visibility": "hide",
+      "tool_mode": "code_mode_only",
+      "responses_lite": true,
+      "multi_agent_version": "v2"
+    },
+    {
+      "slug": "gpt-daybreak-red-latest",
+      "visibility": "hide",
+      "tool_mode": "code_mode_only",
+      "responses_lite": true,
+      "multi_agent_version": "v2"
     }
   ],
   "multi_agent": [
@@ -105,6 +119,16 @@
     }
   ],
   "app_server_methods": [
+    {
+      "method": "account/bedrock/discover",
+      "request": "BedrockDiscover",
+      "experimental": true
+    },
+    {
+      "method": "account/bedrock/setup",
+      "request": "BedrockSetup",
+      "experimental": true
+    },
     {
       "method": "account/login/cancel",
       "request": "CancelLoginAccount",
@@ -371,6 +395,16 @@
       "experimental": false
     },
     {
+      "method": "mcpServer/event/stream/start",
+      "request": "McpServerEventStreamStart",
+      "experimental": true
+    },
+    {
+      "method": "mcpServer/event/stream/stop",
+      "request": "McpServerEventStreamStop",
+      "experimental": true
+    },
+    {
       "method": "mcpServer/oauth/login",
       "request": "McpServerOauthLogin",
       "experimental": false
@@ -436,6 +470,11 @@
       "experimental": false
     },
     {
+      "method": "plugin/search",
+      "request": "PluginSearch",
+      "experimental": true
+    },
+    {
       "method": "plugin/share/checkout",
       "request": "PluginShareCheckout",
       "experimental": false
@@ -491,6 +530,41 @@
       "experimental": true
     },
     {
+      "method": "project/create",
+      "request": "ProjectCreate",
+      "experimental": true
+    },
+    {
+      "method": "project/delete",
+      "request": "ProjectDelete",
+      "experimental": true
+    },
+    {
+      "method": "project/import",
+      "request": "ProjectImport",
+      "experimental": true
+    },
+    {
+      "method": "project/list",
+      "request": "ProjectList",
+      "experimental": true
+    },
+    {
+      "method": "project/move",
+      "request": "ProjectMove",
+      "experimental": true
+    },
+    {
+      "method": "project/read",
+      "request": "ProjectRead",
+      "experimental": true
+    },
+    {
+      "method": "project/update",
+      "request": "ProjectUpdate",
+      "experimental": true
+    },
+    {
       "method": "remoteControl/client/list",
       "request": "RemoteControlClientsList",
       "experimental": true
@@ -529,6 +603,11 @@
       "method": "review/start",
       "request": "ReviewStart",
       "experimental": false
+    },
+    {
+      "method": "server/diagnostics",
+      "request": "ServerDiagnostics",
+      "experimental": true
     },
     {
       "method": "skills/config/write",
@@ -646,6 +725,36 @@
       "experimental": false
     },
     {
+      "method": "thread/queue/add",
+      "request": "ThreadQueueAdd",
+      "experimental": true
+    },
+    {
+      "method": "thread/queue/delete",
+      "request": "ThreadQueueDelete",
+      "experimental": true
+    },
+    {
+      "method": "thread/queue/list",
+      "request": "ThreadQueueList",
+      "experimental": true
+    },
+    {
+      "method": "thread/queue/reorder",
+      "request": "ThreadQueueReorder",
+      "experimental": true
+    },
+    {
+      "method": "thread/queue/start",
+      "request": "ThreadQueueStart",
+      "experimental": true
+    },
+    {
+      "method": "thread/queue/update",
+      "request": "ThreadQueueUpdate",
+      "experimental": true
+    },
+    {
       "method": "thread/read",
       "request": "ThreadRead",
       "experimental": false
@@ -686,6 +795,11 @@
       "experimental": false
     },
     {
+      "method": "thread/revert",
+      "request": "ThreadRevert",
+      "experimental": true
+    },
+    {
       "method": "thread/rollback",
       "request": "ThreadRollback",
       "experimental": false
@@ -699,6 +813,11 @@
       "method": "thread/searchOccurrences",
       "request": "ThreadSearchOccurrences",
       "experimental": true
+    },
+    {
+      "method": "thread/section/move",
+      "request": "ThreadSectionMove",
+      "experimental": false
     },
     {
       "method": "thread/settings/update",
@@ -731,8 +850,23 @@
       "experimental": false
     },
     {
+      "method": "threadSection/create",
+      "request": "ThreadSectionCreate",
+      "experimental": false
+    },
+    {
+      "method": "threadSection/delete",
+      "request": "ThreadSectionDelete",
+      "experimental": false
+    },
+    {
       "method": "threadSection/list",
       "request": "ThreadSectionList",
+      "experimental": false
+    },
+    {
+      "method": "threadSection/update",
+      "request": "ThreadSectionUpdate",
       "experimental": false
     },
     {
@@ -761,5 +895,5 @@
       "experimental": false
     }
   ],
-  "fingerprint": "31db852938688a3823373a3c91700511f80178509ad15faf2f4d5acfe229a9ee"
+  "fingerprint": "5903a1ba0f346266ba1b706fe67eb8fef7048b969918efd17303bf5b774b1e2b"
 }

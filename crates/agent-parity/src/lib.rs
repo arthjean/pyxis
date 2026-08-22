@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 pub mod client_model;
 
 /// Normative Codex commit for this parity campaign (PRD hard constraint).
-pub const BASELINE_COMMIT: &str = "fa1d4c40d0e63eef2e0ba8a9e004ccd0a80b77f5";
+pub const BASELINE_COMMIT: &str = "343074d4207d572809bd8cea15f4be1d09d98e0b";
 
 /// Default location of the read-only clone. Overridable so the verifier is not
 /// tied to one machine.
