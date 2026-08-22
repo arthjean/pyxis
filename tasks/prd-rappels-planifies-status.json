@@ -26,10 +26,10 @@
     {
       "id": "EP-048",
       "title": "L'horloge dans l'acteur",
-      "status": "READY",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 3,
-      "stories_done": 0
+      "stories_done": 3
     },
     {
       "id": "EP-049",
@@ -150,44 +150,44 @@
       "id": "US-155",
       "title": "Le bras de minuterie est borné et relit l'horloge murale à chaque réveil",
       "epic": "EP-048",
-      "status": "READY",
+      "status": "DONE",
       "priority": "P0",
       "size": "L",
       "blocked_by": [
         "US-150",
         "US-152"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-22",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
     },
     {
       "id": "US-156",
       "title": "Un dispatch est durable avant d'être livré, et exactement une fois",
       "epic": "EP-048",
-      "status": "READY",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-155"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-22",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
     },
     {
       "id": "US-157",
       "title": "Le budget de réveils est unique, partagé, et un refus conserve le rappel",
       "epic": "EP-048",
-      "status": "READY",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-156"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-22",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
     },
     {
       "id": "US-158",
