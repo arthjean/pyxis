@@ -18,10 +18,10 @@
     {
       "id": "EP-042",
       "title": "Les terminaux entrent au registre",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "stories_total": 3,
-      "stories_done": 0
+      "stories_done": 3
     },
     {
       "id": "EP-043",
@@ -107,43 +107,43 @@
       "id": "US-135",
       "title": "Le lanceur est un trait du runtime, implémenté par le binaire",
       "epic": "EP-042",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-132"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-22",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
     },
     {
       "id": "US-136",
       "title": "exec_command réserve puis enregistre, dans cet ordre",
       "epic": "EP-042",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-135"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-22",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
     },
     {
       "id": "US-137",
       "title": "La fin d'un processus règle le travail une fois, avec son code de sortie",
       "epic": "EP-042",
-      "status": "TODO",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-136"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-22",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
     },
     {
       "id": "US-138",
