@@ -16,10 +16,19 @@ use agent_core::input::InputQueue;
 use agent_core::message::Message;
 use tokio::sync::Notify;
 
+use crate::thread::Submission;
+
 /// Inputs accepted for one turn, in acceptance order.
+///
+/// The whole [`Submission`] is queued and not just its text: the engine only
+/// ever reads the text, but the actor re-admits what the engine never consumed,
+/// and an input that came back stripped of its origin and of its idempotency
+/// key would be indistinguishable from something a human just typed. A reminder
+/// steered into a turn that ended too early would then rearm the wake budget it
+/// was supposed to spend (ADR-17).
 #[derive(Debug, Default)]
 pub struct TurnInputs {
-    queue: Mutex<VecDeque<String>>,
+    queue: Mutex<VecDeque<Submission>>,
     waiting: Notify,
 }
 
@@ -30,10 +39,10 @@ impl TurnInputs {
 
     /// Queues an input and wakes a sampling that is waiting on it. Returns the
     /// new depth so the actor can publish it as pending state.
-    pub fn push(&self, text: String) -> usize {
+    pub fn push(&self, submission: Submission) -> usize {
         let depth = {
             let mut queue = self.lock();
-            queue.push_back(text);
+            queue.push_back(submission);
             queue.len()
         };
         // `notify_one` and not `notify_waiters`: it stores a permit when nobody
@@ -53,11 +62,11 @@ impl TurnInputs {
 
     /// Takes what the engine never consumed. Called by the actor AFTER the turn
     /// task returned, so no consumer can be racing with it.
-    pub fn drain_remaining(&self) -> Vec<String> {
+    pub fn drain_remaining(&self) -> Vec<Submission> {
         self.lock().drain(..).collect()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<String>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<Submission>> {
         self.queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -67,7 +76,10 @@ impl TurnInputs {
 #[async_trait::async_trait]
 impl InputQueue for TurnInputs {
     fn take(&self) -> Vec<Message> {
-        self.lock().drain(..).map(Message::user).collect()
+        self.lock()
+            .drain(..)
+            .map(|submission| Message::user(submission.text))
+            .collect()
     }
 
     async fn ready(&self) {
@@ -89,8 +101,8 @@ mod tests {
     #[tokio::test]
     async fn inputs_are_taken_once_in_acceptance_order() {
         let inputs = TurnInputs::new();
-        assert_eq!(inputs.push("un".into()), 1);
-        assert_eq!(inputs.push("deux".into()), 2);
+        assert_eq!(inputs.push(Submission::new("un")), 1);
+        assert_eq!(inputs.push(Submission::new("deux")), 2);
 
         let taken: Vec<String> = inputs.take().iter().map(|m| m.text()).collect();
         assert_eq!(taken, vec!["un".to_string(), "deux".to_string()]);
@@ -101,7 +113,7 @@ mod tests {
     #[tokio::test]
     async fn ready_resolves_for_an_input_queued_before_anyone_waits() {
         let inputs = TurnInputs::new();
-        inputs.push("déjà là".into());
+        inputs.push(Submission::new("déjà là"));
         tokio::time::timeout(Duration::from_millis(100), inputs.ready())
             .await
             .expect("an input queued before the wait must still wake it");
@@ -118,7 +130,7 @@ mod tests {
         );
 
         let producer = Arc::clone(&inputs);
-        tokio::spawn(async move { producer.push("corrige".into()) });
+        tokio::spawn(async move { producer.push(Submission::new("corrige")) });
         tokio::time::timeout(Duration::from_secs(1), inputs.ready())
             .await
             .expect("a queued input wakes the sampling");
@@ -127,9 +139,14 @@ mod tests {
     #[tokio::test]
     async fn what_the_engine_never_consumed_can_be_re_admitted() {
         let inputs = TurnInputs::new();
-        inputs.push("un".into());
-        inputs.push("deux".into());
-        assert_eq!(inputs.drain_remaining(), vec!["un", "deux"]);
+        inputs.push(Submission::new("un"));
+        inputs.push(Submission::new("deux"));
+        let remaining: Vec<String> = inputs
+            .drain_remaining()
+            .into_iter()
+            .map(|submission| submission.text)
+            .collect();
+        assert_eq!(remaining, vec!["un", "deux"]);
         assert!(inputs.is_empty());
     }
 }

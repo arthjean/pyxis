@@ -23,8 +23,19 @@
 //!
 //! Every bound below is a crate constant, never a configuration key
 //! (invariant 15, ADR-12).
+//!
+//! What this module does NOT own is the wake budget a dispatch spends. There is
+//! exactly ONE, [`crate::jobs::MAX_CONSECUTIVE_WAKES`], shared by every producer
+//! of a turn nobody asked for, and ADR-17 is where that rule is written: the
+//! threshold answers "is this thread talking to itself?", which is a property of
+//! the thread and not of the producer, so a second counter for reminders would
+//! buy six unrequested turns in a row while each half swore it had stayed within
+//! its bound. A refused dispatch therefore leaves the record [`ScheduleState::Overdue`]
+//! rather than spending it, which costs nothing durable because `Overdue` is a
+//! folded state and never a stored one.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +83,21 @@ pub const MAX_SCHEDULE_PROMPT_CHARS: usize = 1_024;
 /// human reads, and a reminder nobody can read the target of is a reminder
 /// nobody can cancel on purpose.
 pub const MAX_SCHEDULE_AT_MS: u64 = 253_402_300_799_999;
+
+/// Longest a single sleep of the timer arm may last.
+///
+/// One minute, where the design harness bounds its own segment at
+/// `MAX_TIMER_DELAY_MS = 2_147_483_647` (`packages/schedule/schedule/src/runtime.ts:22`).
+/// The divergence is not a tightening of the same number: the harness's value is
+/// the `i32` ceiling of `setTimeout` and bounds nothing else, whereas the sleep
+/// this constant cuts up is a `CLOCK_MONOTONIC` one, which does NOT advance
+/// while the machine is suspended. A laptop closed for two hours therefore
+/// wakes up with a monotonic timer that still believes it has two hours to
+/// wait, and only a re-read of the WALL clock can notice. The segment is what
+/// forces that re-read, so its value is exactly the lateness a reminder may
+/// suffer after a suspend, and a minute is the coarsest delay a human still
+/// reads as "on time".
+pub const MAX_TIMER_SEGMENT: Duration = Duration::from_secs(60);
 
 /// How a reminder is asked for. Closed at three forms, so a `match` that forgets
 /// one refuses to compile.
@@ -459,6 +485,38 @@ impl ScheduleChange {
     }
 }
 
+/// Identifier a dispatched reminder submits itself under.
+///
+/// Derived, never generated: the reminder and the SLOT it fills are the whole
+/// key, so replaying the same occurrence produces the same string and the
+/// existing idempotency map refuses it a second turn (invariant 12). It is the
+/// shape [`crate::jobs::delivery_message_id`] already uses for a background job,
+/// with the occurrence added because a recurring reminder submits many times
+/// under one identifier.
+///
+/// A batch of recurring reminders settled at one instant is ONE submission, and
+/// it takes the key of its first occurrence.
+pub fn dispatch_message_id(schedule_id: ScheduleId, occurrence_at_ms: u64) -> String {
+    format!("schedule-dispatch:{schedule_id}:{occurrence_at_ms}")
+}
+
+/// One dispatch the fold has already spent, kept so a stop between the durable
+/// entry and the submission it owes can be repaired at the next opening.
+///
+/// The fold consumes a reminder as soon as its `ScheduleDispatched` line is
+/// durable, which is what makes a delivery exactly-once; the flip side is that
+/// nothing in `active` remembers the occurrence any more. This carries what a
+/// submission needs, and the actor decides on reopening whether the submission
+/// ever happened by looking its key up in the acceptances it rebuilt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchedOccurrence {
+    pub schedule_id: ScheduleId,
+    /// Slot delivered, and half of [`dispatch_message_id`].
+    pub occurrence_at_ms: u64,
+    /// Text of the reminder, as its creation wrote it.
+    pub prompt: String,
+}
+
 /// One active reminder plus what an instant makes of it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleView {
@@ -477,6 +535,16 @@ pub struct FoldedSchedules {
     pub active: Vec<ScheduleView>,
     /// Durable records the fold refused to believe. Counted rather than fatal.
     pub corrupt: usize,
+    /// Occurrences of the LAST dispatch batch, in the order they were written.
+    ///
+    /// Bounded to the last batch on purpose, and not a history: a dispatch is
+    /// only ever written after the wake budget and the input queue have both
+    /// said yes, and the submission follows it inside the same handler, so the
+    /// only entry that can exist without its submission is the most recent one.
+    /// Keeping the whole history instead would clone every prompt a thread ever
+    /// scheduled, on every timer wake, to repair a failure that cannot reach
+    /// back that far.
+    pub dispatched: Vec<DispatchedOccurrence>,
 }
 
 impl FoldedSchedules {
@@ -544,6 +612,11 @@ where
     let mut index: HashMap<ScheduleId, usize> = HashMap::new();
     let mut seen: HashSet<ScheduleId> = HashSet::new();
     let mut corrupt = 0usize;
+    // The batch being accumulated, keyed by the acceptance instant its lines
+    // share. A one-shot carries none and is always alone, so it opens a batch
+    // of exactly one and closes it.
+    let mut batch: Option<u64> = None;
+    let mut dispatched: Vec<DispatchedOccurrence> = Vec::new();
 
     for change in changes {
         match change {
@@ -572,6 +645,7 @@ where
                     continue;
                 };
                 let due_at_ms = order[position].due_at_ms;
+                let prompt = order[position].prompt.clone();
                 if !order[position].rule.is_recurring() {
                     if accepted_at_ms.is_some() {
                         corrupt += 1;
@@ -582,6 +656,12 @@ where
                     }
                     // Spent either way: a delivered one-shot no longer exists.
                     take(&mut order, &mut index, *schedule_id);
+                    open_batch(&mut batch, &mut dispatched, None);
+                    dispatched.push(DispatchedOccurrence {
+                        schedule_id: *schedule_id,
+                        occurrence_at_ms: due_at_ms,
+                        prompt,
+                    });
                     continue;
                 }
                 // A missing or backwards acceptance instant is repaired at the
@@ -609,17 +689,28 @@ where
                 };
                 match resolve_every_occurrence(&order[position], accepted) {
                     Ok(EveryOccurrence {
-                        next_at_ms: Some(next),
-                        ..
-                    }) => order[position].due_at_ms = next,
-                    // The series ran past what an instant can represent, or its
-                    // interval is unusable. Ending it is the only alternative
-                    // to corrupting it; an unusable interval is also counted.
-                    Ok(EveryOccurrence {
-                        next_at_ms: None, ..
+                        occurrence_at_ms,
+                        next_at_ms,
                     }) => {
-                        take(&mut order, &mut index, *schedule_id);
+                        open_batch(&mut batch, &mut dispatched, Some(accepted));
+                        dispatched.push(DispatchedOccurrence {
+                            schedule_id: *schedule_id,
+                            occurrence_at_ms,
+                            prompt,
+                        });
+                        match next_at_ms {
+                            Some(next) => order[position].due_at_ms = next,
+                            // The series ran past what an instant can
+                            // represent, or its interval is unusable. Ending it
+                            // is the only alternative to corrupting it.
+                            None => {
+                                take(&mut order, &mut index, *schedule_id);
+                            }
+                        }
                     }
+                    // An unusable interval leaves no occurrence to replay:
+                    // nothing here can name the slot that was delivered, and
+                    // inventing one would risk a second delivery.
                     Err(err) => {
                         corrupt += 1;
                         refuse(*schedule_id, err.code());
@@ -640,7 +731,28 @@ where
             })
             .collect(),
         corrupt,
+        dispatched,
     }
+}
+
+/// Starts a new batch unless the line belongs to the one being accumulated.
+///
+/// Only the last batch is kept, so opening a new one drops the previous.
+fn open_batch(
+    batch: &mut Option<u64>,
+    dispatched: &mut Vec<DispatchedOccurrence>,
+    accepted_at_ms: Option<u64>,
+) {
+    let continues = match (*batch, accepted_at_ms) {
+        (Some(current), Some(incoming)) => current == incoming,
+        // A one-shot is alone by construction: `due_decision` never returns it
+        // alongside anything else.
+        _ => false,
+    };
+    if !continues {
+        dispatched.clear();
+    }
+    *batch = accepted_at_ms;
 }
 
 /// Removes one reminder and keeps the position map consistent with the vector.

@@ -85,6 +85,12 @@ pub(crate) struct ResumePlan {
     /// Messages the recovery commit must add to the canonical transcript.
     pub(crate) tool_results: Vec<Message>,
     pub(crate) thread_created: bool,
+    /// The scheduling changes of the log, in order, so the actor can re-fold
+    /// them against a later instant. The folded state on `resumed` is a REPORT
+    /// settled at the instant of the resume (ADR-17); the live timer needs the
+    /// sequence itself, and rebuilding it from the snapshot a second time would
+    /// duplicate the mapping this pass already did.
+    pub(crate) schedule_changes: Vec<ScheduleChange>,
 }
 
 /// Replays `snapshot` into the state a thread resumes on.
@@ -313,6 +319,7 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot, now_ms: u64) 
         queued,
         tool_results,
         thread_created,
+        schedule_changes: schedules,
     }
 }
 

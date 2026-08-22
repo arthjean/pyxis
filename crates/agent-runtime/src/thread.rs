@@ -35,6 +35,10 @@ use crate::jobs::{
 use crate::lifecycle::{TurnLifecycle, TurnState};
 use crate::resume::{self, ResumedThread};
 use crate::runner::{TurnOutcome, TurnRequest, TurnRunner};
+use crate::schedule::{
+    DispatchedOccurrence, DueDecision, MAX_TIMER_SEGMENT, ScheduleChange, dispatch_message_id,
+    due_decision, fold_schedules,
+};
 use crate::store::{
     ForkPoint, RecoveryCommit, StoreError, StoreOperation, ThreadSnapshot, ThreadStore,
 };
@@ -550,6 +554,8 @@ impl ThreadHandle {
                 .collect(),
             pending: VecDeque::new(),
             straggler_deadline: None,
+            schedule_changes: Vec::new(),
+            schedule_deferred: false,
             events: events.clone(),
             status: status_tx,
             finished_tx,
@@ -562,6 +568,11 @@ impl ThreadHandle {
         }
 
         actor.pending = plan.queued.into();
+        // Seeded from the plan rather than mapped a second time from the
+        // snapshot: the resume already walked the log once, and the folded
+        // report it produced is settled at `resumed_at_ms` while the actor
+        // needs the sequence itself to re-fold later.
+        actor.schedule_changes = plan.schedule_changes;
         let mut resumed = plan.resumed;
         resumed.recovered = recovered;
         resumed.reconciled_calls = reconciled_calls;
@@ -694,6 +705,12 @@ impl ThreadHandle {
             );
             jobs.restore(resumed.jobs.clone(), interrupted_jobs);
         }
+
+        // Before the first turn is started and before the loop runs: a
+        // dispatch the log carries without its submission is owed to this
+        // opening, and asking later would let the timer arm decide on a state
+        // that still has an unpaid delivery in it.
+        actor.replay_pending_dispatch().await;
 
         actor.start_next_turn().await;
         let join = tokio::spawn(actor.run(command_rx));
@@ -869,6 +886,24 @@ struct ThreadActor {
     /// Armed when a turn is cancelled. Past it, a turn that ignored the signal
     /// is aborted and the actor writes its terminal itself (US-008 AC5).
     straggler_deadline: Option<Instant>,
+    /// Every scheduling change the log carries, in order (EP-048).
+    ///
+    /// The sequence and not a projection: the timer arm re-folds it against a
+    /// FRESH instant at every wake, which is what makes the actor read the same
+    /// state a resume would have read, and what keeps a wall clock stepped
+    /// backwards from being a state anything cached could disagree with. Fed by
+    /// [`Self::commit`] itself, so the tool that creates a reminder and the
+    /// dispatch that spends it both reach it through the single writer.
+    schedule_changes: Vec<ScheduleChange>,
+    /// Set when a due reminder was refused, and the only thing standing between
+    /// a conserved reminder and a busy loop.
+    ///
+    /// Conservation means a refused dispatch stays `Overdue` (ADR-17), so the
+    /// decision that produced it stays due, and a timer armed on it would fire
+    /// again with no delay, forever. The flag disarms the arm until something
+    /// that could change the answer happens: a human input, which rearms the
+    /// budget, or the end of a turn, which frees the input queue.
+    schedule_deferred: bool,
     events: broadcast::Sender<RuntimeEvent>,
     status: watch::Sender<ThreadStatus>,
     finished_tx: mpsc::Sender<TurnFinished>,
@@ -928,6 +963,65 @@ async fn straggler(deadline: Option<Instant>) {
     }
 }
 
+/// Fires when `target_ms` has passed on the WALL clock, or never when no
+/// reminder is armed (US-155).
+///
+/// Same shape as [`straggler`], and for the same reason: a thread holding no
+/// reminder must contribute a future that never resolves, so the loop it sits
+/// in never wakes on its own account.
+///
+/// What differs is the sleep. The target is an epoch instant while the sleep is
+/// monotonic, and the two disagree across a system suspend, an NTP correction
+/// or a hand-set clock. So the wait is cut into segments of at most
+/// [`MAX_TIMER_SEGMENT`] and the WALL clock is read again after each one: the
+/// arm never trusts the elapsed time it was promised, only the time it reads.
+/// A clock stepped BACKWARDS therefore lengthens the wait instead of firing,
+/// which is what makes a wake impossible to trigger by moving the clock, and a
+/// clock jumped forward is noticed at the end of the current segment at the
+/// latest.
+///
+/// Time comes from the injected [`Clock`] alone: no `Instant::now`, no
+/// `SystemTime::now`, so a test drives three hours without waiting for any.
+async fn schedule_timer(clock: Arc<dyn Clock>, target_ms: Option<u64>) {
+    let Some(target_ms) = target_ms else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        let remaining = target_ms.saturating_sub(clock.now_ms());
+        if remaining == 0 {
+            return;
+        }
+        clock
+            .sleep(Duration::from_millis(remaining).min(MAX_TIMER_SEGMENT))
+            .await;
+    }
+}
+
+/// What the model reads when a reminder it asked for comes due.
+///
+/// Deliberately the smallest text that names the reminder and carries what was
+/// written: the framed, escaped form a prompt cannot impersonate is US-161, and
+/// it replaces the body of this one function. Composed here rather than at the
+/// creation site because a batch is ONE input, so the shape has to be able to
+/// carry several occurrences.
+fn reminder_notice(occurrences: &[DispatchedOccurrence]) -> String {
+    if let [only] = occurrences {
+        return format!(
+            "Scheduled reminder {} is due. You asked to be reminded of this:\n{}",
+            only.schedule_id, only.prompt
+        );
+    }
+    let mut out = format!("{} scheduled reminders are due.", occurrences.len());
+    for occurrence in occurrences {
+        out.push_str(&format!(
+            "\n- {}: {}",
+            occurrence.schedule_id, occurrence.prompt
+        ));
+    }
+    out
+}
+
 impl ThreadActor {
     /// Persists an event then advances the sequence. On failure the sequence
     /// does NOT move: a refused operation leaves no hole in the log.
@@ -947,6 +1041,39 @@ impl ThreadActor {
             return Err(error);
         }
         self.seq = self.seq.saturating_add(1);
+        // Fed from the single writer rather than from each call site: a
+        // reminder is created by a tool, deleted by another and spent by the
+        // dispatch below, and the sequence the timer folds has to carry all
+        // three without any of them remembering to say so.
+        match &event.payload {
+            ThreadEventPayload::ScheduleCreated {
+                schedule_id,
+                rule,
+                prompt,
+                due_at_ms,
+            } => self.schedule_changes.push(ScheduleChange::Created(
+                crate::schedule::ScheduleRecord {
+                    schedule_id: *schedule_id,
+                    rule: *rule,
+                    prompt: prompt.clone(),
+                    due_at_ms: *due_at_ms,
+                    created_at_ms: event.at_ms,
+                },
+            )),
+            ThreadEventPayload::ScheduleDispatched {
+                schedule_id,
+                accepted_at_ms,
+            } => self.schedule_changes.push(ScheduleChange::Dispatched {
+                schedule_id: *schedule_id,
+                accepted_at_ms: *accepted_at_ms,
+            }),
+            ThreadEventPayload::ScheduleDeleted { schedule_id } => {
+                self.schedule_changes.push(ScheduleChange::Deleted {
+                    schedule_id: *schedule_id,
+                });
+            }
+            _ => {}
+        }
         Ok(event)
     }
 
@@ -1009,10 +1136,14 @@ impl ThreadActor {
     }
 
     async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
+        // Cloned once, outside the loop: the timer arm is rebuilt at every
+        // iteration and may not borrow `self`.
+        let clock = Arc::clone(&self.clock);
         loop {
             // Copied out: the `select!` arms may not hold a borrow of `self`
             // while a handler takes it mutably.
             let deadline = self.straggler_deadline;
+            let target = self.schedule_target();
             tokio::select! {
                 // Biased: a terminal always wins over a new command, so the
                 // order the actor observes is deterministic under a race, and a
@@ -1034,9 +1165,41 @@ impl ThreadActor {
                         None => break,
                     }
                 }
+                // FIFTH and last (US-155). Placed after the four that were
+                // here, so the `biased;` order still gives a terminal, a
+                // cancellation and a force-stop deadline priority over a
+                // reminder: an echeance is the only one of the five that loses
+                // nothing by being served one iteration later, because the
+                // decision is recomputed from the wall clock every time.
+                () = schedule_timer(Arc::clone(&clock), target) => {
+                    self.on_schedule_due().await;
+                }
             }
         }
         self.shutdown(&mut commands).await;
+    }
+
+    /// Instant the timer arm is armed on, or `None` when nothing should wake
+    /// this thread.
+    ///
+    /// Recomputed from the change sequence at every iteration rather than
+    /// cached, so no invalidation rule has to be kept in step with a tool that
+    /// creates a reminder, a tool that deletes one, and a dispatch that spends
+    /// one. `None` covers three cases that must all disarm the arm: no reminder
+    /// at all, a reminder that was refused and is being conserved, and a thread
+    /// already shutting down.
+    fn schedule_target(&self) -> Option<u64> {
+        if self.schedule_deferred || self.shutting_down {
+            return None;
+        }
+        let now_ms = self.clock.now_ms();
+        let folded = fold_schedules(&self.schedule_changes, now_ms);
+        match due_decision(&folded, now_ms) {
+            // Already due: arm on the present instant, which the arm turns into
+            // a sleep of zero and a wake on the next poll.
+            DueDecision::OneShot { .. } | DueDecision::Recurring { .. } => Some(now_ms),
+            DueDecision::Wait { next_at_ms } => next_at_ms,
+        }
     }
 
     async fn on_command(&mut self, command: Command) {
@@ -1118,6 +1281,187 @@ impl ThreadActor {
         Some(accepted)
     }
 
+    /// Serves an echeance the timer arm woke on (US-156, US-157).
+    ///
+    /// The whole order of this handler is the guarantee: DECIDE, CHECK, WRITE,
+    /// SUBMIT. Deciding first is what makes the batch a function of the wall
+    /// clock read at this instant; checking before writing is what makes a
+    /// refusal cost nothing durable, so the reminder stays `Overdue` and comes
+    /// back; writing before submitting is the inversion of the harness, which
+    /// calls `agent.followup` at `runtime.ts:275` and appends its change at
+    /// `:284` and can therefore only promise at-least-once. Here the entry is
+    /// durable first, so a stop between the two leaves a dispatch nothing
+    /// acknowledged, which the next opening replays under the same derived key
+    /// and the acceptance map refuses a second time (invariant 12).
+    async fn on_schedule_due(&mut self) {
+        let now_ms = self.clock.now_ms();
+        let folded = fold_schedules(&self.schedule_changes, now_ms);
+        // `accepted_at_ms` follows the FORM of the decision and not the clock:
+        // a one-shot line carries none, which is what the fold reads to know it
+        // must spend the record, and a recurring batch carries the single
+        // instant the whole batch realigns on, so two reminders of one batch
+        // cannot land on two different slots.
+        let (batch, accepted_at_ms) = match due_decision(&folded, now_ms) {
+            // The arm fired on a target the clock no longer agrees with: a
+            // backwards step, or a reminder deleted while the segment ran.
+            // Nothing is dispatched and the next iteration rearms.
+            DueDecision::Wait { .. } => return,
+            DueDecision::OneShot { record } => (
+                vec![DispatchedOccurrence {
+                    schedule_id: record.schedule_id,
+                    occurrence_at_ms: record.due_at_ms,
+                    prompt: record.prompt,
+                }],
+                None,
+            ),
+            DueDecision::Recurring {
+                due,
+                accepted_at_ms,
+            } => (
+                due.into_iter()
+                    .map(|due| DispatchedOccurrence {
+                        schedule_id: due.record.schedule_id,
+                        occurrence_at_ms: due.occurrence_at_ms,
+                        prompt: due.record.prompt,
+                    })
+                    .collect(),
+                Some(accepted_at_ms),
+            ),
+        };
+        self.dispatch(batch, accepted_at_ms).await;
+    }
+
+    /// Refuses, writes, then submits ONE batch of due reminders.
+    ///
+    /// A batch is a single submission and a single turn: two reminders that
+    /// come due together are one interruption, not two, which is also what
+    /// keeps them from spending two thirds of the wake budget between them.
+    /// The key of the submission is that of the FIRST occurrence, and the
+    /// acceptance instant the batch shares is what lets a reopening rebuild the
+    /// same grouping and ask the same question about the same key.
+    async fn dispatch(&mut self, batch: Vec<DispatchedOccurrence>, accepted_at_ms: Option<u64>) {
+        let Some(first) = batch.first() else {
+            return;
+        };
+        let client_message_id = dispatch_message_id(first.schedule_id, first.occurrence_at_ms);
+
+        // Refusals FIRST, so nothing durable is spent by one. A running turn
+        // takes the reminder as a steer and answers about its own buffer; an
+        // idle thread is woken and answers about the shared budget.
+        let refusal = match self.turn.as_ref() {
+            Some(running) if running.inputs.len() >= MAX_PENDING_INPUTS => {
+                Some("the input queue is full")
+            }
+            Some(_) => None,
+            None if !self.wakes.may_wake() => Some("the wake budget is spent"),
+            None => None,
+        };
+        if let Some(reason) = refusal {
+            tracing::debug!(
+                target: "pyxis::runtime",
+                thread_id = %self.thread_id,
+                schedule_id = %first.schedule_id,
+                max = MAX_CONSECUTIVE_WAKES,
+                reason,
+                "reminder not dispatched and kept overdue"
+            );
+            self.schedule_deferred = true;
+            return;
+        }
+
+        for occurrence in &batch {
+            if let Err(error) = self
+                .commit(ThreadEventPayload::ScheduleDispatched {
+                    schedule_id: occurrence.schedule_id,
+                    accepted_at_ms,
+                })
+                .await
+            {
+                // Nothing is submitted: an entry the log does not carry must
+                // never become an input. The record stays due, the thread stays
+                // up, and the arm is disarmed because a store that just refused
+                // a write will refuse the next one at the same speed.
+                tracing::warn!(
+                    target: "pyxis::runtime",
+                    thread_id = %self.thread_id,
+                    schedule_id = %occurrence.schedule_id,
+                    error = %error,
+                    "reminder dispatch not persisted; the reminder stays due"
+                );
+                self.schedule_deferred = true;
+                return;
+            }
+        }
+
+        let submission = Submission {
+            text: reminder_notice(&batch),
+            client_message_id: Some(client_message_id),
+            origin: InputOrigin::Runtime,
+        };
+        self.deliver_dispatch(submission).await;
+    }
+
+    /// Puts a dispatched batch into the thread, wherever the thread is.
+    ///
+    /// A running turn takes it by the STEERING path, which hands it to the
+    /// engine at its next safe point and never between a `tool_use` and its
+    /// result; nothing is woken, so nothing is spent. An idle thread is woken
+    /// once, and the budget is spent only on a turn that was actually opened
+    /// AND made durable, on the rule [`Self::on_deliver_job`] already follows.
+    async fn deliver_dispatch(&mut self, submission: Submission) {
+        if self.turn.is_some() {
+            let _ = self.on_steer(submission, None).await;
+            return;
+        }
+        if self.on_submit(submission).await.is_ok() {
+            self.wakes.spend();
+        }
+    }
+
+    /// Replays a dispatch the log carries and no submission ever acknowledged
+    /// (US-156, edge cases 14 and 33).
+    ///
+    /// The fold spends a reminder as soon as its dispatch line is durable, so
+    /// after a stop between the write and the submission nothing in `active`
+    /// remembers the occurrence: [`crate::schedule::FoldedSchedules::dispatched`]
+    /// is what does. The question asked here is the only one that decides
+    /// anything: is the key that batch would have submitted under already in
+    /// the acceptance map? If it is, the delivery happened and this reopening
+    /// owes nothing, which is what makes two consecutive resumes write no
+    /// second dispatch. If it is not, the batch is submitted, once.
+    ///
+    /// Under `Quiet` the budget is zero, so nothing is opened and nothing is
+    /// written: the dispatch stays unacknowledged and the NEXT opening, of an
+    /// interactive client, is still able to replay it.
+    async fn replay_pending_dispatch(&mut self) {
+        let now_ms = self.clock.now_ms();
+        let folded = fold_schedules(&self.schedule_changes, now_ms);
+        let Some(first) = folded.dispatched.first() else {
+            return;
+        };
+        let client_message_id = dispatch_message_id(first.schedule_id, first.occurrence_at_ms);
+        if self.accepted.contains_key(&client_message_id) {
+            return;
+        }
+        if !self.wakes.may_wake() {
+            self.schedule_deferred = true;
+            return;
+        }
+        tracing::debug!(
+            target: "pyxis::runtime",
+            thread_id = %self.thread_id,
+            schedule_id = %first.schedule_id,
+            occurrences = folded.dispatched.len(),
+            "dispatched reminder replayed: its submission never reached the log"
+        );
+        let submission = Submission {
+            text: reminder_notice(&folded.dispatched),
+            client_message_id: Some(client_message_id),
+            origin: InputOrigin::Runtime,
+        };
+        self.deliver_dispatch(submission).await;
+    }
+
     /// Makes an input durable and announces it. The ONLY place an input becomes
     /// visible, so "durable before acknowledgement" holds for a submit and for a
     /// steer alike.
@@ -1134,13 +1478,16 @@ impl ThreadActor {
             })
             .await?;
         if let Some(key) = submission.client_message_id.clone() {
-            self.accepted.insert(
-                key,
-                Accepted {
-                    turn_id,
-                    event_id: event.event_id,
-                },
-            );
+            // FIRST acceptance wins, on the rule `resume.rs` already folds by:
+            // a keyed input the engine never consumed is re-admitted under a
+            // NEW turn, and overwriting here would hand a replaying client the
+            // identifiers of that second turn while a restarted process, which
+            // rebuilds the map from the log, would still hand it the first
+            // (invariant 12).
+            self.accepted.entry(key).or_insert(Accepted {
+                turn_id,
+                event_id: event.event_id,
+            });
         }
         // The single point where an input becomes visible is also the single
         // point where the wake budget is rearmed, so a submit and a steer are
@@ -1148,6 +1495,9 @@ impl ThreadActor {
         // (US-143 AC1).
         if submission.origin == InputOrigin::Human {
             self.wakes.rearm();
+            // A conserved reminder becomes deliverable again the moment the
+            // budget does, and this is the only place the budget rearms.
+            self.schedule_deferred = false;
         }
         self.publish(
             event.event_id,
@@ -1248,7 +1598,7 @@ impl ThreadActor {
             .map_err(|_| SubmitError::StoreFailed)?;
         // Queued only AFTER the event is durable: the engine must never consume
         // an input the log does not carry.
-        inputs.push(submission.text);
+        inputs.push(submission);
         self.publish_status();
         Ok(Accepted {
             turn_id: active,
@@ -1717,8 +2067,11 @@ impl ThreadActor {
             // turn of its own. It carries a new `TurnId` because the one it was
             // accepted under is terminal, and the engine takes an input exactly
             // once, so nothing is consumed twice.
-            for text in running.inputs.drain_remaining() {
-                let submission = Submission::new(text);
+            // Re-admitted AS IT WAS ACCEPTED, origin and idempotency key
+            // included: a reminder that a too-short turn never consumed is
+            // still a reminder, and coming back as a human input would rearm
+            // the wake budget it was meant to spend (US-157).
+            for submission in running.inputs.drain_remaining() {
                 let turn_id = TurnId::generate(self.ids.as_ref());
                 match self.persist_input(turn_id, &submission).await {
                     Ok(_) => self.pending.push_back((turn_id, submission)),
@@ -1729,6 +2082,9 @@ impl ThreadActor {
                 }
             }
             self.start_next_turn().await;
+            // The input queue a dispatch may have been refused on is drained by
+            // the turn that just ended, so the question is worth asking again.
+            self.schedule_deferred = false;
         }
         self.publish_status();
     }
