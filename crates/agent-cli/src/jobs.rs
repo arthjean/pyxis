@@ -124,12 +124,29 @@ mod tests {
     /// `Quiet` is what `-p` and the app-server pass; `Wake` is the interactive
     /// loop (EP-044).
     async fn wired_with(delivery: CompletionDelivery) -> Wired {
+        wired_on(
+            Arc::new(MemoryThreadStore::new()) as Arc<dyn ThreadStore>,
+            ExecSessions::new(),
+            delivery,
+            11,
+        )
+        .await
+    }
+
+    /// The same wiring on a log and a session store the caller already owns,
+    /// which is what a RESTART looks like from here: a second process opens the
+    /// durable log of the first and binds a registry of its own to the handle
+    /// the tools carry.
+    async fn wired_on(
+        store: Arc<dyn ThreadStore>,
+        sessions: ExecSessions,
+        delivery: CompletionDelivery,
+        seed: u64,
+    ) -> Wired {
         // The tools only need a directory that exists; nothing below writes to
         // it, so the process temp directory is enough and leaves nothing.
         let dir = std::env::temp_dir();
-        let sessions = ExecSessions::new();
-        let ids = Arc::new(SequentialIds::starting_at(11));
-        let store = Arc::new(MemoryThreadStore::new()) as Arc<dyn ThreadStore>;
+        let ids = Arc::new(SequentialIds::starting_at(seed));
         let registry = JobRegistry::new(
             Arc::clone(&ids) as Arc<_>,
             Arc::new(SystemClock),
@@ -149,8 +166,14 @@ mod tests {
                 max_pending_inputs: 16,
             },
         };
+        let thread_id = store
+            .read()
+            .await
+            .expect("the store reads")
+            .thread_id
+            .unwrap_or_else(|| ThreadId::generate(ids.as_ref()));
         let handle = ThreadHandle::start(ThreadOptions {
-            thread_id: ThreadId::generate(ids.as_ref()),
+            thread_id,
             store: Arc::clone(&store),
             runner: Arc::new(IdleRunner),
             turn_contexts: Arc::new(FixedTurnContext::new(turn_context))
@@ -287,6 +310,56 @@ mod tests {
             only_job(&w.registry).status.is_terminal(),
             "the job never settled"
         );
+    }
+
+    /// US-146 AC3: what the restart closed reaches the MODEL, and not only the
+    /// screen. The proof goes through the registered tool: `list_jobs` on the
+    /// same job handle the terminal tools carry, after a second process opened
+    /// the durable log of the first.
+    #[tokio::test]
+    async fn a_resumed_thread_hands_the_interrupted_job_to_list_jobs() {
+        let first = wired().await;
+        let sessions = first.ctx.sessions.clone();
+        let store = Arc::clone(&first.store);
+        agent_tools::ExecCommand
+            .call(exec("sleep 30", 250), &first.ctx)
+            .await
+            .expect("the session opens");
+        assert_eq!(only_job(&first.registry).status, JobStatus::Running);
+
+        // The crash: the process VANISHES. Dropping the handle would close the
+        // mailbox, the actor would reach its teardown, and the job would already
+        // be settled before the next run ever read the log.
+        let Wired { _handle, .. } = first;
+        std::mem::forget(_handle);
+
+        let second = wired_on(store, sessions, CompletionDelivery::Quiet, 500).await;
+        let listed = list_jobs(&second, None)
+            .await
+            .expect("the tool answers without a job id");
+
+        assert!(listed.contains("[killed]"), "{listed}");
+        assert!(listed.contains("sleep 30"), "{listed}");
+        assert!(
+            listed.contains(agent_runtime::jobs::RESTART_CAUSE),
+            "the model reads the same cause the screen shows: {listed}"
+        );
+        assert_eq!(
+            only_job(&second.registry).status,
+            JobStatus::Killed,
+            "no active job survived the restart"
+        );
+
+        // US-146 AC2 on the same wiring: the sentence the human reads at the top
+        // of the reopened session, composed from the registry the tools carry.
+        let notice = crate::interactive::interrupted_jobs_notice(&second.ctx.sessions)
+            .expect("the restart closed one job");
+        assert!(
+            notice.starts_with("1 background job interrupted by the restart:"),
+            "{notice}"
+        );
+        assert!(notice.contains("sleep 30"), "{notice}");
+        second.ctx.sessions.shutdown().await;
     }
 
     /// US-136 AC1/AC2: a terminal that stays open is a job of the thread, and

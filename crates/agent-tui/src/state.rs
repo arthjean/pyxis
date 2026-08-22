@@ -2430,6 +2430,8 @@ pub struct RuntimeFacts {
     pub max_agent_depth: usize,
     pub command_mailbox: usize,
     pub max_pending_inputs: usize,
+    pub active_jobs: usize,
+    pub max_active_jobs: usize,
 }
 
 /// Keys of `SessionFacts::config_sources`. They are the configuration key names,
@@ -2535,6 +2537,10 @@ pub fn session_status_report(state: &AppState, facts: SessionFacts<'_>) -> Strin
         runtime.max_active_agents,
         runtime.max_agents_per_root,
         runtime.max_agent_depth
+    ));
+    report.push_str(&format!(
+        "\n  background jobs: {} active (max {})",
+        runtime.active_jobs, runtime.max_active_jobs
     ));
     if !facts.tool_activity.is_empty() {
         report.push_str("\n  tools:");

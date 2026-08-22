@@ -883,6 +883,8 @@ fn runtime_status_narrow() {
                     max_agent_depth: 1,
                     command_mailbox: 64,
                     max_pending_inputs: 16,
+                    active_jobs: 2,
+                    max_active_jobs: 4,
                 },
             },
         )));
@@ -903,6 +905,37 @@ fn runtime_steering_notice() {
     insta::assert_snapshot!(
         "runtime_steering_notice",
         harness::frame("runtime_steering_notice", &s, W, H)
+    );
+}
+
+/// US-146 AC7: the notice a RESUME writes when the restart closed background
+/// jobs, one line per job. The text is passed as a literal because this crate
+/// renders and does not compose: `agent-cli` owns the sentence and asserts it,
+/// and the snapshot records what the human ends up reading.
+#[test]
+fn runtime_interrupted_jobs_notice() {
+    let mut s = runtime_state();
+    s.blocks.push(agent_tui::Block::Notice(
+        "2 background jobs interrupted by the restart:\n           job_5b1e07d4c2a9f38610be4d27a95c0f3e (npm run dev): interrupted: the process restarted \
+         while the background job was running\n           job_9f2c4a17b3d84e0192cf5a7b6d3e8140 (cargo watch -x test): interrupted: the process \
+         restarted while the background job was running"
+            .into(),
+    ));
+    insta::assert_snapshot!(
+        "runtime_interrupted_jobs_notice",
+        harness::frame("runtime_interrupted_jobs_notice", &s, W, H)
+    );
+}
+
+/// US-146 AC7, the other half: a resume that interrupted NOTHING pushes no
+/// notice at all. The snapshot is the proof that the absence is an absence, and
+/// not an empty block leaving a hole above the composer.
+#[test]
+fn runtime_no_interrupted_jobs_notice() {
+    let s = runtime_state();
+    insta::assert_snapshot!(
+        "runtime_no_interrupted_jobs_notice",
+        harness::frame("runtime_no_interrupted_jobs_notice", &s, W, H)
     );
 }
 

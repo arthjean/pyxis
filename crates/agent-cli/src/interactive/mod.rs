@@ -557,6 +557,13 @@ impl Loop {
                 initial_messages.len()
             )));
         }
+        // US-146 AC2: what the RESTART closed is said as the session opens, not
+        // at the end of the first turn. The registry is already bound and
+        // already reconciled at this point, so the notice reads the same facts
+        // `list_jobs` will hand the model.
+        if let Some(notice) = interrupted_jobs_notice(&cfg.exec_sessions) {
+            state.blocks.push(Block::Notice(notice));
+        }
         apply_runtime_status(&mut state, &status);
         // Empty transcript at startup -> the welcome screen (card + logo) shows
         // by itself (see `AppState::is_welcome`), no Notice to push.
@@ -1393,21 +1400,41 @@ pub fn compose_system(base: &str, goal: Option<&str>) -> String {
     }
 }
 
-/// Names the shell sessions a finished turn is leaving behind, or `None` when
+/// Names the background jobs a finished turn is leaving behind, or `None` when
 /// it left none.
+///
+/// Reads the REGISTRY and not the session store (US-146 AC1). The two answered
+/// the same thing while a session and a job were the same object, and they stop
+/// agreeing the moment a resume closes a job whose session store the dead run
+/// took with it. The registry is the durable half, so it is the half that
+/// answers; without one there is nothing this run is accountable for.
 ///
 /// The command is truncated on a char boundary: it is untrusted text that the
 /// model composed, and a hundred-line heredoc must not take over the screen.
 fn left_running_notice(sessions: &agent_tools::ExecSessions) -> Option<String> {
-    format_left_running(&sessions.open_sessions())
+    let registry = sessions.job_handle().registry()?;
+    format_left_running(&registry.snapshots())
 }
 
 /// Longest command line either notice shows.
 const MAX_NOTICE_COMMAND: usize = 60;
 
-/// First line of an untrusted command, cut on a char boundary.
+/// First line of an untrusted command, neutralized and cut on a char boundary.
+///
+/// A control character is replaced rather than dropped: the command the model
+/// composed can carry an ESC, and an escape sequence reaching the terminal would
+/// let the text it describes repaint the screen around it. Replacing keeps the
+/// length honest, which is what the truncation below counts.
 fn short_command(command: &str) -> String {
-    let single_line = command.split('\n').next().unwrap_or_default().trim();
+    let single_line: String = command
+        .split('\n')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let single_line = single_line.trim();
     let mut cut = MAX_NOTICE_COMMAND.min(single_line.len());
     while cut > 0 && !single_line.is_char_boundary(cut) {
         cut -= 1;
@@ -1417,6 +1444,44 @@ fn short_command(command: &str) -> String {
     } else {
         single_line.to_string()
     }
+}
+
+/// Names the background jobs a RESUME just closed, one line each, or `None`
+/// when the restart found nothing running (US-146 AC2).
+///
+/// Composed once, when the session opens, and never at end of turn: it reports
+/// an event that happened before this run existed, and a sentence about the
+/// previous process has nothing to say about the turn that just ended.
+pub(crate) fn interrupted_jobs_notice(sessions: &agent_tools::ExecSessions) -> Option<String> {
+    let registry = sessions.job_handle().registry()?;
+    format_interrupted_jobs(&registry.interrupted_by_restart())
+}
+
+/// Composes the notice from the jobs THIS resume closed, which the registry
+/// hands over already selected.
+///
+/// Filtering the full snapshot list on the durable cause would be wrong rather
+/// than merely coarse: the reconciliation is durable by design, so a job an
+/// earlier restart closed keeps that cause forever and every later reopening of
+/// the same log would repeat an interruption nobody just suffered.
+fn format_interrupted_jobs(interrupted: &[agent_runtime::JobSnapshot]) -> Option<String> {
+    if interrupted.is_empty() {
+        return None;
+    }
+    let count = interrupted.len();
+    let plural = if count > 1 { "s" } else { "" };
+    let mut notice = format!("{count} background job{plural} interrupted by the restart:");
+    for job in interrupted {
+        // The cause is repeated verbatim on each line rather than truncated: it
+        // is this crate's own constant, so nothing untrusted rides on it.
+        notice.push_str(&format!(
+            "\n  {} ({}): {}",
+            job.job_id,
+            short_command(&job.command),
+            agent_runtime::jobs::RESTART_CAUSE
+        ));
+    }
+    Some(notice)
 }
 
 /// Names the background jobs that ENDED and whose result nobody collected.
@@ -1456,19 +1521,21 @@ fn format_finished_jobs(unreported: &[agent_runtime::JobSnapshot]) -> Option<Str
     ))
 }
 
-fn format_left_running(open: &[(u64, String)]) -> Option<String> {
+fn format_left_running(jobs: &[agent_runtime::JobSnapshot]) -> Option<String> {
+    let open: Vec<&agent_runtime::JobSnapshot> =
+        jobs.iter().filter(|job| job.status.is_active()).collect();
     if open.is_empty() {
         return None;
     }
     let listed = open
         .iter()
-        .map(|(id, command)| format!("{id} ({})", short_command(command)))
+        .map(|job| format!("{} ({})", job.job_id, short_command(&job.command)))
         .collect::<Vec<_>>()
         .join(", ");
     let count = open.len();
     let plural = if count > 1 { "s" } else { "" };
     Some(format!(
-        "{count} shell session{plural} still running: {listed}. Each keeps running until it \
+        "{count} background job{plural} still running: {listed}. Each keeps running until it \
          finishes, until the agent ends it, or until this run does."
     ))
 }
@@ -1704,21 +1771,48 @@ pub(crate) fn new_session_path(dir: &Path) -> PathBuf {
 mod tests {
     use super::{
         Conversation, GOAL_DONE_MARKER, Switch, apply_runtime_status, compose_system,
-        format_left_running, is_running, left_running_notice, session_path_from_arg,
-        take_goal_done, workspace_file_mentions,
+        format_interrupted_jobs, format_left_running, interrupted_jobs_notice, is_running,
+        left_running_notice, session_path_from_arg, take_goal_done, workspace_file_mentions,
     };
+    use agent_runtime::JobSnapshot;
     use agent_runtime::lifecycle::TurnState;
     use agent_runtime::thread::{ThreadStatus, TurnStatus};
     use agent_tui::{AppState, Block};
     use std::path::Path;
     use std::time::SystemTime;
 
+    /// One job of the registry, as a notice composer reads it.
+    fn snapshot(seed: u64, command: &str, status: agent_runtime::JobStatus) -> JobSnapshot {
+        JobSnapshot {
+            job_id: agent_runtime::JobId::generate(&agent_runtime::SequentialIds::starting_at(
+                seed,
+            )),
+            kind: agent_runtime::JobKind::Terminal,
+            command: command.to_string(),
+            status,
+            reported: false,
+            exit_code: None,
+            cause: None,
+            started_at_ms: 0,
+            ended_at_ms: None,
+            attached: false,
+            token: Some(seed),
+        }
+    }
+
     /// A turn that leaves nothing running says nothing: a notice on every turn
     /// would be noise, and noise is what makes the real one invisible.
     #[test]
     fn a_turn_that_leaves_nothing_running_reports_nothing() {
         assert_eq!(format_left_running(&[]), None);
-        // The live path agrees with the pure one: a fresh store holds nothing.
+        // A registry that holds only SETTLED jobs is the same silence: what the
+        // turn leaves behind is what is still active, not what it ran.
+        assert_eq!(
+            format_left_running(&[snapshot(1, "npm test", agent_runtime::JobStatus::Completed)]),
+            None
+        );
+        // The live path agrees with the pure one: no registry is bound, so this
+        // run is accountable for nothing.
         assert_eq!(left_running_notice(&agent_tools::ExecSessions::new()), None);
     }
 
@@ -1728,9 +1822,13 @@ mod tests {
     #[test]
     fn a_long_command_is_cut_on_a_char_boundary() {
         let command = format!("écho {}", "é".repeat(80));
-        let notice = format_left_running(&[(7, command)]).expect("one session is left running");
+        let job = snapshot(7, &command, agent_runtime::JobStatus::Running);
+        let notice = format_left_running(&[job.clone()]).expect("one job is left running");
         assert!(
-            notice.starts_with("1 shell session still running: 7 (écho"),
+            notice.starts_with(&format!(
+                "1 background job still running: {} (écho",
+                job.job_id
+            )),
             "{notice}"
         );
         assert!(notice.contains('…'), "{notice}");
@@ -1740,21 +1838,87 @@ mod tests {
         );
     }
 
-    /// Only the first line of a command reaches the notice, and the count is
-    /// spelled in the plural once more than one session survives the turn.
+    /// US-146 AC6: an escape sequence in a command is neutralized before it
+    /// reaches the screen. The command is text the MODEL composed, and a raw ESC
+    /// would let it repaint the terminal around the notice that describes it.
     #[test]
-    fn several_sessions_are_listed_on_their_first_line() {
-        let notice = format_left_running(&[
-            (1, "cargo test --workspace\nsecond line".to_string()),
-            (3, "npm run dev".to_string()),
-        ])
-        .expect("two sessions are left running");
+    fn a_command_carrying_control_characters_is_neutralized() {
+        let notice = format_left_running(&[snapshot(
+            2,
+            "npm \u{1b}[31mrun\u{1b}[0m dev\u{7}",
+            agent_runtime::JobStatus::Running,
+        )])
+        .expect("one job is left running");
         assert!(
-            notice.starts_with(
-                "2 shell sessions still running: 1 (cargo test --workspace), 3 (npm run dev)."
-            ),
+            !notice.chars().any(char::is_control),
+            "no control character survives: {notice:?}"
+        );
+        assert!(notice.contains("npm  [31mrun [0m dev"), "{notice}");
+    }
+
+    /// Only the first line of a command reaches the notice, and the count is
+    /// spelled in the plural once more than one job survives the turn.
+    #[test]
+    fn several_jobs_are_listed_on_their_first_line() {
+        let first = snapshot(
+            1,
+            "cargo test --workspace\nsecond line",
+            agent_runtime::JobStatus::Running,
+        );
+        let second = snapshot(3, "npm run dev", agent_runtime::JobStatus::Running);
+        let notice = format_left_running(&[first.clone(), second.clone()])
+            .expect("two jobs are left running");
+        assert!(
+            notice.starts_with(&format!(
+                "2 background jobs still running: {} (cargo test --workspace), {} (npm run dev).",
+                first.job_id, second.job_id
+            )),
             "{notice}"
         );
+        assert!(!notice.contains("second line"), "{notice}");
+    }
+
+    /// US-146 AC2: a restart that closed nothing writes nothing. The selection
+    /// itself belongs to the registry, which alone knows which reconciliation
+    /// is the one that just happened; a resume that closed nothing hands an
+    /// empty list, and an unbound registry hands nothing at all.
+    #[test]
+    fn a_resume_that_interrupted_nothing_says_nothing() {
+        assert_eq!(format_interrupted_jobs(&[]), None);
+        assert_eq!(
+            interrupted_jobs_notice(&agent_tools::ExecSessions::new()),
+            None
+        );
+    }
+
+    /// US-146 AC2: one line per interrupted job, each naming its truncated
+    /// command and the cause the reconciliation made durable.
+    #[test]
+    fn each_job_a_restart_closed_gets_its_own_line() {
+        let mut first = snapshot(1, "npm run dev", agent_runtime::JobStatus::Killed);
+        first.cause = Some(agent_runtime::jobs::RESTART_CAUSE.to_string());
+        let mut second = snapshot(
+            3,
+            "cargo watch\nsecond line",
+            agent_runtime::JobStatus::Killed,
+        );
+        second.cause = Some(agent_runtime::jobs::RESTART_CAUSE.to_string());
+
+        let notice = format_interrupted_jobs(&[first.clone(), second.clone()])
+            .expect("two jobs were interrupted");
+
+        let lines: Vec<&str> = notice.lines().collect();
+        assert_eq!(lines.len(), 3, "a header and one line per job: {notice}");
+        assert_eq!(lines[0], "2 background jobs interrupted by the restart:");
+        assert_eq!(
+            lines[1],
+            format!(
+                "  {} (npm run dev): {}",
+                first.job_id,
+                agent_runtime::jobs::RESTART_CAUSE
+            )
+        );
+        assert!(lines[2].contains("cargo watch"), "{notice}");
         assert!(!notice.contains("second line"), "{notice}");
     }
 

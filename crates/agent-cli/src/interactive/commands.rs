@@ -485,6 +485,11 @@ impl Loop {
                 .blocks
                 .push(Block::Notice("Empty session.".into()));
         }
+        // US-146 AC2: `/resume` opens a thread exactly like a startup does, so
+        // it owes the same sentence about the jobs that reopening just closed.
+        if let Some(notice) = super::interrupted_jobs_notice(&self.cfg.exec_sessions) {
+            self.state.blocks.push(Block::Notice(notice));
+        }
     }
 
     // ──────────────────────── local inspection ────────────────────────
@@ -503,7 +508,14 @@ impl Loop {
                 // counts, failures and average durations per tool, refusals
                 // included.
                 tool_activity: &self.cfg.registry.dispatch_log().summary(),
-                runtime: runtime_facts(),
+                runtime: runtime_facts(
+                    self.cfg
+                        .exec_sessions
+                        .job_handle()
+                        .registry()
+                        .map(|registry| registry.active())
+                        .unwrap_or(0),
+                ),
             },
         );
         self.state.blocks.push(Block::Notice(report));
@@ -722,7 +734,7 @@ fn parse_turn_argument(arg: &str) -> Result<Option<agent_runtime::TurnId>, Strin
 /// Read from the runtime CONSTANTS, never from a setting: FR-20 forbids a
 /// configuration key for orchestration in v1, and a `/status` that read one
 /// would be describing a knob that does not exist.
-fn runtime_facts() -> agent_tui::RuntimeFacts {
+fn runtime_facts(active_jobs: usize) -> agent_tui::RuntimeFacts {
     agent_tui::RuntimeFacts {
         // EP-004 built the supervisor and its five tools but the binary does not
         // expose them yet, so a session of this version owns no child. Reported
@@ -733,6 +745,11 @@ fn runtime_facts() -> agent_tui::RuntimeFacts {
         max_agent_depth: agent_runtime::MAX_AGENT_DEPTH,
         command_mailbox: agent_runtime::COMMAND_MAILBOX,
         max_pending_inputs: agent_runtime::MAX_PENDING_INPUTS,
+        // US-146 AC4: unlike the sub-agent count above, this one is REAL. The
+        // registry is bound to the live thread, so `/status` can say how many
+        // of the slots are taken instead of only how many exist.
+        active_jobs,
+        max_active_jobs: agent_runtime::MAX_ACTIVE_JOBS,
     }
 }
 
@@ -1039,7 +1056,7 @@ mod tests {
     /// else would be describing a knob that does not exist.
     #[test]
     fn the_reported_limits_are_the_runtime_constants() {
-        let facts = runtime_facts();
+        let facts = runtime_facts(0);
         assert_eq!(facts.max_active_agents, agent_runtime::MAX_ACTIVE_AGENTS);
         assert_eq!(
             facts.max_agents_per_root,
@@ -1048,6 +1065,7 @@ mod tests {
         assert_eq!(facts.max_agent_depth, agent_runtime::MAX_AGENT_DEPTH);
         assert_eq!(facts.command_mailbox, agent_runtime::COMMAND_MAILBOX);
         assert_eq!(facts.max_pending_inputs, agent_runtime::MAX_PENDING_INPUTS);
+        assert_eq!(facts.max_active_jobs, agent_runtime::MAX_ACTIVE_JOBS);
     }
 
     #[test]

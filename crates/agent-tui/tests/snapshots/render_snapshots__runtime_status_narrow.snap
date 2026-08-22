@@ -22,8 +22,8 @@ expression: "harness::frame(\"runtime_status_narrow\", &s, NARROW, 32)"
     (running)  pending inputs: 2 (max
     16 per turn, mailbox 64)
     sub-agents: 0 active (max 4 active,
-    8 created, depth 1)
-
+    8 created, depth 1)  background
+    jobs: 2 active (max 4)
 
 
 
