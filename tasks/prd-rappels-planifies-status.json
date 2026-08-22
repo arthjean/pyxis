@@ -1,0 +1,295 @@
+{
+  "prd": {
+    "file": "tasks/prd-rappels-planifies.md",
+    "title": "Rappels planifiés",
+    "created_at": "2026-08-22",
+    "status": "IN_PROGRESS",
+    "updated_at": "2026-08-22"
+  },
+  "epics": [
+    {
+      "id": "EP-046",
+      "title": "Le domaine pur",
+      "status": "DONE",
+      "priority": "P0",
+      "stories_total": 4,
+      "stories_done": 4
+    },
+    {
+      "id": "EP-047",
+      "title": "L'écriture durable et la frontière de reprise",
+      "status": "READY",
+      "priority": "P0",
+      "stories_total": 3,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-048",
+      "title": "L'horloge dans l'acteur",
+      "status": "READY",
+      "priority": "P0",
+      "stories_total": 3,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-049",
+      "title": "Ce que le modèle voit",
+      "status": "READY",
+      "priority": "P0",
+      "stories_total": 5,
+      "stories_done": 0
+    },
+    {
+      "id": "EP-050",
+      "title": "La notice humaine et les documents",
+      "status": "READY",
+      "priority": "P1",
+      "stories_total": 2,
+      "stories_done": 0
+    }
+  ],
+  "stories": [
+    {
+      "id": "US-148",
+      "title": "Le vocabulaire d'un rappel est fermé et vérifié par le compilateur",
+      "epic": "EP-046",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [],
+      "started_at": "2026-08-22",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
+    },
+    {
+      "id": "US-149",
+      "title": "Le pli reconstruit l'état et ne rend jamais un fil inouvrable",
+      "epic": "EP-046",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-148"
+      ],
+      "started_at": "2026-08-22",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
+    },
+    {
+      "id": "US-150",
+      "title": "La décision d'échéance choisit un seul dû à la fois",
+      "epic": "EP-046",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-149"
+      ],
+      "started_at": "2026-08-22",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
+    },
+    {
+      "id": "US-151",
+      "title": "La récurrence saute au dernier créneau et ne rattrape jamais un arriéré",
+      "epic": "EP-046",
+      "status": "DONE",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-148"
+      ],
+      "started_at": "2026-08-22",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
+    },
+    {
+      "id": "US-152",
+      "title": "Trois variantes additives, et aucune version ne bouge",
+      "epic": "EP-047",
+      "status": "READY",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-148"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-153",
+      "title": "La reprise plie, rapporte, et n'exécute rien",
+      "epic": "EP-047",
+      "status": "READY",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-149",
+        "US-152"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-154",
+      "title": "ADR-17 distingue un rappel d'un processus ressuscité",
+      "epic": "EP-047",
+      "status": "READY",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-153"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-155",
+      "title": "Le bras de minuterie est borné et relit l'horloge murale à chaque réveil",
+      "epic": "EP-048",
+      "status": "READY",
+      "priority": "P0",
+      "size": "L",
+      "blocked_by": [
+        "US-150",
+        "US-152"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-156",
+      "title": "Un dispatch est durable avant d'être livré, et exactement une fois",
+      "epic": "EP-048",
+      "status": "READY",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-155"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-157",
+      "title": "Le budget de réveils est unique, partagé, et un refus conserve le rappel",
+      "epic": "EP-048",
+      "status": "READY",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-156"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-158",
+      "title": "schedule_create accepte exactement un sélecteur et nomme ce qu'il refuse",
+      "epic": "EP-049",
+      "status": "READY",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-152",
+        "US-155"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-159",
+      "title": "schedule_list rend l'état plié sans qu'aucun identifiant ne soit à retenir",
+      "epic": "EP-049",
+      "status": "READY",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-158"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-160",
+      "title": "schedule_delete traite un inconnu comme un succès",
+      "epic": "EP-049",
+      "status": "READY",
+      "priority": "P0",
+      "size": "S",
+      "blocked_by": [
+        "US-158"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-161",
+      "title": "Le rappel arrive dans un cadre qui se déclare non fiable",
+      "epic": "EP-049",
+      "status": "READY",
+      "priority": "P0",
+      "size": "M",
+      "blocked_by": [
+        "US-156"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-162",
+      "title": "Le sélecteur at prend une date civile dans un fuseau nommé",
+      "epic": "EP-049",
+      "status": "READY",
+      "priority": "P1",
+      "size": "L",
+      "blocked_by": [
+        "US-158"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-163",
+      "title": "La notice de reprise nomme les rappels dus et les rappels à venir",
+      "epic": "EP-050",
+      "status": "READY",
+      "priority": "P1",
+      "size": "M",
+      "blocked_by": [
+        "US-153",
+        "US-157"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    },
+    {
+      "id": "US-164",
+      "title": "Les catalogues et les documents disent la vérité après le lot",
+      "epic": "EP-050",
+      "status": "READY",
+      "priority": "P1",
+      "size": "M",
+      "blocked_by": [
+        "US-158",
+        "US-159",
+        "US-160"
+      ],
+      "started_at": null,
+      "completed_at": null,
+      "reviewed_at": null
+    }
+  ]
+}
