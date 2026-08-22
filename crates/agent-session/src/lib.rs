@@ -1508,6 +1508,87 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// US-152 AC6: the three schedule entries are additive by construction, on
+    /// the pattern the job entries set. A v1 reader knows none of them, so each
+    /// line deserializes to `SessionEntry::Unknown` and the transcript resumes
+    /// past them.
+    #[test]
+    fn a_v1_reader_maps_the_three_schedule_entries_to_unknown_and_resumes_past_them() {
+        use agent_runtime::event::{THREAD_RUNTIME_VERSION, ThreadEventPayload};
+        use agent_runtime::id::{EventId, ScheduleId, SequentialIds};
+        use agent_runtime::schedule::ScheduleRule;
+
+        assert_eq!(
+            (SESSION_SCHEMA_VERSION, THREAD_RUNTIME_VERSION),
+            (1, 1),
+            "the schedule entries are additive: bumping either version would make every new file unreadable by an older binary"
+        );
+
+        let ids = SequentialIds::new();
+        let thread_id = ThreadId::generate(&ids);
+        let schedule_id = ScheduleId::generate(&ids);
+        let payloads = [
+            ThreadEventPayload::ScheduleCreated {
+                schedule_id,
+                rule: ScheduleRule::Every {
+                    first_at_ms: 1_700_000_000_000,
+                    interval_seconds: 300,
+                },
+                prompt: "relire le journal".into(),
+                due_at_ms: 1_700_000_000_000,
+            },
+            ThreadEventPayload::ScheduleDispatched {
+                schedule_id,
+                accepted_at_ms: Some(1_700_000_300_000),
+            },
+            ThreadEventPayload::ScheduleDeleted { schedule_id },
+        ];
+        let lines: Vec<String> = payloads
+            .into_iter()
+            .enumerate()
+            .map(|(i, payload)| {
+                serde_json::to_string(&ThreadLine::ThreadEvent(ThreadEvent {
+                    event_id: EventId::generate(&ids),
+                    thread_id,
+                    seq: i as u64 + 1,
+                    at_ms: 2_000 + i as u64,
+                    payload,
+                }))
+                .unwrap()
+            })
+            .collect();
+
+        for line in &lines {
+            assert!(
+                matches!(
+                    serde_json::from_str::<SessionEntry>(line).unwrap(),
+                    SessionEntry::Unknown
+                ),
+                "a v1 reader must map a schedule entry to Unknown, not fail on it: {line}"
+            );
+        }
+
+        let dir = tmp("schedule-entries");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SESSION_FILE);
+        let meta = format!("{{\"entry\":\"meta\",\"schema_version\":{SESSION_SCHEMA_VERSION}}}");
+        let user = serde_json::to_string(&SessionEntry::Message(Message::user("ok"))).unwrap();
+        let answer =
+            serde_json::to_string(&SessionEntry::Message(Message::assistant_text("done"))).unwrap();
+        let schedules = lines.join("\n");
+        std::fs::write(&path, format!("{meta}\n{user}\n{schedules}\n{answer}\n")).unwrap();
+
+        let resumed = resume_file(&path).unwrap();
+        assert_eq!(
+            resumed.messages.len(),
+            2,
+            "the three schedule entries are skipped, never counted as transcript"
+        );
+        assert_eq!(resumed.messages[0].text(), "ok");
+        assert_eq!(resumed.messages[1].text(), "done");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// US-133 AC2: the version stays at 1, so bytes written before this lot
     /// reopen unchanged. The lines below are literal on purpose: they are what
     /// an older binary wrote, not what the current types re-serialize.
