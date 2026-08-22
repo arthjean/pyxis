@@ -618,12 +618,14 @@ L'autorité d'un enfant est l'**intersection** de celle du parent et de la deman
 de spawn, jamais plus large ; par défaut, lecture seule. Un enfant mutateur n'est
 pas livré (`docs/DECISIONS.md`, no-go mesuré).
 
-État livré : le runtime, les bornes, l'autorité, le handoff et les cinq outils
-(`spawn_agent`, `list_agents`, `wait_agent`, `send_agent`, `interrupt_agent`) sont
-écrits et testés. Le binaire, lui, ne les enregistre pas encore et démarre son
-thread sans superviseur : exposer un enfant demande un spawner côté client
-capable de construire un registre d'outils restreint à son autorité, ce qui reste
-à livrer (voir `docs/CURRENT_STATUS.md`, section *Deferred*).
+État livré : le runtime, les bornes, l'autorité, le handoff et les six outils
+(`spawn_agent`, `send_message`, `followup_task`, `list_agents`, `wait_agent`,
+`interrupt_agent`) sont écrits et testés. Le binaire les enregistre
+(`crates/agent-cli/src/main.rs:1906-1911`) et construit le spawner qui bâtit le
+registre d'outils d'un enfant depuis l'autorité du parent
+(`crates/agent-cli/src/subagents.rs`) ; ce que chaque outil expose réellement au
+modèle dépend ensuite du `multi_agent_version` du catalogue
+([`docs/tool-catalog.md`](tool-catalog.md)).
 
 ---
 
