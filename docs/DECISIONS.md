@@ -22,6 +22,7 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/CURRENT_S
 | ADR-14 | Garde-fou de boucle : échelle vétoiste `[3, 5, 8]`, rappel borné, clé intacte | Accepté (2026-08-20) |
 | ADR-15 | Déversement de sortie d'outil : racine sous `.pyxis` du workspace, meilleur effort strict, plafond de crate | Accepté (2026-08-21) |
 | ADR-16 | Frontière de survie des travaux de fond : enregistrements durables, processus non ; une reprise rapporte et n'exécute rien | Accepté (2026-08-22) |
+| ADR-17 | Frontière de délivrance des rappels planifiés : un rappel n'a pas de processus, la reprise plie et rapporte, l'acteur vivant délivre sur le budget de réveils unique | Accepté (2026-08-22) |
 
 ---
 
@@ -658,3 +659,50 @@ La question posée par le plan est de savoir si « un redémarrage le retrouve �
 - **Un journal écrit avant ce lot se rouvre sans travail et sans erreur.** Aucune entrée de travail n'y existe, donc la reconstruction en trouve zéro et n'écrit rien ; `SESSION_SCHEMA_VERSION` reste à 1 et aucune migration n'est nécessaire.
 - **La notice de reprise nomme une commande composée par le modèle.** Elle est neutralisée de ses caractères de contrôle et tronquée sur frontière de caractère avant d'atteindre l'écran, sur le même chemin que la notice de fin de tour.
 - **Le jour où la survie réelle deviendrait un besoin**, les trois coûts nommés plus haut sont le devis, et le trou d'identité par pid est la question à résoudre en premier. Rouvrir cet ADR est le passage obligé ; l'ajouter par une pull request ne l'est pas.
+
+---
+
+## ADR-17 : Frontière de délivrance des rappels planifiés
+
+**Statut.** Accepté 2026-08-22. Lot des rappels planifiés, EP-047. Aucune clé de configuration n'est ouverte, `SESSION_SCHEMA_VERSION` reste à 1, `THREAD_RUNTIME_VERSION` reste à 1 et aucune migration n'est écrite : les trois entrées de planification sont additives, et un lecteur antérieur les mappe sur `SessionEntry::Unknown`. **ADR-16 n'est pas modifié** ; cet ADR en précise la lecture sans en toucher une ligne, et ADR-16 reste tel quel. N'altère ni ADR-12, qui fixe la façon dont `agent-runtime` atteint `run_agent`, ni ADR-14, dont le garde-fou porte sur la boucle modèle-outil et non sur l'ouverture d'un tour. Les surfaces qu'il contraint sont `crates/agent-runtime/src/schedule.rs`, `crates/agent-runtime/src/thread.rs` et `crates/agent-runtime/src/resume.rs`.
+
+**Contexte.** ADR-16 a tranché qu'une reprise **rapporte et n'exécute rien**. Un rappel planifié rouvre la question sous un angle qu'elle n'avait pas prévu : un fil rouvert peut porter un rappel dont l'échéance est passée pendant que Pyxis était arrêté. Le délivrer est-il exactement ce qu'ADR-16 interdit ?
+
+La tentation de répondre oui vient d'une lecture par analogie : un travail de fond en retard n'est pas relancé, donc un rappel en retard ne serait pas délivré. Mais la clause d'ADR-16 ne porte pas sur le retard. Elle porte sur ce dont la reprise **ne peut pas prouver l'identité** : un pid recyclé, un processus dont rien dans l'enregistrement n'établit que le numéro qu'il porte au redémarrage est celui qui a été lancé. C'est cette impossibilité qui fait que ressusciter est partiel là où rapporter est complet.
+
+Un rappel n'a pas de processus. Ce que son enregistrement porte est un **texte que l'humain a écrit d'avance**, avec l'instant où il a demandé qu'il lui revienne. Il n'y a ni pid, ni groupe de processus, ni puits de sortie, ni rien dont l'identité pourrait avoir été recyclée : le journal porte l'intégralité de ce qu'il faut pour délivrer, et la relecture du journal la prouve.
+
+**Décision.** Un rappel n'est pas un processus ressuscité. La frontière se pose entre le code de reprise et l'acteur vivant, pas entre l'avant et l'après d'un arrêt.
+
+- **La reprise plie et rapporte.** `resume.rs` traduit les trois entrées durables en `ScheduleChange` et rend l'état plié dans `ResumedThread`. Elle n'appelle aucune soumission, n'ouvre aucun tour, n'écrit aucune entrée et ne dépense aucun réveil. Un rappel dont l'échéance est passée est **nommé** `Overdue` dans le rapport, et rien de plus.
+- **L'acteur vivant délivre, par le chemin ordinaire.** Ce qui dispatche un rappel en retard est le bras de minuterie du `select!` de l'acteur, une fois celui-ci démarré, exactement comme il dispatcherait une échéance atteinte pendant que le fil tournait. Il n'existe pas de chemin de délivrance propre à la reprise : le retard n'est pas un cas particulier, c'est une échéance déjà atteinte au moment où le bras s'arme.
+- **L'état planifié n'est jamais stocké, il est reconstruit.** L'échéance courante d'un rappel récurrent est recalculée à partir de son entrée de création et de l'instant d'acceptation de son dernier dispatch. Aucun champ « prochaine échéance » n'est durable, donc aucune reprise ne peut lire une valeur qui aurait divergé de ce que le journal raconte.
+- **Le budget de réveils est unique.** `WakeBudget` (`crates/agent-runtime/src/jobs.rs`) borne à `MAX_CONSECUTIVE_WAKES` **tous** les producteurs de tours non demandés, quels qu'ils soient. Un rappel dispatché dépense un réveil du même budget qu'une fin de travail de fond, et une entrée humaine le réarme, elle seule. **Un second budget est explicitement refusé** : le seuil répond à la question « ce fil est-il en train de se parler à lui-même ? », qui est une propriété du fil et non du producteur. Deux budgets de trois font six tours non demandés d'affilée tout en laissant chaque compteur affirmer qu'il a respecté sa borne, ce qui est très exactement la boucle que la borne existe pour empêcher.
+- **La conservation prime la délivrance.** Un dispatch refusé faute de budget **laisse l'enregistrement en `Overdue`** et ne le perd pas. Le rappel reste dans le pli, reste dû, et repart dès que le budget est réarmé par une entrée humaine. Un rappel n'est jamais consommé par une tentative refusée : ce que l'humain a écrit d'avance ne disparaît pas parce qu'un travail de fond a parlé trois fois avant lui.
+
+**Justification.**
+
+- **La distinction d'ADR-16 est enregistrement contre processus, pas passé contre présent.** Ce qu'une reprise ne doit jamais faire est ressusciter une exécution dont elle ne peut pas prouver l'identité. Soumettre le texte d'un rappel n'est pas une résurrection : c'est la lecture d'un enregistrement dont le journal porte la totalité, et dont l'identité est celle de son `ScheduleId`, écrit une fois et jamais recyclé. Invoquer ADR-16 pour refuser un rappel en retard revient à confondre sa clause avec son exemple.
+- **Faire délivrer la reprise casserait la frontière pour de vrai.** C'est là que la lecture inverse est fausse : le danger n'est pas de délivrer un rappel en retard, il est de faire du code de reprise un chemin d'exécution. Une reprise qui soumet ouvre un tour avant que l'acteur ne serve sa première commande, hors du `select!`, hors de l'arbre d'annulation qui n'existe pas encore et hors du budget. Garder la reprise pure est ce qui rend la question « qu'est-ce qui a ouvert ce tour ? » toujours répondable, et ce qui fait de `plan` une fonction pure du journal, rejouable autant de fois qu'on veut sans effet.
+- **L'idempotence vient de la clé de message, pas d'un drapeau.** Une double reprise consécutive ne peut pas réécrire un dispatch, parce que la reprise n'en écrit aucun ; et un dispatch soumis par l'acteur porte un `client_message_id` dérivé du rappel et de son créneau, donc l'invariant 12 le déduplique sans qu'un drapeau ad hoc ait à exister.
+- **Un ADR, pas une note.** La règle de frontière d'`AGENTS.md` tranche seule : une pull request sur `crates/` peut faire soumettre `resume.rs`, ou ouvrir un second compteur de réveils pour les rappels, ou laisser un dispatch refusé effacer son enregistrement. Ce sont trois régressions qu'aucun test de style ne rattrape et que le compilateur autorise.
+
+**Alternatives écartées.**
+
+| Option | Pourquoi écartée |
+|---|---|
+| **La reprise délivre elle-même les rappels en retard** | Fait du code de reprise un chemin d'exécution, ce qu'ADR-16 interdit pour de bon. Le tour s'ouvrirait avant que l'acteur ne serve sa première commande, donc hors du `select!`, hors de l'arbre d'annulation et hors du budget de réveils ; `plan` cesserait d'être une fonction pure du journal et une reprise en lecture seule écrirait. Le gain visé, délivrer plus tôt, se mesure en millisecondes, puisque l'acteur démarre juste après. |
+| **Attendre une entrée humaine avant toute délivrance** | Rend le rappel inutile : sa raison d'être est précisément d'arriver quand personne n'a rien demandé. Une échéance qui ne se réalise qu'au prochain message de l'humain est un pense-bête que l'humain doit penser à consulter, ce qui est le problème que la fonctionnalité résout. Le garde-fou contre les tours non demandés existe déjà, et c'est le budget. |
+| **Un budget de réveils séparé pour les rappels** | Deux budgets de trois donnent six tours non demandés d'affilée, chaque compteur affirmant qu'il a respecté sa borne. Le seuil répond à « ce fil se parle-t-il à lui-même ? », une propriété du fil et non du producteur. Séparer les compteurs achète une borne dont la valeur totale n'est écrite nulle part, ce qui est la définition d'une borne qui ne borne pas. |
+| **Un dispatch refusé par le budget supprime l'enregistrement** | Perdrait ce que l'humain a écrit d'avance à cause d'un travail de fond qui a parlé trois fois avant lui. La conservation coûte zéro entrée durable, puisque `Overdue` est un état plié et non un état stocké : ne rien écrire est déjà le comportement correct. |
+| **Persister la prochaine échéance d'un rappel récurrent** | Ouvre la divergence entre un champ stocké et ce que le journal raconte, et fait de chaque reprise un lecteur d'une valeur que personne ne revérifie. Le recalcul à partir de l'entrée de création et de l'instant d'acceptation est déterministe et se prouve sans horloge. |
+| **Une clé de configuration pour choisir si un rappel en retard est délivré** | Interdite par l'invariant 15, et pire, ferait de la frontière une préférence. Une frontière qu'une variable d'environnement déplace n'est pas opposable à une pull request. |
+| **Modifier ADR-16 pour y inscrire l'exception** | ADR-16 est livré et son texte est exact : sa clause porte déjà sur l'identité d'une exécution, pas sur le retard. Ce qui manquait était la lecture, pas la règle. Réécrire un ADR accepté pour rattraper une lecture erronée déplacerait la trace de la décision au lieu de l'ajouter. |
+
+**Conséquences & risques.**
+
+- **Un rappel dû pendant un arrêt long arrive au redémarrage, pas à l'heure dite.** Le pli le nomme `Overdue`, l'acteur le dispatche dès que son bras s'arme, et le texte livré est celui que l'humain avait écrit. C'est le comportement voulu ; ce qui n'existe pas est une notification hors de Pyxis.
+- **Une salve de rappels en retard partage trois réveils avec les travaux de fond.** Au-delà, les suivants restent `Overdue` et attendent une entrée humaine. Le mode d'échec est un retard supplémentaire, jamais une perte.
+- **Un journal écrit avant ce lot se rouvre sans rappel et sans erreur.** Aucune entrée de planification n'y existe, donc le pli en trouve zéro et n'écrit rien.
+- **Un enregistrement de planification illisible est compté, pas fatal.** Le fil s'ouvre, le compteur d'illisibles est rapporté, et les autres rappels fonctionnent : une entrée corrompue ne prend pas le fil en otage.
+- **Le jour où une délivrance hors session deviendrait un besoin**, c'est un autre transport et un autre ADR. `ScheduleDelivery` n'a qu'une valeur, `SessionLocal`, et cette unicité est ce qui rend le manque explicite plutôt que silencieux.
