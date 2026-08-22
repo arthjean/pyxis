@@ -1147,6 +1147,16 @@ impl Loop {
         {
             self.state.blocks.push(Block::Notice(notice));
         }
+        // A job that FINISHED and whose result nobody read is the other half of
+        // the same promise (US-140 AC4): a background build that ended while
+        // the agent was elsewhere must not disappear in silence. A job already
+        // reported is not named again, which is what keeps the notice from
+        // repeating itself at every turn (US-140 AC3).
+        if !self.running
+            && let Some(notice) = finished_jobs_notice(&self.cfg.exec_sessions)
+        {
+            self.state.blocks.push(Block::Notice(notice));
+        }
         // `Stop` fires when the agent really stops, hence not when the goal loop
         // or a queued input opens another turn right away.
         if !self.running && self.cfg.hooks.watches(agent_tools::HookEvent::Stop) {
@@ -1392,25 +1402,67 @@ fn left_running_notice(sessions: &agent_tools::ExecSessions) -> Option<String> {
     format_left_running(&sessions.open_sessions())
 }
 
+/// Longest command line either notice shows.
+const MAX_NOTICE_COMMAND: usize = 60;
+
+/// First line of an untrusted command, cut on a char boundary.
+fn short_command(command: &str) -> String {
+    let single_line = command.split('\n').next().unwrap_or_default().trim();
+    let mut cut = MAX_NOTICE_COMMAND.min(single_line.len());
+    while cut > 0 && !single_line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    if cut < single_line.len() {
+        format!("{}…", &single_line[..cut])
+    } else {
+        single_line.to_string()
+    }
+}
+
+/// Names the background jobs that ENDED and whose result nobody collected.
+///
+/// Reads the registry, which is the only place that knows the difference: a
+/// finished job is gone from the session store, and its report flag is the one
+/// fact that says whether the model was ever told. `None` without a registry,
+/// where there is nothing to account for.
+pub(crate) fn finished_jobs_notice(sessions: &agent_tools::ExecSessions) -> Option<String> {
+    let registry = sessions.job_handle().registry()?;
+    format_finished_jobs(&registry.unreported())
+}
+
+fn format_finished_jobs(unreported: &[agent_runtime::JobSnapshot]) -> Option<String> {
+    if unreported.is_empty() {
+        return None;
+    }
+    let listed = unreported
+        .iter()
+        .map(|job| {
+            let end = match job.exit_code {
+                Some(code) => format!("exit code {code}"),
+                None => job
+                    .cause
+                    .as_deref()
+                    .map(short_command)
+                    .unwrap_or_else(|| job.status.as_str().to_string()),
+            };
+            format!("{} ({}, {end})", job.job_id, short_command(&job.command))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let count = unreported.len();
+    let plural = if count > 1 { "s" } else { "" };
+    Some(format!(
+        "{count} background job{plural} finished unread: {listed}. Ask the agent to read one with list_jobs."
+    ))
+}
+
 fn format_left_running(open: &[(u64, String)]) -> Option<String> {
-    const MAX_COMMAND: usize = 60;
     if open.is_empty() {
         return None;
     }
     let listed = open
         .iter()
-        .map(|(id, command)| {
-            let single_line = command.split('\n').next().unwrap_or_default().trim();
-            let mut cut = MAX_COMMAND.min(single_line.len());
-            while cut > 0 && !single_line.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            if cut < single_line.len() {
-                format!("{id} ({}…)", &single_line[..cut])
-            } else {
-                format!("{id} ({single_line})")
-            }
-        })
+        .map(|(id, command)| format!("{id} ({})", short_command(command)))
         .collect::<Vec<_>>()
         .join(", ");
     let count = open.len();

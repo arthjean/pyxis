@@ -74,8 +74,8 @@ struct TestProcess;
 
 #[async_trait::async_trait]
 impl JobProcess for TestProcess {
-    async fn read_output(&self) -> Result<Vec<u8>, String> {
-        Ok(Vec::new())
+    async fn read_output(&self) -> Result<agent_runtime::jobs::JobOutput, String> {
+        Ok(agent_runtime::jobs::JobOutput::default())
     }
 
     async fn stop(&self) {}
@@ -415,4 +415,77 @@ async fn an_interruption_during_a_registration_leaves_the_registry_coherent() {
             }
         }
     }
+}
+
+/// US-140 AC3 and AC5: `unreported` names the finished jobs nothing announced,
+/// the flag flips exactly once, and a thread reopened on the same log reads the
+/// flag back instead of re-announcing what was already delivered.
+#[tokio::test]
+async fn the_report_flag_is_written_once_and_read_back_by_a_reopened_thread() {
+    let memory = Arc::new(MemoryThreadStore::new());
+    let store = Arc::clone(&memory) as Arc<dyn ThreadStore>;
+    let first = open(Arc::clone(&store), 1).await;
+    let read = first
+        .jobs
+        .register(JobKind::Terminal, "cargo build", 0)
+        .await
+        .expect("the registration is accepted");
+    let unread = first
+        .jobs
+        .register(JobKind::Terminal, "cargo test", 0)
+        .await
+        .expect("the registration is accepted");
+    for job in [read.job_id, unread.job_id] {
+        first
+            .jobs
+            .settle(job, JobOutcome::Completed { exit_code: 0 })
+            .await
+            .expect("the job is known");
+    }
+
+    assert!(
+        first.jobs.mark_reported(read.job_id).await.expect("known"),
+        "the first collection is the flip"
+    );
+    assert!(
+        !first.jobs.mark_reported(read.job_id).await.expect("known"),
+        "reading it again announces nothing"
+    );
+    assert_eq!(
+        first
+            .jobs
+            .unreported()
+            .iter()
+            .map(|job| job.job_id)
+            .collect::<Vec<_>>(),
+        vec![unread.job_id],
+        "only what nobody read"
+    );
+    first.handle.shutdown().await;
+
+    memory.reopen();
+    let second = open(Arc::clone(&store), 500).await;
+    let trace = job_trace(&store).await;
+    assert_eq!(
+        steps(&trace, read.job_id),
+        vec!["registered", "completed", "reported"],
+        "one durable line for the flip, and only one"
+    );
+    assert_eq!(
+        steps(&trace, unread.job_id),
+        vec!["registered", "completed"]
+    );
+    assert_eq!(
+        second
+            .jobs
+            .unreported()
+            .iter()
+            .map(|job| job.job_id)
+            .collect::<Vec<_>>(),
+        vec![unread.job_id],
+        "the reopened thread does not re-announce a delivered result"
+    );
+    second.handle.shutdown().await;
+    drop(first.root);
+    drop(second.root);
 }

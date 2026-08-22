@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use agent_runtime::jobs::{JobLaunch, JobLauncher, JobProcess};
+use agent_runtime::jobs::{JobLaunch, JobLauncher, JobOutput, JobProcess};
 use agent_tools::ExecSessions;
 
 /// Starts the terminal a registered job stands for.
@@ -48,9 +48,14 @@ struct TerminalJobProcess {
 
 #[async_trait::async_trait]
 impl JobProcess for TerminalJobProcess {
-    async fn read_output(&self) -> Result<Vec<u8>, String> {
+    /// The transcript of the session, not its cursor.
+    ///
+    /// `write_stdin` keeps the consuming read that makes its poll loop advance;
+    /// what the registry hands the model is the whole output, and handing it
+    /// twice hands the same bytes (US-139 AC1/AC2).
+    async fn read_output(&self) -> Result<JobOutput, String> {
         self.sessions
-            .drain_output(self.session_id)
+            .transcript(self.session_id)
             .map_err(|e| e.to_string())
     }
 
@@ -326,6 +331,9 @@ mod tests {
             job_trace(&w.store).await,
             vec![
                 "registered true".to_string(),
+                // US-140: the answer that carries the exit code IS the report,
+                // so the flag is durable before the settle it belongs to.
+                "reported".to_string(),
                 "completed Some(0) None".to_string()
             ]
         );
@@ -488,7 +496,7 @@ mod tests {
         assert!(job.reported, "the owner was told before the stop");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         loop {
-            if w.ctx.sessions.drain_output(1).is_err() || tokio::time::Instant::now() >= deadline {
+            if w.ctx.sessions.transcript(1).is_err() || tokio::time::Instant::now() >= deadline {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;

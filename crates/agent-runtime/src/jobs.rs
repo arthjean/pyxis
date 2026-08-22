@@ -49,6 +49,17 @@ pub const MAX_ACTIVE_JOBS: usize = 4;
 /// is an invocation, not a script.
 pub const MAX_JOB_COMMAND: usize = 4_000;
 
+/// Bytes of a job's output the registry keeps for its FINAL relève (US-139).
+///
+/// Deliberately larger than `agent_tools::tool::MAX_TOOL_OUTPUT_BYTES`: the
+/// relève is a plain tool result, so anything above that smaller bound already
+/// goes through the spill of ADR-15 and reaches the model as a path. A bound
+/// below it would truncate before the spill could ever trigger, and the model
+/// would silently lose the head of a long build for no reason. Keeping the tail
+/// is the same policy the terminals apply: on a chatty process the end carries
+/// the diagnosis.
+pub const MAX_JOB_OUTPUT: usize = 131_072;
+
 /// Cause persisted for a job its thread stopped on the way down. Named so every
 /// surface reports the same sentence for the same event.
 pub const TEARDOWN_CAUSE: &str = "interrupted: the thread stopped while the job was running";
@@ -209,6 +220,39 @@ pub struct JobSnapshot {
     /// rebuilt from a log is detached: nothing here can stop it, because the
     /// process that owned it is gone.
     pub attached: bool,
+    /// Producer handle the job was registered with, carried verbatim. `None`
+    /// for a job rebuilt from a log, exactly like `attached`: the run that
+    /// minted it is gone. The registry still does not read it; it repeats it,
+    /// so a surface that DOES know what a shell is can tell the model which
+    /// session id reaches this job.
+    pub token: Option<u64>,
+}
+
+/// Everything a job has produced so far, as its producer retained it.
+///
+/// Not a cursor. The incremental read `write_stdin` performs consumes what it
+/// returns, which is what makes a poll loop advance; this one is the opposite
+/// contract, and the two coexist on the same process because they answer two
+/// different questions. Reading this twice returns the same bytes (US-139 AC2),
+/// which is the only way a model that lost a tool result can ask again instead
+/// of rerunning the command.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JobOutput {
+    pub bytes: Vec<u8>,
+    /// Bytes the tail bound dropped, counted exactly rather than guessed.
+    pub omitted: u64,
+}
+
+impl JobOutput {
+    /// Keeps the TAIL within [`MAX_JOB_OUTPUT`] and counts what that costs.
+    fn bounded(mut self) -> Self {
+        if self.bytes.len() > MAX_JOB_OUTPUT {
+            let overflow = self.bytes.len() - MAX_JOB_OUTPUT;
+            self.bytes.drain(0..overflow);
+            self.omitted = self.omitted.saturating_add(overflow as u64);
+        }
+        self
+    }
 }
 
 /// What a producer hands the registry once the process of a job runs.
@@ -220,9 +264,13 @@ pub struct JobSnapshot {
 /// something else entirely, and the registry would not notice.
 #[async_trait::async_trait]
 pub trait JobProcess: Send + Sync {
-    /// Bytes the job produced since the previous read, as the producer renders
-    /// them. Consuming or not is the producer's policy, not the registry's.
-    async fn read_output(&self) -> Result<Vec<u8>, String>;
+    /// Everything the job has produced so far, as the producer retained it.
+    ///
+    /// Non-consuming by contract, not by policy: the registry hands this to the
+    /// model as a final relève, and a relève that emptied its source could not
+    /// be asked twice (US-139 AC2). A producer that also serves an incremental
+    /// cursor keeps the two reads separate.
+    async fn read_output(&self) -> Result<JobOutput, String>;
 
     /// Stops the process. Must be idempotent: a stop can race the exit it is
     /// trying to cause, and the first arrival is what settles the job.
@@ -324,6 +372,13 @@ struct Job {
     /// rebuilt from a log, which is why stopping one is a trace and not an
     /// error: there is nothing left in this process to stop.
     process: Option<Arc<dyn JobProcess>>,
+    /// Producer handle this job was registered with. Opaque, repeated.
+    token: Option<u64>,
+    /// What the producer retained of the job's output, kept for the final
+    /// relève. In memory ONLY: the durable record carries the accounting of a
+    /// job, never its bytes, so a resumed thread correctly has no output to
+    /// hand back for a process that no longer exists.
+    output: JobOutput,
 }
 
 impl Job {
@@ -340,6 +395,7 @@ impl Job {
             started_at_ms: record.started_at_ms,
             ended_at_ms: record.ended_at_ms,
             attached: self.cancel.is_some(),
+            token: self.token,
         }
     }
 }
@@ -446,6 +502,16 @@ impl JobRegistry {
             .map(Job::snapshot)
     }
 
+    /// Now, on the SAME clock the snapshots are stamped with.
+    ///
+    /// A surface that renders an age has to subtract two readings of one clock.
+    /// Reaching for the system clock instead would drift against a registry
+    /// driven by a frozen one, and every test that renders a duration would
+    /// have to become a real-time test.
+    pub fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
     /// Jobs currently holding a slot.
     pub fn active(&self) -> usize {
         self.lock().active()
@@ -508,6 +574,8 @@ impl JobRegistry {
                 },
                 cancel: Some(cancel.clone()),
                 process: None,
+                token: Some(token),
+                output: JobOutput::default(),
             });
         }
 
@@ -581,6 +649,117 @@ impl JobRegistry {
             .iter()
             .find(|job| job.record.job_id == job_id)
             .and_then(|job| job.process.clone())
+    }
+
+    /// Keeps what a job produced, for a relève that may come after the process
+    /// is gone (US-139).
+    ///
+    /// Called by the PRODUCER, which is the only place the bytes are still
+    /// reachable: a settled job releases its process, and a closed terminal
+    /// drops its buffer. The last write wins, which is what makes a session
+    /// destroyed without ceremony still hand back the most complete output it
+    /// had rather than an older snapshot of it.
+    ///
+    /// Synchronous, and never called while the producer holds its own store
+    /// lock: this takes the registry lock, and the settle path takes them in
+    /// the other order.
+    pub fn retain_output(&self, job_id: JobId, output: JobOutput) {
+        let mut state = self.lock();
+        match state
+            .jobs
+            .iter_mut()
+            .find(|job| job.record.job_id == job_id)
+        {
+            Some(job) => job.output = output.bounded(),
+            None => tracing::debug!(
+                job_id = %job_id,
+                "output retained for a background job this thread does not carry"
+            ),
+        }
+    }
+
+    /// The state of a job and everything it produced, for the model.
+    ///
+    /// Reads the live process when there is one, so a running job answers with
+    /// what it has so far instead of with nothing, and retains what it read so
+    /// the same bytes survive the settle. Reading twice returns the same bytes:
+    /// nothing here consumes (US-139 AC2).
+    ///
+    /// Marks nothing. Whether a result reached the model is the caller's
+    /// judgement, and it says so through [`Self::mark_reported`].
+    pub async fn read_output(&self, job_id: JobId) -> Result<(JobSnapshot, JobOutput), JobError> {
+        // Taken and released before the await: the producer's read grabs its
+        // own store lock, and holding this one across it would close the cycle.
+        let process = {
+            let state = self.lock();
+            let Some(job) = state.jobs.iter().find(|job| job.record.job_id == job_id) else {
+                return Err(JobError::Unknown { job_id });
+            };
+            job.process.clone()
+        };
+        if let Some(process) = process {
+            match process.read_output().await {
+                Ok(output) => self.retain_output(job_id, output),
+                Err(err) => tracing::debug!(
+                    job_id = %job_id,
+                    error = %err,
+                    "background job output could not be read from its process"
+                ),
+            }
+        }
+        let state = self.lock();
+        let Some(job) = state.jobs.iter().find(|job| job.record.job_id == job_id) else {
+            return Err(JobError::Unknown { job_id });
+        };
+        Ok((job.snapshot(), job.output.clone()))
+    }
+
+    /// Records that the result of a job REACHED the model, once (US-140).
+    ///
+    /// `Ok(true)` on the flip, `Ok(false)` when it had already happened. The
+    /// durable line is written only on the flip, so a thread reopened after
+    /// fifty turns re-reads a job that was announced once and announces it
+    /// zero more times.
+    ///
+    /// The flag is one-way and says nothing about the state: a job is marked
+    /// because someone handed its result over, never because it finished.
+    pub async fn mark_reported(&self, job_id: JobId) -> Result<bool, JobError> {
+        self.owner()?;
+        let flipped = {
+            let mut state = self.lock();
+            let Some(job) = state
+                .jobs
+                .iter_mut()
+                .find(|job| job.record.job_id == job_id)
+            else {
+                return Err(JobError::Unknown { job_id });
+            };
+            if job.record.reported {
+                false
+            } else {
+                job.record.reported = true;
+                true
+            }
+        };
+        if flipped {
+            self.journal(ThreadEventPayload::JobReported { job_id })
+                .await;
+        }
+        Ok(flipped)
+    }
+
+    /// Jobs that FINISHED and whose result nobody handed to the model yet.
+    ///
+    /// What an end-of-turn notice owes its reader: a result is never lost in
+    /// silence, and a job already announced is never announced twice
+    /// (US-140 AC3/AC4).
+    pub fn unreported(&self) -> Vec<JobSnapshot> {
+        self.lock()
+            .jobs
+            .iter()
+            .filter(|job| job.record.status.is_terminal() && !job.record.reported)
+            .map(Job::snapshot)
+            .collect()
     }
 
     /// Settles a job in its terminal state.
@@ -727,6 +906,19 @@ impl JobRegistry {
         // this call an interrupted thread would leave its shells running.
         if let Some(process) = process {
             process.stop().await;
+            // Read AFTER the stop and before the settle: the settle releases
+            // the process, and a killed job whose output was never retained
+            // would answer a later relève with nothing (US-139 AC2 on the kill
+            // path). What the process wrote on its way out is part of what the
+            // model is owed.
+            match process.read_output().await {
+                Ok(output) => self.retain_output(job_id, output),
+                Err(err) => tracing::debug!(
+                    job_id = %job_id,
+                    error = %err,
+                    "stopped background job left no readable output"
+                ),
+            }
         }
 
         match self
@@ -780,6 +972,8 @@ impl JobRegistry {
                 record,
                 cancel: None,
                 process: None,
+                token: None,
+                output: JobOutput::default(),
             })
             .collect();
     }
@@ -950,9 +1144,7 @@ mod tests {
             if let Some(cause) = &self.fails {
                 return Err(cause.clone());
             }
-            let process = Arc::new(FakeProcess {
-                stops: AtomicUsize::new(0),
-            });
+            let process = Arc::new(FakeProcess::idle());
             self.processes
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -963,12 +1155,38 @@ mod tests {
 
     struct FakeProcess {
         stops: AtomicUsize,
+        /// What the process has produced so far. Never emptied by a read: the
+        /// contract of [`JobProcess::read_output`] is a transcript.
+        output: Mutex<Vec<u8>>,
+    }
+
+    impl FakeProcess {
+        fn idle() -> Self {
+            Self {
+                stops: AtomicUsize::new(0),
+                output: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn writes(&self, data: &str) {
+            self.output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(data.as_bytes());
+        }
     }
 
     #[async_trait::async_trait]
     impl JobProcess for FakeProcess {
-        async fn read_output(&self) -> Result<Vec<u8>, String> {
-            Ok(Vec::new())
+        async fn read_output(&self) -> Result<JobOutput, String> {
+            Ok(JobOutput {
+                bytes: self
+                    .output
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+                omitted: 0,
+            })
         }
 
         async fn stop(&self) {
@@ -988,9 +1206,7 @@ mod tests {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 registry: OnceLock::new(),
-                process: Arc::new(FakeProcess {
-                    stops: AtomicUsize::new(0),
-                }),
+                process: Arc::new(FakeProcess::idle()),
             })
         }
     }
@@ -1497,6 +1713,7 @@ mod tests {
             .await
             .expect("the registration is accepted");
 
+        launcher.processes()[0].writes("half a build\n");
         registry
             .cancel(job.job_id, "stopped by the user")
             .await
@@ -1509,6 +1726,13 @@ mod tests {
             1,
             "the launcher's process was told to stop, once"
         );
+        // US-139: a killed job still owes its reader what it produced, so the
+        // output is harvested at the stop and not lost with the process.
+        let (_, output) = registry
+            .read_output(job.job_id)
+            .await
+            .expect("the job is known");
+        assert_eq!(output.bytes, b"half a build\n");
     }
     /// A record whose process the registry cannot keep must not leave that
     /// process running: the snapshot no longer names it and nothing could ever

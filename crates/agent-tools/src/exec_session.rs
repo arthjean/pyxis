@@ -39,7 +39,7 @@ use agent_core::provider::ToolKind;
 use agent_core::tools::ToolExecution;
 
 use agent_runtime::id::JobId;
-use agent_runtime::jobs::{JobKind, JobOutcome, JobRegistry};
+use agent_runtime::jobs::{JobKind, JobOutcome, JobOutput, JobRegistry, MAX_JOB_OUTPUT};
 
 use crate::error::{ToolError, ValidationError};
 use crate::jobs::JobHandle;
@@ -131,6 +131,13 @@ enum ClosedCause {
 }
 
 /// Output waiting to be read, with an EXACT count of what the cap dropped.
+///
+/// Two readings of the same stream live here, and they are not variants of one
+/// another. `bytes` is a CURSOR: `write_stdin` consumes it, which is what makes
+/// a poll loop advance. `retained` is a TRANSCRIPT: nothing consumes it, so the
+/// final relève of a background job can be asked twice and answer the same
+/// bytes (US-139 AC1/AC2). Splitting them is what keeps the two readers from
+/// dividing one stream between themselves.
 #[derive(Debug, Default)]
 struct OutputBuffer {
     bytes: Vec<u8>,
@@ -138,6 +145,12 @@ struct OutputBuffer {
     omitted: u64,
     /// Bytes the process produced since the last read, before the cap.
     produced: u64,
+    /// Everything the process produced, never consumed, bounded by its own
+    /// larger tail cap. Empty on an accumulator: only the buffer a reader task
+    /// writes into carries the transcript.
+    retained: Vec<u8>,
+    /// Bytes the transcript cap dropped, over the life of the session.
+    retained_omitted: u64,
 }
 
 impl OutputBuffer {
@@ -145,9 +158,27 @@ impl OutputBuffer {
         self.produced = self.produced.saturating_add(data.len() as u64);
         self.bytes.extend_from_slice(data);
         self.trim_to(MAX_CHUNK_BYTES);
+        self.retained.extend_from_slice(data);
+        if self.retained.len() > MAX_JOB_OUTPUT {
+            let overflow = self.retained.len() - MAX_JOB_OUTPUT;
+            self.retained.drain(0..overflow);
+            self.retained_omitted = self.retained_omitted.saturating_add(overflow as u64);
+        }
+    }
+
+    /// What the job registry keeps of this session, for a relève that may come
+    /// after the session itself is gone.
+    fn transcript(&self) -> JobOutput {
+        JobOutput {
+            bytes: self.retained.clone(),
+            omitted: self.retained_omitted,
+        }
     }
 
     /// Merges a drained chunk into an accumulator, cap and counters included.
+    ///
+    /// The transcript is deliberately NOT merged: an accumulator is a local
+    /// view of one tool call, and the transcript belongs to the session.
     fn absorb(&mut self, other: &OutputBuffer) {
         self.bytes.extend_from_slice(&other.bytes);
         self.produced = self.produced.saturating_add(other.produced);
@@ -165,8 +196,16 @@ impl OutputBuffer {
         }
     }
 
+    /// Takes the CURSOR and leaves the transcript in place: a read advances the
+    /// incremental view of the session and never erases its history.
     fn take(&mut self) -> OutputBuffer {
-        std::mem::take(self)
+        OutputBuffer {
+            bytes: std::mem::take(&mut self.bytes),
+            omitted: std::mem::replace(&mut self.omitted, 0),
+            produced: std::mem::replace(&mut self.produced, 0),
+            retained: Vec::new(),
+            retained_omitted: 0,
+        }
     }
 }
 
@@ -247,6 +286,14 @@ impl Session {
         }
     }
 
+    /// Everything the process produced, without consuming it.
+    fn transcript(&self) -> JobOutput {
+        match self.buffer.lock() {
+            Ok(buf) => buf.transcript(),
+            Err(_) => JobOutput::default(),
+        }
+    }
+
     fn allocate_chunk(&mut self) -> u64 {
         self.next_chunk = self.next_chunk.saturating_add(1);
         self.next_chunk
@@ -274,8 +321,26 @@ impl Session {
     /// Settles the job of this session, once. Taking the tie is what makes it
     /// once: the second caller finds nothing left to settle, and `Drop` finds
     /// nothing either.
-    async fn settle_job(&mut self, outcome: JobOutcome) {
+    ///
+    /// The transcript is handed over BEFORE the settle: settling releases the
+    /// process, and the buffer dies with the session, so this is the last
+    /// moment the bytes exist anywhere (US-139 AC2).
+    ///
+    /// `reported` says the caller is handing the terminal result to the model
+    /// in the same breath. `finish` does, because the tool result it is about
+    /// to return carries the exit code and the output; a teardown does not, and
+    /// the job stays unreported so the notice still names it (US-140 AC4).
+    async fn settle_job(&mut self, outcome: JobOutcome, reported: bool) {
         let Some(tie) = self.job.take() else { return };
+        tie.registry.retain_output(tie.job_id, self.transcript());
+        if reported && let Err(err) = tie.registry.mark_reported(tie.job_id).await {
+            tracing::debug!(
+                target: "pyxis::tools",
+                job_id = %tie.job_id,
+                error = %err,
+                "background job of a shell session was not marked reported"
+            );
+        }
         if let Err(err) = tie.registry.settle(tie.job_id, outcome).await {
             tracing::debug!(
                 target: "pyxis::tools",
@@ -294,6 +359,10 @@ impl Drop for Session {
         // claimed here and its durable line goes to the deferred queue the
         // thread actor drains while it still owns the log.
         if let Some(tie) = self.job.take() {
+            // The bytes die with this buffer, so they are handed over first.
+            // Last write wins in the registry, and `Drop` is by construction
+            // the most complete view a session ever had.
+            tie.registry.retain_output(tie.job_id, self.transcript());
             // An exit already observed is an ANSWER, whatever brought the
             // session here: settling it `Killed` would lose the code the model
             // is owed (US-137 AC1/AC2). Only a session still running when it is
@@ -512,7 +581,7 @@ impl ExecSessions {
                     cause: "killed: the run ended while the shell session was open".to_string(),
                 },
             };
-            session.settle_job(outcome).await;
+            session.settle_job(outcome, false).await;
         }
         // Dropped OUTSIDE the lock: each `Drop` kills a process tree, and
         // holding the mutex across that would serialize a watchdog onto it.
@@ -588,12 +657,13 @@ impl ExecSessions {
         }
     }
 
-    /// Bytes a session produced since the previous read, consumed.
+    /// Everything a session produced, WITHOUT consuming it.
     ///
-    /// The public side of what `collect` uses internally: it is what a reader
-    /// of the job registry needs, which knows a job id and no session at all.
-    pub fn drain_output(&self, id: u64) -> Result<Vec<u8>, ToolError> {
-        self.with_session(id, |session| session.drain().bytes)
+    /// What the job registry reads for a final relève: asking twice returns the
+    /// same bytes, and the incremental cursor `write_stdin` advances is left
+    /// exactly where its own reader left it (US-139 AC1/AC2).
+    pub fn transcript(&self, id: u64) -> Result<JobOutput, ToolError> {
+        self.with_session(id, |session| session.transcript())
     }
 
     /// Ends a session's process group, on the budget `write_stdin terminate`
@@ -1457,7 +1527,7 @@ async fn finish(
             // an exit the log does not carry yet.
             if let Some(session) = closed.as_mut() {
                 session
-                    .settle_job(session_outcome(code, signal, terminated))
+                    .settle_job(session_outcome(code, signal, terminated), true)
                     .await;
             }
             // The command is kept on the session for the trace below, which
