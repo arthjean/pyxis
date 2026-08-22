@@ -66,6 +66,11 @@ pub struct AgentWiring {
 pub struct JobWiring {
     pub launcher: Arc<dyn agent_runtime::jobs::JobLauncher>,
     pub handle: Arc<agent_tools::JobHandle>,
+    /// Whether a job that finishes unwatched may open a turn on this client
+    /// (EP-044). Carried here rather than as a ninth argument of
+    /// [`SessionRuntime::open`] because it is a property of the job wiring and
+    /// of nothing else: without a registry there is nothing to deliver.
+    pub delivery: agent_runtime::jobs::CompletionDelivery,
 }
 
 /// Everything a turn is committed to, plus what the prompt is composed from.
@@ -778,6 +783,11 @@ impl SessionRuntime {
             parent_cancel: parent_cancel.clone(),
             agents: supervisor,
             jobs: Some(jobs),
+            // A thread opened without job wiring has no launcher either, so
+            // nothing can ever settle on it; `Quiet` is the honest default.
+            completion_delivery: jobs_wiring
+                .map(|wiring| wiring.delivery)
+                .unwrap_or_default(),
         })
         .await
         .map_err(|err| anyhow::anyhow!("thread: {err}"))?;
@@ -966,6 +976,7 @@ mod tests {
     };
     use agent_runtime::lifecycle::TurnState;
     use agent_runtime::thread::Submission;
+    use agent_tools::Tool;
 
     /// Answers one scripted turn then ends. Enough to drive the real wiring:
     /// what is under test here is the runtime the binary assembles, not the
@@ -1177,6 +1188,88 @@ mod tests {
             std::fs::read_dir(&dir).unwrap().count(),
             0,
             "`--ephemeral` must open no file at all"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// US-144 AC3: `--ephemeral` is not a reason to refuse a background job.
+    /// The registry of an in-memory thread is the same registry, the terminal
+    /// starts, the accounting holds, and the run still opens NO file: the job
+    /// record lives on the in-memory store like every other event of that
+    /// thread and dies with it. Registration is allowed rather than refused
+    /// because the thread already accepts inputs and turns on that store, and a
+    /// named refusal would be a second, narrower rule for no gained property.
+    #[tokio::test]
+    async fn an_ephemeral_run_registers_a_background_job_and_still_opens_no_file() {
+        let dir = std::env::temp_dir().join(format!("pyxis-rt-jobs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let registry = Arc::new(agent_tools::Registry::builder(&dir).build());
+        let steps = CliStepSource::new(Arc::clone(&registry), Vec::new());
+        let root = CancellationToken::new();
+        let sessions = agent_tools::ExecSessions::new();
+        // The wiring the binary builds, with the delivery `-p` and the
+        // app-server force: an ephemeral run is a script's run.
+        let wiring = JobWiring {
+            launcher: Arc::new(crate::jobs::TerminalJobLauncher::new(sessions.clone())),
+            handle: sessions.job_handle(),
+            delivery: agent_runtime::jobs::CompletionDelivery::Quiet,
+        };
+        let runtime = SessionRuntime::open(
+            None,
+            engine(&registry),
+            Arc::clone(&registry),
+            settings(&dir),
+            steps,
+            &root,
+            None,
+            Some(&wiring),
+        )
+        .await
+        .expect("an in-memory thread opens");
+
+        agent_tools::ExecCommand
+            .call(
+                agent_tools::exec_session::ExecCommandInput {
+                    cmd: "sleep 30".to_string(),
+                    workdir: None,
+                    shell: None,
+                    tty: None,
+                    yield_time_ms: Some(100),
+                    max_output_tokens: None,
+                },
+                &{
+                    let mut ctx = agent_tools::ToolCtx::new(dir.clone());
+                    ctx.sessions = sessions.clone();
+                    ctx
+                },
+            )
+            .await
+            .expect("the session opens on an ephemeral thread too");
+
+        // Read back through the tool the model would use, on the handle the
+        // runtime bound to the in-memory thread's registry.
+        let listed = agent_tools::ListJobs::new(sessions.job_handle())
+            .call(
+                agent_tools::jobs::ListJobsInput { job_id: None },
+                &agent_tools::ToolCtx::new(dir.clone()),
+            )
+            .await
+            .expect("the registry answers")
+            .content;
+        assert!(
+            listed.contains("sleep 30"),
+            "the ephemeral thread owns the job: {listed}"
+        );
+
+        sessions.shutdown().await;
+        runtime.shutdown().await;
+
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "a background job opens no session file under `--ephemeral`"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

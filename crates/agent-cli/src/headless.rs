@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use agent_core::AgentEvent;
 use agent_runtime::TurnState;
-use agent_runtime::thread::{RuntimeEventPayload, Submission};
+use agent_runtime::thread::{InputOrigin, RuntimeEventPayload, Submission};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -85,6 +85,14 @@ pub async fn run(run: HeadlessRun<'_>) -> anyhow::Result<()> {
         None => None,
     };
 
+    // FR-14: a script has nobody to wake. The wiring the binary resolved is
+    // forced quiet HERE rather than at the dispatch site, so no caller of this
+    // entry point can arm a delivery that would open a turn behind a pipe.
+    let jobs = jobs.map(|wiring| crate::runtime::JobWiring {
+        delivery: agent_runtime::jobs::CompletionDelivery::Quiet,
+        ..wiring
+    });
+
     // Root of this run's cancellation tree. Every thread, turn, tool and process
     // hangs from it, so a single `cancel()` reaches all of them.
     let cancel = CancellationToken::new();
@@ -121,6 +129,7 @@ pub async fn run(run: HeadlessRun<'_>) -> anyhow::Result<()> {
         .submit(Submission {
             text: prompt,
             client_message_id: None,
+            origin: InputOrigin::Human,
         })
         .await
         .map_err(|err| anyhow::anyhow!("submit: {err}"))?;

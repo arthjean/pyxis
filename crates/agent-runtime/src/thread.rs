@@ -29,7 +29,9 @@ use crate::context::TurnContextSource;
 use crate::event::{ThreadEvent, ThreadEventPayload, ThreadJournal};
 use crate::id::{EventId, IdGenerator, ThreadId, TurnId};
 use crate::inputs::TurnInputs;
-use crate::jobs::JobRegistry;
+use crate::jobs::{
+    CompletionDelivery, JobDelivery, JobRegistry, MAX_CONSECUTIVE_WAKES, WakeBudget,
+};
 use crate::lifecycle::{TurnLifecycle, TurnState};
 use crate::resume::{self, ResumedThread};
 use crate::runner::{TurnOutcome, TurnRequest, TurnRunner};
@@ -52,12 +54,34 @@ pub const STRAGGLER_ABORT_AFTER: Duration = Duration::from_secs(2);
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
 const MAX_TURN_FAILURE_CAUSE_CHARS: usize = 500;
 
+/// Who an input came from.
+///
+/// Carried by the DATA rather than guessed from the shape of a call, because
+/// the one thing that rearms the wake budget must not be inferrable: an input
+/// the runtime composed for itself travels through the same `submit` and the
+/// same `steer` a human's does, and a heuristic on the text or on the caller
+/// would eventually read one as the other (US-143 AC4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InputOrigin {
+    /// A person, through a client. The ONLY origin that rearms the budget.
+    #[default]
+    Human,
+    /// Composed by the runtime for itself: a background job announcing its own
+    /// completion (EP-044), or a sub-agent handing a result back to its parent
+    /// (EP-004). A turn opened by one of these can never pass as human, so a
+    /// chain of them runs the budget down and stops (US-143 AC5).
+    Runtime,
+}
+
 /// A client input.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Submission {
     pub text: String,
     /// Idempotency key. Persisted now, honoured in US-009.
     pub client_message_id: Option<String>,
+    /// Whether a human is behind this input. Not durable, and deliberately so:
+    /// see [`crate::jobs::WakeBudget`].
+    pub origin: InputOrigin,
 }
 
 impl Submission {
@@ -65,6 +89,7 @@ impl Submission {
         Self {
             text: text.into(),
             client_message_id: None,
+            origin: InputOrigin::Human,
         }
     }
 }
@@ -253,6 +278,10 @@ pub struct ThreadOptions {
     /// starts none, which is what every child gets: a job belongs to the thread
     /// that registered it and to no other.
     pub jobs: Option<Arc<JobRegistry>>,
+    /// Whether a job finishing unwatched may open a turn on this thread
+    /// (EP-044). The interactive client takes `Wake`; `-p`, the app-server and
+    /// every sub-agent take the fail-closed `Quiet`.
+    pub completion_delivery: CompletionDelivery,
 }
 
 enum Command {
@@ -279,6 +308,13 @@ enum Command {
         payload: Box<ThreadEventPayload>,
         reply: oneshot::Sender<Result<EventId, SubmitError>>,
     },
+    /// Announces a finished background job (EP-044). `None` in the reply means
+    /// the announcement did NOT become durable, whatever the reason: the job
+    /// stays unreported and is announced later.
+    DeliverJob {
+        submission: Submission,
+        reply: oneshot::Sender<Option<Accepted>>,
+    },
 }
 
 impl Command {
@@ -294,6 +330,9 @@ impl Command {
             }
             Self::Record { reply, .. } => {
                 let _ = reply.send(Err(error));
+            }
+            Self::DeliverJob { reply, .. } => {
+                let _ = reply.send(None);
             }
             Self::Fork { reply, .. } => {
                 let _ = reply.send(Err(error.into()));
@@ -332,6 +371,37 @@ impl ThreadJournal for MailboxJournal {
             Err(mpsc::error::TrySendError::Closed(_)) => return Err(SubmitError::Stopped),
         }
         answer.await.map_err(|_| SubmitError::Stopped)?
+    }
+}
+
+/// [`JobDelivery`] served by the thread's own mailbox.
+///
+/// Same weak sender and same bounded queue as [`MailboxJournal`], for the same
+/// reason: a job settles in a tool task, and the actor must stay free to reach
+/// the branch where nothing can command it anymore.
+struct MailboxDelivery {
+    commands: mpsc::WeakSender<Command>,
+}
+
+#[async_trait::async_trait]
+impl JobDelivery for MailboxDelivery {
+    async fn deliver(&self, client_message_id: String, text: String) -> bool {
+        let Some(commands) = self.commands.upgrade() else {
+            return false;
+        };
+        let (reply, answer) = oneshot::channel();
+        let sent = commands.try_send(Command::DeliverJob {
+            submission: Submission {
+                text,
+                client_message_id: Some(client_message_id),
+                origin: InputOrigin::Runtime,
+            },
+            reply,
+        });
+        if sent.is_err() {
+            return false;
+        }
+        matches!(answer.await, Ok(Some(_)))
     }
 }
 
@@ -381,6 +451,7 @@ impl ThreadHandle {
             parent_cancel,
             agents,
             jobs,
+            completion_delivery,
         } = options;
 
         store.create(&thread_id).await?;
@@ -456,6 +527,7 @@ impl ThreadHandle {
             clock,
             agents: agents.clone(),
             jobs: jobs.clone(),
+            wakes: WakeBudget::new(completion_delivery),
             token: token.clone(),
             tracker: TaskTracker::new(),
             seq: snapshot.next_seq(),
@@ -536,12 +608,23 @@ impl ThreadHandle {
         // to a run that is gone; reconciling it is a decision of its own and it
         // is not taken here.
         if let Some(jobs) = &jobs {
+            // EP-044: under `Quiet` the registry gets NO delivery half at all,
+            // rather than a delivery that always refuses. A `-p` run then has
+            // nothing that could open a turn, which is the property FR-14 asks
+            // for, proved by the absence of a caller and not by a branch.
+            let delivery = match completion_delivery {
+                CompletionDelivery::Wake => Some(Arc::new(MailboxDelivery {
+                    commands: command_tx.downgrade(),
+                }) as Arc<dyn JobDelivery>),
+                CompletionDelivery::Quiet => None,
+            };
             jobs.attach(
                 thread_id,
                 Arc::new(MailboxJournal {
                     commands: command_tx.downgrade(),
                 }),
                 token.child_token(),
+                delivery,
             );
             jobs.restore(resumed.jobs.clone());
         }
@@ -679,6 +762,9 @@ struct ThreadActor {
     /// Background jobs this thread owns. Held for the same reason: a process a
     /// turn started must not outlive the thread that started it (US-134 AC2).
     jobs: Option<Arc<JobRegistry>>,
+    /// Consecutive turns opened by a job completion since the last human input
+    /// (EP-044). Held here and nowhere else: the actor is what opens a turn.
+    wakes: WakeBudget,
     token: CancellationToken,
     tracker: TaskTracker,
     seq: u64,
@@ -901,7 +987,50 @@ impl ThreadActor {
                 };
                 let _ = reply.send(outcome);
             }
+            Command::DeliverJob { submission, reply } => {
+                let outcome = self.on_deliver_job(submission).await;
+                let _ = reply.send(outcome);
+            }
         }
+    }
+
+    /// Delivers a finished job's announcement (US-142).
+    ///
+    /// Three branches, in this order, because each one answers a question the
+    /// next would answer wrongly:
+    ///
+    /// - a REPLAY returns the identifiers the log already carries and opens
+    ///   nothing. Checked first, as every idempotent path here is, so a
+    ///   redelivered completion cannot spend a wake it already spent
+    ///   (invariant 12);
+    /// - a turn IN PROGRESS takes the announcement as a steer, which the turn
+    ///   consumes at its next safe point and never between a `tool_use` and its
+    ///   result. Nothing was woken, so nothing is spent;
+    /// - an IDLE thread is woken, once, if the budget allows it. A spent budget
+    ///   opens nothing and answers `None`, which leaves the job unreported and
+    ///   in the end-of-turn notice.
+    async fn on_deliver_job(&mut self, submission: Submission) -> Option<Accepted> {
+        if let Some(prior) = self.already_accepted(&submission) {
+            return Some(prior);
+        }
+        if self.turn.is_some() {
+            return self.on_steer(submission, None).await.ok();
+        }
+        if !self.wakes.may_wake() {
+            tracing::debug!(
+                target: "pyxis::runtime",
+                thread_id = %self.thread_id,
+                max = MAX_CONSECUTIVE_WAKES,
+                "wake budget spent; the finished background job stays unreported"
+            );
+            return None;
+        }
+        let accepted = self.on_submit(submission).await.ok()?;
+        // Spent only on a turn that was actually opened AND made durable: a
+        // delivery the store refused costs nothing, because it will be retried
+        // as a job that is still unreported.
+        self.wakes.spend();
+        Some(accepted)
     }
 
     /// Makes an input durable and announces it. The ONLY place an input becomes
@@ -927,6 +1056,13 @@ impl ThreadActor {
                     event_id: event.event_id,
                 },
             );
+        }
+        // The single point where an input becomes visible is also the single
+        // point where the wake budget is rearmed, so a submit and a steer are
+        // treated alike and no third path can rearm without persisting
+        // (US-143 AC1).
+        if submission.origin == InputOrigin::Human {
+            self.wakes.rearm();
         }
         self.publish(
             event.event_id,

@@ -194,6 +194,7 @@ async fn start_with_contexts(
         parent_cancel: root.clone(),
         agents: None,
         jobs: None,
+        completion_delivery: agent_runtime::jobs::CompletionDelivery::Quiet,
     })
     .await
     .expect("the thread starts");
@@ -359,6 +360,7 @@ async fn a_running_commit_failure_keeps_the_accepted_input_queued_and_closes_adm
     let submission = Submission {
         text: "durable queued input".into(),
         client_message_id: Some("client-queued".into()),
+        origin: agent_runtime::thread::InputOrigin::Human,
     };
 
     let accepted = handle.submit(submission.clone()).await.unwrap();

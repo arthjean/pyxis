@@ -75,6 +75,7 @@ async fn start_race(
         parent_cancel: root.clone(),
         agents,
         jobs: None,
+        completion_delivery: agent_runtime::jobs::CompletionDelivery::Quiet,
     })
     .await
     .expect("the thread starts");

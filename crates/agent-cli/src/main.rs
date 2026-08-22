@@ -1780,6 +1780,10 @@ async fn run(
         launcher: Arc::new(jobs::TerminalJobLauncher::new(exec_sessions.clone()))
             as Arc<dyn agent_runtime::jobs::JobLauncher>,
         handle: exec_sessions.job_handle(),
+        // EP-044: the base wiring is the silent one, and the three dispatch
+        // branches below each state what they can take. Only the interactive
+        // loop has someone to wake.
+        delivery: agent_runtime::jobs::CompletionDelivery::Quiet,
     };
 
     let agent_handle = Arc::new(agent_tools::AgentHandle::new());
@@ -1989,6 +1993,8 @@ async fn run(
                 settings: Arc::clone(&settings),
                 steps: Arc::clone(&steps),
                 agents: Some(agents.clone()),
+                // FR-14: a protocol client drives its own turns, and the
+                // contract has no method for a turn nobody asked for.
                 jobs: Some(jobs.clone()),
                 bridge: Arc::clone(&app_bridge),
                 cancel: tokio_util::sync::CancellationToken::new(),
@@ -2004,6 +2010,8 @@ async fn run(
         } else if let Some(prompt) = args.prompt {
             let outcome = headless::run(headless::HeadlessRun {
                 agents: Some(agents.clone()),
+                // FR-14: `-p` has already printed its `run_summary` by the time
+                // a straggler settles. Nothing here may open a turn.
                 jobs: Some(jobs.clone()),
                 prompt,
                 session_path: (!args.ephemeral).then(|| current_session.clone()),
@@ -2029,7 +2037,11 @@ async fn run(
         } else {
             let cfg = InteractiveConfig {
                 agents: Some(agents.clone()),
-                jobs: Some(jobs.clone()),
+                // The one client with a human in front of it (FR-13).
+                jobs: Some(runtime::JobWiring {
+                    delivery: agent_runtime::jobs::CompletionDelivery::Wake,
+                    ..jobs.clone()
+                }),
                 model: args.model,
                 reasoning_effort: initial_reasoning_effort,
                 goal,

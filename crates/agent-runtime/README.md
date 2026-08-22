@@ -68,3 +68,30 @@ None: the counter never leaves the runtime.
 Préfixe stable répété, made observable. The counter is the runtime's own record
 of whether a prefix survived, which is what lets a change of injected context be
 diagnosed as a cache event rather than guessed at from latency.
+
+### The background job completion notice
+
+#### What the model sees
+
+One user-role message opening a turn nobody asked for, composed by
+`completion_notice` in `crates/agent-runtime/src/jobs.rs`: the job identifier,
+its terminal status with its exit code or its cause, the command it ran cut at
+160 characters with its control characters neutralized, and the sentence naming
+`list_jobs` as where the output is. Never the output itself, which stays in the
+registry until the model asks for it.
+
+#### Token effect
+
+Around 60 tokens per announcement, bounded by construction: the command is the
+only variable part and it is capped, so a job whose process wrote megabytes
+costs the same as one that wrote nothing. At most three such messages can enter
+a thread without an intervening human input (`MAX_CONSECUTIVE_WAKES`), and a
+given job can produce at most one of them, because delivery marks it reported.
+
+#### KV Cache effect
+
+Préfixe stable répété. The notice is appended to the transcript exactly like a
+human message, so it extends the prefix instead of rewriting it. This is why the
+announcement is an index into `list_jobs` rather than the process output: an
+unbounded transcript spliced into the thread would push every later turn past
+the cached window for a result the model may never read.

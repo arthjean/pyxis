@@ -304,6 +304,7 @@ fn options(
         parent_cancel: CancellationToken::new(),
         agents: None,
         jobs: None,
+        completion_delivery: agent_runtime::jobs::CompletionDelivery::Quiet,
     }
 }
 
@@ -331,6 +332,7 @@ async fn reopening_a_closed_thread_rebuilds_its_last_state_and_its_submissions()
         .submit(Submission {
             text: "un".into(),
             client_message_id: Some("cli-1".into()),
+            origin: agent_runtime::thread::InputOrigin::Human,
         })
         .await
         .unwrap();
@@ -603,6 +605,7 @@ async fn a_replayed_client_message_id_returns_the_original_identifiers() {
     let submission = Submission {
         text: "une seule fois".into(),
         client_message_id: Some("cli-42".into()),
+        origin: agent_runtime::thread::InputOrigin::Human,
     };
     let first = handle.submit(submission.clone()).await.unwrap();
     let replay = handle.submit(submission.clone()).await.unwrap();
@@ -661,6 +664,7 @@ async fn a_steer_carrying_a_replayed_identifier_is_not_queued_twice() {
     let steer = Submission {
         text: "corrige".into(),
         client_message_id: Some("cli-steer".into()),
+        origin: agent_runtime::thread::InputOrigin::Human,
     };
     let first = handle.steer(steer.clone(), None).await.unwrap();
     let pending = handle.status().pending_steers;

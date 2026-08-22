@@ -64,6 +64,85 @@ pub const MAX_JOB_OUTPUT: usize = 131_072;
 /// surface reports the same sentence for the same event.
 pub const TEARDOWN_CAUSE: &str = "interrupted: the thread stopped while the job was running";
 
+/// Turns a completing background job may open IN A ROW without a human saying
+/// anything in between (FR-13).
+///
+/// Three, the value the design harness ships as `maxConsecutiveWakes`
+/// (`packages/jobs/tool-jobs/src/index.ts:49-52`). The bound exists because a
+/// completion that opens a turn is the ONE event of this runtime the human did
+/// not ask for: three jobs reporting back to back is a build, a test run and a
+/// linter, which is worth being woken by; a fourth without a word from the
+/// human means the thread is talking to itself, and the remaining results read
+/// perfectly well from the end-of-turn notice and `list_jobs`. A crate
+/// constant, never a key (FR-16): raising it is buying an unbounded loop with
+/// one's own token budget, which is not a setting anyone should be sold.
+pub const MAX_CONSECUTIVE_WAKES: usize = 3;
+
+/// Bytes of a command line or of a cause an announcement repeats. An
+/// announcement is an index into `list_jobs`, not a transcript.
+const MAX_ANNOUNCED_TEXT: usize = 160;
+
+/// What a thread does with a job that finishes while nobody is looking.
+///
+/// The interactive client is the only one with someone to wake. A `-p` run has
+/// already printed its `run_summary` by the time a straggler settles, and an
+/// app-server client drives its own turns from the other side of a protocol
+/// that has no method for "a turn you did not ask for". Both take [`Self::Quiet`],
+/// where a completion is still accounted for and still durable, and is read
+/// through `list_jobs` like any other (FR-14, US-144).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompletionDelivery {
+    /// The completion opens a turn, within [`MAX_CONSECUTIVE_WAKES`].
+    Wake,
+    /// The completion opens nothing. Fail-closed default, on the same rule as
+    /// the [`crate::tool`]-side defaults: a client that never said it could be
+    /// woken is not woken.
+    #[default]
+    Quiet,
+}
+
+/// Consecutive turns opened by a job completion, against
+/// [`MAX_CONSECUTIVE_WAKES`].
+///
+/// Held by the thread actor and deliberately NOT durable: the counter answers
+/// "is this thread talking to itself right now?", and a thread being reopened
+/// is a human coming back to it. Restarting on a full budget is therefore the
+/// safe reading of a counter nobody persisted, and the cost of being wrong is
+/// one extra turn, not a loop (US-143 AC6).
+pub(crate) struct WakeBudget {
+    spent: usize,
+    budget: usize,
+}
+
+impl WakeBudget {
+    pub(crate) fn new(mode: CompletionDelivery) -> Self {
+        Self::with_budget(match mode {
+            CompletionDelivery::Wake => MAX_CONSECUTIVE_WAKES,
+            CompletionDelivery::Quiet => 0,
+        })
+    }
+
+    /// A budget of a stated size. `Quiet` reaches it with zero, which is also
+    /// what the whole feature degrades to if [`MAX_CONSECUTIVE_WAKES`] were
+    /// ever set to zero: nothing is opened, ever (US-142 AC7).
+    pub(crate) fn with_budget(budget: usize) -> Self {
+        Self { spent: 0, budget }
+    }
+
+    pub(crate) fn may_wake(&self) -> bool {
+        self.spent < self.budget
+    }
+
+    pub(crate) fn spend(&mut self) {
+        self.spent = self.spent.saturating_add(1);
+    }
+
+    /// Called on a HUMAN input and on nothing else (US-143 AC1).
+    pub(crate) fn rearm(&mut self) {
+        self.spent = 0;
+    }
+}
+
 /// What kind of thing runs in the background.
 ///
 /// Exactly one genre in v1. The harness this design comes from also runs
@@ -361,6 +440,83 @@ struct JobOwner {
     /// cancelling the thread reaches every job, and cancelling one job reaches
     /// neither its thread nor a sibling (FR-10, invariant 13).
     cancel: CancellationToken,
+    /// How a completion nobody is watching reaches the model. `None` under
+    /// [`CompletionDelivery::Quiet`]: the accounting is identical, and no turn
+    /// is ever opened (US-144).
+    delivery: Option<Arc<dyn JobDelivery>>,
+}
+
+/// How a finished job reaches the thread that owns it (EP-044).
+///
+/// Served by the thread actor's mailbox, exactly like [`ThreadJournal`] is, and
+/// for the same reason: a job settles inside a tool task and never inside the
+/// actor, so its announcement takes the same bounded queue a client's
+/// submission takes, and is refused the same way when that queue is full.
+#[async_trait::async_trait]
+pub(crate) trait JobDelivery: Send + Sync {
+    /// Opens a turn carrying `text`, or steers the running one, under
+    /// `client_message_id`.
+    ///
+    /// `true` when the announcement is DURABLE. Anything else, a spent budget
+    /// and a refused write alike, leaves the job unreported so it is announced
+    /// later rather than lost (US-142 AC4, AC8).
+    async fn deliver(&self, client_message_id: String, text: String) -> bool;
+}
+
+/// Idempotency key of a job's announcement, derived from the job identifier.
+///
+/// The SAME job always produces the same key, which is what makes a replayed
+/// delivery return the original identifiers and open no second turn
+/// (invariant 12, US-142 AC5).
+fn delivery_message_id(job_id: JobId) -> String {
+    format!("job-completion:{job_id}")
+}
+
+/// Renders a fragment a job produced for a model that must not be steered by
+/// it. The two defenses `list_jobs` applies to a command line, applied here for
+/// the same reason: this text becomes a durable INPUT of the thread, so a
+/// control character could forge a line break inside the announcement, and an
+/// unbounded command would put an unbounded string where nothing truncates
+/// anymore.
+fn announced(text: &str) -> String {
+    let mut out = String::new();
+    let mut truncated = false;
+    for c in text.chars() {
+        let c = if c.is_control() { ' ' } else { c };
+        if out.len() + c.len_utf8() > MAX_ANNOUNCED_TEXT {
+            truncated = true;
+            break;
+        }
+        out.push(c);
+    }
+    if truncated {
+        out.push_str("...");
+    }
+    out
+}
+
+/// What the model reads when a job it stopped watching finishes.
+///
+/// An index, not a result: the exit code is the decision the model needs, and
+/// the bytes are one `list_jobs` call away. Inlining the output here would put
+/// a process transcript into the thread's durable input log, where the spill of
+/// ADR-15 cannot reach it and no later truncation is possible.
+fn completion_notice(job: &JobSnapshot) -> String {
+    let exit = job
+        .exit_code
+        .map(|code| format!(" exit_code={code}"))
+        .unwrap_or_default();
+    let cause = job
+        .cause
+        .as_deref()
+        .map(|cause| format!(" cause={}", announced(cause)))
+        .unwrap_or_default();
+    format!(
+        "Background job {} finished while you were not watching it: {}{exit}{cause}\n  command: {}\nRead its output with list_jobs, or move on if it no longer matters.",
+        job.job_id,
+        job.status.as_str(),
+        announced(&job.command),
+    )
 }
 
 struct Job {
@@ -461,8 +617,17 @@ impl JobRegistry {
         thread_id: ThreadId,
         journal: Arc<dyn ThreadJournal>,
         cancel: CancellationToken,
+        delivery: Option<Arc<dyn JobDelivery>>,
     ) {
-        if self.owner.set(JobOwner { journal, cancel }).is_err() {
+        if self
+            .owner
+            .set(JobOwner {
+                journal,
+                cancel,
+                delivery,
+            })
+            .is_err()
+        {
             // A registry belongs to ONE thread: its slots and its jobs are that
             // thread's. Rebinding would make a second thread spend the first
             // one's budget, and would hang its processes from a foreign
@@ -787,7 +952,51 @@ impl JobRegistry {
             cause: snapshot.cause.clone(),
         })
         .await;
+        // AFTER the durable line, never before: an announcement is a promise
+        // that the log already carries what it announces, and a thread that
+        // opened a turn about a transition it then failed to persist would be
+        // reporting a job the next resume cannot find (US-142 AC6).
+        self.announce(&snapshot).await;
         Ok(Some(snapshot))
+    }
+
+    /// Hands a completion nobody relieved to the thread, once (EP-044).
+    ///
+    /// Does nothing for a job whose result already reached the model, which is
+    /// what makes a teardown silent: [`Self::cancel`] raises the flag before it
+    /// stops anything, so a job its own thread is killing announces nothing to
+    /// the thread that is killing it.
+    ///
+    /// The report flag is raised only on a DURABLE delivery. A refusal, a spent
+    /// budget or a store failure all leave the job unreported: it then appears
+    /// in the end-of-turn notice and can be announced later, which is the
+    /// survivable direction of the two (US-142 AC4, AC8).
+    async fn announce(&self, snapshot: &JobSnapshot) {
+        if snapshot.reported {
+            return;
+        }
+        let Ok(owner) = self.owner() else { return };
+        let Some(delivery) = owner.delivery.clone() else {
+            return;
+        };
+        let job_id = snapshot.job_id;
+        if !delivery
+            .deliver(delivery_message_id(job_id), completion_notice(snapshot))
+            .await
+        {
+            tracing::debug!(
+                job_id = %job_id,
+                "finished background job was not announced; it stays unreported"
+            );
+            return;
+        }
+        if let Err(err) = self.mark_reported(job_id).await {
+            tracing::debug!(
+                job_id = %job_id,
+                error = %err,
+                "background job completion was announced but not marked reported"
+            );
+        }
     }
 
     /// Settles a job from a place that cannot await: a `Drop`.
@@ -797,6 +1006,10 @@ impl JobRegistry {
     /// which the thread actor drains while it still owns the log. A session
     /// dropped without ceremony therefore still ends `Killed` in the log,
     /// instead of staying `Running` forever (US-137 AC6).
+    ///
+    /// Nothing is announced here. A `Drop` cannot await, and the only thing
+    /// that drops a live session is the run itself ending: there is no thread
+    /// left to wake, and the job is found unreported by the next reader.
     pub fn settle_deferred(
         &self,
         job_id: JobId,
@@ -1247,6 +1460,7 @@ mod tests {
             ThreadId::generate(&SequentialIds::new()),
             Arc::clone(log) as Arc<dyn ThreadJournal>,
             thread.child_token(),
+            None,
         );
         ((registry, thread), launcher)
     }
@@ -1631,6 +1845,7 @@ mod tests {
             ThreadId::generate(&SequentialIds::new()),
             Arc::clone(&log) as Arc<dyn ThreadJournal>,
             thread.child_token(),
+            None,
         );
 
         assert_eq!(
@@ -1750,6 +1965,7 @@ mod tests {
             ThreadId::generate(&SequentialIds::new()),
             Arc::clone(&log) as Arc<dyn ThreadJournal>,
             CancellationToken::new().child_token(),
+            None,
         );
         let _ = launcher.registry.set(Arc::clone(&registry));
 
@@ -1817,5 +2033,36 @@ mod tests {
                 .is_none(),
             "the second arrival settles nothing"
         );
+    }
+
+    /// US-142 AC7: the budget IS the switch. A [`WakeBudget`] of zero, which is
+    /// what `MAX_CONSECUTIVE_WAKES` set to zero would give every `Wake` client,
+    /// refuses the first wake as well as the fifty-first, and rearming a budget
+    /// that was never spendable does not create one.
+    #[test]
+    fn a_wake_budget_of_zero_never_opens_anything_however_it_is_pushed() {
+        let mut budget = WakeBudget::with_budget(0);
+        assert!(!budget.may_wake(), "nothing is spendable to begin with");
+        for _ in 0..50 {
+            budget.spend();
+            assert!(!budget.may_wake(), "spending past zero opens nothing");
+        }
+        budget.rearm();
+        assert!(!budget.may_wake(), "a human input rearms zero to zero");
+    }
+
+    /// The counterpart, so the assertion above is about the budget and not
+    /// about the counter: three is spendable exactly three times, and a human
+    /// input gives the three back (US-143 AC1).
+    #[test]
+    fn a_wake_budget_spends_down_to_zero_and_a_rearm_gives_it_back() {
+        let mut budget = WakeBudget::new(CompletionDelivery::Wake);
+        for _ in 0..MAX_CONSECUTIVE_WAKES {
+            assert!(budget.may_wake());
+            budget.spend();
+        }
+        assert!(!budget.may_wake(), "the fourth in a row is refused");
+        budget.rearm();
+        assert!(budget.may_wake(), "a human input reopens the budget");
     }
 }

@@ -15,8 +15,8 @@ use agent_runtime::context::{FixedTurnContext, TurnContext, TurnContextSource, T
 use agent_runtime::event::ThreadEventPayload;
 use agent_runtime::id::{JobId, SequentialIds, ThreadId, TurnId};
 use agent_runtime::jobs::{
-    JobError, JobKind, JobLaunch, JobLauncher, JobOutcome, JobProcess, JobRegistry, JobStatus,
-    MAX_ACTIVE_JOBS, TEARDOWN_CAUSE,
+    CompletionDelivery, JobError, JobKind, JobLaunch, JobLauncher, JobOutcome, JobProcess,
+    JobRegistry, JobStatus, MAX_ACTIVE_JOBS, MAX_CONSECUTIVE_WAKES, TEARDOWN_CAUSE,
 };
 use agent_runtime::runner::{TurnOutcome, TurnRequest, TurnRunner};
 use agent_runtime::store::{
@@ -104,7 +104,23 @@ struct Owner {
 }
 
 /// Opens a thread that owns a registry, on the store the caller hands over.
+///
+/// `Quiet` unless a test says otherwise: EP-041 and EP-042 assert the durable
+/// log of a registry, and a completion opening a turn is EP-044's subject.
 async fn open(store: Arc<dyn ThreadStore>, seed: u64) -> Owner {
+    open_with(store, seed, CompletionDelivery::Quiet).await
+}
+
+async fn open_with(store: Arc<dyn ThreadStore>, seed: u64, delivery: CompletionDelivery) -> Owner {
+    open_full(store, seed, delivery, Arc::new(IdleRunner)).await
+}
+
+async fn open_full(
+    store: Arc<dyn ThreadStore>,
+    seed: u64,
+    delivery: CompletionDelivery,
+    runner: Arc<dyn TurnRunner>,
+) -> Owner {
     let ids = Arc::new(SequentialIds::starting_at(seed));
     let thread_id = store
         .read()
@@ -121,7 +137,7 @@ async fn open(store: Arc<dyn ThreadStore>, seed: u64) -> Owner {
     let handle = ThreadHandle::start(ThreadOptions {
         thread_id,
         store: Arc::clone(&store),
-        runner: Arc::new(IdleRunner),
+        runner,
         turn_contexts: Arc::new(FixedTurnContext::new(turn_context(TurnId::generate(
             ids.as_ref(),
         )))) as Arc<dyn TurnContextSource>,
@@ -130,6 +146,7 @@ async fn open(store: Arc<dyn ThreadStore>, seed: u64) -> Owner {
         parent_cancel: root.clone(),
         agents: None,
         jobs: Some(Arc::clone(&jobs)),
+        completion_delivery: delivery,
     })
     .await
     .expect("the thread starts");
@@ -488,4 +505,387 @@ async fn the_report_flag_is_written_once_and_read_back_by_a_reopened_thread() {
     second.handle.shutdown().await;
     drop(first.root);
     drop(second.root);
+}
+
+// ───────── EP-044: the completion that comes back on its own ─────────
+
+/// A runner that parks a turn until the test releases it, so a completion can
+/// land while a turn is genuinely in progress rather than between two.
+struct ParkedRunner {
+    started: mpsc::Sender<()>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl TurnRunner for ParkedRunner {
+    async fn run_turn(
+        &self,
+        _request: TurnRequest,
+        _events: mpsc::Sender<AgentEvent>,
+        _cancel: CancellationToken,
+    ) -> TurnOutcome {
+        let _ = self.started.send(()).await;
+        self.release.notified().await;
+        TurnOutcome::Completed
+    }
+}
+
+/// Every input the durable log carries, oldest first.
+async fn inputs(store: &Arc<dyn ThreadStore>) -> Vec<(TurnId, Option<String>, String)> {
+    store
+        .read()
+        .await
+        .expect("the store reads")
+        .events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            ThreadEventPayload::InputSubmitted {
+                turn_id,
+                client_message_id,
+                text,
+            } => Some((*turn_id, client_message_id.clone(), text.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The idempotency key EP-044 derives from a job identifier. Spelled out here
+/// rather than imported: it is a CONTRACT the log carries across restarts, so a
+/// change to it has to break a test and not merely follow one.
+fn delivery_key(job_id: JobId) -> String {
+    format!("job-completion:{job_id}")
+}
+
+/// US-142 AC2 and AC5: an idle thread whose job settles unreported opens a turn
+/// through the ordinary submit path, and the input that opens it is keyed on
+/// the job.
+#[tokio::test]
+async fn a_completion_nobody_relieved_opens_a_turn_keyed_on_the_job() {
+    let store = Arc::new(MemoryThreadStore::new()) as Arc<dyn ThreadStore>;
+    let owner = open_with(Arc::clone(&store), 1, CompletionDelivery::Wake).await;
+    let job = owner
+        .jobs
+        .register(JobKind::Terminal, "npm test", 0)
+        .await
+        .expect("the registration is accepted");
+
+    owner
+        .jobs
+        .settle(job.job_id, JobOutcome::Completed { exit_code: 1 })
+        .await
+        .expect("the job is known")
+        .expect("the first settle wins");
+
+    let submitted = inputs(&store).await;
+    assert_eq!(submitted.len(), 1, "exactly one turn was opened");
+    let (_, key, text) = &submitted[0];
+    assert_eq!(key.as_deref(), Some(delivery_key(job.job_id).as_str()));
+    assert!(
+        text.contains(&job.job_id.to_string()) && text.contains("exit_code=1"),
+        "the announcement names the job and its exit code: {text}"
+    );
+    assert!(
+        text.contains("npm test") && text.contains("list_jobs"),
+        "the announcement is an index into list_jobs: {text}"
+    );
+    assert!(
+        owner.jobs.unreported().is_empty(),
+        "an announced job owes no second announcement"
+    );
+
+    // AC6: the announcement follows the commit. The terminal transition is in
+    // the log BEFORE the input that announces it.
+    let trace = job_trace(&store).await;
+    assert_eq!(
+        steps(&trace, job.job_id),
+        vec!["registered", "completed", "reported"]
+    );
+    owner.handle.shutdown().await;
+    owner.root.cancel();
+}
+
+/// US-142 AC5, second half: replaying the key a delivery used returns the
+/// original identifiers and opens nothing. Proved through the real `submit`,
+/// which is the path a redelivery takes (invariant 12).
+#[tokio::test]
+async fn a_replayed_delivery_returns_the_original_identifiers_and_opens_no_second_turn() {
+    let store = Arc::new(MemoryThreadStore::new()) as Arc<dyn ThreadStore>;
+    let owner = open_with(Arc::clone(&store), 1, CompletionDelivery::Wake).await;
+    let job = owner
+        .jobs
+        .register(JobKind::Terminal, "npm test", 0)
+        .await
+        .expect("the registration is accepted");
+    owner
+        .jobs
+        .settle(job.job_id, JobOutcome::Completed { exit_code: 0 })
+        .await
+        .expect("the job is known");
+    let first = inputs(&store).await;
+    let (opened_turn, _, announcement) = first[0].clone();
+
+    let replayed = owner
+        .handle
+        .submit(agent_runtime::thread::Submission {
+            text: announcement,
+            client_message_id: Some(delivery_key(job.job_id)),
+            origin: agent_runtime::thread::InputOrigin::Human,
+        })
+        .await
+        .expect("a replay is accepted, not refused");
+
+    assert_eq!(
+        replayed.turn_id, opened_turn,
+        "the replay answers with the turn the first delivery opened"
+    );
+    assert_eq!(
+        inputs(&store).await.len(),
+        1,
+        "nothing was executed a second time"
+    );
+    owner.handle.shutdown().await;
+    owner.root.cancel();
+}
+
+/// US-142 AC3: a completion that lands while a turn runs enters that turn as a
+/// steer, at its next safe point, and spends no wake.
+#[tokio::test]
+async fn a_completion_landing_during_a_turn_enters_it_as_a_steer() {
+    let store = Arc::new(MemoryThreadStore::new()) as Arc<dyn ThreadStore>;
+    let (started_tx, mut started_rx) = mpsc::channel(1);
+    let release = Arc::new(tokio::sync::Notify::new());
+    let owner = open_full(
+        Arc::clone(&store),
+        1,
+        CompletionDelivery::Wake,
+        Arc::new(ParkedRunner {
+            started: started_tx,
+            release: Arc::clone(&release),
+        }),
+    )
+    .await;
+    let job = owner
+        .jobs
+        .register(JobKind::Terminal, "npm test", 0)
+        .await
+        .expect("the registration is accepted");
+
+    let human = owner
+        .handle
+        .submit(agent_runtime::thread::Submission::new("what is going on"))
+        .await
+        .expect("the submission is accepted");
+    started_rx.recv().await.expect("the turn is running");
+
+    owner
+        .jobs
+        .settle(job.job_id, JobOutcome::Completed { exit_code: 0 })
+        .await
+        .expect("the job is known");
+
+    let submitted = inputs(&store).await;
+    assert_eq!(submitted.len(), 2, "the human input and the announcement");
+    let (announced_turn, key, _) = &submitted[1];
+    assert_eq!(key.as_deref(), Some(delivery_key(job.job_id).as_str()));
+    assert_eq!(
+        *announced_turn, human.turn_id,
+        "the announcement joined the running turn instead of opening one"
+    );
+    release.notify_waiters();
+    owner.handle.shutdown().await;
+    owner.root.cancel();
+}
+
+/// US-142 AC4: past the budget nothing is opened, and the job stays unreported
+/// so the end-of-turn notice still names it.
+#[tokio::test]
+async fn the_wake_budget_stops_at_three_and_leaves_the_rest_unreported() {
+    let store = Arc::new(MemoryThreadStore::new()) as Arc<dyn ThreadStore>;
+    let owner = open_with(Arc::clone(&store), 1, CompletionDelivery::Wake).await;
+
+    let mut jobs = Vec::new();
+    for index in 0..MAX_CONSECUTIVE_WAKES + 1 {
+        let job = owner
+            .jobs
+            .register(JobKind::Terminal, format!("job {index}"), 0)
+            .await
+            .expect("the registration is accepted");
+        owner
+            .jobs
+            .settle(job.job_id, JobOutcome::Completed { exit_code: 0 })
+            .await
+            .expect("the job is known");
+        jobs.push(job.job_id);
+    }
+
+    assert_eq!(
+        inputs(&store).await.len(),
+        MAX_CONSECUTIVE_WAKES,
+        "the fourth completion opened nothing"
+    );
+    let left = owner.jobs.unreported();
+    assert_eq!(left.len(), 1, "one job is still owed an announcement");
+    assert_eq!(left[0].job_id, jobs[MAX_CONSECUTIVE_WAKES]);
+    owner.handle.shutdown().await;
+    owner.root.cancel();
+}
+
+/// US-143 AC2 and AC3: a human message rearms the budget, and only a human
+/// message does.
+#[tokio::test]
+async fn only_a_human_message_rearms_the_wake_budget() {
+    let store = Arc::new(MemoryThreadStore::new()) as Arc<dyn ThreadStore>;
+    let owner = open_with(Arc::clone(&store), 1, CompletionDelivery::Wake).await;
+
+    let settle_one = async |command: &str| {
+        let job = owner
+            .jobs
+            .register(JobKind::Terminal, command, 0)
+            .await
+            .expect("the registration is accepted");
+        owner
+            .jobs
+            .settle(job.job_id, JobOutcome::Completed { exit_code: 0 })
+            .await
+            .expect("the job is known");
+        job.job_id
+    };
+
+    for index in 0..MAX_CONSECUTIVE_WAKES {
+        settle_one(&format!("first wave {index}")).await;
+    }
+    let exhausted = settle_one("refused").await;
+    assert_eq!(inputs(&store).await.len(), MAX_CONSECUTIVE_WAKES);
+
+    owner
+        .handle
+        .submit(agent_runtime::thread::Submission::new("carry on"))
+        .await
+        .expect("the submission is accepted");
+    let after_human = settle_one("rearmed").await;
+
+    let keys: Vec<String> = inputs(&store)
+        .await
+        .into_iter()
+        .filter_map(|(_, key, _)| key)
+        .collect();
+    assert!(
+        keys.contains(&delivery_key(after_human)),
+        "the completion after a human message opened a turn: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&delivery_key(exhausted)),
+        "the one refused before the human message stays refused"
+    );
+    owner.handle.shutdown().await;
+    owner.root.cancel();
+}
+
+/// US-143 AC5: a turn a completion opened cannot pass as human, so a chain of
+/// completions runs the budget down instead of renewing it.
+#[tokio::test]
+async fn a_turn_opened_by_a_completion_does_not_rearm_the_budget() {
+    let store = Arc::new(MemoryThreadStore::new()) as Arc<dyn ThreadStore>;
+    let owner = open_with(Arc::clone(&store), 1, CompletionDelivery::Wake).await;
+
+    // Each job settles only once the previous one's turn is over, which is the
+    // chain the budget is meant to stop: settle, wake, settle again.
+    let mut opened = 0;
+    for index in 0..MAX_CONSECUTIVE_WAKES * 2 {
+        let job = owner
+            .jobs
+            .register(JobKind::Terminal, format!("chained {index}"), 0)
+            .await
+            .expect("the registration is accepted");
+        owner
+            .jobs
+            .settle(job.job_id, JobOutcome::Completed { exit_code: 0 })
+            .await
+            .expect("the job is known");
+        opened = inputs(&store).await.len();
+    }
+
+    assert_eq!(
+        opened, MAX_CONSECUTIVE_WAKES,
+        "the chain stopped at the budget instead of renewing it"
+    );
+    owner.handle.shutdown().await;
+    owner.root.cancel();
+}
+
+/// US-142 AC7 and US-144 AC1: with the budget at zero, which is what
+/// [`CompletionDelivery::Quiet`] sets it to, nothing is ever opened. The
+/// accounting is unchanged and the job is simply left unreported, which is the
+/// behavior every client had before EP-044.
+#[tokio::test]
+async fn a_quiet_client_opens_nothing_and_still_accounts_for_the_job() {
+    let store = Arc::new(MemoryThreadStore::new()) as Arc<dyn ThreadStore>;
+    let owner = open_with(Arc::clone(&store), 1, CompletionDelivery::Quiet).await;
+    let job = owner
+        .jobs
+        .register(JobKind::Terminal, "npm test", 0)
+        .await
+        .expect("the registration is accepted");
+
+    owner
+        .jobs
+        .settle(job.job_id, JobOutcome::Completed { exit_code: 0 })
+        .await
+        .expect("the job is known");
+
+    assert!(
+        inputs(&store).await.is_empty(),
+        "a quiet client is never woken"
+    );
+    let trace = job_trace(&store).await;
+    assert_eq!(steps(&trace, job.job_id), vec!["registered", "completed"]);
+    assert_eq!(
+        owner.jobs.unreported().len(),
+        1,
+        "the completion is owed to the end-of-turn notice"
+    );
+    owner.handle.shutdown().await;
+    owner.root.cancel();
+}
+
+/// US-142 AC8: a delivery whose durable write fails leaves the job unreported.
+/// Never the inverse, because a job marked reported on a write nobody kept is a
+/// result lost in silence.
+#[tokio::test]
+async fn a_delivery_whose_write_fails_leaves_the_job_unreported() {
+    let memory = Arc::new(MemoryThreadStore::new());
+    // The registration and the terminal transition go through first; the fourth
+    // append is the input the announcement would open its turn with.
+    let failing = Arc::new(FailingThreadStore::new(
+        Arc::clone(&memory) as Arc<dyn ThreadStore>,
+        FailurePoint::before(
+            StoreOperation::Append,
+            4,
+            "the announcement could not be persisted",
+        ),
+    ));
+    let store = Arc::clone(&failing) as Arc<dyn ThreadStore>;
+    let owner = open_with(Arc::clone(&store), 1, CompletionDelivery::Wake).await;
+    let job = owner
+        .jobs
+        .register(JobKind::Terminal, "npm test", 0)
+        .await
+        .expect("the registration is accepted");
+
+    let _ = owner
+        .jobs
+        .settle(job.job_id, JobOutcome::Completed { exit_code: 0 })
+        .await;
+
+    // The fault fell on the announcement and not before it: the terminal
+    // transition is durable, and no input opened a turn about it.
+    let trace = job_trace(&store).await;
+    assert_eq!(steps(&trace, job.job_id), vec!["registered", "completed"]);
+    assert!(inputs(&store).await.is_empty(), "no turn was opened");
+    assert_eq!(
+        owner.jobs.unreported().len(),
+        1,
+        "the job is still owed an announcement"
+    );
+    owner.root.cancel();
 }

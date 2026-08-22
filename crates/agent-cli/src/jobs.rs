@@ -81,7 +81,7 @@ mod tests {
     use agent_runtime::context::{FixedTurnContext, TurnContext, TurnContextSource, TurnLimits};
     use agent_runtime::event::ThreadEventPayload;
     use agent_runtime::id::{SequentialIds, ThreadId, TurnId};
-    use agent_runtime::jobs::{JobRegistry, JobStatus};
+    use agent_runtime::jobs::{CompletionDelivery, JobRegistry, JobStatus};
     use agent_runtime::runner::{TurnOutcome, TurnRequest, TurnRunner};
     use agent_runtime::store::{MemoryThreadStore, ThreadStore};
     use agent_runtime::thread::{ThreadHandle, ThreadOptions};
@@ -117,6 +117,13 @@ mod tests {
     }
 
     async fn wired() -> Wired {
+        wired_with(CompletionDelivery::Quiet).await
+    }
+
+    /// The same wiring, with the completion delivery of the client under test.
+    /// `Quiet` is what `-p` and the app-server pass; `Wake` is the interactive
+    /// loop (EP-044).
+    async fn wired_with(delivery: CompletionDelivery) -> Wired {
         // The tools only need a directory that exists; nothing below writes to
         // it, so the process temp directory is enough and leaves nothing.
         let dir = std::env::temp_dir();
@@ -153,6 +160,7 @@ mod tests {
             parent_cancel: CancellationToken::new(),
             agents: None,
             jobs: Some(Arc::clone(&registry)),
+            completion_delivery: delivery,
         })
         .await
         .expect("the thread starts");
@@ -201,6 +209,27 @@ mod tests {
                     cause.as_deref()
                 )),
                 ThreadEventPayload::JobReported { .. } => Some("reported".to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every input the durable log carries, oldest first. A turn opened by a
+    /// completion is an input like any other, which is exactly why this reads
+    /// the log rather than a counter.
+    async fn inputs(store: &Arc<dyn ThreadStore>) -> Vec<(Option<String>, String)> {
+        store
+            .read()
+            .await
+            .expect("the store reads")
+            .events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                ThreadEventPayload::InputSubmitted {
+                    client_message_id,
+                    text,
+                    ..
+                } => Some((client_message_id.clone(), text.clone())),
                 _ => None,
             })
             .collect()
@@ -1030,5 +1059,156 @@ mod tests {
         );
         w.ctx.sessions.shutdown().await;
         let _ = std::fs::remove_dir_all(&spill_dir);
+    }
+
+    /// US-144 AC1/AC2: the real teardown of a headless run. `-p` calls
+    /// `ExecSessions::shutdown` on its way out, which settles the terminal
+    /// nobody polled. The settle is durable BEFORE the process leaves, and it
+    /// opens no turn: there is no delivery half attached at all under `Quiet`,
+    /// so FR-14 holds by absence of a caller rather than by a branch.
+    #[tokio::test]
+    async fn a_quiet_client_settles_its_jobs_on_the_way_out_and_opens_no_turn() {
+        let w = wired_with(CompletionDelivery::Quiet).await;
+        agent_tools::ExecCommand
+            .call(exec("sleep 30", 100), &w.ctx)
+            .await
+            .expect("the session opens");
+
+        w.ctx.sessions.shutdown().await;
+
+        let job = only_job(&w.registry);
+        assert_eq!(job.status, JobStatus::Killed, "the run ended under it");
+        assert!(
+            !job.reported,
+            "nobody read the result, so the job stays announceable on a resume"
+        );
+        assert!(
+            job_trace(&w.store)
+                .await
+                .iter()
+                .any(|line| line.starts_with("killed")),
+            "the terminal state is durable before the process exits: {:?}",
+            job_trace(&w.store).await
+        );
+        assert!(
+            inputs(&w.store).await.is_empty(),
+            "a script has nobody to wake: {:?}",
+            inputs(&w.store).await
+        );
+    }
+
+    /// The other half of the same path, and the reason the assertion above is
+    /// about the client and not about the teardown: the SAME settle, on a
+    /// `Wake` client, opens exactly one turn keyed on the job. The announcement
+    /// follows the commit, so the terminal line is already in the log when the
+    /// input lands (US-142 AC2/AC5/AC6).
+    #[tokio::test]
+    async fn a_waking_client_turns_the_same_settle_into_one_turn_keyed_on_the_job() {
+        let w = wired_with(CompletionDelivery::Wake).await;
+        agent_tools::ExecCommand
+            .call(exec("sleep 30", 100), &w.ctx)
+            .await
+            .expect("the session opens");
+        let job_id = only_job(&w.registry).job_id;
+
+        w.ctx.sessions.shutdown().await;
+
+        let inputs = inputs(&w.store).await;
+        assert_eq!(inputs.len(), 1, "one announcement, not two: {inputs:?}");
+        let (client_message_id, text) = &inputs[0];
+        assert_eq!(
+            client_message_id.as_deref(),
+            Some(format!("job-completion:{job_id}").as_str()),
+            "the idempotency key is derived from the job identifier"
+        );
+        assert!(
+            text.contains(&job_id.to_string()) && text.contains("list_jobs"),
+            "the notice names the job and where its output is: {text}"
+        );
+        assert!(
+            only_job(&w.registry).reported,
+            "a delivered announcement marks the job reported"
+        );
+        let trace = job_trace(&w.store).await;
+        let killed = trace
+            .iter()
+            .position(|line| line.starts_with("killed"))
+            .expect("the terminal state is in the log");
+        let reported = trace
+            .iter()
+            .position(|line| line == "reported")
+            .expect("the report is in the log");
+        assert!(
+            killed < reported,
+            "the announcement follows the commit: {trace:?}"
+        );
+    }
+
+    /// US-142 AC1, the case the story is named after: the model launched a
+    /// build, went on to something else, and the build finished. No poll, no
+    /// teardown, no tool call of any kind happens between the launch and the
+    /// assertions, so the only thing that can settle this job is the watch the
+    /// session carries. The turn that follows is the proof it ran.
+    #[tokio::test]
+    async fn a_job_that_ends_while_nobody_polls_it_settles_itself_and_opens_a_turn() {
+        let w = wired_with(CompletionDelivery::Wake).await;
+        // The yield expires long before the command does, so the tool answers
+        // an open session and the model is free to work elsewhere.
+        agent_tools::ExecCommand
+            .call(exec("sleep 0.6; exit 7", 100), &w.ctx)
+            .await
+            .expect("the session opens");
+        let job_id = only_job(&w.registry).job_id;
+        assert_eq!(only_job(&w.registry).status, JobStatus::Running);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline && inputs(&w.store).await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let job = only_job(&w.registry);
+        assert_eq!(job.status, JobStatus::Completed, "the exit was observed");
+        assert_eq!(job.exit_code, Some(7), "with the code the shell returned");
+        let inputs = inputs(&w.store).await;
+        assert_eq!(inputs.len(), 1, "one turn, not one per tick: {inputs:?}");
+        assert_eq!(
+            inputs[0].0.as_deref(),
+            Some(format!("job-completion:{job_id}").as_str()),
+            "keyed on the job, so a redelivery re-executes nothing"
+        );
+        w.ctx.sessions.shutdown().await;
+    }
+
+    /// The other half of the same watch: it settles the job and closes NOTHING.
+    /// A model that comes back to its session after the wake still reads the
+    /// output where it left it, because the store still holds the session and
+    /// its buffer (US-015, unchanged by EP-044).
+    #[tokio::test]
+    async fn the_watch_settles_the_job_without_taking_the_session_away() {
+        let w = wired_with(CompletionDelivery::Wake).await;
+        agent_tools::ExecCommand
+            // The bytes land AFTER the opening yield, so what the poll below
+            // reads is what survived the settle, not what the first call left.
+            .call(exec("sleep 0.6; echo watched", 100), &w.ctx)
+            .await
+            .expect("the session opens");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline && !only_job(&w.registry).status.is_terminal()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            only_job(&w.registry).status.is_terminal(),
+            "the job settled"
+        );
+
+        // The real poll, on the same session id, after the settle.
+        let out = poll(&w, 1, 100).await;
+        assert!(
+            out.contains("watched"),
+            "the session is still readable: {out}"
+        );
+        w.ctx.sessions.shutdown().await;
     }
 }

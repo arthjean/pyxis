@@ -24,7 +24,7 @@ use crate::id::{ThreadId, TurnId};
 use crate::jobs::{JobRecord, JobStatus};
 use crate::lifecycle::TurnState;
 use crate::store::ThreadSnapshot;
-use crate::thread::{Accepted, Submission, TurnStatus};
+use crate::thread::{Accepted, InputOrigin, Submission, TurnStatus};
 
 /// State a client gets back when it opens an existing thread.
 #[derive(Debug, Clone, PartialEq)]
@@ -121,6 +121,12 @@ pub(crate) fn plan(thread_id: ThreadId, snapshot: &ThreadSnapshot) -> ResumePlan
                         Submission {
                             text: text.clone(),
                             client_message_id: client_message_id.clone(),
+                            // The log does not carry an origin, and does not
+                            // need to: a queued input is replayed straight into
+                            // the actor's queue, which never rearms the wake
+                            // budget, and a resume starts on a full one anyway
+                            // (US-143 AC6).
+                            origin: InputOrigin::Human,
                         },
                     ));
                 }

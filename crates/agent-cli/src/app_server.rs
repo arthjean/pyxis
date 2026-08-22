@@ -18,7 +18,7 @@ use agent_app_server::host::{HostError, OpenThread, RuntimeHost, ThreadControl};
 use agent_app_server::items::project_messages;
 use agent_app_server::protocol::{DynamicToolSpec, ThreadItem};
 use agent_runtime::id::{ThreadId, TurnId};
-use agent_runtime::thread::{Submission, SubmitError};
+use agent_runtime::thread::{InputOrigin, Submission, SubmitError};
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::{
@@ -81,6 +81,14 @@ impl CliHost {
         path: PathBuf,
         dynamic: Vec<DynamicToolSpec>,
     ) -> Result<OpenThread, HostError> {
+        // FR-14: the protocol has one direction for a new turn, `session/prompt`,
+        // and a background job is not a client. Forced quiet here rather than at
+        // the dispatch site, so opening a thread through this host can never arm
+        // a delivery that would push a turn the client never asked for.
+        let jobs = self.parts.jobs.clone().map(|wiring| JobWiring {
+            delivery: agent_runtime::jobs::CompletionDelivery::Quiet,
+            ..wiring
+        });
         let runtime = SessionRuntime::open(
             Some(&path),
             self.parts.engine.clone(),
@@ -89,7 +97,7 @@ impl CliHost {
             Arc::clone(&self.parts.steps),
             &self.parts.cancel,
             self.parts.agents.as_ref(),
-            self.parts.jobs.as_ref(),
+            jobs.as_ref(),
         )
         .await
         .map_err(|err| HostError::Internal(err.to_string()))?;
@@ -199,6 +207,9 @@ impl ThreadControl for CliControl {
             .submit(Submission {
                 text,
                 client_message_id,
+                // A protocol client speaks for a person: `session/prompt` is
+                // how that person's message reaches this thread.
+                origin: InputOrigin::Human,
             })
             .await
             .map(|accepted| accepted.turn_id.to_string())
@@ -217,6 +228,7 @@ impl ThreadControl for CliControl {
                 Submission {
                     text,
                     client_message_id,
+                    origin: InputOrigin::Human,
                 },
                 expected,
             )

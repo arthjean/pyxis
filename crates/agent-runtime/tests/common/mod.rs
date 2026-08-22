@@ -414,6 +414,7 @@ pub async fn start_on(
         parent_cancel: root.clone(),
         agents,
         jobs: None,
+        completion_delivery: agent_runtime::jobs::CompletionDelivery::Quiet,
     })
     .await
     .expect("the thread starts");

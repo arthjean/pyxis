@@ -36,12 +36,14 @@ use crate::context::TurnContextSource;
 use crate::event::{ThreadEventPayload, ThreadJournal};
 use crate::handoff::{AgentHandoff, HandoffDraft};
 use crate::id::{AgentId, EventId, IdGenerator, ThreadId};
+use crate::jobs::CompletionDelivery;
 use crate::lifecycle::TurnState;
 use crate::path::AgentPath;
 use crate::runner::TurnRunner;
 use crate::store::ThreadStore;
 use crate::thread::{
-    RuntimeEventPayload, Submission, ThreadHandle, ThreadOptions, ThreadStatus, TurnStatus,
+    InputOrigin, RuntimeEventPayload, Submission, ThreadHandle, ThreadOptions, ThreadStatus,
+    TurnStatus,
 };
 
 /// Characters a spawn task may carry. A task is a brief, not a transcript.
@@ -476,6 +478,9 @@ impl AgentSupervisor {
             parent_cancel: cancel.clone(),
             agents: None,
             jobs: None,
+            // A child owns no registry, so nothing of its own can wake it; and
+            // its parent is the only one entitled to open a turn on it.
+            completion_delivery: CompletionDelivery::Quiet,
         })
         .await
         {
@@ -720,6 +725,10 @@ impl AgentSupervisor {
             handle
                 .steer(
                     Submission {
+                        // A child reporting to its parent is the runtime
+                        // talking to itself: it must not rearm the wake budget
+                        // a human's message rearms (US-143 AC4).
+                        origin: InputOrigin::Runtime,
                         text,
                         client_message_id: Some(message_id.clone()),
                     },
@@ -756,6 +765,8 @@ impl AgentSupervisor {
             let composed = compose_turn(&taken, &text);
             match handle
                 .submit(Submission {
+                    // Same reason as above: nobody typed this.
+                    origin: InputOrigin::Runtime,
                     text: composed,
                     client_message_id: Some(message_id.clone()),
                 })
