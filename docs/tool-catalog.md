@@ -3,7 +3,7 @@
 
 # Catalogue d'outils
 
-Les 29 outils qu'une session de `pyxis` expose, avec leurs propriétés de politique.
+Les 30 outils qu'une session de `pyxis` expose, avec leurs propriétés de politique.
 Ils sont instanciés depuis les sites `.register(` de [`crates/agent-cli/src/main.rs`](../crates/agent-cli/src/main.rs) et lus
 sur les `DynTool` eux-mêmes : une propriété se corrige dans l'outil qui la déclare,
 jamais ici, et ce document est réécrit par la commande de son en-tête.
@@ -35,7 +35,7 @@ tacite, le jour où un outil ferait varier son schéma avec les capacités du fo
 
 ## Synthèse
 
-Sur 29 outils, **19 rendent une sortie non fiable** et 10 ne le font pas.
+Sur 30 outils, **20 rendent une sortie non fiable** et 10 ne le font pas.
 
 | Outil | Espace de noms | Nature | Lecture seule | Concurrence | Sensible | Sensible à la souillure | Sortie non fiable | Différable | Condition d'enregistrement |
 |---|---|---|---|---|---|---|---|---|---|
@@ -51,6 +51,7 @@ Sur 29 outils, **19 rendent une sortie non fiable** et 10 ne le font pas.
 | `grep` | aucun | `function` | oui | oui | non | non | oui | non | aucune |
 | `interrupt_agent` | aucun | `function` | non | non | non | oui | oui | non | toujours enregistré, exposé au modèle selon le `multi_agent_version` du catalogue |
 | `list_agents` | aucun | `function` | oui | oui | non | non | oui | non | toujours enregistré, exposé au modèle selon le `multi_agent_version` du catalogue |
+| `list_jobs` | aucun | `function` | oui | oui | non | non | oui | non | aucune |
 | `list_mcp_resource_templates` | aucun | `function` | oui | non | non | non | oui | non | aucune |
 | `list_mcp_resources` | aucun | `function` | oui | non | non | non | oui | non | aucune |
 | `new_context_window` | aucun | `function` | non | non | oui | oui | non | non | aucune |
@@ -479,6 +480,35 @@ Schéma d'entrée :
   },
   "required": [
     "path_prefix"
+  ],
+  "type": "object"
+}
+```
+
+### `list_jobs`
+
+Description :
+
+```text
+List the background jobs of this conversation: job id, kind, shell session id, status, elapsed time and command. Pass a job id to get that job's full output instead, which can be read again and returns the same bytes. Reads only: it never starts, stops or consumes anything.
+```
+
+Schéma d'entrée :
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "job_id": {
+      "description": "Return this job's status and full output. Null lists every background job.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "job_id"
   ],
   "type": "object"
 }

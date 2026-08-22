@@ -13,14 +13,14 @@ is defined here.
 
 The `description()` of every registered tool, one entry per tool in the `tools`
 array of the request, rendered for a reader in
-[`docs/tool-catalog.md`](../../docs/tool-catalog.md): 29 tools today, from
+[`docs/tool-catalog.md`](../../docs/tool-catalog.md): 30 tools today, from
 [`apply_patch`](../../docs/tool-catalog.md#apply_patch) to
 [`write_stdin`](../../docs/tool-catalog.md#write_stdin), each with its JSON input
 schema.
 
 #### Token effect
 
-The `## Outils` section of the catalog renders 26 117 bytes, a measure of the
+The `## Outils` section of the catalog renders 26 762 bytes, a measure of the
 generated Markdown and not a token count, which puts the tool block in the low
 thousands of tokens on every single request of the session, before a word of
 conversation is counted.
