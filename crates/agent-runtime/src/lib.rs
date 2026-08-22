@@ -52,8 +52,8 @@ pub use id::{
 };
 pub use inputs::TurnInputs;
 pub use jobs::{
-    JobError, JobKind, JobOutcome, JobRecord, JobRegistry, JobSnapshot, JobStatus, MAX_ACTIVE_JOBS,
-    MAX_JOB_COMMAND, RegisteredJob, TEARDOWN_CAUSE,
+    JobError, JobKind, JobLaunch, JobLauncher, JobOutcome, JobProcess, JobRecord, JobRegistry,
+    JobSnapshot, JobStatus, MAX_ACTIVE_JOBS, MAX_JOB_COMMAND, RegisteredJob, TEARDOWN_CAUSE,
 };
 pub use lifecycle::{LifecycleError, TurnLifecycle, TurnState};
 pub use path::{AgentPath, AgentPathError, MAX_AGENT_NAME, MAX_AGENT_PATH, ROOT_PATH};

@@ -57,6 +57,17 @@ pub struct AgentWiring {
     pub authority: agent_runtime::AgentAuthority,
 }
 
+/// What the binary needs to give a thread a registry that can actually launch.
+///
+/// Same split as [`AgentWiring`], for the same reason: the registry belongs to
+/// ONE thread, while the launcher (how a terminal is spawned) and the handle
+/// the tools address are shared for the whole run.
+#[derive(Clone)]
+pub struct JobWiring {
+    pub launcher: Arc<dyn agent_runtime::jobs::JobLauncher>,
+    pub handle: Arc<agent_tools::JobHandle>,
+}
+
 /// Everything a turn is committed to, plus what the prompt is composed from.
 ///
 /// Behind a mutex because `/models`, `/effort` and `/goal` move it BETWEEN turns
@@ -651,6 +662,10 @@ fn build_context(
 impl SessionRuntime {
     /// Opens (or resumes) the thread whose durable log is `path`, or an
     /// in-memory one when `path` is `None` (`--ephemeral`, US-018 AC4).
+    // The wiring of a thread is a list of collaborators, not a parameter object
+    // waiting to be extracted: each one comes from a different owner in `main`
+    // and none of them travels with another.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open(
         path: Option<&Path>,
         engine: EngineDeps,
@@ -659,6 +674,7 @@ impl SessionRuntime {
         steps: Arc<CliStepSource>,
         parent_cancel: &CancellationToken,
         agents: Option<&AgentWiring>,
+        jobs_wiring: Option<&JobWiring>,
     ) -> anyhow::Result<Self> {
         let ids = Arc::clone(&engine.ids);
         // US-121 AC4: the thread handle and the engine now read the SAME clock.
@@ -739,8 +755,19 @@ impl SessionRuntime {
         });
         // One job registry per thread, for the same reason: a background process
         // belongs to the conversation that started it, and reopening a thread
-        // must not make the previous one's processes reachable (EP-041).
-        let jobs = agent_runtime::jobs::JobRegistry::new(Arc::clone(&ids), Arc::clone(&clock));
+        // must not make the previous one's processes reachable (EP-041). The
+        // handle is rebound here too, so a terminal opened between two threads
+        // reaches the registry of the one that is actually running: the
+        // app-server holds `max_open_threads: 1`, and the TUI and the headless
+        // path each run a single thread at a time (US-136 AC6).
+        let jobs = agent_runtime::jobs::JobRegistry::new(
+            Arc::clone(&ids),
+            Arc::clone(&clock),
+            jobs_wiring.map(|wiring| Arc::clone(&wiring.launcher)),
+        );
+        if let Some(wiring) = jobs_wiring {
+            wiring.handle.bind(Arc::clone(&jobs));
+        }
         let handle = ThreadHandle::start(ThreadOptions {
             thread_id,
             store,
@@ -1047,6 +1074,7 @@ mod tests {
                 steps,
                 &root,
                 None,
+                None,
             )
             .await
             .expect("an in-memory thread opens");
@@ -1109,6 +1137,7 @@ mod tests {
             settings(&dir),
             steps,
             &root,
+            None,
             None,
         )
         .await
@@ -1173,6 +1202,7 @@ mod tests {
                 CliStepSource::new(Arc::clone(&registry), Vec::new()),
                 &root,
                 None,
+                None,
             )
             .await
             .expect("the thread opens");
@@ -1201,6 +1231,7 @@ mod tests {
             settings(&dir),
             CliStepSource::new(Arc::clone(&registry), Vec::new()),
             &root,
+            None,
             None,
         )
         .await

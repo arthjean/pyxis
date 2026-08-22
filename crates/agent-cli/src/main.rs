@@ -19,6 +19,7 @@ mod context;
 mod failure_line;
 mod headless;
 mod interactive;
+mod jobs;
 mod jsonl;
 mod observability;
 mod prompt;
@@ -1770,6 +1771,17 @@ async fn run(
         Arc::clone(&harden),
         (!args.ephemeral).then(|| current_session.clone()),
     );
+    // EP-042: the launcher half of the background job registry, on the same
+    // split. `agent-runtime` accounts for a job and `agent-tools` owns the
+    // terminal; only this crate sees both, so this is where a recorded job
+    // becomes a running shell. The handle is the one the terminal tools already
+    // carry, rebound by `SessionRuntime` to the registry of the open thread.
+    let jobs = runtime::JobWiring {
+        launcher: Arc::new(jobs::TerminalJobLauncher::new(exec_sessions.clone()))
+            as Arc<dyn agent_runtime::jobs::JobLauncher>,
+        handle: exec_sessions.job_handle(),
+    };
+
     let agent_handle = Arc::new(agent_tools::AgentHandle::new());
     let agents = runtime::AgentWiring {
         spawner: Arc::clone(&subagent_spawner) as Arc<dyn agent_runtime::supervisor::AgentSpawner>,
@@ -1973,6 +1985,7 @@ async fn run(
                 settings: Arc::clone(&settings),
                 steps: Arc::clone(&steps),
                 agents: Some(agents.clone()),
+                jobs: Some(jobs.clone()),
                 bridge: Arc::clone(&app_bridge),
                 cancel: tokio_util::sync::CancellationToken::new(),
             });
@@ -1981,12 +1994,13 @@ async fn run(
                 Arc::clone(&app_bridge),
             );
             let outcome = serve_app_server(server, args.app_server_listen.clone()).await;
-            exec_sessions.shutdown();
+            exec_sessions.shutdown().await;
             steps.shutdown_code_mode().await;
             outcome?;
         } else if let Some(prompt) = args.prompt {
             let outcome = headless::run(headless::HeadlessRun {
                 agents: Some(agents.clone()),
+                jobs: Some(jobs.clone()),
                 prompt,
                 session_path: (!args.ephemeral).then(|| current_session.clone()),
                 session_id: session_id.clone(),
@@ -2005,12 +2019,13 @@ async fn run(
             // US-012 AC4: a one-shot run leaves no shell session behind, whatever
             // the outcome (several paths bail from here). Same reasoning for the
             // Code Mode session: a cell must not outlive the run that opened it.
-            exec_sessions.shutdown();
+            exec_sessions.shutdown().await;
             steps.shutdown_code_mode().await;
             outcome?;
         } else {
             let cfg = InteractiveConfig {
                 agents: Some(agents.clone()),
+                jobs: Some(jobs.clone()),
                 model: args.model,
                 reasoning_effort: initial_reasoning_effort,
                 goal,
@@ -2062,7 +2077,7 @@ async fn run(
             // US-012 AC4: the session ending closes every shell session and kills
             // its process tree, on the error path too. The Code Mode session is
             // closed on the same reasoning: no cell outlives the run.
-            exec_sessions.shutdown();
+            exec_sessions.shutdown().await;
             steps.shutdown_code_mode().await;
             outcome?;
         }

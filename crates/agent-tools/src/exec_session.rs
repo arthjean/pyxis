@@ -38,9 +38,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use agent_core::provider::ToolKind;
 use agent_core::tools::ToolExecution;
 
+use agent_runtime::id::JobId;
+use agent_runtime::jobs::{JobKind, JobOutcome, JobRegistry};
+
 use crate::error::{ToolError, ValidationError};
+use crate::jobs::JobHandle;
 use crate::permission::{PermCtx, PermissionDecision};
-use crate::tool::{MAX_COMMAND_BYTES, Tool, ToolCtx, ToolOutput, terminates};
+use crate::tool::{CommandHardener, MAX_COMMAND_BYTES, Tool, ToolCtx, ToolOutput, terminates};
 
 /// Concurrent sessions cap. A session holds a process and its reader task;
 /// past a handful the model is juggling, not working.
@@ -195,6 +199,19 @@ struct Session {
     /// Monotonic chunk counter (US-015 AC1): the model can order two reads of
     /// the same session without comparing their content.
     next_chunk: u64,
+    /// Entry this session holds in the thread's job registry (EP-042). `None`
+    /// when no registry is bound, which is every context without a thread.
+    job: Option<JobTie>,
+}
+
+/// What ties a live session to its entry in the thread's job registry.
+///
+/// Held by the session rather than by the store, so the tie dies exactly when
+/// the session does: whoever closes it settles the job, and a session dropped
+/// without ceremony still settles it on its way out.
+struct JobTie {
+    registry: Arc<JobRegistry>,
+    job_id: JobId,
 }
 
 impl Session {
@@ -253,8 +270,51 @@ impl Session {
     }
 }
 
+impl Session {
+    /// Settles the job of this session, once. Taking the tie is what makes it
+    /// once: the second caller finds nothing left to settle, and `Drop` finds
+    /// nothing either.
+    async fn settle_job(&mut self, outcome: JobOutcome) {
+        let Some(tie) = self.job.take() else { return };
+        if let Err(err) = tie.registry.settle(tie.job_id, outcome).await {
+            tracing::debug!(
+                target: "pyxis::tools",
+                job_id = %tie.job_id,
+                error = %err,
+                "background job of a shell session was not settled"
+            );
+        }
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
+        // A session destroyed without ceremony still owes its registry an
+        // outcome (US-137 AC6). `Drop` cannot await, so the terminal state is
+        // claimed here and its durable line goes to the deferred queue the
+        // thread actor drains while it still owns the log.
+        if let Some(tie) = self.job.take() {
+            // An exit already observed is an ANSWER, whatever brought the
+            // session here: settling it `Killed` would lose the code the model
+            // is owed (US-137 AC1/AC2). Only a session still running when it is
+            // destroyed is a kill. The status is read, never polled: `Drop`
+            // reaps below, and reaping before the group is signalled would aim
+            // the signal at a leader the kernel has already released.
+            let outcome = match self.status {
+                SessionStatus::Exited { code, signal } => session_outcome(code, signal, false),
+                SessionStatus::Running => JobOutcome::Killed {
+                    cause: "killed: the shell session was dropped while running".to_string(),
+                },
+            };
+            if let Err(err) = tie.registry.settle_deferred(tie.job_id, outcome) {
+                tracing::debug!(
+                    target: "pyxis::tools",
+                    job_id = %tie.job_id,
+                    error = %err,
+                    "dropped shell session left its background job unsettled"
+                );
+            }
+        }
         // Synchronous on purpose: `Drop` cannot await, and a session dropped at
         // the end of the program must not leave an orphan behind.
         if let Some(pid) = self.pid {
@@ -276,6 +336,10 @@ impl Drop for Session {
 #[derive(Clone)]
 pub struct ExecSessions {
     inner: Arc<Mutex<Store>>,
+    /// Registry of the thread currently open (EP-042). Rebound per thread by
+    /// the binary; unbound in every context without a thread, where a terminal
+    /// still opens and simply is not accounted for.
+    jobs: Arc<JobHandle>,
 }
 
 impl Default for ExecSessions {
@@ -294,13 +358,30 @@ struct Store {
     /// Ids held between the cap check and the spawn (US-014 AC4): the slot is
     /// taken BEFORE a process exists, so the fifth call cannot race past it.
     reserved: HashSet<u64>,
+    /// Spawn recipes waiting for their launch, keyed by reserved id.
+    staged: HashMap<u64, StagedSpawn>,
     closed: VecDeque<(u64, ClosedCause)>,
     next_id: u64,
+}
+
+/// Everything needed to spawn a session, held between the slot and the launch.
+///
+/// `exec_command` resolves the shell, the working directory and the hardening,
+/// but it is no longer what spawns: the registry records the job first and the
+/// launcher the binary bound to it spawns second (US-136 AC2). The launcher
+/// receives only the session id, so the recipe waits here under that id.
+struct StagedSpawn {
+    shell: crate::shell::ShellChoice,
+    command: String,
+    workdir: PathBuf,
+    tty: bool,
+    harden: Option<CommandHardener>,
 }
 
 impl Store {
     fn close(&mut self, id: u64, cause: ClosedCause) -> Option<Session> {
         self.reserved.remove(&id);
+        self.staged.remove(&id);
         let session = self.sessions.remove(&id);
         if self.closed.len() >= CLOSED_MEMORY {
             self.closed.pop_front();
@@ -344,7 +425,13 @@ impl ExecSessions {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Store::default())),
+            jobs: Arc::new(JobHandle::new()),
         }
+    }
+
+    /// The handle the binary rebinds to the registry of each thread it opens.
+    pub fn job_handle(&self) -> Arc<JobHandle> {
+        Arc::clone(&self.jobs)
     }
 
     /// Number of live sessions (inspection, tests).
@@ -360,16 +447,36 @@ impl ExecSessions {
     ///
     /// A session outlives the turn that opened it, on purpose: a build left
     /// running is the point of a background terminal. What is NOT wanted is for
-    /// it to be forgotten, still burning CPU until the idle watchdog reaps it
-    /// five minutes later. The turn end reads this to say what it is leaving
-    /// behind (Codex exposes the same thing as `list_background_terminals`).
+    /// it to be forgotten, still burning CPU while nothing accounts for it. The
+    /// turn end reads this to say what it is leaving behind (Codex exposes the
+    /// same thing as `list_background_terminals`).
+    ///
+    /// When a registry is bound this is a PROJECTION of it (US-136 AC2): the
+    /// listed sessions are the ones whose job is still active there, so a job
+    /// the registry settled disappears from here even if the local store has
+    /// not caught up. Without a registry the local store answers, which is the
+    /// only truth that exists in that case.
     pub fn open_sessions(&self) -> Vec<(u64, String)> {
+        let active: Option<HashSet<JobId>> = self.jobs.registry().map(|registry| {
+            registry
+                .snapshots()
+                .into_iter()
+                .filter(|job| job.kind == JobKind::Terminal && job.status.is_active())
+                .map(|job| job.job_id)
+                .collect()
+        });
         let Ok(store) = self.inner.lock() else {
             return Vec::new();
         };
         let mut open: Vec<(u64, String)> = store
             .sessions
             .iter()
+            .filter(|(_, session)| match (&active, &session.job) {
+                (Some(active), Some(tie)) => active.contains(&tie.job_id),
+                // No registry, or a session opened before one was bound: the
+                // store is all there is to read.
+                (Some(_), None) | (None, _) => true,
+            })
             .map(|(id, session)| (*id, session.command.clone()))
             .collect();
         open.sort_by_key(|(id, _)| *id);
@@ -377,10 +484,16 @@ impl ExecSessions {
     }
 
     /// Closes every session and kills every process tree. Called when the Pyxis
-    /// session ends; also what `Drop` falls back on.
-    pub fn shutdown(&self) {
-        let drained: Vec<Session> = match self.inner.lock() {
+    /// session ends.
+    ///
+    /// Async because a session owes its registry an outcome before it dies: the
+    /// job is settled `Killed` first, and only then is the process torn down.
+    /// A session whose settle could not run still settles through `Drop`, which
+    /// defers the durable line instead of awaiting it.
+    pub async fn shutdown(&self) {
+        let mut drained: Vec<Session> = match self.inner.lock() {
             Ok(mut store) => {
+                store.staged.clear();
                 let ids: Vec<u64> = store.sessions.keys().copied().collect();
                 ids.into_iter()
                     .filter_map(|id| store.close(id, ClosedCause::Shutdown))
@@ -388,6 +501,19 @@ impl ExecSessions {
             }
             Err(_) => Vec::new(),
         };
+        for session in &mut drained {
+            // A process that finished while nobody polled it still finished:
+            // the run ending is what OBSERVES the exit, not what causes it, so
+            // the job settles `Completed` with its code (US-137 AC1/AC2). Only
+            // a session still running is killed by the end of the run.
+            let outcome = match session.status() {
+                SessionStatus::Exited { code, signal } => session_outcome(code, signal, false),
+                SessionStatus::Running => JobOutcome::Killed {
+                    cause: "killed: the run ended while the shell session was open".to_string(),
+                },
+            };
+            session.settle_job(outcome).await;
+        }
         // Dropped OUTSIDE the lock: each `Drop` kills a process tree, and
         // holding the mutex across that would serialize a watchdog onto it.
         drop(drained);
@@ -401,10 +527,7 @@ impl ExecSessions {
             .lock()
             .map_err(|_| ToolError::Io("session store poisoned".to_string()))?;
         if store.sessions.len() + store.reserved.len() >= MAX_SESSIONS {
-            return Err(ToolError::Rejected(format!(
-                "too many open shell sessions ({MAX_SESSIONS}): terminate one \
-                 (write_stdin with terminate) before opening another"
-            )));
+            return Err(too_many_sessions());
         }
         store.next_id += 1;
         let id = store.next_id;
@@ -415,13 +538,72 @@ impl ExecSessions {
     fn release(&self, id: u64) {
         if let Ok(mut store) = self.inner.lock() {
             store.reserved.remove(&id);
+            store.staged.remove(&id);
         }
+    }
+
+    /// Parks a spawn recipe under a reserved id, for the launcher to pick up.
+    fn stage(&self, id: u64, spawn: StagedSpawn) -> Result<(), ToolError> {
+        let mut store = self
+            .inner
+            .lock()
+            .map_err(|_| ToolError::Io("session store poisoned".to_string()))?;
+        store.staged.insert(id, spawn);
+        Ok(())
+    }
+
+    /// Spawns what `token` staged and commits the session under the same id.
+    ///
+    /// This is the launch side of the registration: the binary's launcher calls
+    /// it once the registry holds a durable record, and `exec_command` calls it
+    /// directly when no registry is bound. `job_id` is what ties the session to
+    /// that record, so whoever closes it settles it.
+    pub fn launch_staged(&self, token: u64, job_id: Option<JobId>) -> Result<(), ToolError> {
+        let staged = {
+            let mut store = self
+                .inner
+                .lock()
+                .map_err(|_| ToolError::Io("session store poisoned".to_string()))?;
+            store.staged.remove(&token)
+        };
+        let Some(staged) = staged else {
+            return Err(ToolError::Io(format!(
+                "shell session {token} has no staged command to launch"
+            )));
+        };
+        let job = job_id.and_then(|job_id| {
+            self.jobs
+                .registry()
+                .map(|registry| JobTie { registry, job_id })
+        });
+        let session = spawn_session(&staged, job)?;
+        self.commit(token, session);
+        Ok(())
     }
 
     fn commit(&self, id: u64, session: Session) {
         if let Ok(mut store) = self.inner.lock() {
             store.reserved.remove(&id);
             store.sessions.insert(id, session);
+        }
+    }
+
+    /// Bytes a session produced since the previous read, consumed.
+    ///
+    /// The public side of what `collect` uses internally: it is what a reader
+    /// of the job registry needs, which knows a job id and no session at all.
+    pub fn drain_output(&self, id: u64) -> Result<Vec<u8>, ToolError> {
+        self.with_session(id, |session| session.drain().bytes)
+    }
+
+    /// Ends a session's process group, on the budget `write_stdin terminate`
+    /// uses. Idempotent: a session already gone is not an error here, because
+    /// the caller is stopping something it may have already lost the race with.
+    pub async fn terminate(&self, id: u64) -> Result<(), ToolError> {
+        match terminate_session(self, id).await {
+            Ok(()) => Ok(()),
+            Err(ToolError::SessionClosed(_)) => Ok(()),
+            Err(e) => Err(e),
         }
     }
 
@@ -598,15 +780,32 @@ impl Tool for ExecCommand {
             .as_ref()
             .map(|observer| observer.mark());
         let id = sessions.reserve()?;
+        sessions.stage(
+            id,
+            StagedSpawn {
+                shell,
+                command: input.cmd.clone(),
+                workdir,
+                tty,
+                harden: ctx.harden.clone(),
+            },
+        )?;
 
-        let session = match spawn_session(&shell, &input.cmd, &workdir, tty, ctx) {
-            Ok(session) => session,
-            Err(e) => {
-                sessions.release(id);
-                return Err(e);
-            }
-        };
-        sessions.commit(id, session);
+        // Reserve, register, THEN launch (US-136 AC2). The registry writes its
+        // record before the launcher it drives spawns anything, so no process
+        // exists that a restart could not account for. Without a registry the
+        // launch is direct: the accounting is what is missing, not the terminal.
+        if let Err(e) = match sessions.jobs.registry() {
+            Some(registry) => registry
+                .register(JobKind::Terminal, &input.cmd, id)
+                .await
+                .map(|_| ())
+                .map_err(job_refusal),
+            None => sessions.launch_staged(id, None),
+        } {
+            sessions.release(id);
+            return Err(e);
+        }
 
         let window = yield_window(
             input.yield_time_ms,
@@ -623,7 +822,8 @@ impl Tool for ExecCommand {
             false,
             ctx,
             sandbox_mark,
-        ))
+        )
+        .await)
     }
 }
 
@@ -789,7 +989,8 @@ impl Tool for WriteStdin {
             terminating,
             ctx,
             sandbox_mark,
-        ))
+        )
+        .await)
     }
 }
 
@@ -889,15 +1090,71 @@ fn yield_window(requested: Option<u64>, default: Duration, shape: YieldShape) ->
     }
 }
 
+/// What a finished session owes its registry (US-137 AC1 to AC4).
+///
+/// An exit code is an ANSWER, whatever its value: a build that fails with 1 ran
+/// and reported, so the job is `Completed` carrying that code. `Failed` is
+/// reserved for the launch that never happened. A signal, or a terminate the
+/// model asked for, is a `Killed` naming its cause.
+fn session_outcome(code: Option<i32>, signal: Option<i32>, terminated: bool) -> JobOutcome {
+    if let Some(signal) = signal {
+        return JobOutcome::Killed {
+            cause: format!("killed by signal {signal}"),
+        };
+    }
+    if terminated {
+        return JobOutcome::Killed {
+            cause: match code {
+                Some(code) => format!("terminated by write_stdin, exit code {code}"),
+                None => "terminated by write_stdin".to_string(),
+            },
+        };
+    }
+    match code {
+        Some(exit_code) => JobOutcome::Completed { exit_code },
+        None => JobOutcome::Killed {
+            cause: "the shell session ended without an exit code".to_string(),
+        },
+    }
+}
+
+/// The cap refusal, in the sentence the model is trained on. Both the session
+/// store and the job registry answer with THIS one: the model must read the
+/// same way out whichever bound it hit (US-136 AC3).
+fn too_many_sessions() -> ToolError {
+    ToolError::Rejected(format!(
+        "too many open shell sessions ({MAX_SESSIONS}): terminate one \
+         (write_stdin with terminate) before opening another"
+    ))
+}
+
+/// Turns a registry refusal into the answer the model gets.
+///
+/// A full registry says exactly what a full session store says, because from
+/// the model's side it IS the same refusal. Everything else keeps the registry's
+/// own sentence: a launch that failed, a log that refused and a thread that is
+/// gone each call for a different next move.
+fn job_refusal(error: agent_runtime::jobs::JobError) -> ToolError {
+    use agent_runtime::jobs::JobError;
+    match error {
+        JobError::LimitReached { .. } => too_many_sessions(),
+        JobError::NotLaunched(cause) => ToolError::Io(format!("shell session launch: {cause}")),
+        other => ToolError::Rejected(other.to_string()),
+    }
+}
+
 /// Spawns the session process: same hardening as `bash`, plus an OPEN standard
 /// input and, on request, a real terminal.
-fn spawn_session(
-    shell: &crate::shell::ShellChoice,
-    command: &str,
-    workdir: &std::path::Path,
-    tty: bool,
-    ctx: &ToolCtx,
-) -> Result<Session, ToolError> {
+fn spawn_session(staged: &StagedSpawn, job: Option<JobTie>) -> Result<Session, ToolError> {
+    let StagedSpawn {
+        shell,
+        command,
+        workdir,
+        tty,
+        harden,
+    } = staged;
+    let tty = *tty;
+    let command = command.as_str();
     #[cfg(windows)]
     let mut cmd = {
         let mut cmd = tokio::process::Command::new(&shell.program);
@@ -919,7 +1176,7 @@ fn spawn_session(
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
-    if let Some(harden) = &ctx.harden {
+    if let Some(harden) = harden {
         harden(&mut cmd);
     }
 
@@ -940,6 +1197,7 @@ fn spawn_session(
             status: SessionStatus::Running,
             command: command.to_string(),
             next_chunk: 0,
+            job,
         });
     }
     #[cfg(not(unix))]
@@ -971,6 +1229,7 @@ fn spawn_session(
         status: SessionStatus::Running,
         command: command.to_string(),
         next_chunk: 0,
+        job,
     })
 }
 
@@ -1156,7 +1415,7 @@ fn emit(ctx: &ToolCtx, chunk: &OutputBuffer, accumulated: &mut OutputBuffer) {
 /// exactly like a `bash` failure. `None` when nothing could have been blocked
 /// since the previous call.
 #[allow(clippy::too_many_arguments)]
-fn finish(
+async fn finish(
     sessions: &ExecSessions,
     id: u64,
     collected: Collected,
@@ -1184,7 +1443,7 @@ fn finish(
 
     let (exit_code, signal, session_id) = match status {
         SessionStatus::Exited { code, signal } => {
-            let closed = sessions.close(
+            let mut closed = sessions.close(
                 id,
                 if terminated {
                     ClosedCause::Terminated
@@ -1192,6 +1451,15 @@ fn finish(
                     ClosedCause::Exited { code, signal }
                 },
             );
+            // The job is settled BEFORE this call answers (US-137 AC7): the
+            // durable transition is written first, and only then does the model
+            // read an exit code. Inverting the two would let a reader learn of
+            // an exit the log does not carry yet.
+            if let Some(session) = closed.as_mut() {
+                session
+                    .settle_job(session_outcome(code, signal, terminated))
+                    .await;
+            }
             // The command is kept on the session for the trace below, which
             // stays at `trace` level: a command line can carry a token, and the
             // observability policy keeps call content out of `debug`.
@@ -1593,7 +1861,7 @@ mod tests {
             .expect("the poll must succeed");
         assert!(!other.content.contains("got:"), "{}", other.content);
         assert_eq!(field(&other, "session_id"), Some(&serde_json::json!(1)));
-        ctx.sessions.shutdown();
+        ctx.sessions.shutdown().await;
     }
 
     // US-015 AC1: a poll returns ONLY what came after the previous chunk, and
@@ -1623,7 +1891,7 @@ mod tests {
             second.content
         );
         assert_eq!(field(&second, "chunk_id"), Some(&serde_json::json!("2")));
-        ctx.sessions.shutdown();
+        ctx.sessions.shutdown().await;
     }
 
     // US-015 AC2: the session survives a yield that expires, and `terminate`
@@ -1795,8 +2063,21 @@ mod tests {
             MAX_SESSIONS,
             "the refused call left nothing behind"
         );
-        ctx.sessions.shutdown();
+        ctx.sessions.shutdown().await;
         assert!(ctx.sessions.is_empty());
+    }
+
+    /// US-136 AC3: the model reads ONE way out of the cap. The registry now has
+    /// a bound of its own, and hitting it must not teach the model a second
+    /// sentence for the same situation.
+    #[test]
+    fn a_full_registry_answers_with_the_session_cap_sentence() {
+        let refusal = job_refusal(agent_runtime::jobs::JobError::LimitReached { active: 4 });
+        assert_eq!(refusal.to_string(), too_many_sessions().to_string());
+        assert!(
+            refusal.to_string().contains("write_stdin with terminate"),
+            "{refusal}"
+        );
     }
 
     // The output travels AS IT COMES on the fragment channel every other tool
@@ -1849,7 +2130,7 @@ mod tests {
             .with_session(1, |s| s.pid)
             .expect("the session must exist")
             .expect("the process must have a pid");
-        ctx.sessions.shutdown();
+        ctx.sessions.shutdown().await;
         assert!(ctx.sessions.is_empty());
         // The kill is a signal, not a promise of immediacy: we let the OS reap.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1902,7 +2183,7 @@ mod tests {
         assert!(is_alive(pid), "its process must still be running");
 
         // The run ending is what reaps it, and it takes the process tree with it.
-        ctx.sessions.shutdown();
+        ctx.sessions.shutdown().await;
         assert!(ctx.sessions.is_empty());
         assert!(!is_alive(pid), "no orphan process may survive the shutdown");
     }

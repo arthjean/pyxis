@@ -15,7 +15,8 @@ use agent_runtime::context::{FixedTurnContext, TurnContext, TurnContextSource, T
 use agent_runtime::event::ThreadEventPayload;
 use agent_runtime::id::{JobId, SequentialIds, ThreadId, TurnId};
 use agent_runtime::jobs::{
-    JobError, JobKind, JobOutcome, JobRegistry, JobStatus, MAX_ACTIVE_JOBS, TEARDOWN_CAUSE,
+    JobError, JobKind, JobLaunch, JobLauncher, JobOutcome, JobProcess, JobRegistry, JobStatus,
+    MAX_ACTIVE_JOBS, TEARDOWN_CAUSE,
 };
 use agent_runtime::runner::{TurnOutcome, TurnRequest, TurnRunner};
 use agent_runtime::store::{
@@ -51,6 +52,35 @@ impl Clock for FrozenClock {
     async fn sleep(&self, _dur: Duration) {}
 }
 
+/// A launcher with nothing behind it. These tests assert the durable log, and a
+/// log does not care whether a process exists; what it needs is a registry that
+/// accepts registrations, which one without a launcher refuses.
+struct TestLauncher;
+
+impl TestLauncher {
+    fn shared() -> Arc<dyn JobLauncher> {
+        Arc::new(Self) as Arc<dyn JobLauncher>
+    }
+}
+
+#[async_trait::async_trait]
+impl JobLauncher for TestLauncher {
+    async fn launch(&self, _launch: JobLaunch) -> Result<Arc<dyn JobProcess>, String> {
+        Ok(Arc::new(TestProcess) as Arc<dyn JobProcess>)
+    }
+}
+
+struct TestProcess;
+
+#[async_trait::async_trait]
+impl JobProcess for TestProcess {
+    async fn read_output(&self) -> Result<Vec<u8>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn stop(&self) {}
+}
+
 fn turn_context(turn_id: TurnId) -> TurnContext {
     TurnContext {
         turn_id,
@@ -82,7 +112,11 @@ async fn open(store: Arc<dyn ThreadStore>, seed: u64) -> Owner {
         .expect("the store reads")
         .thread_id
         .unwrap_or_else(|| ThreadId::generate(ids.as_ref()));
-    let jobs = JobRegistry::new(Arc::clone(&ids) as Arc<_>, Arc::new(FrozenClock));
+    let jobs = JobRegistry::new(
+        Arc::clone(&ids) as Arc<_>,
+        Arc::new(FrozenClock),
+        Some(TestLauncher::shared()),
+    );
     let root = CancellationToken::new();
     let handle = ThreadHandle::start(ThreadOptions {
         thread_id,
@@ -141,12 +175,12 @@ async fn a_reopened_thread_finds_its_jobs_their_terminal_state_and_their_flag() 
     let first = open(Arc::clone(&store), 1).await;
     let exited = first
         .jobs
-        .register(JobKind::Terminal, "npm test")
+        .register(JobKind::Terminal, "npm test", 0)
         .await
         .expect("the registration is accepted");
     let stopped = first
         .jobs
-        .register(JobKind::Terminal, "npm run dev")
+        .register(JobKind::Terminal, "npm run dev", 0)
         .await
         .expect("the registration is accepted");
     first
@@ -200,7 +234,7 @@ async fn a_terminal_reaches_the_log_before_the_settle_answers() {
     let owner = open(Arc::clone(&store), 1).await;
     let job = owner
         .jobs
-        .register(JobKind::Terminal, "npm test")
+        .register(JobKind::Terminal, "npm test", 0)
         .await
         .expect("the registration is accepted");
 
@@ -233,7 +267,7 @@ async fn a_registration_whose_log_write_is_cut_refuses_and_registers_nothing() {
 
     let refused = owner
         .jobs
-        .register(JobKind::Terminal, "npm run dev")
+        .register(JobKind::Terminal, "npm run dev", 0)
         .await
         .expect_err("a registration the log refuses is refused");
 
@@ -257,7 +291,7 @@ async fn a_job_of_one_thread_is_invisible_from_another() {
 
     let job = owner
         .jobs
-        .register(JobKind::Terminal, "npm run dev")
+        .register(JobKind::Terminal, "npm run dev", 0)
         .await
         .expect("the registration is accepted");
 
@@ -297,7 +331,7 @@ async fn a_thread_shutdown_stops_every_job_and_the_log_carries_both_states() {
         running.push(
             owner
                 .jobs
-                .register(JobKind::Terminal, format!("tail -f {index}.log"))
+                .register(JobKind::Terminal, format!("tail -f {index}.log"), 0)
                 .await
                 .expect("a slot is free"),
         );
@@ -338,7 +372,7 @@ async fn an_interruption_during_a_registration_leaves_the_registry_coherent() {
         let owner = open(Arc::clone(&store), round * 100 + 1).await;
         let jobs = Arc::clone(&owner.jobs);
         let registering =
-            tokio::spawn(async move { jobs.register(JobKind::Terminal, "npm run dev").await });
+            tokio::spawn(async move { jobs.register(JobKind::Terminal, "npm run dev", 0).await });
         // The interruption lands at a different point of the registration each
         // round, without a single sleep.
         for _ in 0..(round % 5) {

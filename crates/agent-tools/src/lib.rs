@@ -24,6 +24,7 @@ pub mod glob;
 pub mod grep;
 pub mod hooks;
 pub mod image;
+pub mod jobs;
 pub mod patch;
 pub mod path;
 pub mod permission;
@@ -67,6 +68,7 @@ pub use hooks::{
     CommandHooks, HOOK_EVENT_NAMES, HookDecision, HookEvent, HookSpec, Hooks, Lifecycle, NoHooks,
 };
 pub use image::ViewImage;
+pub use jobs::JobHandle;
 pub use patch::ApplyPatch;
 pub use permission::{
     ApprovalEntry, ApprovalKey, ApprovalMemo, ApprovalMemory, ApprovalResponse, Approver,

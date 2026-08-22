@@ -7,10 +7,11 @@
 //! BEFORE anything is launched, so a job the log does not carry is a job nobody
 //! can account for after a restart.
 //!
-//! What it deliberately does not do is launch anything. Spawning the process,
-//! draining its output and settling it when it exits belong to the crates that
-//! own a terminal; the registry only knows that a job exists, which state it
-//! reached, and whether its owner was told (EP-042 plugs a launcher into it).
+//! What it deliberately does not do is know what it launched. Spawning the
+//! process, draining its output and stopping it belong to the crate that owns a
+//! terminal, reached through [`JobLauncher`] and [`JobProcess`]; the registry
+//! only knows that a job exists, which state it reached, and whether its owner
+//! was told.
 //!
 //! Three properties are load-bearing:
 //! - the bound is a CONSTANT ([`MAX_ACTIVE_JOBS`]), never a configuration key
@@ -210,6 +211,59 @@ pub struct JobSnapshot {
     pub attached: bool,
 }
 
+/// What a producer hands the registry once the process of a job runs.
+///
+/// The two operations here are the ones the registry CANNOT implement: reading
+/// what a job produced and stopping it both mean knowing what the thing is, and
+/// the registry only knows that it exists. A terminal answers them with its
+/// output buffer and its process group; another genre would answer them with
+/// something else entirely, and the registry would not notice.
+#[async_trait::async_trait]
+pub trait JobProcess: Send + Sync {
+    /// Bytes the job produced since the previous read, as the producer renders
+    /// them. Consuming or not is the producer's policy, not the registry's.
+    async fn read_output(&self) -> Result<Vec<u8>, String>;
+
+    /// Stops the process. Must be idempotent: a stop can race the exit it is
+    /// trying to cause, and the first arrival is what settles the job.
+    async fn stop(&self);
+}
+
+/// What the registry tells a launcher about the job it has just recorded.
+///
+/// `token` is the ONLY field the registry does not understand: it is the
+/// producer's own handle for the thing to start, minted before the
+/// registration, and carried here verbatim. A terminal puts its session id in
+/// it. Reading it would mean the registry knows what a shell is, and it does
+/// not.
+#[derive(Debug, Clone)]
+pub struct JobLaunch {
+    pub job_id: JobId,
+    pub kind: JobKind,
+    /// Command line, already bounded, exactly as the log recorded it.
+    pub command: String,
+    /// Producer handle for the thing to start. Opaque here.
+    pub token: u64,
+    /// Cancellation node of THIS job, a child of the thread's.
+    pub cancel: CancellationToken,
+}
+
+/// Starts the process of a job the log already carries.
+///
+/// Declared here and implemented by the binary, on the pattern
+/// `crates/agent-tools/Cargo.toml` documents for [`crate::supervisor::AgentSpawner`]
+/// and its `SubAgentSpawner`: the runtime owns the accounting and the
+/// durability, the binary owns what a process is. That is what keeps the crate
+/// graph one-way and the registry testable with a fake, without a shell and
+/// without a tool registry.
+///
+/// Called AFTER the slot is taken and the registration is durable, never
+/// before: a process nobody recorded is a process nobody can account for.
+#[async_trait::async_trait]
+pub trait JobLauncher: Send + Sync {
+    async fn launch(&self, launch: JobLaunch) -> Result<Arc<dyn JobProcess>, String>;
+}
+
 /// Identity handed back for an accepted registration.
 ///
 /// The token is the caller's half of the contract: a launcher hangs its process
@@ -237,9 +291,19 @@ pub enum JobError {
     Unknown { job_id: JobId },
     #[error("background jobs are not available: no registry is bound to this thread")]
     Detached,
+    /// No launcher: the registry knows how to account for a job and nothing
+    /// else. Same "no store, no behavior" refusal as a `ToolCtx` built without
+    /// a spill store, rather than a registration that records a process nobody
+    /// will ever start.
+    #[error("background jobs are not available: no launcher is bound to this registry")]
+    NoLauncher,
     /// The registration could not be made durable. Nothing was launched.
     #[error("background job was not registered: {0}")]
     NotRegistered(String),
+    /// The registration held, the process did not start. The job is already
+    /// settled `Failed` with this cause and its slot is back.
+    #[error("background job did not start: {0}")]
+    NotLaunched(String),
 }
 
 /// Thread link, bound once the thread actor exists.
@@ -256,6 +320,10 @@ struct Job {
     /// `None` for a job rebuilt from a log: its process belongs to a run that
     /// no longer exists.
     cancel: Option<CancellationToken>,
+    /// What the launcher handed back. `None` before the launch and for a job
+    /// rebuilt from a log, which is why stopping one is a trace and not an
+    /// error: there is nothing left in this process to stop.
+    process: Option<Arc<dyn JobProcess>>,
 }
 
 impl Job {
@@ -302,6 +370,9 @@ impl RegistryState {
 pub struct JobRegistry {
     ids: Arc<dyn IdGenerator>,
     clock: Arc<dyn Clock>,
+    /// How a recorded job becomes a running process. `None` outside the binary:
+    /// the accounting still works, every registration is refused.
+    launcher: Option<Arc<dyn JobLauncher>>,
     owner: OnceLock<JobOwner>,
     state: Mutex<RegistryState>,
     /// Transitions the log refused while the thread was closing. Handed back at
@@ -311,10 +382,15 @@ pub struct JobRegistry {
 }
 
 impl JobRegistry {
-    pub fn new(ids: Arc<dyn IdGenerator>, clock: Arc<dyn Clock>) -> Arc<Self> {
+    pub fn new(
+        ids: Arc<dyn IdGenerator>,
+        clock: Arc<dyn Clock>,
+        launcher: Option<Arc<dyn JobLauncher>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             ids,
             clock,
+            launcher,
             owner: OnceLock::new(),
             state: Mutex::new(RegistryState::default()),
             unrecorded: Mutex::new(Vec::new()),
@@ -375,21 +451,29 @@ impl JobRegistry {
         self.lock().active()
     }
 
-    /// Registers a background job and hands back its identity.
+    /// Registers a background job, starts it, and hands back its identity.
     ///
     /// Order is the contract: take the slot, mint the identifier, make the
-    /// registration durable, and only then admit the job. A caller gets the
-    /// identifier once the log carries it, so nothing is ever launched for a
-    /// job a restart could not find (US-133, invariant 12).
+    /// registration durable, and only THEN launch. A caller gets the identifier
+    /// once the log carries it, so nothing is ever launched for a job a restart
+    /// could not find (US-133, invariant 12), and no process exists before the
+    /// record that accounts for it (US-136 AC2).
+    ///
+    /// `token` is the producer's own handle for the thing to start. The
+    /// registry carries it to the launcher and never reads it.
     ///
     /// The slot is taken BEFORE the durable write and given back if that write
-    /// fails: a refusal must not leak the budget it never spent.
+    /// fails: a refusal must not leak the budget it never spent. A launch that
+    /// fails settles the job `Failed` instead, so the record says what happened
+    /// rather than claiming a process that never ran (US-135 AC5).
     pub async fn register(
         &self,
         kind: JobKind,
         command: impl Into<String>,
+        token: u64,
     ) -> Result<RegisteredJob, JobError> {
         let owner = self.owner()?;
+        let launcher = Arc::clone(self.launcher.as_ref().ok_or(JobError::NoLauncher)?);
         let command = bounded_command(command.into());
         self.reserve()?;
         let job_id = JobId::generate(self.ids.as_ref());
@@ -414,7 +498,7 @@ impl JobRegistry {
                 record: JobRecord {
                     job_id,
                     kind,
-                    command,
+                    command: command.clone(),
                     status: JobStatus::Running,
                     reported: false,
                     exit_code: None,
@@ -423,7 +507,42 @@ impl JobRegistry {
                     ended_at_ms: None,
                 },
                 cancel: Some(cancel.clone()),
+                process: None,
             });
+        }
+
+        match launcher
+            .launch(JobLaunch {
+                job_id,
+                kind,
+                command,
+                token,
+                cancel: cancel.clone(),
+            })
+            .await
+        {
+            Ok(process) => {
+                // A job settled while its launch was in flight keeps nothing,
+                // but the process the launcher just started is real. Stopping
+                // it here is what keeps a settled job from leaving a live child
+                // no snapshot names and no owner can reach.
+                if !self.attach_process(job_id, Arc::clone(&process)) {
+                    process.stop().await;
+                }
+            }
+            Err(cause) => {
+                // `Failed` is the launch that never ran, and it frees the slot
+                // by being terminal. A non-zero exit is NOT this: that is a
+                // process that ran and answered (US-137 AC2).
+                self.settle(
+                    job_id,
+                    JobOutcome::Failed {
+                        cause: cause.clone(),
+                    },
+                )
+                .await?;
+                return Err(JobError::NotLaunched(cause));
+            }
         }
 
         // A thread that was interrupted DURING this registration leaves the
@@ -434,6 +553,34 @@ impl JobRegistry {
             self.cancel(job_id, TEARDOWN_CAUSE).await?;
         }
         Ok(RegisteredJob { job_id, cancel })
+    }
+
+    /// Hangs the launcher's answer on the record. `false` when the job settled
+    /// while the launch was in flight: the record keeps nothing, and the caller
+    /// owes the process it was handed a stop.
+    fn attach_process(&self, job_id: JobId, process: Arc<dyn JobProcess>) -> bool {
+        let mut state = self.lock();
+        match state
+            .jobs
+            .iter_mut()
+            .find(|job| job.record.job_id == job_id && !job.record.status.is_terminal())
+        {
+            Some(job) => {
+                job.process = Some(process);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// What the producer attached to a job, for the caller that needs to read
+    /// its output rather than its accounting.
+    pub fn process(&self, job_id: JobId) -> Option<Arc<dyn JobProcess>> {
+        self.lock()
+            .jobs
+            .iter()
+            .find(|job| job.record.job_id == job_id)
+            .and_then(|job| job.process.clone())
     }
 
     /// Settles a job in its terminal state.
@@ -450,29 +597,8 @@ impl JobRegistry {
         outcome: JobOutcome,
     ) -> Result<Option<JobSnapshot>, JobError> {
         self.owner()?;
-        let now = self.clock.now_ms();
-        let snapshot = {
-            let mut state = self.lock();
-            let Some(job) = state
-                .jobs
-                .iter_mut()
-                .find(|job| job.record.job_id == job_id)
-            else {
-                return Err(JobError::Unknown { job_id });
-            };
-            if job.record.status.is_terminal() {
-                tracing::debug!(
-                    job_id = %job_id,
-                    status = job.record.status.as_str(),
-                    "background job already settled; the second outcome is ignored"
-                );
-                return Ok(None);
-            }
-            job.record.status = outcome.status();
-            job.record.exit_code = outcome.exit_code();
-            job.record.cause = outcome.cause();
-            job.record.ended_at_ms = Some(now);
-            job.snapshot()
+        let Some(snapshot) = self.claim(job_id, outcome)? else {
+            return Ok(None);
         };
 
         self.journal(ThreadEventPayload::JobStateChanged {
@@ -483,6 +609,65 @@ impl JobRegistry {
         })
         .await;
         Ok(Some(snapshot))
+    }
+
+    /// Settles a job from a place that cannot await: a `Drop`.
+    ///
+    /// The terminal state is claimed exactly as [`Self::settle`] claims it, and
+    /// the durable line goes to the same deferred queue a refused write uses,
+    /// which the thread actor drains while it still owns the log. A session
+    /// dropped without ceremony therefore still ends `Killed` in the log,
+    /// instead of staying `Running` forever (US-137 AC6).
+    pub fn settle_deferred(
+        &self,
+        job_id: JobId,
+        outcome: JobOutcome,
+    ) -> Result<Option<JobSnapshot>, JobError> {
+        self.owner()?;
+        let Some(snapshot) = self.claim(job_id, outcome)? else {
+            return Ok(None);
+        };
+        self.unrecorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(ThreadEventPayload::JobStateChanged {
+                job_id,
+                to: snapshot.status,
+                exit_code: snapshot.exit_code,
+                cause: snapshot.cause.clone(),
+            });
+        Ok(Some(snapshot))
+    }
+
+    /// Takes the terminal state under the lock, or reports that someone else
+    /// already did. Claiming is not publishing: nothing here writes.
+    fn claim(&self, job_id: JobId, outcome: JobOutcome) -> Result<Option<JobSnapshot>, JobError> {
+        let now = self.clock.now_ms();
+        let mut state = self.lock();
+        let Some(job) = state
+            .jobs
+            .iter_mut()
+            .find(|job| job.record.job_id == job_id)
+        else {
+            return Err(JobError::Unknown { job_id });
+        };
+        if job.record.status.is_terminal() {
+            tracing::debug!(
+                job_id = %job_id,
+                status = job.record.status.as_str(),
+                "background job already settled; the second outcome is ignored"
+            );
+            return Ok(None);
+        }
+        job.record.status = outcome.status();
+        job.record.exit_code = outcome.exit_code();
+        job.record.cause = outcome.cause();
+        job.record.ended_at_ms = Some(now);
+        // The process is released with the state: a settled job has nothing
+        // left to stop, and holding the handle would keep a dead child alive in
+        // the registry.
+        job.process = None;
+        Ok(Some(job.snapshot()))
     }
 
     /// Stops one job and settles it, whatever the cancellation achieves.
@@ -497,7 +682,7 @@ impl JobRegistry {
     /// Siblings are untouched: each job hangs from its own node.
     pub async fn cancel(&self, job_id: JobId, cause: &str) -> Result<JobSnapshot, JobError> {
         self.owner()?;
-        let (payloads, token) = {
+        let (payloads, token, process) = {
             let mut state = self.lock();
             let Some(job) = state
                 .jobs
@@ -523,7 +708,7 @@ impl JobRegistry {
                     cause: None,
                 });
             }
-            (payloads, job.cancel.clone())
+            (payloads, job.cancel.clone(), job.process.clone())
         };
         for payload in payloads {
             self.journal(payload).await;
@@ -535,6 +720,13 @@ impl JobRegistry {
                 job_id = %job_id,
                 "background job holds no cancellation node in this process; settling it anyway"
             ),
+        }
+
+        // The token says stop to whoever is watching it; the process is what
+        // actually dies. A terminal reads its own token in no loop, so without
+        // this call an interrupted thread would leave its shells running.
+        if let Some(process) = process {
+            process.stop().await;
         }
 
         match self
@@ -587,6 +779,7 @@ impl JobRegistry {
             .map(|record| Job {
                 record,
                 cancel: None,
+                process: None,
             })
             .collect();
     }
@@ -650,7 +843,7 @@ fn bounded_command(command: String) -> String {
 mod tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use crate::id::{EventId, SequentialIds};
     use crate::thread::SubmitError;
@@ -705,15 +898,141 @@ mod tests {
         async fn sleep(&self, _dur: std::time::Duration) {}
     }
 
+    /// A launcher with no process behind it: it records what the registry asked
+    /// for and hands back a stub. That is the whole point of the trait, and this
+    /// module proves the registry with it, without a shell and without a tool
+    /// registry (US-135 AC6).
+    struct FakeLauncher {
+        launched: Mutex<Vec<JobLaunch>>,
+        fails: Option<String>,
+        processes: Mutex<Vec<Arc<FakeProcess>>>,
+    }
+
+    impl FakeLauncher {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                launched: Mutex::new(Vec::new()),
+                fails: None,
+                processes: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn failing(cause: &str) -> Arc<Self> {
+            Arc::new(Self {
+                launched: Mutex::new(Vec::new()),
+                fails: Some(cause.to_string()),
+                processes: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn launched(&self) -> Vec<JobLaunch> {
+            self.launched
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn processes(&self) -> Vec<Arc<FakeProcess>> {
+            self.processes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl JobLauncher for FakeLauncher {
+        async fn launch(&self, launch: JobLaunch) -> Result<Arc<dyn JobProcess>, String> {
+            self.launched
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(launch);
+            if let Some(cause) = &self.fails {
+                return Err(cause.clone());
+            }
+            let process = Arc::new(FakeProcess {
+                stops: AtomicUsize::new(0),
+            });
+            self.processes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(Arc::clone(&process));
+            Ok(process as Arc<dyn JobProcess>)
+        }
+    }
+
+    struct FakeProcess {
+        stops: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl JobProcess for FakeProcess {
+        async fn read_output(&self) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn stop(&self) {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A launcher that settles the job WHILE it is starting its process. That
+    /// is the race a thread teardown creates: the stop lands between the spawn
+    /// and the moment the registry can hang the process on the record.
+    struct RacingLauncher {
+        registry: OnceLock<Arc<JobRegistry>>,
+        process: Arc<FakeProcess>,
+    }
+
+    impl RacingLauncher {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                registry: OnceLock::new(),
+                process: Arc::new(FakeProcess {
+                    stops: AtomicUsize::new(0),
+                }),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl JobLauncher for RacingLauncher {
+        async fn launch(&self, launch: JobLaunch) -> Result<Arc<dyn JobProcess>, String> {
+            if let Some(registry) = self.registry.get() {
+                registry
+                    .settle(
+                        launch.job_id,
+                        JobOutcome::Killed {
+                            cause: "the thread went down mid-launch".to_string(),
+                        },
+                    )
+                    .await
+                    .map_err(|err| err.to_string())?;
+            }
+            Ok(Arc::clone(&self.process) as Arc<dyn JobProcess>)
+        }
+    }
+
     fn bound(log: &Arc<Log>) -> (Arc<JobRegistry>, CancellationToken) {
-        let registry = JobRegistry::new(Arc::new(SequentialIds::new()), Arc::new(FrozenClock));
+        bound_to(log, FakeLauncher::new()).0
+    }
+
+    fn bound_to(
+        log: &Arc<Log>,
+        launcher: Arc<FakeLauncher>,
+    ) -> ((Arc<JobRegistry>, CancellationToken), Arc<FakeLauncher>) {
+        let registry = JobRegistry::new(
+            Arc::new(SequentialIds::new()),
+            Arc::new(FrozenClock),
+            Some(Arc::clone(&launcher) as Arc<dyn JobLauncher>),
+        );
         let thread = CancellationToken::new();
         registry.attach(
             ThreadId::generate(&SequentialIds::new()),
             Arc::clone(log) as Arc<dyn ThreadJournal>,
             thread.child_token(),
         );
-        (registry, thread)
+        ((registry, thread), launcher)
     }
 
     #[tokio::test]
@@ -722,7 +1041,7 @@ mod tests {
         let (registry, _thread) = bound(&log);
 
         let job = registry
-            .register(JobKind::Terminal, "npm run dev")
+            .register(JobKind::Terminal, "npm run dev", 0)
             .await
             .expect("the registration is accepted");
 
@@ -741,9 +1060,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_detached_registry_refuses_before_anything_is_written() {
-        let registry = JobRegistry::new(Arc::new(SequentialIds::new()), Arc::new(FrozenClock));
+        let registry = JobRegistry::new(
+            Arc::new(SequentialIds::new()),
+            Arc::new(FrozenClock),
+            Some(FakeLauncher::new() as Arc<dyn JobLauncher>),
+        );
         assert_eq!(
-            registry.register(JobKind::Terminal, "sleep 1").await.err(),
+            registry
+                .register(JobKind::Terminal, "sleep 1", 0)
+                .await
+                .err(),
             Some(JobError::Detached)
         );
         assert!(registry.snapshots().is_empty());
@@ -757,13 +1083,13 @@ mod tests {
         let (registry, _thread) = bound(&log);
         for _ in 0..MAX_ACTIVE_JOBS {
             registry
-                .register(JobKind::Terminal, "tail -f log")
+                .register(JobKind::Terminal, "tail -f log", 0)
                 .await
                 .expect("a slot is free");
         }
 
         let refused = registry
-            .register(JobKind::Terminal, "one too many")
+            .register(JobKind::Terminal, "one too many", 0)
             .await
             .expect_err("the registry is full");
 
@@ -793,7 +1119,7 @@ mod tests {
         for _ in 0..MAX_ACTIVE_JOBS {
             jobs.push(
                 registry
-                    .register(JobKind::Terminal, "tail -f log")
+                    .register(JobKind::Terminal, "tail -f log", 0)
                     .await
                     .expect("a slot is free"),
             );
@@ -805,7 +1131,7 @@ mod tests {
 
         assert_eq!(registry.active(), MAX_ACTIVE_JOBS - 1);
         registry
-            .register(JobKind::Terminal, "the released slot")
+            .register(JobKind::Terminal, "the released slot", 0)
             .await
             .expect("the freed slot is usable");
     }
@@ -819,7 +1145,7 @@ mod tests {
         log.refuses.store(true, Ordering::SeqCst);
 
         let refused = registry
-            .register(JobKind::Terminal, "npm run dev")
+            .register(JobKind::Terminal, "npm run dev", 0)
             .await
             .expect_err("a registration the log refuses is refused");
 
@@ -828,7 +1154,7 @@ mod tests {
         assert_eq!(registry.active(), 0);
         log.refuses.store(false, Ordering::SeqCst);
         registry
-            .register(JobKind::Terminal, "npm run dev")
+            .register(JobKind::Terminal, "npm run dev", 0)
             .await
             .expect("the slot was given back");
     }
@@ -840,7 +1166,7 @@ mod tests {
         let log = Log::new();
         let (registry, _thread) = bound(&log);
         let job = registry
-            .register(JobKind::Terminal, "npm test")
+            .register(JobKind::Terminal, "npm test", 0)
             .await
             .expect("the registration is accepted");
 
@@ -900,7 +1226,7 @@ mod tests {
         let log = Log::new();
         let (registry, _thread) = bound(&log);
         let job = registry
-            .register(JobKind::Terminal, "tail -f log")
+            .register(JobKind::Terminal, "tail -f log", 0)
             .await
             .expect("the registration is accepted");
 
@@ -936,11 +1262,11 @@ mod tests {
         let log = Log::new();
         let (registry, _thread) = bound(&log);
         let stopped = registry
-            .register(JobKind::Terminal, "tail -f a")
+            .register(JobKind::Terminal, "tail -f a", 0)
             .await
             .expect("the registration is accepted");
         let sibling = registry
-            .register(JobKind::Terminal, "tail -f b")
+            .register(JobKind::Terminal, "tail -f b", 0)
             .await
             .expect("the registration is accepted");
 
@@ -962,7 +1288,7 @@ mod tests {
         let log = Log::new();
         let (registry, _thread) = bound(&log);
         let job = registry
-            .register(JobKind::Terminal, "npm test")
+            .register(JobKind::Terminal, "npm test", 0)
             .await
             .expect("the registration is accepted");
         registry
@@ -989,7 +1315,7 @@ mod tests {
         let log = Log::new();
         let (registry, _thread) = bound(&log);
         let job = registry
-            .register(JobKind::Terminal, "npm run dev")
+            .register(JobKind::Terminal, "npm run dev", 0)
             .await
             .expect("the registration is accepted");
         let taken = registry.get(job.job_id).expect("the job is known");
@@ -1011,7 +1337,8 @@ mod tests {
     /// nothing, and admits it can no longer stop anything.
     #[test]
     fn a_restored_job_keeps_its_state_and_its_flag_and_is_detached() {
-        let registry = JobRegistry::new(Arc::new(SequentialIds::new()), Arc::new(FrozenClock));
+        let registry =
+            JobRegistry::new(Arc::new(SequentialIds::new()), Arc::new(FrozenClock), None);
         let job_id = JobId::generate(&SequentialIds::starting_at(70));
         registry.restore(vec![JobRecord {
             job_id,
@@ -1040,5 +1367,231 @@ mod tests {
         let long = "e\u{301}".repeat(MAX_JOB_COMMAND);
         let bounded = bounded_command(long);
         assert_eq!(bounded.chars().count(), MAX_JOB_COMMAND);
+    }
+
+    /// US-137 AC7: a settle WRITES first and answers second. The assertion is
+    /// on the order: by the time the caller holds the snapshot, the log already
+    /// carries the transition. Journaling after the return would leave the log
+    /// empty here and fail.
+    #[tokio::test]
+    async fn a_settle_is_durable_before_it_hands_back_the_snapshot() {
+        let log = Log::new();
+        let (registry, _thread) = bound(&log);
+        let job = registry
+            .register(JobKind::Terminal, "npm test", 1)
+            .await
+            .expect("the registration is accepted");
+
+        let snapshot = registry
+            .settle(job.job_id, JobOutcome::Completed { exit_code: 0 })
+            .await
+            .expect("the settle holds")
+            .expect("this settle is the first arrival");
+
+        assert_eq!(snapshot.status, JobStatus::Completed);
+        assert!(
+            matches!(
+                log.written().last(),
+                Some(ThreadEventPayload::JobStateChanged { job_id, to, exit_code, .. })
+                    if *job_id == job.job_id
+                        && *to == JobStatus::Completed
+                        && *exit_code == Some(0)
+            ),
+            "the transition is in the log before the caller reads the snapshot: {:?}",
+            log.written()
+        );
+    }
+
+    /// US-135 AC3: no launcher, no behavior. The refusal is named and it comes
+    /// before anything is written, exactly as a `ToolCtx` without a spill store
+    /// refuses rather than pretending.
+    #[tokio::test]
+    async fn a_registry_without_a_launcher_refuses_the_registration_by_name() {
+        let log = Log::new();
+        let registry =
+            JobRegistry::new(Arc::new(SequentialIds::new()), Arc::new(FrozenClock), None);
+        let thread = CancellationToken::new();
+        registry.attach(
+            ThreadId::generate(&SequentialIds::new()),
+            Arc::clone(&log) as Arc<dyn ThreadJournal>,
+            thread.child_token(),
+        );
+
+        assert_eq!(
+            registry
+                .register(JobKind::Terminal, "npm run dev", 7)
+                .await
+                .err(),
+            Some(JobError::NoLauncher)
+        );
+        assert!(log.written().is_empty(), "a refusal writes nothing");
+        assert_eq!(registry.active(), 0, "and it spends no slot");
+    }
+
+    /// US-135 AC4: what crosses to the launcher is the identity of the job and
+    /// the producer's own opaque token, never anything shaped like a shell.
+    #[tokio::test]
+    async fn a_launch_carries_the_identity_the_producer_token_and_the_job_node() {
+        let log = Log::new();
+        let ((registry, thread), launcher) = bound_to(&log, FakeLauncher::new());
+
+        let job = registry
+            .register(JobKind::Terminal, "npm run dev", 42)
+            .await
+            .expect("the registration is accepted");
+
+        let launched = launcher.launched();
+        assert_eq!(launched.len(), 1);
+        assert_eq!(launched[0].job_id, job.job_id);
+        assert_eq!(launched[0].kind, JobKind::Terminal);
+        assert_eq!(launched[0].command, "npm run dev");
+        assert_eq!(launched[0].token, 42, "the producer handle crosses intact");
+        thread.cancel();
+        assert!(
+            launched[0].cancel.is_cancelled(),
+            "the launcher holds the job node, a child of the thread's"
+        );
+    }
+
+    /// US-135 AC5: a launch that fails leaves an accounted failure, not a job
+    /// waiting for a process that never started.
+    #[tokio::test]
+    async fn a_launch_that_fails_settles_the_job_failed_and_gives_the_slot_back() {
+        let log = Log::new();
+        let ((registry, _thread), _launcher) =
+            bound_to(&log, FakeLauncher::failing("shell not found"));
+
+        let err = registry
+            .register(JobKind::Terminal, "npm run dev", 3)
+            .await
+            .expect_err("the launch failed");
+        assert!(
+            matches!(&err, JobError::NotLaunched(cause) if cause == "shell not found"),
+            "the caller learns why: {err}"
+        );
+
+        let snapshot = registry
+            .snapshots()
+            .pop()
+            .expect("the failure is still accounted for");
+        assert_eq!(snapshot.status, JobStatus::Failed);
+        assert_eq!(snapshot.cause.as_deref(), Some("shell not found"));
+        assert_eq!(registry.active(), 0, "the slot is back");
+        assert!(
+            registry
+                .snapshots()
+                .iter()
+                .all(|job| job.status != JobStatus::Running),
+            "no Running record survives a launch that never ran"
+        );
+    }
+
+    /// The token says stop, the process is what dies. Without this the registry
+    /// would settle a job whose shell keeps running.
+    #[tokio::test]
+    async fn cancelling_a_job_stops_the_process_the_launcher_handed_back() {
+        let log = Log::new();
+        let ((registry, _thread), launcher) = bound_to(&log, FakeLauncher::new());
+        let job = registry
+            .register(JobKind::Terminal, "npm run dev", 1)
+            .await
+            .expect("the registration is accepted");
+
+        registry
+            .cancel(job.job_id, "stopped by the user")
+            .await
+            .expect("the job is stopped");
+
+        let processes = launcher.processes();
+        assert_eq!(processes.len(), 1);
+        assert_eq!(
+            processes[0].stops.load(Ordering::SeqCst),
+            1,
+            "the launcher's process was told to stop, once"
+        );
+    }
+    /// A record whose process the registry cannot keep must not leave that
+    /// process running: the snapshot no longer names it and nothing could ever
+    /// stop it again.
+    #[tokio::test]
+    async fn a_job_settled_during_its_launch_still_stops_the_process_it_started() {
+        let log = Log::new();
+        let launcher = RacingLauncher::new();
+        let registry = JobRegistry::new(
+            Arc::new(SequentialIds::new()),
+            Arc::new(FrozenClock),
+            Some(Arc::clone(&launcher) as Arc<dyn JobLauncher>),
+        );
+        registry.attach(
+            ThreadId::generate(&SequentialIds::new()),
+            Arc::clone(&log) as Arc<dyn ThreadJournal>,
+            CancellationToken::new().child_token(),
+        );
+        let _ = launcher.registry.set(Arc::clone(&registry));
+
+        let job = registry
+            .register(JobKind::Terminal, "npm run dev", 1)
+            .await
+            .expect("the registration is accepted");
+
+        let snapshot = registry.get(job.job_id).expect("the job is there");
+        assert_eq!(snapshot.status, JobStatus::Killed);
+        assert!(
+            registry.process(job.job_id).is_none(),
+            "a settled job keeps no process"
+        );
+        assert_eq!(
+            launcher.process.stops.load(Ordering::SeqCst),
+            1,
+            "the process the launcher started was stopped anyway"
+        );
+    }
+
+    /// A settle from a place that cannot await claims the terminal state at
+    /// once and leaves its durable line to the actor, so the log carries it
+    /// without the registry ever announcing a state the log does not hold.
+    #[tokio::test]
+    async fn a_deferred_settle_claims_the_state_and_hands_its_line_to_the_actor() {
+        let log = Log::new();
+        let (registry, _thread) = bound(&log);
+        let job = registry
+            .register(JobKind::Terminal, "npm run dev", 1)
+            .await
+            .expect("the registration is accepted");
+
+        let before = log.written().len();
+        let snapshot = registry
+            .settle_deferred(job.job_id, JobOutcome::Completed { exit_code: 0 })
+            .expect("the job is known")
+            .expect("the first arrival settles it");
+
+        assert_eq!(snapshot.status, JobStatus::Completed);
+        assert_eq!(
+            log.written().len(),
+            before,
+            "nothing is written from a place that cannot await"
+        );
+        let deferred = registry.take_unrecorded();
+        assert_eq!(
+            deferred,
+            vec![ThreadEventPayload::JobStateChanged {
+                job_id: job.job_id,
+                to: JobStatus::Completed,
+                exit_code: Some(0),
+                cause: None,
+            }]
+        );
+        assert!(
+            registry
+                .settle_deferred(
+                    job.job_id,
+                    JobOutcome::Killed {
+                        cause: "late".to_string()
+                    }
+                )
+                .expect("the job is known")
+                .is_none(),
+            "the second arrival settles nothing"
+        );
     }
 }

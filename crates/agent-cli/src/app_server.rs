@@ -21,7 +21,9 @@ use agent_runtime::id::{ThreadId, TurnId};
 use agent_runtime::thread::{Submission, SubmitError};
 use tokio_util::sync::CancellationToken;
 
-use crate::runtime::{AgentWiring, CliStepSource, EngineDeps, SessionRuntime, SettingsCell};
+use crate::runtime::{
+    AgentWiring, CliStepSource, EngineDeps, JobWiring, SessionRuntime, SettingsCell,
+};
 
 /// Everything the binary resolved before the runtime, kept so a thread can be
 /// opened on demand rather than at startup.
@@ -32,6 +34,9 @@ pub struct CliHostParts {
     pub settings: Arc<SettingsCell>,
     pub steps: Arc<CliStepSource>,
     pub agents: Option<AgentWiring>,
+    /// How a background job becomes a process, shared by every thread the
+    /// server opens (one at a time: `max_open_threads` is 1).
+    pub jobs: Option<JobWiring>,
     pub bridge: Arc<agent_app_server::ClientBridge>,
     pub cancel: CancellationToken,
 }
@@ -84,6 +89,7 @@ impl CliHost {
             Arc::clone(&self.parts.steps),
             &self.parts.cancel,
             self.parts.agents.as_ref(),
+            self.parts.jobs.as_ref(),
         )
         .await
         .map_err(|err| HostError::Internal(err.to_string()))?;

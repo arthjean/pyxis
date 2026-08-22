@@ -113,6 +113,9 @@ pub struct InteractiveConfig {
     /// Sub-agent wiring: the spawner and the handle the six multi-agent tools
     /// address. `None` when the build has no spawner.
     pub agents: Option<crate::runtime::AgentWiring>,
+    /// How a background job becomes a process. Rebound to each thread this
+    /// module opens, `/fork` and `/rewind` included.
+    pub jobs: Option<crate::runtime::JobWiring>,
     /// Mutable permission mode, shared with the tool registry.
     pub permission_mode: PermissionModeState,
     /// Answers remembered this session, shared with the tool registry
@@ -260,6 +263,7 @@ async fn open_session(
         Arc::clone(&cfg.steps),
         root,
         cfg.agents.as_ref(),
+        cfg.jobs.as_ref(),
     )
     .await?;
     // Every way into a thread goes through here, `/fork` and `/rewind`

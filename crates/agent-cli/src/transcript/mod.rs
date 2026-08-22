@@ -170,6 +170,9 @@ async fn transcript_of(scenario: &Scenario, seed: u64) -> Run {
     };
 
     let outcome = crate::headless::run(crate::headless::HeadlessRun {
+        // The frozen transcripts drive no terminal, so the registry stays
+        // accounting-only here rather than carrying a launcher nothing calls.
+        jobs: None,
         prompt: scenario.prompt.clone(),
         // Ephemeral: no file is opened, so no absolute path can reach the
         // stream through a session locator (US-018 AC4).
