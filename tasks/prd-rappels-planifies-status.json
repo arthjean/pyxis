@@ -18,10 +18,10 @@
     {
       "id": "EP-047",
       "title": "L'écriture durable et la frontière de reprise",
-      "status": "READY",
+      "status": "IN_REVIEW",
       "priority": "P0",
       "stories_total": 3,
-      "stories_done": 0
+      "stories_done": 2
     },
     {
       "id": "EP-048",
@@ -107,44 +107,44 @@
       "id": "US-152",
       "title": "Trois variantes additives, et aucune version ne bouge",
       "epic": "EP-047",
-      "status": "READY",
+      "status": "DONE",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-148"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-22",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
     },
     {
       "id": "US-153",
       "title": "La reprise plie, rapporte, et n'exécute rien",
       "epic": "EP-047",
-      "status": "READY",
+      "status": "IN_REVIEW",
       "priority": "P0",
       "size": "M",
       "blocked_by": [
         "US-149",
         "US-152"
       ],
-      "started_at": null,
+      "started_at": "2026-08-22",
       "completed_at": null,
-      "reviewed_at": null
+      "reviewed_at": "2026-08-22"
     },
     {
       "id": "US-154",
       "title": "ADR-17 distingue un rappel d'un processus ressuscité",
       "epic": "EP-047",
-      "status": "READY",
+      "status": "DONE",
       "priority": "P0",
       "size": "S",
       "blocked_by": [
         "US-153"
       ],
-      "started_at": null,
-      "completed_at": null,
-      "reviewed_at": null
+      "started_at": "2026-08-22",
+      "completed_at": "2026-08-22",
+      "reviewed_at": "2026-08-22"
     },
     {
       "id": "US-155",
