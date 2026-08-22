@@ -27,6 +27,7 @@ pub mod lifecycle;
 pub mod path;
 pub mod resume;
 pub mod runner;
+pub mod schedule;
 pub mod store;
 pub mod supervisor;
 pub mod thread;
@@ -47,8 +48,8 @@ pub use event::{
 pub use failure::{FailureCategory, TurnFailure};
 pub use handoff::{AgentHandoff, HandoffDraft, MAX_HANDOFF_SUMMARY, UNTRUSTED_BANNER};
 pub use id::{
-    AgentId, EventId, IdError, IdGenerator, JobId, RandomIds, SequentialIds, StepId, ThreadId,
-    TurnId,
+    AgentId, EventId, IdError, IdGenerator, JobId, RandomIds, ScheduleId, SequentialIds, StepId,
+    ThreadId, TurnId,
 };
 pub use inputs::TurnInputs;
 pub use jobs::{
@@ -59,6 +60,12 @@ pub use lifecycle::{LifecycleError, TurnLifecycle, TurnState};
 pub use path::{AgentPath, AgentPathError, MAX_AGENT_NAME, MAX_AGENT_PATH, ROOT_PATH};
 pub use resume::ResumedThread;
 pub use runner::{RunAgentRunner, TurnOutcome, TurnRequest, TurnRunner};
+pub use schedule::{
+    DueDecision, EveryOccurrence, FoldedSchedules, MAX_ACTIVE_SCHEDULES, MAX_SCHEDULE_AT_MS,
+    MAX_SCHEDULE_PROMPT_CHARS, MIN_EVERY_INTERVAL_SECONDS, RecurringDue, ScheduleChange,
+    ScheduleDelivery, ScheduleError, ScheduleRecord, ScheduleRule, ScheduleState, ScheduleView,
+    due_decision, fold_schedules, resolve_every_occurrence,
+};
 pub use store::{
     FailingThreadStore, FailureMode, FailurePoint, ForkPoint, MemoryThreadStore, RecoveryCommit,
     StoreCall, StoreError, StoreOperation, ThreadSnapshot, ThreadStore,

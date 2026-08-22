@@ -215,6 +215,19 @@ define_id!(
     JobId,
     "job_"
 );
+define_id!(
+    /// One scheduled reminder of a thread (EP-046).
+    ///
+    /// Opaque like every other identifier here, and deliberately NOT the
+    /// readable `schedule-N` counter the design harness allocates
+    /// (`packages/schedule/schedule/src/domain.ts:620`, `allocateScheduleId`):
+    /// a readable counter has to be derived from the fold to stay unique, which
+    /// makes minting an identifier depend on having read the whole log first.
+    /// The model never has to retain one, because `schedule_list` hands it
+    /// back with the reminder it belongs to.
+    ScheduleId,
+    "sch_"
+);
 
 #[cfg(test)]
 mod tests {
